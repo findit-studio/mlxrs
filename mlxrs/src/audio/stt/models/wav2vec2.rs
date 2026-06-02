@@ -80,18 +80,23 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload,
-    MalformedDataPayload, MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload,
-    ParsePayload, RankMismatchPayload, Result, ShapePairMismatchPayload, UnknownEnumValuePayload,
+    Error, InvariantViolationPayload, KeyCollisionPayload, LayerKeyedPayload,
+    LengthMismatchPayload, MalformedDataPayload, MissingKeyPayload, NonFiniteScalarPayload,
+    OutOfRangePayload, ParsePayload, RankMismatchPayload, Result, ShapePairMismatchPayload,
+    UnknownEnumValuePayload,
   },
-  lm::nn::{
-    attention::{Mask, scaled_dot_product_attention},
-    norm::{GroupNorm, LayerNorm},
+  lm::{
+    nn::{
+      attention::{Mask, scaled_dot_product_attention},
+      norm::{GroupNorm, LayerNorm},
+    },
+    quant::{PerLayerQuantization, QuantizationOption},
   },
   model_validation::{
     checked_mul, insert_unique, pin_bool, pin_str, require_divisible, require_positive,
     reserve_or_error,
   },
+  nn::{MaybeQuantizedLinear, QuantizedLinear},
   ops,
 };
 
@@ -762,6 +767,75 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
   Ok(out)
 }
 
+/// Reproject the per-layer [`PerLayerQuantization`] override keys into the same
+/// sanitized namespace the builders resolve a layer's scheme in.
+///
+/// [`sanitize`] strips a leading supported backbone prefix (`wav2vec2.` /
+/// `hubert.`, [`SUPPORTED_BACKBONE_PREFIXES`]) from every weight key, and the
+/// builders then look a layer's scheme up by its **sanitized** prefix (e.g.
+/// `encoder.layers.0.attention.q_proj`) via
+/// [`PerLayerQuantization::quantization_for`]. An on-disk `config.json`, by
+/// contrast, keys its per-layer overrides in the HF form that carries the
+/// backbone prefix (`wav2vec2.encoder.layers.0.attention.q_proj`). Without this
+/// rewrite an override would never match the sanitized lookup and the layer
+/// would silently fall back to the global scheme — loading with the wrong
+/// `(group_size, bits)` or being rejected by the shape gate. Mirrors the
+/// per-tower key reprojection the embeddings towers apply for the same reason.
+///
+/// Each override key has the leading backbone prefix stripped (a key already in
+/// the sanitized form, e.g. the top-level `lm_head`, is left unchanged). The
+/// global default ([`PerLayerQuantization::quantization`]) is carried through
+/// untouched. Collisions are handled **deterministically**, never by an
+/// arbitrary `HashMap` survivor: two source keys that reproject to the same
+/// sanitized key are deduplicated when their [`QuantizationOption`] is identical
+/// and rejected with [`Error::KeyCollision`] when it conflicts (a checkpoint
+/// carrying both `wav2vec2.<x>` and the unprefixed `<x>` with different schemes
+/// is a genuine config contradiction).
+///
+/// This is **idempotent**: an already-sanitized key carries no leading backbone
+/// prefix, so re-stripping it is a no-op and a key unchanged by the first pass
+/// is unchanged by a second. Re-normalizing an already-normalized
+/// [`PerLayerQuantization`] therefore returns an equivalent map — which lets
+/// [`Wav2Vec2Ctc::from_weights_quantized`] normalize unconditionally at its
+/// single boundary without double-strip hazards.
+#[cfg(feature = "wav2vec2")]
+fn reproject_quant_keys(quant: &PerLayerQuantization) -> Result<PerLayerQuantization> {
+  let per_layer = quant.per_layer_ref();
+  let mut out: HashMap<String, QuantizationOption> = HashMap::new();
+  // The reprojected map has at most as many entries as the source (a strip can
+  // only collapse two keys onto one, never add); reserve fallibly so a hostile
+  // config's huge per-layer set surfaces a typed `AllocFailure`.
+  reserve_or_error(&mut out, "Wav2Vec2 reproject_quant_keys", per_layer.len())?;
+  for (key, &opt) in per_layer {
+    // Strip whichever supported backbone prefix leads (a key carries at most
+    // one); a key already unprefixed (e.g. the top-level `lm_head`) is kept.
+    let stripped = SUPPORTED_BACKBONE_PREFIXES
+      .iter()
+      .find_map(|p| key.strip_prefix(p))
+      .unwrap_or(key.as_str());
+    match out.get(stripped) {
+      // Same destination, identical scheme: a benign duplicate (e.g. a
+      // prefixed + unprefixed form of one layer that agree). Keep the single
+      // entry without growing the map.
+      Some(existing) if *existing == opt => {}
+      // Same destination, conflicting scheme: a genuine config contradiction —
+      // a typed error, never an arbitrary `HashMap` survivor.
+      Some(_) => {
+        return Err(Error::KeyCollision(KeyCollisionPayload::new(
+          "Wav2Vec2 reproject_quant_keys: two per-layer overrides reproject to the same sanitized layer with conflicting schemes",
+          format_smolstr!("{stripped}"),
+        )));
+      }
+      // First occurrence of this sanitized key: insert it (the map is already
+      // reserved to the source length, so this cannot reallocate).
+      None => {
+        out.insert(stripped.to_string(), opt);
+      }
+    }
+  }
+  Ok(PerLayerQuantization::new(quant.quantization, out))
+}
+
 // ───────────────────────────── CTC decode ─────────────────────────────
 
 /// CTC blank token id (`pad_token_id = 0` for `base-960h`). Greedy decoding
@@ -958,18 +1032,61 @@ impl Vocab {
 
 // ───────────────────────────── linear helper ─────────────────────────────
 
-/// `y = x @ wᵀ (+ bias)` — a private `nn.Linear` forward.
+/// A wav2vec2 linear projection `y = x @ Wᵀ (+ b)` — quantize-aware.
 ///
-/// mlxrs ships no public `nn::Linear` (GAP by design); each transformer
-/// projection composes this. HF stores a `Linear` weight as `(out, in)`, so
-/// the matmul is `x @ wᵀ`. With a bias this is the fused
-/// `addmm(bias, x, wᵀ, 1, 1)`; without, a plain `matmul(x, wᵀ)`.
+/// Mirrors `mlx.nn.Linear` (`weight` stored `(out, in)`, the forward
+/// transposes it) for a dense checkpoint, and `mlx.nn.QuantizedLinear` for an
+/// mlx-community quantized (e.g. 8-bit) wav2vec2 checkpoint. The two cases
+/// share one [`forward`](Self::forward) call site via the shared
+/// [`MaybeQuantizedLinear`], so the attention / feed-forward / feature
+/// projection / CTC-head code is unchanged whether the weights are dense or
+/// quantized.
+///
+/// This is the wav2vec2 adoption of the shared quantize-aware layer, mirroring
+/// the Whisper model's `Linear` wrapper exactly. Only the Linear / projection
+/// layers (the encoder attention `q/k/v/out` projections, the feed-forward
+/// `intermediate` / `output` projections, the feature projection, and the CTC
+/// `lm_head`) use it — the convolutional feature extractor / positional conv
+/// stay dense, matching what mlx-audio / MLX quantizes (`nn.Linear` only).
 #[cfg(feature = "wav2vec2")]
-fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
-  let wt = ops::shape::swapaxes(weight, 0, 1)?;
-  match bias {
-    Some(b) => ops::linalg_basic::addmm(b, x, &wt, 1.0, 1.0),
-    None => ops::linalg_basic::matmul(x, &wt),
+struct Linear {
+  /// The dense-or-quantized projection. Built by the model builders (either
+  /// directly from a shape-validated dense `(weight, bias)` via [`Self::new`],
+  /// or from the checkpoint's quantized `(weight, scales, biases)` triple via
+  /// [`Self::quantized`]).
+  inner: MaybeQuantizedLinear,
+}
+
+#[cfg(feature = "wav2vec2")]
+impl Linear {
+  /// Construct a **dense** projection from a `(out, in)` `weight` and an
+  /// optional `(out,)` `bias`.
+  fn new(weight: Array, bias: Option<Array>) -> Self {
+    Self {
+      inner: MaybeQuantizedLinear::Dense(crate::nn::Linear::new(weight, bias)),
+    }
+  }
+
+  /// Wrap an already-built [`MaybeQuantizedLinear`] (the quantized path: the
+  /// model builders construct it from the checkpoint's quantized
+  /// `(weight, scales, biases)` triple).
+  fn quantized(inner: MaybeQuantizedLinear) -> Self {
+    Self { inner }
+  }
+
+  /// `y = x @ weightᵀ (+ bias)` (dense) or `quantized_matmul(...) (+ bias)`
+  /// (quantized). `x` is `(..., in)`; the result is `(..., out)`.
+  ///
+  /// # Errors
+  /// Propagates the transpose / matmul / quantized-matmul / add op errors.
+  fn forward(&self, x: &Array) -> Result<Array> {
+    self.inner.forward(x)
+  }
+
+  /// `true` if this projection was loaded from a quantized checkpoint.
+  #[cfg(test)]
+  fn is_quantized(&self) -> bool {
+    self.inner.is_quantized()
   }
 }
 
@@ -1047,6 +1164,280 @@ fn take_shaped(
   let tensor = take(weights, key)?;
   expect_shape(&tensor, key, descriptor, expected)?;
   Ok(tensor)
+}
+
+// ───────────────────────── quantize-aware projection ─────────────────────────
+
+/// Validate a quantized layer's packed `<prefix>.weight` + `<prefix>.scales`
+/// against the config-derived `(out, in_features)` BEFORE the quantized layer
+/// is constructed — the quantized analogue of [`expect_shape`].
+///
+/// The dense path pins every consumed tensor to its exact config shape via
+/// [`take_shaped`]; the quantized path must reach the same load-time gate,
+/// because a corrupt quantized checkpoint could otherwise ship a packed weight
+/// whose *logical* output or input dimension disagrees with the config, and the
+/// first forward would then size projections / logits from the checkpoint
+/// tensors instead of the validated config. The packed `uint32` weight has a
+/// different shape than the dense `(out, in)`, so the recovery mirrors mlx's
+/// quantized layout (`mlx/ops.cpp:107,131,4790-4792`):
+///
+/// - the weight is rank-2 `uint32` `(out, in * bits / 32)`; its *logical*
+///   output dim is the leading axis and must equal `out`, and its *logical*
+///   input width — mlx's `w_inner_dims = w.shape(-1) * 32 / bits`, the dimension
+///   `quantized_matmul` contracts against — must equal `in_features`;
+/// - the `scales` are rank-2 `(out, in / group_size)`; the leading axis must
+///   equal `out`, and `scales.shape(-1) * group_size` must equal `in_features`
+///   (mlx's `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+///   invariant).
+///
+/// `group_size` / `bits` are the per-layer-resolved scheme parameters; both are
+/// checked `> 0` before they divide (a non-positive value is a malformed config
+/// and an [`Error::OutOfRange`], never a panic). The per-mode value tables
+/// remain mlx-c's; this only pins the structural relationship to the config the
+/// dense gate also enforces. Reads only `shape()` / `dtype()` metadata (no
+/// materialization), so it is bounded regardless of the declared dims.
+///
+/// On mismatch returns an [`Error::ShapePairMismatch`] (or [`Error::RankMismatch`]
+/// / [`Error::InvariantViolation`] for a wrong rank / dtype) wrapped in an
+/// [`Error::LayerKeyed`] naming the offending `<prefix>.weight` / `<prefix>.scales`
+/// key.
+#[cfg(feature = "wav2vec2")]
+fn check_quantized_shape(
+  weights: &HashMap<String, Array>,
+  prefix: &str,
+  descriptor: &'static str,
+  out: i32,
+  in_features: i32,
+  group_size: i32,
+  bits: i32,
+) -> Result<()> {
+  // The scheme parameters divide the recovered widths; a non-positive value is
+  // a malformed config (`from_parts` also rejects it, but guard here so the
+  // divisions below cannot trap).
+  if bits <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Wav2Vec2Ctc: quantized layer bits",
+      "must be > 0",
+      format_smolstr!("{bits}"),
+    )));
+  }
+  if group_size <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Wav2Vec2Ctc: quantized layer group_size",
+      "must be > 0",
+      format_smolstr!("{group_size}"),
+    )));
+  }
+
+  // Packed weight `(out, in * bits / 32)`, `uint32`.
+  let weight_key = format!("{prefix}.weight");
+  let weight = weights.get(&weight_key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "Wav2Vec2Ctc: quantized weight not found in checkpoint",
+      weight_key.clone(),
+    ))
+  })?;
+  let w_shape = weight.shape();
+  if w_shape.len() != 2 {
+    let rank = w_shape.len() as u32;
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::RankMismatch(RankMismatchPayload::new(
+        "quantized weight must be rank-2 (out, in * bits / 32)",
+        rank,
+        w_shape,
+      )),
+    )));
+  }
+  if weight.dtype()? != crate::dtype::Dtype::U32 {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "quantized weight dtype",
+        "must be `uint32` (the packed-quantized-weight dtype)",
+      )),
+    )));
+  }
+  // Logical output dim is the leading axis; logical input width is mlx's
+  // `w_inner_dims = w.shape(-1) * 32 / bits` (the contraction dim). Compare in
+  // i64 so the recovery cannot overflow on a corrupt huge packed width.
+  let logical_in = (w_shape[1] as i64) * 32 / i64::from(bits);
+  if w_shape[0] as i64 != i64::from(out) || logical_in != i64::from(in_features) {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        vec![out.max(0) as usize, in_features.max(0) as usize],
+        vec![w_shape[0], logical_in.max(0) as usize],
+      )),
+    )));
+  }
+
+  // Scales `(out, in / group_size)`: leading axis is `out`, and the per-group
+  // count recovers the same logical input width as the packed weight.
+  let scales_key = format!("{prefix}.scales");
+  let scales = weights.get(&scales_key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "Wav2Vec2Ctc: quantized scales not found in checkpoint",
+      scales_key.clone(),
+    ))
+  })?;
+  let s_shape = scales.shape();
+  if s_shape.len() != 2 {
+    let rank = s_shape.len() as u32;
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &scales_key,
+      Error::RankMismatch(RankMismatchPayload::new(
+        "quantized scales must be rank-2 (out, in / group_size)",
+        rank,
+        s_shape,
+      )),
+    )));
+  }
+  let scales_in = (s_shape[1] as i64) * i64::from(group_size);
+  if s_shape[0] as i64 != i64::from(out) || scales_in != i64::from(in_features) {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &scales_key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "quantized scales (out, in / group_size) must match the config",
+        vec![out.max(0) as usize, in_features.max(0) as usize],
+        vec![s_shape[0], scales_in.max(0) as usize],
+      )),
+    )));
+  }
+
+  Ok(())
+}
+
+/// Build a quantize-aware [`Linear`] from `<prefix>.weight` (+ the dense
+/// `<prefix>.bias` when the architecture `bias` flag is `true`) — the wav2vec2
+/// analogue of the Whisper `Builder::linear`.
+///
+/// **Quantized path** — when `quant` is `Some` AND the checkpoint carries a
+/// `<prefix>.scales` sibling: the projection is built quantized via
+/// [`crate::nn::QuantizedLinear::from_parts`], running
+/// [`crate::ops::quantized::quantized_matmul`] over the packed
+/// `(weight, scales, biases)` triple with the per-layer-resolved
+/// `(group_size, bits, mode)`. The packed `uint32` weight has shape
+/// `(out, in * bits / 32)`, NOT the dense `(out, in)`, so it does **not** go
+/// through the dense [`take_shaped`] config-shape check — its structural
+/// consistency is validated by [`check_quantized_shape`] (against the config)
+/// and [`crate::nn::QuantizedLinear::from_parts`] (the triple). This mirrors
+/// mlx-audio's whisper `class_predicate` (`f"{p}.scales" in weights`), with the
+/// global `quantization` block's scheme parameters.
+///
+/// The dense output `<prefix>.bias` is loaded with the **same arity** the dense
+/// path enforces: when `bias` is `true` this path **requires** `<prefix>.bias`,
+/// validates it as `(out,)`, and passes it as the explicit dense bias to
+/// [`crate::nn::QuantizedLinear::from_parts`] (NOT via the optional-bias
+/// `from_weights` convenience), so a quantized checkpoint missing a required
+/// bias fails fast with the same typed error the dense path returns.
+///
+/// **Dense path** — otherwise: pops `<prefix>.weight` `(out, in)` (+ the
+/// `<prefix>.bias` `(out,)` when `bias` is `true`), both shape-validated against
+/// the config-derived extents via [`take_shaped`] BEFORE materialization,
+/// exactly as before — so a dense (no `.scales`) checkpoint loads identically
+/// whether or not a `quantization` config is threaded.
+///
+/// # Errors
+/// - [`Error::InvariantViolation`] if `<prefix>.scales` is present but `quant`
+///   resolved no scheme parameters for this layer;
+/// - [`Error::MissingKey`] / [`Error::ShapePairMismatch`] / [`Error::RankMismatch`]
+///   for an absent / mis-shaped tensor;
+/// - propagates [`crate::nn::QuantizedLinear::from_parts`]'s structural
+///   validation of the quantized triple.
+#[cfg(feature = "wav2vec2")]
+#[allow(clippy::too_many_arguments)]
+fn build_linear(
+  weights: &mut HashMap<String, Array>,
+  quant: Option<&PerLayerQuantization>,
+  prefix: &str,
+  weight_descriptor: &'static str,
+  bias_descriptor: &'static str,
+  out: i32,
+  in_features: i32,
+  bias: bool,
+) -> Result<Linear> {
+  // `<prefix>.scales` is the load-bearing "this layer is quantized" signal
+  // (mlx-audio whisper `class_predicate`). Only when it is present AND a
+  // quantization config is threaded do we take the quantized path.
+  let scales_key = format!("{prefix}.scales");
+  if quant.is_some() && weights.contains_key(&scales_key) {
+    // Resolve the per-layer `(group_size, bits, mode)` from the config. A
+    // `quantization_for` of `None` (an explicit per-layer `Skip`, or no global
+    // default) next to a present `.scales` is a config/checkpoint inconsistency
+    // — a typed error, never a guessed scheme.
+    let Some(q) = quant.and_then(|q| q.quantization_for(prefix)) else {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "Wav2Vec2Ctc: Linear carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
+        "a quantized Linear requires (group_size, bits, mode) from the config `quantization` block",
+      )));
+    };
+    // The quantized triple must reach the same config-shape gate the dense
+    // `take_shaped` enforces: the packed weight's logical `(out, in)` (and the
+    // scales' recovery) must equal the config-derived extents BEFORE
+    // construction.
+    check_quantized_shape(
+      weights,
+      prefix,
+      weight_descriptor,
+      out,
+      in_features,
+      q.group_size,
+      q.bits,
+    )?;
+    // Load the dense output bias with the SAME arity as the dense branch: when
+    // `bias` is `true`, `take_shaped` REQUIRES `<prefix>.bias` and validates it
+    // `(out,)`; when `false`, any stray `<prefix>.bias` is dropped unused. The
+    // loaded bias is passed as the explicit dense bias to `from_parts`.
+    let dense_bias = if bias {
+      Some(take_shaped(
+        weights,
+        &format!("{prefix}.bias"),
+        bias_descriptor,
+        &[out],
+      )?)
+    } else {
+      weights.remove(&format!("{prefix}.bias"));
+      None
+    };
+    // Pop the packed triple by key: the `uint32` weight, the `.scales`, and the
+    // per-group affine `.biases` (present iff `mode == "affine"`; `from_parts`
+    // enforces the mode/arity contract).
+    let weight = take(weights, &format!("{prefix}.weight"))?;
+    let scales = take(weights, &format!("{prefix}.scales"))?;
+    let quant_biases = weights.remove(&format!("{prefix}.biases"));
+    let q = QuantizedLinear::from_parts(
+      weight,
+      scales,
+      quant_biases,
+      dense_bias,
+      q.group_size,
+      q.bits,
+      q.mode.as_str(),
+    )?;
+    return Ok(Linear::quantized(MaybeQuantizedLinear::Quantized(q)));
+  }
+
+  // Dense path (unchanged): shape-validate against the config-derived
+  // `(out, in)` before materialization.
+  let weight = take_shaped(
+    weights,
+    &format!("{prefix}.weight"),
+    weight_descriptor,
+    &[out, in_features],
+  )?;
+  let b = if bias {
+    Some(take_shaped(
+      weights,
+      &format!("{prefix}.bias"),
+      bias_descriptor,
+      &[out],
+    )?)
+  } else {
+    None
+  };
+  Ok(Linear::new(weight, b))
 }
 
 // ───────────────────────── feature encoder ─────────────────────────
@@ -1132,15 +1523,15 @@ impl FeatureEncoder {
 #[cfg(feature = "wav2vec2")]
 struct FeatureProjection {
   layer_norm: LayerNorm,
-  proj_weight: Array,
-  proj_bias: Array,
+  /// `Linear(conv_dim[-1] → hidden_size)` — quantize-aware.
+  projection: Linear,
 }
 
 #[cfg(feature = "wav2vec2")]
 impl FeatureProjection {
   fn forward(&self, hidden_states: &Array) -> Result<Array> {
     let normed = self.layer_norm.forward(hidden_states)?;
-    linear(&normed, &self.proj_weight, Some(&self.proj_bias))
+    self.projection.forward(&normed)
   }
 }
 
@@ -1266,14 +1657,14 @@ fn reconstruct_wn_weight(weight_g: &Array, weight_v: &Array) -> Result<Array> {
 /// [att]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L293-L393
 #[cfg(feature = "wav2vec2")]
 struct Attention {
-  q_weight: Array,
-  q_bias: Array,
-  k_weight: Array,
-  k_bias: Array,
-  v_weight: Array,
-  v_bias: Array,
-  out_weight: Array,
-  out_bias: Array,
+  /// `Linear(hidden → hidden)` query projection — quantize-aware.
+  q_proj: Linear,
+  /// `Linear(hidden → hidden)` key projection — quantize-aware.
+  k_proj: Linear,
+  /// `Linear(hidden → hidden)` value projection — quantize-aware.
+  v_proj: Linear,
+  /// `Linear(hidden → hidden)` output projection — quantize-aware.
+  out_proj: Linear,
   num_heads: i32,
   head_dim: i32,
   /// `head_dim**-0.5`, pre-multiplied into the query.
@@ -1294,11 +1685,11 @@ impl Attention {
     // attention — a bare F32 scalar would promote half-precision q to F32 under
     // MLX type promotion, breaking mixed-precision numerics and inflating
     // memory / the KV-cache.
-    let q = linear(hidden_states, &self.q_weight, Some(&self.q_bias))?;
+    let q = self.q_proj.forward(hidden_states)?;
     let scale = scalar_like(self.scaling, &q)?;
     let q = q.multiply(&scale)?;
-    let k = linear(hidden_states, &self.k_weight, Some(&self.k_bias))?;
-    let v = linear(hidden_states, &self.v_weight, Some(&self.v_bias))?;
+    let k = self.k_proj.forward(hidden_states)?;
+    let v = self.v_proj.forward(hidden_states)?;
 
     // (B, T, C) → (B, n_heads, T, head_dim): reshape then transpose(0,2,1,3).
     let q = self.split_heads(&q, bsz, tgt_len)?;
@@ -1317,7 +1708,7 @@ impl Attention {
       self.head_dim,
     )?;
     let attn = ops::shape::reshape(&attn, &[bsz, tgt_len, embed_dim])?;
-    linear(&attn, &self.out_weight, Some(&self.out_bias))
+    self.out_proj.forward(&attn)
   }
 
   /// `(B, T, C) → (B, n_heads, T, head_dim)`.
@@ -1336,10 +1727,10 @@ impl Attention {
 /// [ff]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L396-L417
 #[cfg(feature = "wav2vec2")]
 struct FeedForward {
-  intermediate_weight: Array,
-  intermediate_bias: Array,
-  output_weight: Array,
-  output_bias: Array,
+  /// `Linear(hidden → intermediate)` — quantize-aware.
+  intermediate: Linear,
+  /// `Linear(intermediate → hidden)` — quantize-aware.
+  output: Linear,
   /// The `hidden_act` (resolved once at build).
   activation: Activation,
 }
@@ -1347,13 +1738,9 @@ struct FeedForward {
 #[cfg(feature = "wav2vec2")]
 impl FeedForward {
   fn forward(&self, hidden_states: &Array) -> Result<Array> {
-    let h = linear(
-      hidden_states,
-      &self.intermediate_weight,
-      Some(&self.intermediate_bias),
-    )?;
+    let h = self.intermediate.forward(hidden_states)?;
     let h = self.activation.forward(&h)?;
-    linear(&h, &self.output_weight, Some(&self.output_bias))
+    self.output.forward(&h)
   }
 }
 
@@ -1479,9 +1866,8 @@ pub struct Wav2Vec2Ctc {
   feature_encoder: FeatureEncoder,
   feature_projection: FeatureProjection,
   encoder: Encoder,
-  /// CTC head `Linear(hidden → vocab)`.
-  lm_head_weight: Array,
-  lm_head_bias: Array,
+  /// CTC head `Linear(hidden → vocab)` — quantize-aware.
+  lm_head: Linear,
   vocab: Vocab,
 }
 
@@ -1548,30 +1934,116 @@ impl Wav2Vec2Ctc {
   /// tensor), before any forward pass.
   pub fn from_weights(
     config: Wav2Vec2Config,
+    weights: HashMap<String, Array>,
+    vocab: Vocab,
+  ) -> Result<Self> {
+    Self::from_weights_quantized(config, weights, vocab, None)
+  }
+
+  /// Build a model from a parsed [`Wav2Vec2Config`], the **sanitized** weight
+  /// map, an optional [`Vocab`], and an optional parsed quantization config —
+  /// the quantization-aware analogue of [`Wav2Vec2Ctc::from_weights`] (which is
+  /// just this with `quantization = None`).
+  ///
+  /// When `quantization` is `Some` AND a Linear / projection layer's
+  /// `<prefix>.weight` carries the sibling `<prefix>.scales` tensor in the
+  /// (sanitized) checkpoint, that projection is built as a quantized layer
+  /// ([`crate::nn::MaybeQuantizedLinear::Quantized`]) running
+  /// [`crate::ops::quantized::quantized_matmul`] — the weight-map analogue of
+  /// mlx-audio's whisper `class_predicate`
+  /// (`isinstance(m, (nn.Linear, nn.Embedding)) and f"{p}.scales" in weights`,
+  /// `mlx_audio/stt/models/whisper/whisper.py:674-676`), with the
+  /// `(group_size, bits, mode)` resolved per layer from `quantization`. A dense
+  /// projection (no `.scales` sibling) builds exactly as before, so a
+  /// non-quantized checkpoint loads identically whether or not a `quantization`
+  /// config is supplied.
+  ///
+  /// Only the Linear / projection layers quantize — the encoder attention
+  /// `q/k/v/out` projections, the feed-forward `intermediate` / `output`
+  /// projections, the feature projection, and the CTC `lm_head`. The
+  /// convolutional feature extractor and the weight-normalized positional conv
+  /// embedding stay dense, matching what mlx-audio / MLX quantizes (`nn.Linear`
+  /// only).
+  ///
+  /// `quantization` is the parsed
+  /// [`crate::lm::quant::PerLayerQuantization`] (the `config.json` quantization
+  /// block parsed by the shared audio resolver
+  /// [`crate::audio::load::apply_quantization`], which accepts either a
+  /// top-level `quantization` block or the HF `quantization_config` key). A
+  /// model whose config carries neither passes `None`.
+  ///
+  /// The supplied `quantization` is taken **as parsed**: its per-layer override
+  /// keys may still carry the on-disk HF backbone prefix
+  /// (`wav2vec2.encoder.layers.0.attention.q_proj`). This constructor normalizes
+  /// them into the sanitized namespace the builders resolve a layer's scheme in
+  /// (`encoder.layers.0.attention.q_proj`, matching the [`sanitize`]d `weights`)
+  /// internally, so a per-layer override is applied regardless of whether the
+  /// caller pre-normalized it — this is the single reprojection boundary every
+  /// caller (the [`Wav2Vec2Ctc::load`] reader and any direct public-API caller)
+  /// crosses. The normalization is idempotent: passing an already-sanitized
+  /// per-layer map is a no-op. Two overrides that reproject to the same
+  /// sanitized layer are deduplicated when identical and rejected with
+  /// [`Error::KeyCollision`] when they conflict.
+  ///
+  /// # Errors
+  /// The [`Wav2Vec2Ctc::from_weights`] errors, plus:
+  /// - [`Error::KeyCollision`] if two per-layer overrides reproject to the same
+  ///   sanitized layer with conflicting schemes (a genuine config
+  ///   contradiction — see the normalization note above);
+  /// - [`Error::InvariantViolation`] if a `<prefix>.scales` sibling is present
+  ///   but `quantization` resolved no scheme parameters for that layer (the
+  ///   weights say quantized, the config says dense);
+  /// - [`Error::MissingKey`] / [`Error::ShapePairMismatch`] if a quantized
+  ///   layer's packed weight / scales is the wrong shape;
+  /// - propagates [`crate::nn::QuantizedLinear::from_parts`]'s structural
+  ///   validation of the quantized triple.
+  pub fn from_weights_quantized(
+    config: Wav2Vec2Config,
     mut weights: HashMap<String, Array>,
     vocab: Vocab,
+    quantization: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
     // Single config-validation gate: reject any unsupported / out-of-scope arm
     // and any malformed dimension BEFORE any tensor is built.
     config.validate()?;
 
+    // Normalize the (possibly HF-prefixed) per-layer override keys into the
+    // sanitized namespace the builders resolve a layer's scheme in — the single
+    // boundary every caller (the `load()` reader AND any direct public-API
+    // caller) crosses. The supplied `weights` are already sanitized (their
+    // backbone prefix stripped), but the parsed config's per-layer overrides may
+    // still be keyed in the on-disk HF form (`wav2vec2.` / `hubert.`), which
+    // would never match the sanitized lookup; without this rewrite the layer
+    // would silently fall back to the global scheme. `reproject_quant_keys` is
+    // idempotent (an already-sanitized key carries no backbone prefix, so the
+    // strip is a no-op), so re-normalizing an already-normalized config is safe.
+    // A config with no per-layer overrides (the common case — only a global
+    // `{ group_size, bits }`) needs no rewrite and is threaded through unchanged.
+    let reprojected = match quantization {
+      Some(q) if !q.per_layer_ref().is_empty() => Some(reproject_quant_keys(q)?),
+      _ => None,
+    };
+    let quantization = match &reprojected {
+      Some(q) => Some(q),
+      None => quantization,
+    };
+
     let feature_encoder = build_feature_encoder(&config, &mut weights)?;
-    let feature_projection = build_feature_projection(&config, &mut weights)?;
-    let encoder = build_encoder(&config, &mut weights)?;
+    let feature_projection = build_feature_projection(&config, &mut weights, quantization)?;
+    let encoder = build_encoder(&config, &mut weights, quantization)?;
     // CTC head Linear (out, in) = (vocab_size, hidden_size); bias (vocab_size,).
-    // Pinning the exact shape is the key allocation guard: an oversized output
-    // dim here would otherwise drive a huge logits tensor at forward time.
-    let lm_head_weight = take_shaped(
+    // Pinning the exact shape (dense path) is the key allocation guard: an
+    // oversized output dim would otherwise drive a huge logits tensor at forward
+    // time. The quantized path reaches the same gate via `check_quantized_shape`.
+    let lm_head = build_linear(
       &mut weights,
-      "lm_head.weight",
+      quantization,
+      "lm_head",
       "CTC head weight (vocab_size, hidden_size)",
-      &[config.vocab_size, config.hidden_size],
-    )?;
-    let lm_head_bias = take_shaped(
-      &mut weights,
-      "lm_head.bias",
       "CTC head bias (vocab_size)",
-      &[config.vocab_size],
+      config.vocab_size,
+      config.hidden_size,
+      true,
     )?;
 
     Ok(Self {
@@ -1579,8 +2051,7 @@ impl Wav2Vec2Ctc {
       feature_encoder,
       feature_projection,
       encoder,
-      lm_head_weight,
-      lm_head_bias,
+      lm_head,
       vocab,
     })
   }
@@ -1618,11 +2089,7 @@ impl Wav2Vec2Ctc {
     let hidden_states = self.feature_projection.forward(&extract_features)?;
     let hidden_states = self.encoder.forward(&hidden_states)?;
     // (B, T', vocab)
-    linear(
-      &hidden_states,
-      &self.lm_head_weight,
-      Some(&self.lm_head_bias),
-    )
+    self.lm_head.forward(&hidden_states)
   }
 
   /// Transcribe a raw 16 kHz mono waveform to text.
@@ -1680,6 +2147,16 @@ impl Wav2Vec2Ctc {
   /// Only the single-file `model.safetensors` layout is handled here; sharded
   /// checkpoints are out of scope (a missing file is a clear
   /// [`Error::MissingKey`]).
+  ///
+  /// A quantized (e.g. 8-bit) checkpoint loads transparently: the
+  /// `config.json` quantization block is parsed by the shared audio resolver
+  /// [`crate::audio::load::apply_quantization`] — which mirrors mlx-audio by
+  /// accepting either a top-level `quantization` block or the HF
+  /// `quantization_config` key and defaulting a missing `group_size` to 64 —
+  /// and threaded into [`Wav2Vec2Ctc::from_weights_quantized`], so each Linear /
+  /// projection layer carrying a `<prefix>.scales` sibling is built quantized
+  /// while the dense layers (and a checkpoint with no quantization block) load
+  /// unchanged.
   pub fn load(path: &str) -> Result<Self> {
     let dir = crate::audio::load::get_model_path(path)?;
     let config_json = crate::audio::load::load_config(&dir)?;
@@ -1688,6 +2165,18 @@ impl Wav2Vec2Ctc {
     // weights file — `from_weights` re-checks, but failing here avoids the
     // safetensors read on a config this port cannot serve.
     config.validate()?;
+    // Parse the optional quantization block (the per-layer scheme params for a
+    // quantized checkpoint) through the shared audio resolver, so wav2vec2
+    // resolves quantization exactly the way the rest of the STT subsystem does:
+    // it prefers a non-null top-level `quantization`, falls back to the HF
+    // `quantization_config` key, and defaults a missing `group_size` to 64
+    // (mlx-audio's convention). A config carrying neither key resolves to
+    // `None`, so a dense checkpoint loads exactly as before. The per-layer
+    // override keys are normalized into the sanitized namespace by
+    // [`Wav2Vec2Ctc::from_weights_quantized`] itself (the single reprojection
+    // boundary every caller crosses), so this raw parsed config is threaded
+    // straight through.
+    let quantization = crate::audio::load::apply_quantization(&config_json)?;
 
     let weights_path = dir.join("model.safetensors");
     if !weights_path.is_file() {
@@ -1709,7 +2198,7 @@ impl Wav2Vec2Ctc {
       None => Vocab::default(),
     };
 
-    Self::from_weights(config, weights, vocab)
+    Self::from_weights_quantized(config, weights, vocab, quantization.as_ref())
   }
 }
 
@@ -1842,11 +2331,14 @@ fn build_feature_encoder(
   Ok(FeatureEncoder { conv_layers })
 }
 
-/// Read `feature_projection.*` into the [`FeatureProjection`].
+/// Read `feature_projection.*` into the [`FeatureProjection`]. The LayerNorm
+/// stays dense; the `projection` Linear is quantize-aware (the dense / quantized
+/// dispatch keyed on `<prefix>.scales`, via [`build_linear`]).
 #[cfg(feature = "wav2vec2")]
 fn build_feature_projection(
   config: &Wav2Vec2Config,
   weights: &mut HashMap<String, Array>,
+  quant: Option<&PerLayerQuantization>,
 ) -> Result<FeatureProjection> {
   // The feature encoder's last conv width (conv_dim[-1]) is the projection's
   // input dim and the pre-norm's normalized dim.
@@ -1870,28 +2362,32 @@ fn build_feature_projection(
   )?;
   let layer_norm = LayerNorm::new(Some(ln_weight), Some(ln_bias), config.layer_norm_eps);
   // HF Linear weight is (out, in) = (hidden_size, conv_dim[-1]); bias (hidden_size,).
-  let proj_weight = take_shaped(
+  let projection = build_linear(
     weights,
-    "feature_projection.projection.weight",
+    quant,
+    "feature_projection.projection",
     "feature_projection projection weight (hidden_size, conv_dim[-1])",
-    &[config.hidden_size, conv_dim_last],
-  )?;
-  let proj_bias = take_shaped(
-    weights,
-    "feature_projection.projection.bias",
     "feature_projection projection bias (hidden_size)",
-    &[config.hidden_size],
+    config.hidden_size,
+    conv_dim_last,
+    true,
   )?;
   Ok(FeatureProjection {
     layer_norm,
-    proj_weight,
-    proj_bias,
+    projection,
   })
 }
 
-/// Read `encoder.*` into the [`Encoder`].
+/// Read `encoder.*` into the [`Encoder`]. The positional conv embedding and the
+/// LayerNorms stay dense; each encoder layer's attention `q/k/v/out` and
+/// feed-forward `intermediate` / `output` projections are quantize-aware (the
+/// dense / quantized dispatch keyed on `<prefix>.scales`, via [`build_linear`]).
 #[cfg(feature = "wav2vec2")]
-fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) -> Result<Encoder> {
+fn build_encoder(
+  config: &Wav2Vec2Config,
+  weights: &mut HashMap<String, Array>,
+  quant: Option<&PerLayerQuantization>,
+) -> Result<Encoder> {
   // Positional conv embedding: reconstruct the fused weight-normalized kernel
   // once, then a plain grouped conv at forward time. Post-sanitize MLX layout
   // (out, k, in/groups): weight_v is (hidden_size, num_conv_pos_embeddings,
@@ -1975,60 +2471,59 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
   // with their respective biases.
   let hs = config.hidden_size;
   let inter = config.intermediate_size;
-  let attn_proj = [hs, hs];
   let mut layers = Vec::new();
   reserve_or_error(&mut layers, "encoder layers", num_layers as usize)?;
   for i in 0..num_layers {
     let prefix = format!("encoder.layers.{i}");
+    // Each attention projection is a square (hidden, hidden) Linear with a
+    // (hidden,) bias — quantize-aware (the dense / quantized dispatch keyed on
+    // `<prefix>.scales`). Built before the struct literal because `build_linear`
+    // borrows `weights` mutably.
+    let q_proj = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.attention.q_proj"),
+      "attention q_proj weight (hidden_size, hidden_size)",
+      "attention q_proj bias (hidden_size)",
+      hs,
+      hs,
+      true,
+    )?;
+    let k_proj = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.attention.k_proj"),
+      "attention k_proj weight (hidden_size, hidden_size)",
+      "attention k_proj bias (hidden_size)",
+      hs,
+      hs,
+      true,
+    )?;
+    let v_proj = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.attention.v_proj"),
+      "attention v_proj weight (hidden_size, hidden_size)",
+      "attention v_proj bias (hidden_size)",
+      hs,
+      hs,
+      true,
+    )?;
+    let out_proj = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.attention.out_proj"),
+      "attention out_proj weight (hidden_size, hidden_size)",
+      "attention out_proj bias (hidden_size)",
+      hs,
+      hs,
+      true,
+    )?;
     let attention = Attention {
-      q_weight: take_shaped(
-        weights,
-        &format!("{prefix}.attention.q_proj.weight"),
-        "attention q_proj weight (hidden_size, hidden_size)",
-        &attn_proj,
-      )?,
-      q_bias: take_shaped(
-        weights,
-        &format!("{prefix}.attention.q_proj.bias"),
-        "attention q_proj bias (hidden_size)",
-        &[hs],
-      )?,
-      k_weight: take_shaped(
-        weights,
-        &format!("{prefix}.attention.k_proj.weight"),
-        "attention k_proj weight (hidden_size, hidden_size)",
-        &attn_proj,
-      )?,
-      k_bias: take_shaped(
-        weights,
-        &format!("{prefix}.attention.k_proj.bias"),
-        "attention k_proj bias (hidden_size)",
-        &[hs],
-      )?,
-      v_weight: take_shaped(
-        weights,
-        &format!("{prefix}.attention.v_proj.weight"),
-        "attention v_proj weight (hidden_size, hidden_size)",
-        &attn_proj,
-      )?,
-      v_bias: take_shaped(
-        weights,
-        &format!("{prefix}.attention.v_proj.bias"),
-        "attention v_proj bias (hidden_size)",
-        &[hs],
-      )?,
-      out_weight: take_shaped(
-        weights,
-        &format!("{prefix}.attention.out_proj.weight"),
-        "attention out_proj weight (hidden_size, hidden_size)",
-        &attn_proj,
-      )?,
-      out_bias: take_shaped(
-        weights,
-        &format!("{prefix}.attention.out_proj.bias"),
-        "attention out_proj bias (hidden_size)",
-        &[hs],
-      )?,
+      q_proj,
+      k_proj,
+      v_proj,
+      out_proj,
       num_heads: config.num_attention_heads,
       head_dim,
       scaling,
@@ -2046,31 +2541,31 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
       &[hs],
     )?;
     let layer_norm_l = LayerNorm::new(Some(el_ln_weight), Some(el_ln_bias), config.layer_norm_eps);
+    // Feed-forward `intermediate` (hidden → intermediate) and `output`
+    // (intermediate → hidden) projections — quantize-aware.
+    let intermediate = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.feed_forward.intermediate_dense"),
+      "feed_forward intermediate weight (intermediate_size, hidden_size)",
+      "feed_forward intermediate bias (intermediate_size)",
+      inter,
+      hs,
+      true,
+    )?;
+    let output = build_linear(
+      weights,
+      quant,
+      &format!("{prefix}.feed_forward.output_dense"),
+      "feed_forward output weight (hidden_size, intermediate_size)",
+      "feed_forward output bias (hidden_size)",
+      hs,
+      inter,
+      true,
+    )?;
     let feed_forward = FeedForward {
-      intermediate_weight: take_shaped(
-        weights,
-        &format!("{prefix}.feed_forward.intermediate_dense.weight"),
-        "feed_forward intermediate weight (intermediate_size, hidden_size)",
-        &[inter, hs],
-      )?,
-      intermediate_bias: take_shaped(
-        weights,
-        &format!("{prefix}.feed_forward.intermediate_dense.bias"),
-        "feed_forward intermediate bias (intermediate_size)",
-        &[inter],
-      )?,
-      output_weight: take_shaped(
-        weights,
-        &format!("{prefix}.feed_forward.output_dense.weight"),
-        "feed_forward output weight (hidden_size, intermediate_size)",
-        &[hs, inter],
-      )?,
-      output_bias: take_shaped(
-        weights,
-        &format!("{prefix}.feed_forward.output_dense.bias"),
-        "feed_forward output bias (hidden_size)",
-        &[hs],
-      )?,
+      intermediate,
+      output,
       activation,
     };
     let fln_weight = take_shaped(

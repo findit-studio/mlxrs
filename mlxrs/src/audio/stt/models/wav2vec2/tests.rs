@@ -1237,18 +1237,22 @@ fn normalize_waveform_promotes_1d_to_2d() {
   assert_eq!(out.shape(), vec![1, 4]);
 }
 
-// ───────────────────────── linear helper ─────────────────────────
+// ───────────────────────── linear wrapper ─────────────────────────
 
 #[test]
-fn linear_with_and_without_bias() {
-  // x (1, 2) = [1, 2]; weight (out=2, in=2) = [[1,0],[0,1]] (identity);
-  // y = x @ wᵀ = [1, 2]. With bias [10, 20] -> [11, 22].
+fn dense_linear_with_and_without_bias() {
+  // The dense `Linear` wrapper (the adoption of the shared `MaybeQuantizedLinear`)
+  // computes `y = x @ wᵀ (+ bias)`. x (1, 2) = [1, 2]; weight (out=2, in=2) =
+  // [[1,0],[0,1]] (identity); y = x @ wᵀ = [1, 2]. With bias [10, 20] -> [11, 22].
   let x = Array::from_slice::<f32>(&[1.0, 2.0], &[1, 2]).unwrap();
   let w = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &[2, 2]).unwrap();
-  let mut y = linear(&x, &w, None).unwrap();
+  let no_bias = Linear::new(w.try_clone().unwrap(), None);
+  let mut y = no_bias.forward(&x).unwrap();
   assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
+  assert!(!no_bias.is_quantized(), "a bare-weight Linear is dense");
   let bias = Array::from_slice::<f32>(&[10.0, 20.0], &[2]).unwrap();
-  let mut yb = linear(&x, &w, Some(&bias)).unwrap();
+  let with_bias = Linear::new(w, Some(bias));
+  let mut yb = with_bias.forward(&x).unwrap();
   assert_eq!(yb.to_vec::<f32>().unwrap(), vec![11.0, 22.0]);
 }
 
@@ -2283,15 +2287,17 @@ fn attention_preserves_half_precision_dtype() {
   let head_dim = hidden / heads;
   for dtype in [crate::dtype::Dtype::F16, crate::dtype::Dtype::BF16] {
     let mk = |shape: &[i32], scale: f32| ramp(shape, scale).astype(dtype).unwrap();
+    // Build each projection as a dense quantize-aware `Linear` (the adoption of
+    // the shared `MaybeQuantizedLinear`); the dtype-preservation contract is on
+    // the dense path here.
+    let mk_proj = |scale_w: f32, scale_b: f32| {
+      Linear::new(mk(&[hidden, hidden], scale_w), Some(mk(&[hidden], scale_b)))
+    };
     let attn = Attention {
-      q_weight: mk(&[hidden, hidden], 0.3),
-      q_bias: mk(&[hidden], 0.1),
-      k_weight: mk(&[hidden, hidden], 0.3),
-      k_bias: mk(&[hidden], 0.1),
-      v_weight: mk(&[hidden, hidden], 0.3),
-      v_bias: mk(&[hidden], 0.1),
-      out_weight: mk(&[hidden, hidden], 0.3),
-      out_bias: mk(&[hidden], 0.1),
+      q_proj: mk_proj(0.3, 0.1),
+      k_proj: mk_proj(0.3, 0.1),
+      v_proj: mk_proj(0.3, 0.1),
+      out_proj: mk_proj(0.3, 0.1),
       num_heads: heads,
       head_dim,
       scaling: (head_dim as f32).powf(-0.5),
@@ -2368,4 +2374,870 @@ fn forward_stable_ln_preserves_half_precision_dtype() {
       "all stable-LN {dtype:?} logits must be finite"
     );
   }
+}
+
+// ───────────────────── quantized-checkpoint loading ─────────────────────
+//
+// No local 8-bit wav2vec2 checkpoint is available, so the quantized load path
+// is covered by a SYNTHETIC quantized checkpoint: a tiny config whose every
+// quantized Linear's input width (`hidden_size`, `intermediate_size`,
+// `conv_dim[-1]`) is divisible by the affine `group_size` (mlx requires
+// `group_size ∈ {32, 64, 128}`), with every encoder attention / feed-forward
+// projection, the feature projection, and the CTC `lm_head` weight replaced by
+// the real `ops::quantized::quantize` `(weight, scales, biases)` triple — the
+// exact on-disk layout an mlx-community 8-bit checkpoint ships. The model must
+// then construct (building `MaybeQuantizedLinear::Quantized` layers) and run a
+// full forward to the right CTC-logits shape with finite output. The
+// convolutional feature extractor + positional conv stay DENSE (the
+// `class_predicate` only quantizes `nn.Linear`).
+
+/// A valid mlx affine group size (`group_size ∈ {32, 64, 128}`).
+const QGROUP: i32 = 32;
+/// 8-bit affine — the common mlx-community quantized scheme.
+const QBITS: i32 = 8;
+
+/// A tiny quant-friendly config: every quantized Linear's input width
+/// (`hidden_size = 64`, `intermediate_size = 128`, `conv_dim[-1] = 64`) is a
+/// whole number of `QGROUP` groups. 3 feat-extract layers, 2 transformer layers.
+fn quant_config_json(extra: &str) -> Wav2Vec2Config {
+  let json = format!(
+    r#"{{
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4
+      {extra}
+    }}"#
+  );
+  Wav2Vec2Config::from_json(&json).unwrap()
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`) at the given affine `group_size`,
+/// mirroring how an mlx-community quantized checkpoint stores a quantized
+/// `Linear`. The `<prefix>.bias` (dense output bias), if any, is left untouched.
+/// `group_size` must divide `<prefix>.weight`'s last (input) axis.
+fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str, group_size: i32) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .unwrap_or_else(|| panic!("dense weight {prefix}.weight present"));
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, group_size, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Build a synthetic post-sanitize quantized wav2vec2 checkpoint at an EXPLICIT
+/// affine `group_size`: the dense `synthetic_weights` for `config`, then every
+/// quantized-eligible Linear (encoder attention `q/k/v/out`, feed-forward
+/// `intermediate` / `output`, the feature projection, and the CTC `lm_head`)
+/// replaced by the 8-bit affine triple. The conv feature extractor + positional
+/// conv stay DENSE — only `nn.Linear` is quantized, matching mlx-audio / MLX.
+/// `group_size` must divide every quantized Linear's input width
+/// (`hidden_size` / `intermediate_size` / `conv_dim[-1]`).
+fn quant_weights_at(config: &Wav2Vec2Config, group_size: i32) -> HashMap<String, Array> {
+  let mut w = synthetic_weights(config);
+  // Feature projection Linear.
+  quantize_weight_in_place(&mut w, "feature_projection.projection", group_size);
+  // Per-layer attention + feed-forward projections.
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.attention.{proj}"), group_size);
+    }
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      group_size,
+    );
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.output_dense"),
+      group_size,
+    );
+  }
+  // CTC head Linear.
+  quantize_weight_in_place(&mut w, "lm_head", group_size);
+  w
+}
+
+/// The synthetic quantized checkpoint at the module-default `QGROUP` — the
+/// shape an mlx-community 8-bit checkpoint ships for these dims.
+fn quant_weights(config: &Wav2Vec2Config) -> HashMap<String, Array> {
+  quant_weights_at(config, QGROUP)
+}
+
+/// The parsed global 8-bit affine quantization config for the synthetic
+/// checkpoint (the analogue of the `config.json` `quantization` block).
+fn quant_config() -> PerLayerQuantization {
+  PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(QGROUP, QBITS))
+}
+
+#[test]
+fn from_weights_quantized_builds_quantized_layers() {
+  // With a quantization config and a checkpoint whose Linear weights carry
+  // `.scales`/`.biases`, the model builds quantized layers — and still builds
+  // (a packed `uint32` weight of a DIFFERENT shape than the dense `(out, in)`
+  // would otherwise be rejected by the dense shape gate).
+  let config = quant_config_json("");
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    config,
+    quant_weights(&quant_config_json("")),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .expect("an 8-bit quantized checkpoint must build through the quantized path");
+  // The CTC head is the quantized variant (a dense `.weight` would have made
+  // `is_quantized()` false).
+  assert!(
+    model.lm_head.is_quantized(),
+    "the CTC lm_head must load as a quantized projection"
+  );
+  // The conv feature extractor stays dense (it is not a `nn.Linear`); its first
+  // conv weight is still a plain f32 tensor, never quantized.
+  let conv0 = &model.feature_encoder.conv_layers[0].weight;
+  assert_eq!(
+    conv0.dtype().unwrap(),
+    crate::dtype::Dtype::F32,
+    "the conv feature extractor must stay dense (never quantized)"
+  );
+}
+
+#[test]
+fn from_weights_quantized_runs_forward_to_finite_ctc_logits() {
+  // The real GOAL contract on a synthetic stand-in: an 8-bit checkpoint loads
+  // AND runs the full forward to FINITE per-frame CTC logits of the right shape
+  // (the quantized attention / feed-forward / projection / lm_head
+  // `quantized_matmul` all execute through mlx-c, the conv front-end runs dense).
+  let config = quant_config_json("");
+  let expected_t = feature_out_len(&config, 400);
+  assert!(expected_t > 0, "choose a longer input: T' = {expected_t}");
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    quant_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("quantized forward must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, vocab],
+    "quantized logits must be (1, T'={expected_t}, vocab={vocab})"
+  );
+  let data = logits.to_vec::<f32>().unwrap();
+  assert!(
+    data.iter().all(|v| v.is_finite()),
+    "all quantized CTC logits must be finite"
+  );
+}
+
+#[test]
+fn from_weights_quantized_stable_ln_runs_forward() {
+  // The stable-LN (pre-norm) encoder arm must likewise load + forward a
+  // quantized checkpoint (it runs the same quantized projections, only
+  // reordered) to finite logits of the right shape.
+  let config = quant_config_json(r#", "do_stable_layer_norm": true"#);
+  assert!(config.do_stable_layer_norm);
+  let expected_t = feature_out_len(&config, 400);
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(r#", "do_stable_layer_norm": true"#),
+    quant_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model.forward(&waveform).unwrap();
+  assert_eq!(logits.shape(), vec![1, expected_t as usize, vocab]);
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "stable-LN quantized logits must be finite"
+  );
+}
+
+#[test]
+fn from_weights_quantized_dense_checkpoint_unchanged() {
+  // A NON-quantized checkpoint loads identically whether or not a quantization
+  // config is threaded (the `.scales` sibling is the load-bearing signal; a
+  // dense checkpoint has none, so the dense path runs regardless). Produces the
+  // same logits shape as the plain `from_weights` path.
+  let config = quant_config_json("");
+  let expected_t = feature_out_len(&config, 400);
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .expect("a dense checkpoint loads even when a quantization config is supplied");
+  // None of its projections is quantized (no `.scales` siblings present).
+  assert!(
+    !model.lm_head.is_quantized(),
+    "a dense checkpoint's lm_head must stay dense even with a quant config"
+  );
+  let waveform = filled(&[1, 400], 0.1);
+  let logits = model.forward(&waveform).unwrap();
+  assert_eq!(logits.shape(), vec![1, expected_t as usize, vocab]);
+}
+
+#[test]
+fn from_weights_quantized_scales_without_config_errors() {
+  // Weights say quantized (`.scales` present) but no quantization config
+  // resolved scheme params → a typed InvariantViolation, not a silent wrong
+  // load. Thread an empty per-layer config with no global default so
+  // `quantization_for` returns None for the quantized layer.
+  let config = quant_config_json("");
+  let empty_cfg = PerLayerQuantization::new(None, HashMap::new());
+  // `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so match rather than
+  // `.unwrap_err()` (which would need the `Ok` value to be `Debug`).
+  match Wav2Vec2Ctc::from_weights_quantized(
+    config,
+    quant_weights(&quant_config_json("")),
+    Vocab::default(),
+    Some(&empty_cfg),
+  ) {
+    Err(Error::InvariantViolation(_)) => {}
+    Err(other) => {
+      panic!(
+        "expected InvariantViolation for `.scales` present but no resolved params, got {other:?}"
+      )
+    }
+    Ok(_) => panic!("expected an error for a `.scales` sibling with no resolved scheme params"),
+  }
+}
+
+#[test]
+fn from_weights_quantized_dense_path_identical_to_from_weights() {
+  // The dense path is byte-for-byte unchanged: `from_weights` (the public
+  // non-quantized entry) and `from_weights_quantized(.., None)` over the same
+  // dense checkpoint must produce identical logits (same graph, same weights).
+  let config = quant_config_json("");
+  let waveform = ramp(&[1, 400], 0.5);
+
+  let model_plain = Wav2Vec2Ctc::from_weights(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+  )
+  .unwrap();
+  let mut logits_plain = model_plain.forward(&waveform).unwrap();
+
+  let model_none = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+    None,
+  )
+  .unwrap();
+  let mut logits_none = model_none.forward(&waveform).unwrap();
+
+  assert_eq!(
+    logits_plain.to_vec::<f32>().unwrap(),
+    logits_none.to_vec::<f32>().unwrap(),
+    "from_weights and from_weights_quantized(.., None) must be identical on a dense checkpoint"
+  );
+}
+
+// ───────────────── on-disk quantized `load()` path ─────────────────
+//
+// The `from_weights_quantized` tests above thread an already-parsed
+// `PerLayerQuantization` straight into the constructor, so they never exercise
+// how the public `load()` entry resolves the `config.json` quantization block.
+// `load()` must resolve it through the shared audio resolver
+// `crate::audio::load::apply_quantization`, which (mirroring mlx-audio) accepts
+// EITHER a top-level `quantization` block OR the HF `quantization_config` key
+// and defaults a missing `group_size` to 64. These tests drive a real on-disk
+// checkpoint (a `config.json` + a quantized `model.safetensors`) through the
+// full `load()` path — `sanitize` included — for exactly those two shapes.
+
+/// A whole-checkpoint **HF pre-sanitize** layout with every quantized-eligible
+/// `nn.Linear` replaced by its `ops::quantized::quantize` affine triple at
+/// `group_size`. Starts from [`hf_layout_prefixed_weights`] (so the conv /
+/// positional weights are in the on-disk HF order [`sanitize`] swaps) and
+/// quantizes only the Linear weights — which `sanitize` passes through
+/// unchanged, so quantizing them in their on-disk (prefixed / top-level) form is
+/// exactly what an mlx-community quantized `*ForCTC` checkpoint ships. The conv
+/// feature extractor and positional conv stay DENSE (only `nn.Linear`
+/// quantizes). `group_size` must divide every quantized Linear's input width.
+fn hf_quant_layout_weights(
+  c: &Wav2Vec2Config,
+  prefix: &str,
+  group_size: i32,
+) -> HashMap<String, Array> {
+  let mut w = hf_layout_prefixed_weights(c, prefix);
+  // Backbone Linears keep the backbone prefix on disk; `lm_head` is top-level.
+  quantize_weight_in_place(
+    &mut w,
+    &format!("{prefix}feature_projection.projection"),
+    group_size,
+  );
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("{prefix}encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.attention.{proj}"), group_size);
+    }
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      group_size,
+    );
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.output_dense"),
+      group_size,
+    );
+  }
+  quantize_weight_in_place(&mut w, "lm_head", group_size);
+  w
+}
+
+/// Drive the PUBLIC `load()` path for a quantized checkpoint whose `config.json`
+/// expresses its quantization scheme via the verbatim `quant_block` JSON
+/// fragment (e.g. `"quantization_config": {...}` or a `"quantization"` block
+/// without `group_size`). The on-disk `model.safetensors` is the HF pre-sanitize
+/// layout with its Linears quantized at `weight_group_size` (the group size the
+/// resolved scheme must agree on). Writes the `config.json` + weights to a temp
+/// dir, calls `Wav2Vec2Ctc::load`, and asserts the quantized path was taken (the
+/// CTC head loaded quantized) and a real forward produces finite CTC logits of
+/// the right shape. The model dims are pinned here (mirroring
+/// `quant_config_json("")`) so the saved quantized weights line up with the
+/// config the loader parses.
+fn assert_quant_load_path(quant_block: &str, tag: &str, weight_group_size: i32) {
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      {quant_block}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+  let weights = hf_quant_layout_weights(&config, "wav2vec2.", weight_group_size);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_quantload_{tag}_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), &config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+
+  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => {
+      panic!("public load() must resolve the {tag} quantization block and build, got {e:?}")
+    }
+  };
+  // A dense `.weight` would have made `is_quantized()` false — proving the
+  // quantization block was resolved (not silently dropped, the bug this guards)
+  // is exactly that the CTC head loaded as a quantized projection.
+  assert!(
+    model.lm_head.is_quantized(),
+    "the {tag} checkpoint must load its CTC lm_head through the quantized path"
+  );
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("quantized forward after load must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+    "{tag} quantized logits must be (1, T'={expected_t}, vocab={})",
+    config.vocab_size
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all {tag} quantized CTC logits must be finite after the public load path"
+  );
+}
+
+#[test]
+fn load_path_resolves_hf_quantization_config_key() {
+  // The exact case the LM-only parser dropped: a VALID 8-bit checkpoint whose
+  // `config.json` expresses quantization under the HF `quantization_config` key
+  // (NOT a top-level `quantization` block). The shared audio resolver falls back
+  // to that key, so `load()` must take the quantized path; the LM parser would
+  // have returned `None` and the dense shape gate would then reject the packed
+  // uint32 weight, failing a valid checkpoint to load.
+  let block = format!(r#""quantization_config": {{ "group_size": {QGROUP}, "bits": {QBITS} }}"#);
+  assert_quant_load_path(&block, "hf_quantization_config", QGROUP);
+}
+
+#[test]
+fn load_path_defaults_missing_group_size_to_64() {
+  // A `quantization` block that OMITS `group_size` must default it to 64 (the
+  // mlx-audio convention the shared resolver applies); the LM parser rejects a
+  // missing `group_size` outright. The on-disk weights are quantized at
+  // group_size 64 so they line up with the defaulted scheme — a successful load
+  // + forward proves the default was applied (a wrong default would mis-shape
+  // the `.scales` and be rejected).
+  let block = format!(r#""quantization": {{ "bits": {QBITS} }}"#);
+  assert_quant_load_path(&block, "missing_group_size", 64);
+}
+
+/// The quantization `group_size` a built [`Linear`] (the wav2vec2 wrapper) was
+/// loaded with, or `None` when the layer is dense. Reads the wrapper's inner
+/// [`MaybeQuantizedLinear`] (a private field reachable from this child module),
+/// proving which scheme a layer actually resolved — the exact fact the per-layer
+/// override reprojection must get right.
+fn loaded_group_size(layer: &super::Linear) -> Option<i32> {
+  match &layer.inner {
+    crate::nn::MaybeQuantizedLinear::Quantized(q) => Some(q.group_size()),
+    crate::nn::MaybeQuantizedLinear::Dense(_) => None,
+  }
+}
+
+/// The transformer layer stack of a built [`Encoder`], regardless of its
+/// (post-norm / stable-LN) arm — both arms share the same `EncoderInner` layout.
+fn encoder_layers(encoder: &super::Encoder) -> &[super::EncoderLayer] {
+  match encoder {
+    super::Encoder::PostNorm(inner) | super::Encoder::StableLayerNorm(inner) => &inner.layers,
+  }
+}
+
+#[test]
+fn load_path_applies_hf_keyed_per_layer_quant_override() {
+  // The finding this guards: a per-layer quantization override keyed in the
+  // on-disk HF form (carrying the `wav2vec2.` backbone prefix) must reach the
+  // layer it names. `load()` runs the weights through `sanitize` (which strips
+  // that prefix) and the builders then resolve a layer's scheme by its SANITIZED
+  // prefix, so an override keyed `wav2vec2.encoder.layers.0.attention.q_proj`
+  // would never match the `encoder.layers.0.attention.q_proj` lookup and the
+  // layer would silently fall back to the GLOBAL scheme. With the reprojection,
+  // the override's per-layer `group_size` must win for exactly that one layer
+  // while every other quantized layer keeps the global `group_size`.
+  const GLOBAL_GROUP: i32 = 64;
+  const OVERRIDE_GROUP: i32 = 32;
+  // Sanity: the two group sizes differ, so reading back `OVERRIDE_GROUP` on the
+  // overridden layer can only mean the override was applied (not the global).
+  assert_ne!(GLOBAL_GROUP, OVERRIDE_GROUP);
+
+  // The override is keyed in the HF on-disk form (with the backbone prefix); its
+  // `group_size` differs from the global default.
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "quantization": {{
+        "group_size": {GLOBAL_GROUP}, "bits": {QBITS},
+        "wav2vec2.encoder.layers.0.attention.q_proj": {{ "group_size": {OVERRIDE_GROUP}, "bits": {QBITS} }}
+      }}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+
+  // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
+  // each quantized-eligible Linear at its scheme's group size — the single
+  // overridden layer at the OVERRIDE size, every other eligible Linear at the
+  // GLOBAL size — quantizing each layer exactly once from its dense weight so
+  // the on-disk `.scales` line up with the per-layer scheme the config declares
+  // (a mismatch would be caught by the shape gate). The conv feature extractor +
+  // positional conv stay dense (only `nn.Linear` quantizes).
+  let mut weights = hf_layout_prefixed_weights(&config, "wav2vec2.");
+  const OVERRIDE_LAYER: &str = "wav2vec2.encoder.layers.0.attention.q_proj";
+  quantize_weight_in_place(
+    &mut weights,
+    "wav2vec2.feature_projection.projection",
+    GLOBAL_GROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      let prefix = format!("{p}.attention.{proj}");
+      let group = if prefix == OVERRIDE_LAYER {
+        OVERRIDE_GROUP
+      } else {
+        GLOBAL_GROUP
+      };
+      quantize_weight_in_place(&mut weights, &prefix, group);
+    }
+    quantize_weight_in_place(
+      &mut weights,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      GLOBAL_GROUP,
+    );
+    quantize_weight_in_place(
+      &mut weights,
+      &format!("{p}.feed_forward.output_dense"),
+      GLOBAL_GROUP,
+    );
+  }
+  quantize_weight_in_place(&mut weights, "lm_head", GLOBAL_GROUP);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_perlayer_override_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), &config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+
+  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("public load() must apply the HF-keyed per-layer override, got {e:?}"),
+  };
+
+  let layers = encoder_layers(&model.encoder);
+  let layer0 = &layers[0];
+  // The overridden layer 0 `q_proj` must load quantized at the OVERRIDE group
+  // size — proving the HF-keyed override reached the sanitized lookup (the bug:
+  // it would otherwise have silently fallen back to GLOBAL_GROUP here).
+  assert_eq!(
+    loaded_group_size(&layer0.attention.q_proj),
+    Some(OVERRIDE_GROUP),
+    "the HF-keyed per-layer override must apply its group_size to encoder.layers.0.attention.q_proj"
+  );
+  // Its siblings in the SAME layer carry no override, so they keep the global
+  // scheme — confirming the override is scoped to exactly the named layer.
+  assert_eq!(
+    loaded_group_size(&layer0.attention.k_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  assert_eq!(
+    loaded_group_size(&layer0.attention.out_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  // A different layer is likewise untouched by the layer-0 override.
+  assert_eq!(
+    loaded_group_size(&layers[1].attention.q_proj),
+    Some(GLOBAL_GROUP),
+    "a different layer must keep the global group_size"
+  );
+  // The CTC head (top-level `lm_head`, never backbone-prefixed) stays global.
+  assert_eq!(
+    loaded_group_size(&model.lm_head),
+    Some(GLOBAL_GROUP),
+    "the top-level lm_head must keep the global group_size"
+  );
+
+  // And the model still runs the full forward to finite CTC logits.
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("mixed-quant forward after load must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all mixed-quant CTC logits must be finite after the public load path"
+  );
+}
+
+#[test]
+fn reproject_quant_keys_strips_backbone_prefix_and_keeps_global() {
+  // Each per-layer override key has its backbone prefix (`wav2vec2.` / `hubert.`)
+  // stripped to the sanitized lookup namespace; an already-unprefixed key (the
+  // top-level `lm_head`) is left as-is; the global default is carried through.
+  let global = crate::lm::quant::Quantization::affine(64, QBITS);
+  let layer_scheme = crate::lm::quant::Quantization::affine(32, QBITS);
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(layer_scheme),
+  );
+  per_layer.insert(
+    "hubert.encoder.layers.1.feed_forward.output_dense".to_string(),
+    QuantizationOption::Skip,
+  );
+  per_layer.insert("lm_head".to_string(), QuantizationOption::Quantize(global));
+
+  let out = reproject_quant_keys(&PerLayerQuantization::new(Some(global), per_layer))
+    .expect("a conflict-free per-layer map must reproject");
+
+  // The global default is preserved.
+  assert_eq!(out.quantization, Some(global));
+  let reprojected = out.per_layer_ref();
+  // The backbone prefixes are stripped to the sanitized lookup form.
+  assert_eq!(
+    reprojected.get("encoder.layers.0.attention.q_proj"),
+    Some(&QuantizationOption::Quantize(layer_scheme)),
+    "the wav2vec2.-prefixed override must reproject to the sanitized key"
+  );
+  assert_eq!(
+    reprojected.get("encoder.layers.1.feed_forward.output_dense"),
+    Some(&QuantizationOption::Skip),
+    "the hubert.-prefixed Skip override must reproject to the sanitized key"
+  );
+  // The already-unprefixed top-level key is unchanged.
+  assert_eq!(
+    reprojected.get("lm_head"),
+    Some(&QuantizationOption::Quantize(global)),
+    "an already-sanitized key (lm_head) must pass through unchanged"
+  );
+  // No backbone-prefixed key survives the reprojection.
+  assert!(
+    !reprojected
+      .keys()
+      .any(|k| k.starts_with("wav2vec2.") || k.starts_with("hubert.")),
+    "no reprojected key may retain a backbone prefix"
+  );
+}
+
+#[test]
+fn reproject_quant_keys_dedups_identical_collision() {
+  // Two source keys (a prefixed + an unprefixed form of the SAME layer) that
+  // reproject to the same sanitized key with the IDENTICAL scheme are a benign
+  // duplicate — deduplicated to a single entry, not an error.
+  let scheme = crate::lm::quant::Quantization::affine(32, QBITS);
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(scheme),
+  );
+  per_layer.insert(
+    "encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(scheme),
+  );
+
+  let out = reproject_quant_keys(&PerLayerQuantization::new(None, per_layer))
+    .expect("identical reprojected schemes must deduplicate, not error");
+  let reprojected = out.per_layer_ref();
+  assert_eq!(
+    reprojected.len(),
+    1,
+    "the identical duplicate must collapse to one entry"
+  );
+  assert_eq!(
+    reprojected.get("encoder.layers.0.attention.q_proj"),
+    Some(&QuantizationOption::Quantize(scheme)),
+  );
+}
+
+#[test]
+fn reproject_quant_keys_rejects_conflicting_collision() {
+  // Two source keys that reproject to the same sanitized key with CONFLICTING
+  // schemes are a genuine config contradiction — a typed `KeyCollision`, never a
+  // silent arbitrary-survivor overwrite.
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(32, QBITS)),
+  );
+  per_layer.insert(
+    "encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(64, QBITS)),
+  );
+
+  match reproject_quant_keys(&PerLayerQuantization::new(None, per_layer)) {
+    Err(Error::KeyCollision(p)) => {
+      assert_eq!(
+        p.key(),
+        "encoder.layers.0.attention.q_proj",
+        "the collision error must name the conflicting sanitized key"
+      );
+    }
+    Err(other) => {
+      panic!("expected KeyCollision for conflicting reprojected schemes, got {other:?}")
+    }
+    Ok(_) => panic!("conflicting reprojected schemes must not silently overwrite"),
+  }
+}
+
+#[test]
+fn from_weights_quantized_applies_hf_keyed_per_layer_override_via_public_api() {
+  // The finding this guards: a caller using the PUBLIC `from_weights_quantized`
+  // constructor directly — `sanitize(raw_weights)` + the parsed
+  // `PerLayerQuantization` from `apply_quantization(config_json)` — with a
+  // per-layer override keyed in the on-disk HF form (carrying the `wav2vec2.`
+  // backbone prefix) must still reach the layer it names. `sanitize` strips that
+  // prefix from the weight keys, and the builders resolve a layer's scheme by
+  // its SANITIZED prefix, so an override keyed
+  // `wav2vec2.encoder.layers.0.attention.q_proj` would never match the
+  // `encoder.layers.0.attention.q_proj` lookup and the layer would silently fall
+  // back to the GLOBAL scheme — unless `from_weights_quantized` itself
+  // normalizes the override keys (the single reprojection boundary, exercised
+  // here WITHOUT the `load()` wrapper). With that boundary fix, the override's
+  // per-layer `group_size` wins for exactly that one layer while every other
+  // quantized layer keeps the global `group_size`.
+  const GLOBAL_GROUP: i32 = 64;
+  const OVERRIDE_GROUP: i32 = 32;
+  // Sanity: the two group sizes differ, so reading back `OVERRIDE_GROUP` on the
+  // overridden layer can only mean the override was applied (not the global).
+  assert_ne!(GLOBAL_GROUP, OVERRIDE_GROUP);
+
+  // The override is keyed in the HF on-disk form (with the backbone prefix); its
+  // `group_size` differs from the global default.
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "quantization": {{
+        "group_size": {GLOBAL_GROUP}, "bits": {QBITS},
+        "wav2vec2.encoder.layers.0.attention.q_proj": {{ "group_size": {OVERRIDE_GROUP}, "bits": {QBITS} }}
+      }}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+
+  // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
+  // each quantized-eligible Linear at its scheme's group size — the single
+  // overridden layer at the OVERRIDE size, every other eligible Linear at the
+  // GLOBAL size — quantizing each layer exactly once from its dense weight so
+  // the `.scales` line up with the per-layer scheme the config declares. The
+  // conv feature extractor + positional conv stay dense (only `nn.Linear`
+  // quantizes).
+  let mut raw_weights = hf_layout_prefixed_weights(&config, "wav2vec2.");
+  const OVERRIDE_LAYER: &str = "wav2vec2.encoder.layers.0.attention.q_proj";
+  quantize_weight_in_place(
+    &mut raw_weights,
+    "wav2vec2.feature_projection.projection",
+    GLOBAL_GROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      let prefix = format!("{p}.attention.{proj}");
+      let group = if prefix == OVERRIDE_LAYER {
+        OVERRIDE_GROUP
+      } else {
+        GLOBAL_GROUP
+      };
+      quantize_weight_in_place(&mut raw_weights, &prefix, group);
+    }
+    quantize_weight_in_place(
+      &mut raw_weights,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      GLOBAL_GROUP,
+    );
+    quantize_weight_in_place(
+      &mut raw_weights,
+      &format!("{p}.feed_forward.output_dense"),
+      GLOBAL_GROUP,
+    );
+  }
+  quantize_weight_in_place(&mut raw_weights, "lm_head", GLOBAL_GROUP);
+
+  // Drive the PUBLIC API exactly as a direct caller would (NOT via `load()`):
+  // sanitize the raw HF-keyed weight map ourselves (stripping the backbone
+  // prefix off the weight keys), parse the quantization config ourselves (the
+  // override is still HF-prefixed), and thread BOTH straight into
+  // `from_weights_quantized`.
+  let weights = sanitize(raw_weights).expect("the HF-keyed weight map must sanitize");
+  let quantization = crate::audio::load::apply_quantization(&config_json)
+    .expect("the quantization block must parse")
+    .expect("a `quantization` block is present, so the parse is Some");
+  // The parsed override is still keyed in the HF form — `from_weights_quantized`
+  // is responsible for normalizing it (the exact gap a direct caller hits).
+  assert!(
+    quantization.per_layer_ref().contains_key(OVERRIDE_LAYER),
+    "precondition: the parsed config carries the HF-prefixed override key the public constructor must normalize"
+  );
+
+  let model = match Wav2Vec2Ctc::from_weights_quantized(
+    config.clone(),
+    weights,
+    Vocab::default(),
+    Some(&quantization),
+  ) {
+    Ok(m) => m,
+    Err(e) => panic!(
+      "the public from_weights_quantized constructor must apply the HF-keyed per-layer override, got {e:?}"
+    ),
+  };
+
+  let layers = encoder_layers(&model.encoder);
+  let layer0 = &layers[0];
+  // The overridden layer 0 `q_proj` must load quantized at the OVERRIDE group
+  // size — proving the HF-keyed override reached the sanitized lookup THROUGH
+  // THE PUBLIC CONSTRUCTOR (the bug: it would otherwise have silently fallen
+  // back to GLOBAL_GROUP here for a direct caller).
+  assert_eq!(
+    loaded_group_size(&layer0.attention.q_proj),
+    Some(OVERRIDE_GROUP),
+    "the HF-keyed per-layer override must apply its group_size via the public constructor"
+  );
+  // Its siblings in the SAME layer carry no override, so they keep the global
+  // scheme — confirming the override is scoped to exactly the named layer.
+  assert_eq!(
+    loaded_group_size(&layer0.attention.k_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  assert_eq!(
+    loaded_group_size(&layer0.attention.out_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  // A different layer is likewise untouched by the layer-0 override.
+  assert_eq!(
+    loaded_group_size(&layers[1].attention.q_proj),
+    Some(GLOBAL_GROUP),
+    "a different layer must keep the global group_size"
+  );
+  // The CTC head (top-level `lm_head`, never backbone-prefixed) stays global.
+  assert_eq!(
+    loaded_group_size(&model.lm_head),
+    Some(GLOBAL_GROUP),
+    "the top-level lm_head must keep the global group_size"
+  );
+
+  // And the model still runs the full forward to finite CTC logits.
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("mixed-quant forward via the public constructor must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all mixed-quant CTC logits must be finite via the public constructor"
+  );
 }
