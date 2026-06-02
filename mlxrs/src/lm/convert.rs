@@ -957,7 +957,7 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
 /// also be invalid (mlx's `quantize` asserts positive `group_size` /
 /// `bits`); the filter rejects those too so a `Some(-1)` doesn't
 /// pretend the caller actually wanted `-1`.
-fn defaults_for_mode(mode: QuantMode, gs: Option<i32>, bits: Option<i32>) -> (i32, i32) {
+pub(crate) fn defaults_for_mode(mode: QuantMode, gs: Option<i32>, bits: Option<i32>) -> (i32, i32) {
   let (default_gs, default_bits) = match mode {
     QuantMode::Affine => (64, 4),
     QuantMode::Mxfp4 => (32, 4),

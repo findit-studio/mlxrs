@@ -11,8 +11,12 @@
 //!   ([`crate::nn::Linear`] / [`crate::nn::QuantizedLinear`]) and the
 //!   quantize-aware [`crate::nn::MaybeQuantizedLinear`] abstraction a model
 //!   uses to load either a dense or an 8-bit/4-bit quantized checkpoint through
-//!   one code path (`mlx.nn.Linear` / `mlx.nn.QuantizedLinear`).
+//!   one code path (`mlx.nn.Linear` / `mlx.nn.QuantizedLinear`), plus the
+//!   embedding analogue [`crate::nn::MaybeQuantizedEmbedding`]
+//!   (`mlx.nn.Embedding` / `mlx.nn.QuantizedEmbedding`).
 
 pub mod quantized;
 
-pub use quantized::{Linear, MaybeQuantizedLinear, QuantizedLinear};
+pub use quantized::{
+  Linear, MaybeQuantizedEmbedding, MaybeQuantizedLinear, QuantizedEmbedding, QuantizedLinear,
+};

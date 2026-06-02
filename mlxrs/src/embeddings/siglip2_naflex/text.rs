@@ -33,11 +33,18 @@ use crate::{
   array::Array,
   embeddings::siglip2_naflex::{
     config::TextConfig,
-    shared::{EncoderLayer, LayerDims, build_layer_norm, dim_i32, linear, take_shaped},
+    shared::{
+      EncoderLayer, LayerDims, QuantLinear, build_layer_norm, dim_i32, expect_logical_shape,
+      expect_shape, resolve_quant,
+    },
   },
   error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
-  lm::nn::{attention::Mask, norm::LayerNorm},
+  lm::{
+    nn::{attention::Mask, norm::LayerNorm},
+    quant::PerLayerQuantization,
+  },
   model_validation::reserve_or_error,
+  nn::MaybeQuantizedEmbedding,
   ops,
 };
 
@@ -50,15 +57,21 @@ use crate::{
 #[cfg(feature = "siglip2-naflex")]
 #[cfg_attr(docsrs, doc(cfg(feature = "siglip2-naflex")))]
 pub struct TextTower {
-  /// Token-embedding table `(vocab, hidden)`.
-  token_embedding: Array,
-  /// Position-embedding table `(max_position_embeddings, hidden)`.
+  /// Token-embedding table `(vocab, hidden)` — quantize-aware: a token lookup is
+  /// an axis-0 row gather, which the [`MaybeQuantizedEmbedding`] dequantize-gather
+  /// handles directly for a quantized checkpoint.
+  token_embedding: MaybeQuantizedEmbedding,
+  /// Position-embedding table `(max_position_embeddings, hidden)`, materialized
+  /// dense at load (dequantized once if the checkpoint quantized it): the
+  /// position lookup is a contiguous row slice (`arange(seq)`), which a packed
+  /// quantized table cannot be sliced for, so the dense table keeps the slice
+  /// path unchanged.
   position_embedding: Array,
   layers: Vec<EncoderLayer>,
   final_layer_norm: LayerNorm,
-  /// Pooled projection `head` (biased `Linear(hidden, projection_size)`).
-  head_weight: Array,
-  head_bias: Array,
+  /// Pooled projection `head` (biased `Linear(hidden, projection_size)`) —
+  /// quantize-aware ([`QuantLinear`]).
+  head: QuantLinear,
   max_position_embeddings: i32,
   hidden: i32,
 }
@@ -76,6 +89,25 @@ impl TextTower {
   /// dimensions (typed [`crate::Error::ShapePairMismatch`] wrapped in
   /// [`crate::Error::LayerKeyed`]).
   pub fn from_weights(config: &TextConfig, weights: &mut HashMap<String, Array>) -> Result<Self> {
+    Self::from_weights_quantized(config, weights, None)
+  }
+
+  /// Build the text tower with an optional parsed quantization config — the
+  /// quantization-aware analogue of [`from_weights`](Self::from_weights) (which
+  /// is just this with `quant == None`).
+  ///
+  /// Each `nn.Linear` (the attention q/k/v/out, the MLP fc1/fc2, and the pooled
+  /// `head`) auto-picks the dense or quantized variant per layer by its
+  /// `<prefix>.scales` sibling (the `class_predicate`'s `f"{p}.scales" in
+  /// weights` signal). The `token_embedding` is quantize-aware too (a quantized
+  /// row gather dequantizes the gathered rows); the `position_embedding` is
+  /// materialized dense at load (dequantized once if quantized) because the
+  /// position lookup is a contiguous row slice a packed table cannot serve.
+  pub fn from_weights_quantized(
+    config: &TextConfig,
+    weights: &mut HashMap<String, Array>,
+    quant: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
     // Idempotent re-validation: `from_weights` is public, so a caller may build
     // a tower from a directly-constructed (unvalidated) config. This bounds
     // `num_hidden_layers` (and every other dim) before the per-layer
@@ -92,18 +124,44 @@ impl TextTower {
     let dims = LayerDims::new(hidden, inter, num_heads, config.layer_norm_eps as f32)?;
     let eps = dims.eps;
 
-    let token_embedding = take_shaped(
+    // Token embedding — quantize-aware (an axis-0 row gather; dequantize-gather
+    // for a quantized table). Pin the LOGICAL `(vocab, hidden)` to the config for
+    // BOTH arms via `logical_shape`: the dense variant from the table's own shape,
+    // the quantized variant from the dequantized `(num_embeddings, dim)` recovered
+    // from the validated triple (no whole-table dequantization). A quantized table
+    // whose logical shape disagrees would otherwise mis-gather at the first
+    // forward instead of failing at load.
+    let token_embedding = MaybeQuantizedEmbedding::from_weights(
       weights,
+      "embeddings.token_embedding",
+      resolve_quant(quant, "embeddings.token_embedding"),
+    )?;
+    expect_logical_shape(
+      &token_embedding,
       "embeddings.token_embedding.weight",
       "text token-embedding table (vocab, hidden)",
-      &[vocab, hidden],
+      vocab,
+      hidden,
     )?;
-    let position_embedding = take_shaped(
-      weights,
-      "embeddings.position_embedding.weight",
-      "text position-embedding table (max_position_embeddings, hidden)",
-      &[max_pos, hidden],
-    )?;
+
+    // Position embedding — materialized dense (dequantized once if quantized):
+    // the lookup is a contiguous row slice a packed table cannot serve. Pin the
+    // materialized table to the config `(max_position_embeddings, hidden)`.
+    let position_embedding = {
+      let pos_quant = MaybeQuantizedEmbedding::from_weights(
+        weights,
+        "embeddings.position_embedding",
+        resolve_quant(quant, "embeddings.position_embedding"),
+      )?;
+      let table = pos_quant.dense_table(None)?;
+      expect_shape(
+        &table,
+        "embeddings.position_embedding.weight",
+        "text position-embedding table (max_position_embeddings, hidden)",
+        &[max_pos, hidden],
+      )?;
+      table
+    };
 
     // `num_hidden_layers` is required positive in `validate`, but reserve
     // fallibly so even a heavyweight per-layer `Vec` the allocator cannot
@@ -116,32 +174,22 @@ impl TextTower {
       config.num_hidden_layers as usize,
     )?;
     for i in 0..config.num_hidden_layers {
-      layers.push(EncoderLayer::from_weights(weights, "encoder", i, dims)?);
+      layers.push(EncoderLayer::from_weights(
+        weights, "encoder", i, dims, quant,
+      )?);
     }
 
     let final_layer_norm = build_layer_norm(weights, "final_layer_norm", hidden, eps)?;
 
-    // The text head is a BIASED Linear(hidden, projection_size).
-    let head_weight = take_shaped(
-      weights,
-      "head.weight",
-      "text head weight (projection_size, hidden)",
-      &[proj, hidden],
-    )?;
-    let head_bias = take_shaped(
-      weights,
-      "head.bias",
-      "text head bias (projection_size,)",
-      &[proj],
-    )?;
+    // The text head is a BIASED Linear(hidden, projection_size) — quantize-aware.
+    let head = QuantLinear::from_weights(weights, "head", proj, hidden, true, quant)?;
 
     Ok(Self {
       token_embedding,
       position_embedding,
       layers,
       final_layer_norm,
-      head_weight,
-      head_bias,
+      head,
       max_position_embeddings: max_pos,
       hidden,
     })
@@ -191,8 +239,9 @@ impl TextTower {
       )));
     }
 
-    // token_embedding(ids): (B, L) → (B, L, hidden) via axis-0 gather.
-    let tok = ops::indexing::take_axis(&self.token_embedding, input_ids, 0)?;
+    // token_embedding(ids): (B, L) → (B, L, hidden) via axis-0 gather (a
+    // dequantize-gather for a quantized table).
+    let tok = self.token_embedding.gather(input_ids)?;
     // position_embedding(arange(L)): (L, hidden), sliced from the table's
     // first L rows (position_ids = arange(seq_len)), then broadcast-added.
     let pos = self.position_rows(seq)?; // (L, hidden)
@@ -209,7 +258,7 @@ impl TextTower {
     let last = ops::indexing::take_axis(&h, &index_last(seq)?, 1)?; // (B, 1, hidden)
     let last = ops::shape::squeeze_axes(&last, &[1])?; // (B, hidden)
     // head(pooled): (B, hidden) → (B, projection_size).
-    linear(&last, &self.head_weight, Some(&self.head_bias))
+    self.head.forward(&last)
   }
 
   /// The first `seq` rows of the position-embedding table — the lazy analogue

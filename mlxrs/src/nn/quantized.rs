@@ -727,5 +727,336 @@ fn take_required(
   })
 }
 
+/// A packed quantized embedding table — the `(weight, scales, biases)` triple
+/// plus the `group_size` / `bits` / `mode` scheme parameters, mirroring
+/// `mlx.nn.QuantizedEmbedding` (`mlx/python/mlx/nn/layers/quantized.py:99-196`).
+///
+/// Used when an mlx-community quantized checkpoint ships a quantized
+/// `nn.Embedding` (the `class_predicate` quantizes `nn.Embedding` alongside
+/// `nn.Linear`, both in mlx-audio's whisper `whisper.py:674-676` and in
+/// mlx-embeddings' `convert.py` `get_class_predicate`).
+///
+/// All fields are private; the triple's structural consistency is validated at
+/// construction by [`MaybeQuantizedEmbedding::from_parts`] via the shared
+/// `validate_quantized_triple`, so the scheme parameters cannot drift apart
+/// from the arrays they describe.
+#[derive(Debug)]
+pub struct QuantizedEmbedding {
+  /// Packed `(num_embeddings, packed_dim)` quantized table (`uint32`).
+  weight: Array,
+  /// Per-group `scales` `(num_embeddings, n_groups)`.
+  scales: Array,
+  /// Per-group affine `biases` (`None` for scale-only `fp` modes).
+  biases: Option<Array>,
+  group_size: i32,
+  bits: i32,
+  mode: String,
+}
+
+impl QuantizedEmbedding {
+  /// The packed quantized table `(num_embeddings, packed_dim)`.
+  #[inline(always)]
+  pub fn weight_ref(&self) -> &Array {
+    &self.weight
+  }
+
+  /// The per-group `scales`.
+  #[inline(always)]
+  pub fn scales_ref(&self) -> &Array {
+    &self.scales
+  }
+
+  /// The per-group affine `biases` (`None` for scale-only `fp` modes).
+  #[inline(always)]
+  pub fn biases(&self) -> Option<&Array> {
+    self.biases.as_ref()
+  }
+
+  /// The quantization group size.
+  #[inline(always)]
+  pub fn group_size(&self) -> i32 {
+    self.group_size
+  }
+
+  /// The quantization bit depth.
+  #[inline(always)]
+  pub fn bits(&self) -> i32 {
+    self.bits
+  }
+
+  /// The quantization mode tag.
+  #[inline(always)]
+  pub fn mode(&self) -> &str {
+    &self.mode
+  }
+}
+
+/// A quantize-aware embedding table: either a dense `(num_embeddings, dim)`
+/// [`Array`] or a [`QuantizedEmbedding`], dispatched at the lookup call site.
+///
+/// This is the embedding analogue of [`MaybeQuantizedLinear`] — the abstraction
+/// a model uses in place of a bare embedding table so the same load + lookup
+/// path serves both dense and quantized checkpoints. [`Self::from_weights`]
+/// picks the quantized variant when the checkpoint carries the sibling
+/// `<prefix>.scales` (and, for `affine`, `<prefix>.biases`) tensors, and the
+/// dense variant otherwise — the weight-map analogue of the
+/// `class_predicate`'s `f"{p}.scales" in weights` signal that quantizes
+/// `nn.Embedding` alongside `nn.Linear`.
+///
+/// Two lookup forms are exposed, both mirroring `mlx.nn.Embedding` /
+/// `mlx.nn.QuantizedEmbedding`:
+///
+/// - [`gather`](Self::gather) — `weight[ids]` along axis 0 (the row gather, the
+///   embedding's `__call__`); for the quantized variant the gathered packed
+///   rows / scales / biases are dequantized (`QuantizedEmbedding.__call__`).
+/// - [`dense_table`](Self::dense_table) — the full `(num_embeddings, dim)` dense
+///   table; for the quantized variant the whole table is dequantized. A model
+///   that consumes the table by a structural op a packed table does not support
+///   (a contiguous row slice, or a grid reshape + interpolation) materializes
+///   the dense table once via this, then operates on it dense.
+#[derive(Debug)]
+pub enum MaybeQuantizedEmbedding {
+  /// A dense `(num_embeddings, dim)` embedding table (`mlx.nn.Embedding`).
+  Dense(Array),
+  /// A quantized embedding table (`mlx.nn.QuantizedEmbedding`).
+  Quantized(QuantizedEmbedding),
+}
+
+impl MaybeQuantizedEmbedding {
+  /// Construct a **dense** embedding from a `(num_embeddings, dim)` table.
+  #[inline(always)]
+  pub fn dense(weight: Array) -> Self {
+    MaybeQuantizedEmbedding::Dense(weight)
+  }
+
+  /// Construct a **quantized** embedding from the checkpoint's packed
+  /// `(weight, scales, biases)` triple and the scheme parameters — mirroring
+  /// `mlx.nn.QuantizedEmbedding`.
+  ///
+  /// The embedding analogue of [`QuantizedLinear::from_parts`]: the
+  /// `(weight, scales, biases, group_size, bits, mode)` triple is validated by
+  /// the shared `validate_quantized_triple` at LOAD time — the ONE place mlx's
+  /// construct-relevant contract is mirrored, so this constructor and
+  /// [`QuantizedLinear::from_parts`] cannot drift apart. The embedding has NO
+  /// separate dense output bias — its `biases` IS the per-group affine bias — so
+  /// the linear-only dense-bias check from `from_parts` does not apply here.
+  ///
+  /// Reads only `shape()` / `dtype()` metadata (no materialization / eval).
+  ///
+  /// # Errors
+  /// Propagates `validate_quantized_triple`'s typed errors (rank / `uint32`
+  /// weight / the scales width identity / per-mode bias arity / the `fp`-mode
+  /// `uint8` scale dtype; the `affine` scale/bias dtype rule is deferred to
+  /// mlx-c at op-time).
+  pub fn from_parts(
+    weight: Array,
+    scales: Array,
+    biases: Option<Array>,
+    group_size: i32,
+    bits: i32,
+    mode: impl Into<String>,
+  ) -> Result<Self> {
+    let mode = mode.into();
+    validate_quantized_triple(
+      "MaybeQuantizedEmbedding::from_parts",
+      &weight,
+      &scales,
+      biases.as_ref(),
+      group_size,
+      bits,
+      &mode,
+    )?;
+    Ok(MaybeQuantizedEmbedding::Quantized(QuantizedEmbedding {
+      weight,
+      scales,
+      biases,
+      group_size,
+      bits,
+      mode,
+    }))
+  }
+
+  /// `true` if this is the quantized variant.
+  #[inline(always)]
+  pub fn is_quantized(&self) -> bool {
+    matches!(self, MaybeQuantizedEmbedding::Quantized(_))
+  }
+
+  /// The **logical** `(num_embeddings, dim)` of the table — the dequantized
+  /// shape a row gather produces (`dim` is the embedding width, NOT the packed
+  /// `uint32` width of a quantized table).
+  ///
+  /// A model that pins its embedding table to a config-derived `(vocab, hidden)`
+  /// uses this for both arms so the quantized arm is shape-checked at load (a
+  /// packed weight whose dequantized width / row count disagrees with the config
+  /// would otherwise only mis-gather at the first forward).
+  ///
+  /// - **Dense**: the table's own `(rows, dim)` (the dense table is the logical
+  ///   table verbatim).
+  /// - **Quantized**: `num_embeddings` is the packed weight's row count (the
+  ///   leading axis, validated equal to the `scales` row count at construction)
+  ///   and `dim` is `scales.shape(-1) * group_size` — the same logical width
+  ///   `validate_quantized_triple` recovers and pins against the packed weight,
+  ///   so no separate dequantization is needed.
+  ///
+  /// Reads only `shape()` metadata (no materialization / eval).
+  ///
+  /// # Errors
+  /// - [`Error::RankMismatch`] if the dense table is not rank-2 (the quantized
+  ///   arm's rank-2 layout is guaranteed by its construction-time validation);
+  /// - [`Error::OutOfRange`] if a dimension exceeds `i32::MAX` (a corrupt huge
+  ///   table; the recovery is computed in `i64` so it cannot overflow first).
+  pub fn logical_shape(&self) -> Result<(i32, i32)> {
+    let context = "MaybeQuantizedEmbedding::logical_shape";
+    let (rows, dim): (i64, i64) = match self {
+      MaybeQuantizedEmbedding::Dense(weight) => {
+        let shape = weight.shape();
+        if shape.len() != 2 {
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MaybeQuantizedEmbedding::logical_shape: dense table must be rank-2 (num_embeddings, dim)",
+            shape.len() as u32,
+            shape.to_vec(),
+          )));
+        }
+        (shape[0] as i64, shape[1] as i64)
+      }
+      MaybeQuantizedEmbedding::Quantized(q) => {
+        // The triple was validated rank-2 at construction; `num_embeddings` is the
+        // packed weight's leading axis and the logical width is
+        // `scales.shape(-1) * group_size` (mlx's per-group recovery,
+        // `validate_quantized_triple` pins it against the packed weight).
+        let w_rows = q.weight.shape()[0] as i64;
+        let s_shape = q.scales.shape();
+        let logical_dim = (s_shape[1] as i64) * i64::from(q.group_size);
+        (w_rows, logical_dim)
+      }
+    };
+    let to_i32 = |v: i64| -> Result<i32> {
+      i32::try_from(v).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          context,
+          "logical embedding dimension exceeds i32::MAX",
+          format_smolstr!("{v}"),
+        ))
+      })
+    };
+    Ok((to_i32(rows)?, to_i32(dim)?))
+  }
+
+  /// Gather embedding rows: `weight[ids]` along axis 0 (the vocab axis),
+  /// mirroring `mlx.nn.Embedding.__call__`'s `self.weight[x]` (dense) and
+  /// `mlx.nn.QuantizedEmbedding.__call__`'s
+  /// `dequantize(weight[x], scales[x], biases[x], ...)` (quantized). `ids` is an
+  /// integer [`Array`] of any shape `S`; the result is `S ++ (dim,)`.
+  ///
+  /// # Errors
+  /// Propagates the gather (`take_axis`) / dequantize op errors.
+  pub fn gather(&self, ids: &Array) -> Result<Array> {
+    match self {
+      MaybeQuantizedEmbedding::Dense(weight) => weight.take_axis(ids, 0),
+      MaybeQuantizedEmbedding::Quantized(q) => {
+        // `mlx.nn.QuantizedEmbedding.__call__`: gather the packed rows + the
+        // per-row scales / biases by id, then dequantize the gathered rows.
+        let w_rows = q.weight.take_axis(ids, 0)?;
+        let s_rows = q.scales.take_axis(ids, 0)?;
+        let b_rows = match &q.biases {
+          Some(b) => Some(b.take_axis(ids, 0)?),
+          None => None,
+        };
+        quantized::dequantize(
+          &w_rows,
+          &s_rows,
+          b_rows.as_ref(),
+          q.group_size,
+          q.bits,
+          &q.mode,
+          None,
+          None,
+        )
+      }
+    }
+  }
+
+  /// The full `(num_embeddings, dim)` dense table — the dense table verbatim, or
+  /// the whole quantized table dequantized (`dequantize(weight, scales, biases,
+  /// ...)`). A model that consumes the table by a structural op a packed table
+  /// does not support (a contiguous row slice, or a grid reshape +
+  /// interpolation) materializes it once through here, then operates dense.
+  ///
+  /// `dtype` optionally casts the dequantized result (the dense variant is
+  /// returned at its stored dtype regardless — a model wanting a uniform dtype
+  /// casts the dense table at load).
+  ///
+  /// # Errors
+  /// Propagates the clone / dequantize op errors.
+  pub fn dense_table(&self, dtype: Option<Dtype>) -> Result<Array> {
+    match self {
+      MaybeQuantizedEmbedding::Dense(weight) => weight.try_clone(),
+      MaybeQuantizedEmbedding::Quantized(q) => quantized::dequantize(
+        &q.weight,
+        &q.scales,
+        q.biases.as_ref(),
+        q.group_size,
+        q.bits,
+        &q.mode,
+        None,
+        dtype,
+      ),
+    }
+  }
+
+  /// Build a quantize-aware embedding from a checkpoint weight map: a
+  /// [`QuantizedEmbedding`] when `<prefix>.scales` is present in `weights`, else
+  /// a dense table.
+  ///
+  /// The embedding analogue of [`MaybeQuantizedLinear::from_weights`]: the
+  /// presence of a `<prefix>.scales` sibling is the `class_predicate` signal
+  /// that this embedding was pre-quantized in the checkpoint.
+  ///
+  /// - **Quantized path** (`<prefix>.scales` present): pops `<prefix>.weight`
+  ///   (the packed `uint32` table), `<prefix>.scales`, and the optional
+  ///   `<prefix>.biases` (present iff `mode == "affine"`), and builds a
+  ///   [`QuantizedEmbedding`] with the resolved `(group_size, bits, mode)`. The
+  ///   triple is validated by [`Self::from_parts`].
+  /// - **Dense path** (no `<prefix>.scales`): pops `<prefix>.weight` and builds
+  ///   a dense table.
+  ///
+  /// `quant` carries the resolved scheme parameters `(group_size, bits, mode)`
+  /// for this embedding (resolved by the caller from the parsed
+  /// [`crate::lm::quant::PerLayerQuantization`]); it is only consulted on the
+  /// quantized path. A `<prefix>.scales` present but `quant == None` is a
+  /// checkpoint / config inconsistency and returns a typed
+  /// [`Error::InvariantViolation`] rather than guessing scheme parameters.
+  ///
+  /// # Errors
+  /// - [`Error::MissingKey`] if `<prefix>.weight` (or, on the quantized path,
+  ///   `<prefix>.scales`) is absent;
+  /// - [`Error::InvariantViolation`] if `<prefix>.scales` is present but `quant`
+  ///   is `None`;
+  /// - propagates [`Self::from_parts`]'s structural validation errors.
+  pub fn from_weights(
+    weights: &mut HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<(i32, i32, &str)>,
+  ) -> Result<Self> {
+    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
+    if weights.contains_key(&scales_key) {
+      let Some((group_size, bits, mode)) = quant else {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "MaybeQuantizedEmbedding::from_weights: checkpoint carries a `.scales` sibling for this embedding but no quantization config resolved scheme parameters",
+          "a quantized embedding requires (group_size, bits, mode) from the config `quantization` block",
+        )));
+      };
+      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
+      let scales = take_required(weights, prefix, SCALES_SUFFIX)?;
+      let biases = weights.remove(&format!("{prefix}{BIASES_SUFFIX}"));
+      Self::from_parts(weight, scales, biases, group_size, bits, mode)
+    } else {
+      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
+      Ok(MaybeQuantizedEmbedding::Dense(weight))
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests;

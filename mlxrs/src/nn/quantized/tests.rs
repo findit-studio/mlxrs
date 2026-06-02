@@ -446,3 +446,134 @@ fn maybe_quantized_dense_missing_weight_errors() {
   let err = MaybeQuantizedLinear::from_weights(&mut weights, "blk.q", None).unwrap_err();
   assert!(matches!(err, crate::Error::MissingKey(_)));
 }
+
+// ───────────────────── MaybeQuantizedEmbedding ─────────────────────
+
+/// A real affine `(packed uint32 weight, scales, biases)` embedding triple of
+/// shape `(num_embeddings, dim)`, produced by the actual
+/// `ops::quantized::quantize` — the exact on-disk layout an mlx-community
+/// quantized checkpoint ships for a quantized `nn.Embedding`. `dim` must be a
+/// whole multiple of the affine group size (here `QUANT_IN = 64`).
+fn embedding_triple(num_embeddings: usize) -> (Array, Array, Array) {
+  let mut data = Vec::with_capacity(num_embeddings * QUANT_IN);
+  for v in 0..num_embeddings {
+    for s in 0..QUANT_IN {
+      data.push(((v * 5 + s) as f32) * 0.001);
+    }
+  }
+  let dense = Array::from_slice::<f32>(&data, &(num_embeddings, QUANT_IN)).unwrap();
+  let (w_q, scales, biases) = quantized::quantize(&dense, 64, 8, "affine", None).unwrap();
+  (
+    w_q,
+    scales,
+    biases.expect("affine produces per-group biases"),
+  )
+}
+
+#[test]
+fn maybe_quantized_embedding_dense_gather_and_table() {
+  // The dense variant gathers rows verbatim and returns its table verbatim.
+  let table = dense_weight(6); // (6, 64) reused as a (num_embeddings, dim) table
+  let emb = MaybeQuantizedEmbedding::dense(table.try_clone().unwrap());
+  assert!(!emb.is_quantized());
+
+  let ids = Array::from_slice::<i32>(&[0, 2, 5], &(3usize,)).unwrap();
+  let rows = emb.gather(&ids).unwrap();
+  assert_eq!(rows.shape(), vec![3, QUANT_IN]);
+
+  let full = emb.dense_table(None).unwrap();
+  assert_eq!(full.shape(), vec![6, QUANT_IN]);
+}
+
+#[test]
+fn maybe_quantized_embedding_quantized_gather_and_table_finite() {
+  // A valid affine triple constructs, gathers rows (dequantize-gather), and
+  // materializes the full dense table (dequantize), both to finite values.
+  let (w_q, scales, biases) = embedding_triple(8);
+  let emb =
+    MaybeQuantizedEmbedding::from_parts(w_q, scales, Some(biases), 64, 8, "affine").unwrap();
+  assert!(emb.is_quantized());
+
+  let ids = Array::from_slice::<i32>(&[0, 3, 7], &(3usize,)).unwrap();
+  let mut rows = emb.gather(&ids).unwrap();
+  assert_eq!(rows.shape(), vec![3, QUANT_IN]);
+  rows.eval().unwrap();
+  for v in rows.to_vec::<f32>().unwrap() {
+    assert!(v.is_finite(), "dequantized embedding row non-finite: {v}");
+  }
+
+  let mut full = emb.dense_table(Some(crate::Dtype::F32)).unwrap();
+  assert_eq!(full.shape(), vec![8, QUANT_IN]);
+  full.eval().unwrap();
+  for v in full.to_vec::<f32>().unwrap() {
+    assert!(v.is_finite(), "dequantized embedding table non-finite: {v}");
+  }
+}
+
+#[test]
+fn maybe_quantized_embedding_from_parts_rejects_affine_without_biases() {
+  // `affine` requires per-group biases (the shared `validate_quantized_triple`
+  // contract) — a missing-biases affine triple is a typed error at load.
+  let (w_q, scales, _biases) = embedding_triple(8);
+  let err = MaybeQuantizedEmbedding::from_parts(w_q, scales, None, 64, 8, "affine").unwrap_err();
+  assert!(matches!(err, crate::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn maybe_quantized_embedding_from_weights_quantized_path() {
+  // `.scales` present + resolved scheme params ⇒ the quantized variant, with the
+  // packed triple consumed from the map.
+  let (w_q, scales, biases) = embedding_triple(8);
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("emb.weight".to_string(), w_q);
+  weights.insert("emb.scales".to_string(), scales);
+  weights.insert("emb.biases".to_string(), biases);
+
+  let emb =
+    MaybeQuantizedEmbedding::from_weights(&mut weights, "emb", Some((64, 8, "affine"))).unwrap();
+  assert!(emb.is_quantized());
+  assert!(weights.is_empty());
+}
+
+#[test]
+fn maybe_quantized_embedding_from_weights_dense_path() {
+  // No `.scales` sibling ⇒ the dense variant (config is ignored on this path).
+  let table = dense_weight(6);
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("emb.weight".to_string(), table);
+  let emb =
+    MaybeQuantizedEmbedding::from_weights(&mut weights, "emb", Some((64, 8, "affine"))).unwrap();
+  assert!(!emb.is_quantized());
+  assert!(weights.is_empty());
+}
+
+#[test]
+fn maybe_quantized_embedding_logical_shape_both_arms() {
+  // `logical_shape` returns the dequantized `(num_embeddings, dim)` for BOTH
+  // arms: the dense table's own shape, and the quantized table's logical shape
+  // recovered from the validated triple (NOT the packed `uint32` width). The two
+  // are built from the same `(num_embeddings, QUANT_IN)` source, so they agree.
+  let dense = MaybeQuantizedEmbedding::dense(dense_weight(6)); // (6, QUANT_IN)
+  assert_eq!(dense.logical_shape().unwrap(), (6, QUANT_IN as i32));
+
+  let (w_q, scales, biases) = embedding_triple(8); // logical (8, QUANT_IN)
+  let quant =
+    MaybeQuantizedEmbedding::from_parts(w_q, scales, Some(biases), 64, 8, "affine").unwrap();
+  // The packed weight's trailing axis is narrower than QUANT_IN (8-bit packs 4
+  // values per `uint32`), so the logical width MUST come from the recovery, not
+  // the packed shape.
+  assert_eq!(quant.logical_shape().unwrap(), (8, QUANT_IN as i32));
+}
+
+#[test]
+fn maybe_quantized_embedding_scales_present_but_no_config_errors() {
+  // `.scales` present but no resolved scheme params is a checkpoint/config
+  // inconsistency — a typed error, not a guess.
+  let (w_q, scales, biases) = embedding_triple(8);
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("emb.weight".to_string(), w_q);
+  weights.insert("emb.scales".to_string(), scales);
+  weights.insert("emb.biases".to_string(), biases);
+  let err = MaybeQuantizedEmbedding::from_weights(&mut weights, "emb", None).unwrap_err();
+  assert!(matches!(err, crate::Error::InvariantViolation(_)));
+}
