@@ -398,6 +398,9 @@ impl EmbeddingModelTypeRegistry {
   ///
   /// - `"siglip"` → [`crate::embeddings::siglip2_naflex::Siglip2NaflexModel`]
   ///   (when the `siglip2-naflex` feature is on).
+  /// - `"gemma3_text"` →
+  ///   [`crate::embeddings::embeddinggemma::EmbeddingGemmaModel`] (when the
+  ///   `embeddinggemma` feature is on).
   ///
   /// With no model features enabled this is a no-op (equivalent to
   /// [`new`](Self::new)). A caller that wants only its own architectures can
@@ -405,18 +408,16 @@ impl EmbeddingModelTypeRegistry {
   /// directly.
   #[must_use]
   pub fn with_builtin_models(self) -> Self {
-    // `mut` is bound only inside the feature arm so the signature stays
+    // `mut` is bound only inside a feature arm so the signature stays
     // warning-free when no model feature is enabled (an unconditional
     // `mut self` would be an unused-mut under `-D warnings` in the per-feature
     // isolation build, where the registration body compiles to nothing).
+    #[allow(unused_mut)]
+    let mut this = self;
     #[cfg(feature = "siglip2-naflex")]
-    let this = {
-      let mut this = self;
-      crate::embeddings::siglip2_naflex::register(&mut this);
-      this
-    };
-    #[cfg(not(feature = "siglip2-naflex"))]
-    let this = self;
+    crate::embeddings::siglip2_naflex::register(&mut this);
+    #[cfg(feature = "embeddinggemma")]
+    crate::embeddings::embeddinggemma::register(&mut this);
     this
   }
 

@@ -32,6 +32,7 @@ audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normaliz
 wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
 siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]        # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
 whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
+embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
 unstable-ops-overload = []
 gguf                 = []
 
