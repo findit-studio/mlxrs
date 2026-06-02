@@ -34,9 +34,11 @@
 //!   spectrum cannot disambiguate odd `n_fft` from the adjacent even length
 //!   from the bin count alone, so both [`stft`] and [`Spectrum::from_parts`]
 //!   reject odd `n_fft` and a [`Spectrum`] can never carry it.
-//! - Mel filterbank uses the HTK formula
+//! - Mel filterbank defaults to the HTK formula
 //!   (`mel = 2595 * log10(1 + hz / 700)`) and returns shape
-//!   **`(n_mels, n_fft / 2 + 1)`**.
+//!   **`(n_mels, n_fft / 2 + 1)`**. The Slaney scale + Slaney area
+//!   normalization (the Whisper front-end) are available via
+//!   [`mel_filter_bank_scaled`] / [`MelScale`].
 //! - `log_mel_spectrogram` uses `log(max(mel, floor))` with `floor` chosen
 //!   via the [`LogFloor`] enum (default [`LogFloor::Whisper`] = `1e-10`,
 //!   matching the Whisper / mlx-audio front-end). [`LogFloor::Kaldi`] =
@@ -2294,6 +2296,71 @@ impl Default for ISTFTCache {
   }
 }
 
+/// Slaney mel-scale break frequency (Hz): the scale is linear below this and
+/// logarithmic at or above it. Matches `mlx-audio/mlx_audio/dsp.py:516`
+/// (`min_log_hz = 1000.0`).
+const SLANEY_MIN_LOG_HZ: f32 = 1000.0;
+/// Slaney linear-region step: `f_sp = 200 / 3` Hz per mel below
+/// [`SLANEY_MIN_LOG_HZ`]. Matches `mlx-audio/mlx_audio/dsp.py:514`
+/// (`f_sp = 200.0 / 3`).
+const SLANEY_F_SP: f32 = 200.0 / 3.0;
+/// Slaney log-region break frequency over which the log warping is measured:
+/// `6.4`. Matches the `math.log(6.4)` literal in
+/// `mlx-audio/mlx_audio/dsp.py:518`. The reference computes
+/// `logstep = math.log(6.4) / 27.0` in double precision; we keep the same
+/// `f64` evaluation ([`slaney_logstep`]) and narrow only at the call sites so
+/// the step matches the reference to the last f32 bit.
+const SLANEY_LOGSTEP_HZ_RATIO: f64 = 6.4;
+/// Slaney log-region divisor: `27.0`. Matches `mlx-audio/mlx_audio/dsp.py:518`
+/// (`/ 27.0`).
+const SLANEY_LOGSTEP_DIV: f64 = 27.0;
+
+/// Slaney log-region step `logstep = ln(6.4) / 27` (f32), evaluated in `f64`
+/// (matching the reference's `math.log` double-precision evaluation) and
+/// narrowed once. `mel per natural-log Hz` at or above [`SLANEY_MIN_LOG_HZ`].
+#[inline]
+fn slaney_logstep() -> f32 {
+  (SLANEY_LOGSTEP_HZ_RATIO.ln() / SLANEY_LOGSTEP_DIV) as f32
+}
+
+/// Which mel-frequency warping the filterbank uses.
+///
+/// Faithful port of the `mel_scale` argument of `mlx_audio.dsp.mel_filters`
+/// (`mlx-audio/mlx_audio/dsp.py:507`). The reference accepts the string
+/// `"htk"` (the default) or any other value (in practice `None`, passed by
+/// the Whisper front-end) for the Slaney scale.
+///
+/// - [`MelScale::Htk`] — `mel = 2595 * log10(1 + hz / 700)` (the historic
+///   mlxrs default; [`mel_filter_bank`] uses it).
+/// - [`MelScale::Slaney`] — the Auditory-Toolbox / librosa "slaney" scale:
+///   linear (`f_sp = 200/3` Hz/mel) below `1000 Hz`, log above. Required by
+///   the Whisper mel front-end (`mlx-audio/.../whisper/audio.py:76` calls
+///   `mel_filters(..., norm="slaney", mel_scale=None)`).
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Hash, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+pub enum MelScale {
+  /// HTK formula `mel = 2595 * log10(1 + hz / 700)` (the mlx-audio default
+  /// and the historic mlxrs [`mel_filter_bank`] behavior).
+  #[default]
+  Htk,
+  /// Slaney (Auditory-Toolbox / librosa) scale: linear below `1000 Hz`
+  /// (`f_sp = 200/3` Hz per mel), logarithmic above. The Whisper front-end
+  /// scale (`mel_scale=None` in the reference).
+  Slaney,
+}
+
+impl MelScale {
+  /// The canonical lowercase string representation (`htk`/`slaney`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Htk => "htk",
+      Self::Slaney => "slaney",
+    }
+  }
+}
+
 /// HTK mel scale: `mel = 2595 * log10(1 + hz / 700)`.
 #[inline]
 fn hz_to_mel(hz: f32) -> f32 {
@@ -2304,6 +2371,53 @@ fn hz_to_mel(hz: f32) -> f32 {
 #[inline]
 fn mel_to_hz(mel: f32) -> f32 {
   MEL_HZ_BREAK * (MEL_LOG_BASE.powf(mel / MEL_HZ_DIV) - 1.0)
+}
+
+/// Slaney `hz_to_mel` (f32). Faithful port of the `mel_scale != "htk"` branch
+/// of `mlx_audio.dsp.mel_filters.hz_to_mel` (`dsp.py:513-521`): linear
+/// `mels = hz / f_sp` below `1000 Hz`, and
+/// `min_log_mel + ln(hz / 1000) / logstep` at or above it. `f_min = 0` is the
+/// reference's hard-coded inner constant, so `min_log_mel = 1000 / f_sp`.
+#[inline]
+fn hz_to_mel_slaney(hz: f32) -> f32 {
+  let min_log_mel = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
+  if hz >= SLANEY_MIN_LOG_HZ {
+    min_log_mel + (hz / SLANEY_MIN_LOG_HZ).ln() / slaney_logstep()
+  } else {
+    hz / SLANEY_F_SP
+  }
+}
+
+/// Slaney `mel_to_hz` (f32). Faithful port of the `mel_scale != "htk"` branch
+/// of `mlx_audio.dsp.mel_filters.mel_to_hz` (`dsp.py:527-538`): linear
+/// `hz = f_sp * mels` below the break mel, `1000 * exp(logstep * (mels -
+/// min_log_mel))` at or above it. (`f_min = 0`.)
+#[inline]
+fn mel_to_hz_slaney(mel: f32) -> f32 {
+  let min_log_mel = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
+  if mel >= min_log_mel {
+    SLANEY_MIN_LOG_HZ * (slaney_logstep() * (mel - min_log_mel)).exp()
+  } else {
+    SLANEY_F_SP * mel
+  }
+}
+
+/// Dispatch `hz -> mel` by [`MelScale`] (f32).
+#[inline]
+fn hz_to_mel_scaled(hz: f32, scale: MelScale) -> f32 {
+  match scale {
+    MelScale::Htk => hz_to_mel(hz),
+    MelScale::Slaney => hz_to_mel_slaney(hz),
+  }
+}
+
+/// Dispatch `mel -> hz` by [`MelScale`] (f32).
+#[inline]
+fn mel_to_hz_scaled(mel: f32, scale: MelScale) -> f32 {
+  match scale {
+    MelScale::Htk => mel_to_hz(mel),
+    MelScale::Slaney => mel_to_hz_slaney(mel),
+  }
 }
 
 /// HTK mel scale in `f64` — the precise ([`MelPrecision::Precise`]) twin of
@@ -2321,6 +2435,53 @@ fn hz_to_mel_f64(hz: f64) -> f64 {
 #[inline]
 fn mel_to_hz_f64(mel: f64) -> f64 {
   f64::from(MEL_HZ_BREAK) * (f64::from(MEL_LOG_BASE).powf(mel / f64::from(MEL_HZ_DIV)) - 1.0)
+}
+
+/// Slaney `hz_to_mel` in `f64` — the precise twin of [`hz_to_mel_slaney`].
+/// Same piecewise-linear/log formula, double precision.
+#[inline]
+fn hz_to_mel_slaney_f64(hz: f64) -> f64 {
+  let min_log_hz = f64::from(SLANEY_MIN_LOG_HZ);
+  let f_sp = f64::from(SLANEY_F_SP);
+  let min_log_mel = min_log_hz / f_sp;
+  if hz >= min_log_hz {
+    min_log_mel + (hz / min_log_hz).ln() / (SLANEY_LOGSTEP_HZ_RATIO.ln() / SLANEY_LOGSTEP_DIV)
+  } else {
+    hz / f_sp
+  }
+}
+
+/// Slaney `mel_to_hz` in `f64` — the precise twin of [`mel_to_hz_slaney`].
+/// Same piecewise-linear/log formula, double precision.
+#[inline]
+fn mel_to_hz_slaney_f64(mel: f64) -> f64 {
+  let min_log_hz = f64::from(SLANEY_MIN_LOG_HZ);
+  let f_sp = f64::from(SLANEY_F_SP);
+  let min_log_mel = min_log_hz / f_sp;
+  let logstep = SLANEY_LOGSTEP_HZ_RATIO.ln() / SLANEY_LOGSTEP_DIV;
+  if mel >= min_log_mel {
+    min_log_hz * (logstep * (mel - min_log_mel)).exp()
+  } else {
+    f_sp * mel
+  }
+}
+
+/// Dispatch `hz -> mel` by [`MelScale`] (f64).
+#[inline]
+fn hz_to_mel_scaled_f64(hz: f64, scale: MelScale) -> f64 {
+  match scale {
+    MelScale::Htk => hz_to_mel_f64(hz),
+    MelScale::Slaney => hz_to_mel_slaney_f64(hz),
+  }
+}
+
+/// Dispatch `mel -> hz` by [`MelScale`] (f64).
+#[inline]
+fn mel_to_hz_scaled_f64(mel: f64, scale: MelScale) -> f64 {
+  match scale {
+    MelScale::Htk => mel_to_hz_f64(mel),
+    MelScale::Slaney => mel_to_hz_slaney_f64(mel),
+  }
 }
 
 /// Computation precision for [`mel_filter_bank_with`] / the precise mel
@@ -2375,8 +2536,9 @@ impl MelPrecision {
 /// in `f32` ([`MelPrecision::Standard`]).
 ///
 /// Faithful port of `mlx_audio.dsp.mel_filters(sample_rate, n_fft, n_mels,
-/// f_min, f_max, norm=None, mel_scale="htk")` — the HTK formula only;
-/// Slaney normalization is a planned follow-up.
+/// f_min, f_max, norm=None, mel_scale="htk")` — the HTK formula, no
+/// normalization. For the Slaney scale / Slaney area normalization (the
+/// Whisper front-end), see [`mel_filter_bank_scaled`].
 ///
 /// `f_max` defaults to `sample_rate / 2` (Nyquist) when `None`. The reference
 /// builds frequency points via `mx.linspace(0, sample_rate // 2, n_freqs)`
@@ -2437,6 +2599,113 @@ pub fn mel_filter_bank_with(
   f_min: f32,
   f_max: Option<f32>,
   precision: MelPrecision,
+) -> Result<Array> {
+  // HTK scale, no Slaney normalization — the historic mlxrs default.
+  mel_filter_bank_core(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    precision,
+    MelScale::Htk,
+    false,
+  )
+}
+
+/// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)`,
+/// choosing the mel-frequency warping ([`MelScale`]) and whether to apply
+/// Slaney area normalization, at [`MelPrecision::Standard`] (f32).
+///
+/// This is the entry point the **Whisper** front-end needs:
+/// `mel_filter_bank_scaled(80, 400, 16_000, 0.0, None, MelScale::Slaney,
+/// true)` reproduces `mlx_audio.dsp.mel_filters(16000, 400, 80,
+/// norm="slaney", mel_scale=None)` (the call in
+/// `mlx-audio/.../whisper/audio.py:76`).
+///
+/// - `scale` selects the [`MelScale`] (HTK vs Slaney warping).
+/// - `slaney_norm` toggles the Slaney area normalization
+///   `enorm[m] = 2 / (f_pts[m + 2] - f_pts[m])` applied per filter row
+///   (`mlx_audio.dsp.mel_filters`'s `if norm == "slaney"` branch,
+///   `dsp.py:567-569`). The HTK / no-norm default ([`mel_filter_bank`])
+///   leaves the triangles un-normalized.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+pub fn mel_filter_bank_scaled(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  scale: MelScale,
+  slaney_norm: bool,
+) -> Result<Array> {
+  mel_filter_bank_scaled_with(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    MelPrecision::Standard,
+    scale,
+    slaney_norm,
+  )
+}
+
+/// Triangular mel filterbank matrix of shape `(n_mels, n_fft / 2 + 1)`,
+/// selecting [`MelPrecision`], [`MelScale`], and Slaney normalization — the
+/// fully-general filterbank entry point.
+///
+/// [`mel_filter_bank`] (HTK, no norm, f32) and [`mel_filter_bank_scaled`]
+/// (HTK/Slaney + optional norm, f32) are convenience shorthands over this. The
+/// precision / scale / normalization are all orthogonal: the validation, the
+/// integer-divided Nyquist frequency grid, the work/allocation caps, and the
+/// triangular-filter construction are identical; only the per-element dtype
+/// (`f32` vs `f64`), the `hz <-> mel` warping, and the optional per-row Slaney
+/// scaling differ.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+#[allow(clippy::too_many_arguments)]
+pub fn mel_filter_bank_scaled_with(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  precision: MelPrecision,
+  scale: MelScale,
+  slaney_norm: bool,
+) -> Result<Array> {
+  mel_filter_bank_core(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    precision,
+    scale,
+    slaney_norm,
+  )
+}
+
+/// Core filterbank construction shared by [`mel_filter_bank_with`] /
+/// [`mel_filter_bank_scaled_with`]. Carries the [`MelScale`] warping and the
+/// `slaney_norm` flag through the f32 SIMD path and the f64 precise path.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+#[allow(clippy::too_many_arguments)]
+fn mel_filter_bank_core(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  precision: MelPrecision,
+  scale: MelScale,
+  slaney_norm: bool,
 ) -> Result<Array> {
   if n_fft == 0 {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
@@ -2523,6 +2792,8 @@ pub fn mel_filter_bank_with(
       sample_rate,
       f_min,
       f_max,
+      scale,
+      slaney_norm,
     );
   }
 
@@ -2547,8 +2818,8 @@ pub fn mel_filter_bank_with(
   }
 
   // Mel grid: `n_mels + 2` points (the +2 give the outer triangle edges).
-  let m_min = hz_to_mel(f_min);
-  let m_max = hz_to_mel(f_max);
+  let m_min = hz_to_mel_scaled(f_min, scale);
+  let m_max = hz_to_mel_scaled(f_max, scale);
   let m_denom = (n_pts as f32 - 1.0).max(1.0);
   let mut f_pts: Vec<f32> = Vec::new();
   f_pts.try_reserve_exact(n_pts).map_err(|e| {
@@ -2561,7 +2832,7 @@ pub fn mel_filter_bank_with(
   })?;
   for i in 0..n_pts {
     let m = m_min + (m_max - m_min) * (i as f32) / m_denom;
-    f_pts.push(mel_to_hz(m));
+    f_pts.push(mel_to_hz_scaled(m, scale));
   }
 
   // Build the filterbank directly on the CPU as `(n_mels, n_freqs)` to
@@ -2602,7 +2873,34 @@ pub fn mel_filter_bank_with(
   // returning; `bank_len <= bank.capacity()` per `try_reserve_exact`.
   unsafe { bank.set_len(bank_len) };
 
+  // Slaney area normalization (`mlx_audio.dsp.mel_filters`'s
+  // `if norm == "slaney"` branch, `dsp.py:567-569`): scale filter row `m` by
+  // `enorm[m] = 2 / (f_pts[m + 2] - f_pts[m])`. The bank is row-major
+  // `(n_mels, n_freqs)`, so each row is a contiguous `n_freqs` slice.
+  if slaney_norm {
+    apply_slaney_norm_f32(&mut bank, &f_pts, n_mels, n_freqs);
+  }
+
   Array::from_slice::<f32>(&bank, &[n_mels_i32, n_freqs_i32])
+}
+
+/// Apply the Slaney area normalization in-place to a row-major
+/// `(n_mels, n_freqs)` f32 filterbank: row `m` is scaled by
+/// `enorm[m] = 2 / (f_pts[m + 2] - f_pts[m])`. Faithful port of
+/// `mlx_audio.dsp.mel_filters`'s `enorm = 2.0 / (f_pts[2 : n_mels + 2] -
+/// f_pts[:n_mels]); filterbank *= enorm` (`dsp.py:567-569`).
+///
+/// `f_pts` is the `n_mels + 2`-point Hz grid; `bank.len() == n_mels *
+/// n_freqs`. Both invariants hold at the single call site (the f32 builder).
+#[inline]
+fn apply_slaney_norm_f32(bank: &mut [f32], f_pts: &[f32], n_mels: usize, n_freqs: usize) {
+  for m in 0..n_mels {
+    let enorm = 2.0 / (f_pts[m + 2] - f_pts[m]);
+    let row = &mut bank[m * n_freqs..(m + 1) * n_freqs];
+    for v in row {
+      *v *= enorm;
+    }
+  }
 }
 
 /// Precise (`f64`) filterbank construction for [`mel_filter_bank_with`] with
@@ -2631,6 +2929,8 @@ fn mel_filter_bank_f64(
   sample_rate: u32,
   f_min: f32,
   f_max: f32,
+  scale: MelScale,
+  slaney_norm: bool,
 ) -> Result<Array> {
   // `all_freqs[i] = i * (sample_rate / 2) / (n_freqs - 1)` in f64 — the
   // f32 path's `mx.linspace(0, sample_rate // 2, n_freqs)` form widened.
@@ -2653,8 +2953,8 @@ fn mel_filter_bank_f64(
   }
 
   // Mel grid: `n_mels + 2` points, evaluated in f64 (mirrors the f32 path).
-  let m_min = hz_to_mel_f64(f64::from(f_min));
-  let m_max = hz_to_mel_f64(f64::from(f_max));
+  let m_min = hz_to_mel_scaled_f64(f64::from(f_min), scale);
+  let m_max = hz_to_mel_scaled_f64(f64::from(f_max), scale);
   let m_denom = (n_pts as f64 - 1.0).max(1.0);
   let mut f_pts: Vec<f64> = Vec::new();
   f_pts.try_reserve_exact(n_pts).map_err(|e| {
@@ -2667,7 +2967,7 @@ fn mel_filter_bank_f64(
   })?;
   for i in 0..n_pts {
     let m = m_min + (m_max - m_min) * (i as f64) / m_denom;
-    f_pts.push(mel_to_hz_f64(m));
+    f_pts.push(mel_to_hz_scaled_f64(m, scale));
   }
 
   // Triangular filters in f64. Mirrors the SCALAR reference
@@ -2702,6 +3002,19 @@ fn mel_filter_bank_f64(
       let up = (freq - left) / lc;
       let down = (right - freq) / cr;
       bank.push(up.min(down).max(0.0));
+    }
+  }
+
+  // Slaney area normalization in f64 (mirrors the f32 path, `dsp.py:567-569`):
+  // scale row `m` by `enorm[m] = 2 / (f_pts[m + 2] - f_pts[m])` before the
+  // f32 cast so the normalization is carried in double precision too.
+  if slaney_norm {
+    for m in 0..n_mels {
+      let enorm = 2.0 / (f_pts[m + 2] - f_pts[m]);
+      let row = &mut bank[m * n_freqs..(m + 1) * n_freqs];
+      for v in row {
+        *v *= enorm;
+      }
     }
   }
 
@@ -2751,6 +3064,12 @@ pub const MEL_FILTER_CACHE_CAP: usize = 8;
 /// returning one for a request for the other would be a silent correctness
 /// bug. `MelPrecision` is `Eq + Hash` (no float payload), so it participates
 /// in the derived `PartialEq`/`Eq` directly.
+///
+/// `scale` ([`MelScale`]) and `slaney_norm` are likewise part of the key: a
+/// Slaney-warped / Slaney-normalized bank is a numerically different matrix
+/// from the HTK / un-normalized bank for otherwise-identical parameters, so
+/// they must never collide. Both are `Eq + Hash` (no float payload) and
+/// participate in the derived `PartialEq`/`Eq` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MelFilterCacheKey {
   n_mels: usize,
@@ -2759,9 +3078,12 @@ struct MelFilterCacheKey {
   f_min_bits: u32,
   f_max_bits: Option<u32>,
   precision: MelPrecision,
+  scale: MelScale,
+  slaney_norm: bool,
 }
 
 impl MelFilterCacheKey {
+  #[allow(clippy::too_many_arguments)]
   fn new(
     n_mels: usize,
     n_fft: usize,
@@ -2769,6 +3091,8 @@ impl MelFilterCacheKey {
     f_min: f32,
     f_max: Option<f32>,
     precision: MelPrecision,
+    scale: MelScale,
+    slaney_norm: bool,
   ) -> Self {
     Self {
       n_mels,
@@ -2777,6 +3101,8 @@ impl MelFilterCacheKey {
       f_min_bits: f_min.to_bits(),
       f_max_bits: f_max.map(f32::to_bits),
       precision,
+      scale,
+      slaney_norm,
     }
   }
 }
@@ -2874,7 +3200,81 @@ pub fn mel_filter_bank_cached_with(
   f_max: Option<f32>,
   precision: MelPrecision,
 ) -> Result<Array> {
-  let key = MelFilterCacheKey::new(n_mels, n_fft, sample_rate, f_min, f_max, precision);
+  // HTK scale, no Slaney normalization — matches `mel_filter_bank_with`.
+  mel_filter_bank_cached_core(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    precision,
+    MelScale::Htk,
+    false,
+  )
+}
+
+/// Cached variant of [`mel_filter_bank_scaled`] — the [`MelScale`] /
+/// Slaney-normalization-aware cached filterbank (f32).
+///
+/// This is the **Whisper front-end's** cached bank entry point:
+/// `mel_filter_bank_scaled_cached(80, 400, 16_000, 0.0, None,
+/// MelScale::Slaney, true)` memoizes the Slaney bank Whisper uses on every
+/// 30-second chunk. Identical per-thread LRU semantics to
+/// [`mel_filter_bank_cached`]; the cache key additionally carries the
+/// [`MelScale`] and the `slaney_norm` flag, so a Slaney bank never aliases the
+/// HTK bank for the same `(n_mels, n_fft, sample_rate, f_min, f_max)`.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+pub fn mel_filter_bank_scaled_cached(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  scale: MelScale,
+  slaney_norm: bool,
+) -> Result<Array> {
+  mel_filter_bank_cached_core(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    MelPrecision::Standard,
+    scale,
+    slaney_norm,
+  )
+}
+
+/// Core cached-filterbank lookup/build/store shared by every public cached
+/// variant. The full `(n_mels, n_fft, sample_rate, f_min, f_max, precision,
+/// scale, slaney_norm)` tuple is the cache key, so no two numerically-distinct
+/// banks ever collide.
+///
+/// # Errors
+/// - Same as [`mel_filter_bank`].
+#[allow(clippy::too_many_arguments)]
+fn mel_filter_bank_cached_core(
+  n_mels: usize,
+  n_fft: usize,
+  sample_rate: u32,
+  f_min: f32,
+  f_max: Option<f32>,
+  precision: MelPrecision,
+  scale: MelScale,
+  slaney_norm: bool,
+) -> Result<Array> {
+  let key = MelFilterCacheKey::new(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    precision,
+    scale,
+    slaney_norm,
+  );
 
   // Fast path: lookup + move-to-front for LRU semantics.
   let hit = MEL_FILTER_CACHE.with(|cell| -> Result<Option<Array>> {
@@ -2898,7 +3298,16 @@ pub fn mel_filter_bank_cached_with(
   // recoverable typed error (invalid params, work cap, etc.); we
   // propagate that error WITHOUT touching the cache, so a failed call
   // cannot poison the cache with an absent or invalid entry.
-  let bank = mel_filter_bank_with(n_mels, n_fft, sample_rate, f_min, f_max, precision)?;
+  let bank = mel_filter_bank_core(
+    n_mels,
+    n_fft,
+    sample_rate,
+    f_min,
+    f_max,
+    precision,
+    scale,
+    slaney_norm,
+  )?;
 
   // Cache the just-built bank. Hold a `try_clone` for the caller so the
   // cached entry is independent. Eviction when full: drop the LRU

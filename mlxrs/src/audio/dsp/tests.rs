@@ -689,6 +689,189 @@ fn mel_spectrogram_short_window_uses_right_pad_unchanged() {
   );
 }
 
+// ---- Slaney mel scale (Whisper front-end) ---------------------------
+
+/// Slaney `hz_to_mel` at the `1000 Hz` break: linear below, log at/above.
+/// Oracle values from the reference formula (`mlx_audio.dsp.mel_filters`'s
+/// `hz_to_mel`, slaney branch), computed in f64:
+/// - `999 Hz`  → `999 / (200/3) = 14.985`         (linear region)
+/// - `1000 Hz` → `min_log_mel = 1000 / (200/3) = 15.0` (boundary, log term 0)
+/// - `1001 Hz` → `15 + ln(1001/1000) / (ln(6.4)/27) ≈ 15.0145378`
+#[test]
+fn slaney_hz_to_mel_boundary_999_1000_1001() {
+  // Linear region just below the break.
+  assert!(
+    (hz_to_mel_slaney(999.0) - 14.985).abs() < 1e-4,
+    "slaney hz_to_mel(999) = {} (want 14.985)",
+    hz_to_mel_slaney(999.0)
+  );
+  // Exactly at the break, the log term vanishes → min_log_mel = 15.0.
+  assert!(
+    (hz_to_mel_slaney(1000.0) - 15.0).abs() < 1e-4,
+    "slaney hz_to_mel(1000) = {} (want 15.0)",
+    hz_to_mel_slaney(1000.0)
+  );
+  // Just above the break, the log region kicks in.
+  assert!(
+    (hz_to_mel_slaney(1001.0) - 15.014_538).abs() < 1e-4,
+    "slaney hz_to_mel(1001) = {} (want ~15.014538)",
+    hz_to_mel_slaney(1001.0)
+  );
+  // hz = 0 maps to mel 0 (linear).
+  assert!(
+    hz_to_mel_slaney(0.0).abs() < 1e-6,
+    "slaney hz_to_mel(0) != 0"
+  );
+}
+
+/// Slaney `mel_to_hz` is the exact inverse of `hz_to_mel` across the break.
+/// Oracle: `mel = 14.985 → 999 Hz` (linear), `mel = 15.0 → 1000 Hz`
+/// (boundary), and a few round-trips `hz → mel → hz`.
+#[test]
+fn slaney_mel_to_hz_boundary_and_roundtrip() {
+  // Linear region.
+  assert!(
+    (mel_to_hz_slaney(14.985) - 999.0).abs() < 1e-2,
+    "slaney mel_to_hz(14.985) = {} (want 999.0)",
+    mel_to_hz_slaney(14.985)
+  );
+  // Boundary mel.
+  assert!(
+    (mel_to_hz_slaney(15.0) - 1000.0).abs() < 1e-2,
+    "slaney mel_to_hz(15.0) = {} (want 1000.0)",
+    mel_to_hz_slaney(15.0)
+  );
+  // Round-trip across both regions: hz -> mel -> hz must be identity.
+  for &hz in &[123.4_f32, 999.0, 1000.0, 1001.0, 5000.0, 7999.0] {
+    let rt = mel_to_hz_slaney(hz_to_mel_slaney(hz));
+    assert!(
+      (rt - hz).abs() < 1e-2 * hz.max(1.0),
+      "slaney round-trip hz={hz} -> {rt}"
+    );
+  }
+}
+
+/// The Slaney scale must differ from HTK off the boundary (a sanity check
+/// that the new branch is actually distinct, not silently aliased to HTK).
+/// At `8000 Hz`: HTK `2595*log10(1+8000/700) ≈ 2840.0` mel vs Slaney
+/// `15 + ln(8) / (ln(6.4)/27) ≈ 45.2456`.
+#[test]
+fn slaney_differs_from_htk_off_boundary() {
+  let htk = hz_to_mel(8000.0);
+  let slaney = hz_to_mel_slaney(8000.0);
+  assert!(
+    (slaney - 45.245_64).abs() < 1e-3,
+    "slaney hz_to_mel(8000) = {slaney} (want ~45.24564)"
+  );
+  assert!(
+    (htk - slaney).abs() > 100.0,
+    "HTK ({htk}) and Slaney ({slaney}) mel must differ materially off the break"
+  );
+}
+
+/// Slaney mel filterbank known-value oracle (`n_mels=4, n_fft=16,
+/// sample_rate=16000, norm="slaney", mel_scale=None`). The expected matrix is
+/// computed by the reference algorithm (`mlx_audio.dsp.mel_filters`) in f64,
+/// row-major `(n_mels, n_freqs)` with `n_freqs = 9`. The Slaney area
+/// normalization (`enorm = 2/(f_pts[m+2]-f_pts[m])`) drives the magnitudes to
+/// the `~1e-3` range, so this also pins the normalization is applied.
+#[test]
+fn slaney_mel_filter_bank_known_values() {
+  let n_mels = 4usize;
+  let n_fft = 16usize;
+  let sr = 16_000u32;
+  let bank =
+    to_vec(&mel_filter_bank_scaled(n_mels, n_fft, sr, 0.0, None, MelScale::Slaney, true).unwrap());
+  let n_freqs = n_fft / 2 + 1; // 9
+  assert_eq!(bank.len(), n_mels * n_freqs, "bank shape");
+  // Reference rows (f64, rounded for display; tolerance covers the f32 path).
+  #[rustfmt::skip]
+  let expected: [[f32; 9]; 4] = [
+    [0.0, 0.000605, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.000735, 0.000336, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.000467, 0.000426, 0.000097, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.000123, 0.000299, 0.000284, 0.00019, 0.000095, 0.0],
+  ];
+  for m in 0..n_mels {
+    for f in 0..n_freqs {
+      let got = bank[m * n_freqs + f];
+      let want = expected[m][f];
+      assert!(
+        (got - want).abs() < 2e-6,
+        "slaney bank[{m}][{f}] = {got} (want {want})"
+      );
+    }
+  }
+}
+
+/// The Slaney bank must differ materially from the HTK / un-normalized bank
+/// for the same `(n_mels, n_fft, sample_rate)` — both because the warping
+/// differs (different triangle edges) and because the Slaney area
+/// normalization rescales every row. Pins that `mel_filter_bank` (HTK,
+/// no-norm) and `mel_filter_bank_scaled(.., Slaney, true)` are not aliased.
+#[test]
+fn slaney_bank_differs_from_htk_bank() {
+  let (n_mels, n_fft, sr) = (8usize, 64usize, 16_000u32);
+  let htk = to_vec(&mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap());
+  let slaney =
+    to_vec(&mel_filter_bank_scaled(n_mels, n_fft, sr, 0.0, None, MelScale::Slaney, true).unwrap());
+  assert_eq!(htk.len(), slaney.len(), "same shape");
+  let max_diff = htk
+    .iter()
+    .zip(slaney.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_diff > 1e-2,
+    "HTK and Slaney+norm banks must differ materially; max diff {max_diff}"
+  );
+}
+
+/// `mel_filter_bank_scaled(.., Htk, false)` must be byte-identical to the
+/// historic [`mel_filter_bank`] (HTK, no norm): the new general entry point
+/// must not perturb the default path.
+#[test]
+fn mel_filter_bank_scaled_htk_no_norm_matches_default() {
+  let (n_mels, n_fft, sr) = (6usize, 32usize, 16_000u32);
+  let default = to_vec(&mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap());
+  let scaled =
+    to_vec(&mel_filter_bank_scaled(n_mels, n_fft, sr, 0.0, None, MelScale::Htk, false).unwrap());
+  assert_eq!(
+    default, scaled,
+    "Htk/no-norm scaled bank must equal the default bank"
+  );
+}
+
+/// The precise (f64) Slaney path must agree with the standard (f32) Slaney
+/// path to within f32 rounding — guards that the f64 branch carries the same
+/// warping + normalization, not a divergent formula.
+#[test]
+fn slaney_precise_matches_standard() {
+  let (n_mels, n_fft, sr) = (8usize, 64usize, 16_000u32);
+  let std_bank =
+    to_vec(&mel_filter_bank_scaled(n_mels, n_fft, sr, 0.0, None, MelScale::Slaney, true).unwrap());
+  let precise = to_vec(
+    &mel_filter_bank_scaled_with(
+      n_mels,
+      n_fft,
+      sr,
+      0.0,
+      None,
+      MelPrecision::Precise,
+      MelScale::Slaney,
+      true,
+    )
+    .unwrap(),
+  );
+  assert_eq!(std_bank.len(), precise.len());
+  for (i, (a, b)) in std_bank.iter().zip(precise.iter()).enumerate() {
+    assert!(
+      (a - b).abs() < 1e-5,
+      "slaney std vs precise[{i}]: {a} vs {b}"
+    );
+  }
+}
+
 // ---- `lfilter` direct-form II transposed parity ---------------------
 
 /// Hand-trace the reference `mlx_audio.dsp.lfilter` for a single-pole IIR
@@ -2027,16 +2210,64 @@ fn mel_filter_bank_cached_precision_does_not_collide() {
   clear_mel_filter_cache();
 }
 
-/// The cache KEY itself distinguishes precision: two keys equal in every
-/// parameter but precision are unequal (the structural guarantee behind
-/// the no-collision behavior above).
+/// The cache KEY itself distinguishes precision, mel scale, and the Slaney
+/// normalization flag: two keys equal in every other parameter are unequal
+/// (the structural guarantee behind the no-collision behavior above).
 #[test]
 fn mel_filter_cache_key_distinguishes_precision() {
-  let std_key = MelFilterCacheKey::new(80, 400, 16_000, 0.0, None, MelPrecision::Standard);
-  let precise_key = MelFilterCacheKey::new(80, 400, 16_000, 0.0, None, MelPrecision::Precise);
+  let std_key = MelFilterCacheKey::new(
+    80,
+    400,
+    16_000,
+    0.0,
+    None,
+    MelPrecision::Standard,
+    MelScale::Htk,
+    false,
+  );
+  let precise_key = MelFilterCacheKey::new(
+    80,
+    400,
+    16_000,
+    0.0,
+    None,
+    MelPrecision::Precise,
+    MelScale::Htk,
+    false,
+  );
   assert_ne!(
     std_key, precise_key,
     "cache keys differing only in precision must be unequal"
+  );
+  // Scale distinguishes (HTK vs Slaney).
+  let slaney_key = MelFilterCacheKey::new(
+    80,
+    400,
+    16_000,
+    0.0,
+    None,
+    MelPrecision::Standard,
+    MelScale::Slaney,
+    false,
+  );
+  assert_ne!(
+    std_key, slaney_key,
+    "cache keys differing only in mel scale must be unequal"
+  );
+  // The Slaney-normalization flag distinguishes.
+  let slaney_norm_key = MelFilterCacheKey::new(
+    80,
+    400,
+    16_000,
+    0.0,
+    None,
+    MelPrecision::Standard,
+    MelScale::Slaney,
+    true,
+  );
+  assert_ne!(
+    slaney_key, slaney_norm_key,
+    "cache keys differing only in the slaney_norm flag must be unequal"
   );
 }
 

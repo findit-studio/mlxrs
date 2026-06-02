@@ -1,0 +1,476 @@
+//! Whisper neural-network building blocks: [`Linear`], [`Embedding`], and the
+//! Whisper-variant [`MultiHeadAttention`].
+//!
+//! Faithful port of the corresponding `nn.Module`s in
+//! `mlx_audio.stt.models.whisper.whisper` (`whisper.py:328-375` for
+//! `MultiHeadAttention`; the `nn.Linear` / `nn.Embedding` it composes).
+//!
+//! These are kept **private to the Whisper model**: the Whisper attention is
+//! non-standard (the `head_dim ** -0.25` scale on BOTH q and k, manual
+//! `qkv_attention`, cross-attention K/V caching) and cannot reuse the generic
+//! [`crate::lm::nn::attention`] fast-SDPA path, so it ports `qkv_attention`
+//! by hand for exact parity.
+
+use crate::{
+  Array, Result,
+  lm::nn::{activations::gelu, norm::LayerNorm},
+  ops::{self, shape::concatenate},
+};
+
+/// A dense linear projection `y = x @ Wᵀ (+ b)`.
+///
+/// Mirrors `mlx.nn.Linear`: `weight` is stored `(out_features, in_features)`
+/// and the forward transposes it, so `y = x @ weight.T + bias`. `bias` is
+/// optional — Whisper's `key` projection is constructed `bias=False`
+/// (`whisper.py:333`), every other projection carries a bias.
+#[derive(Debug)]
+pub(crate) struct Linear {
+  /// `(out_features, in_features)` weight (the `mlx.nn.Linear` layout).
+  weight: Array,
+  /// Optional `(out_features,)` bias. `None` for Whisper's `key` projection.
+  bias: Option<Array>,
+}
+
+impl Linear {
+  /// Construct from a `(out_features, in_features)` `weight` and an optional
+  /// `(out_features,)` `bias`.
+  pub(crate) fn new(weight: Array, bias: Option<Array>) -> Self {
+    Self { weight, bias }
+  }
+
+  /// `y = x @ weightᵀ (+ bias)`. `x` is `(..., in_features)`; the result is
+  /// `(..., out_features)`.
+  ///
+  /// # Errors
+  /// Propagates the transpose / matmul / add op errors.
+  pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
+    let wt = self.weight.transpose()?;
+    let y = x.matmul(&wt)?;
+    match &self.bias {
+      Some(b) => y.add(b),
+      None => Ok(y),
+    }
+  }
+
+  /// The `(out_features, in_features)` weight (test / introspection).
+  #[cfg(test)]
+  pub(crate) fn weight_ref(&self) -> &Array {
+    &self.weight
+  }
+}
+
+/// A token embedding table `weight` of shape `(n_vocab, n_state)`, with a
+/// weight-tied [`Embedding::as_linear`] projection.
+///
+/// Mirrors `mlx.nn.Embedding`: [`Embedding::forward`] gathers rows by integer
+/// id; [`Embedding::as_linear`] reuses the SAME `weight` as a linear
+/// projection `x @ weightᵀ` (the Whisper decoder's weight-tied logit head —
+/// `whisper.py` `TextDecoder.__call__` ends with
+/// `self.token_embedding.as_linear(x)`).
+#[derive(Debug)]
+pub(crate) struct Embedding {
+  /// `(n_vocab, n_state)` embedding table.
+  weight: Array,
+}
+
+impl Embedding {
+  /// Construct from a `(n_vocab, n_state)` embedding table.
+  pub(crate) fn new(weight: Array) -> Self {
+    Self { weight }
+  }
+
+  /// Gather embedding rows: `weight[ids]` — gather along axis 0 (the vocab
+  /// axis), mirroring `mlx.nn.Embedding.__call__`'s `self.weight[x]`. `ids`
+  /// is an integer [`Array`] of any shape `S`; the result is `S ++
+  /// (n_state,)`. (Plain `take` would flatten the table — `take_axis(.., 0)`
+  /// is the row-gather.)
+  ///
+  /// # Errors
+  /// Propagates the gather (`take_axis`) op error.
+  pub(crate) fn forward(&self, ids: &Array) -> Result<Array> {
+    self.weight.take_axis(ids, 0)
+  }
+
+  /// Weight-tied linear projection `x @ weightᵀ` (the decoder logit head).
+  /// `x` is `(..., n_state)`; the result is `(..., n_vocab)`.
+  ///
+  /// # Errors
+  /// Propagates the transpose / matmul op errors.
+  pub(crate) fn as_linear(&self, x: &Array) -> Result<Array> {
+    let wt = self.weight.transpose()?;
+    x.matmul(&wt)
+  }
+
+  /// The `(n_vocab, n_state)` embedding table (test / introspection).
+  #[cfg(test)]
+  pub(crate) fn weight_ref(&self) -> &Array {
+    &self.weight
+  }
+}
+
+/// Whisper multi-head attention (`whisper.py:328-375`).
+///
+/// **Non-standard scaling**: `scale = (n_state / n_head) ** -0.25` is applied
+/// to BOTH `q` and `k` before `q @ kᵀ` (so the effective scale is
+/// `head_dim ** -0.5`, but split across the two operands — bit-for-bit with
+/// the reference, which does NOT fold it into one factor). The softmax is
+/// `precise=True`. The causal mask is **additive** and **offset-aware** —
+/// `qk + mask[offset : offset + T_q, 0 : offset + T_q]`, where `offset` is the
+/// warm-cache key count, so a multi-token warm-cache step masks each new query
+/// against the keys at or before its absolute position. This ports
+/// `qkv_attention` by hand rather than using the fast SDPA so the scaling split
+/// and the mask slice match exactly.
+///
+/// Projections: `query` / `value` / `out` carry a bias; `key` does **not**
+/// (`whisper.py:333`).
+#[derive(Debug)]
+pub(crate) struct MultiHeadAttention {
+  n_head: usize,
+  query: Linear,
+  key: Linear,
+  value: Linear,
+  out: Linear,
+}
+
+/// The `(key, value)` pair produced by an attention step — the KV cache
+/// payload. For self-attention these are the FULL (post-concatenation)
+/// projected key/value along the time axis; for cross-attention they are the
+/// projected encoder key/value (computed once, reused across decode steps).
+/// Mirrors the reference's `(k, v)` tuple returned from `__call__`.
+pub(crate) type KvPair = (Array, Array);
+
+impl MultiHeadAttention {
+  /// Construct from the four already-built [`Linear`] projections and the head
+  /// count.
+  pub(crate) fn new(n_head: usize, query: Linear, key: Linear, value: Linear, out: Linear) -> Self {
+    Self {
+      n_head,
+      query,
+      key,
+      value,
+      out,
+    }
+  }
+
+  /// Run attention. Faithful port of `MultiHeadAttention.__call__`
+  /// (`whisper.py:337-359`).
+  ///
+  /// - `x`: the query input `(B, T_q, n_state)`.
+  /// - `xa`: the cross-attention key/value source `(B, T_kv, n_state)`.
+  ///   `None` ⇒ self-attention (key/value projected from `x`).
+  /// - `mask`: an optional additive causal mask `(>= offset + T_q, >= offset +
+  ///   T_q)` (sliced offset-aware to `[offset : offset + T_q, 0 : offset +
+  ///   T_q]`, where `offset` is the warm-cache key count) — the decoder's causal
+  ///   mask.
+  /// - `kv_cache`: an optional incoming `(k, v)` pair.
+  ///   - self-attention (`xa is None`): the cached `(k, v)` are concatenated
+  ///     with the freshly-projected `(k, v)` along the time axis (axis 1).
+  ///   - cross-attention (`xa is Some`): when `kv_cache` is `Some`, the cached
+  ///     `(k, v)` are reused verbatim (the encoder K/V never change across
+  ///     decode steps); when `None`, they are projected from `xa`.
+  ///
+  /// Returns `(output, (k, v))` — the projected output `(B, T_q, n_state)` and
+  /// the (full) `(k, v)` to store back in the cache. The reference's third
+  /// `qk` return (attention weights, for word-timing DTW) is dropped here;
+  /// that is a deferred feature.
+  ///
+  /// # Errors
+  /// Propagates the projection / reshape / transpose / matmul / softmax errors.
+  pub(crate) fn forward(
+    &self,
+    x: &Array,
+    xa: Option<&Array>,
+    mask: Option<&Array>,
+    kv_cache: Option<&KvPair>,
+  ) -> Result<(Array, KvPair)> {
+    let q = self.query.forward(x)?;
+
+    let (k, v) = match (xa, kv_cache) {
+      // Self-attention: project k/v from x, concatenating any cached k/v
+      // along the time axis (axis 1).
+      (None, cache) => {
+        let mut k = self.key.forward(x)?;
+        let mut v = self.value.forward(x)?;
+        if let Some((ck, cv)) = cache {
+          k = concatenate(&[ck, &k], 1)?;
+          v = concatenate(&[cv, &v], 1)?;
+        }
+        (k, v)
+      }
+      // Cross-attention, first step: project k/v from the encoder states `xa`.
+      (Some(xa), None) => {
+        let k = self.key.forward(xa)?;
+        let v = self.value.forward(xa)?;
+        (k, v)
+      }
+      // Cross-attention, cached: reuse the encoder k/v verbatim, ignoring this
+      // step's `xa` — matching the reference decoder, which projects the
+      // cross-attention k/v from the first step's encoder states and reuses it
+      // for the rest of the decode. The library trusts that a warm cache is
+      // threaded with the same utterance's `xa`; reusing one cache across
+      // different utterances is caller misuse the library does not detect (it
+      // would decode against the first utterance's features). See
+      // `WhisperModel`'s threat-model note.
+      (Some(_), Some((ck, cv))) => (ck.try_clone()?, cv.try_clone()?),
+    };
+
+    let wv = self.qkv_attention(&q, &k, &v, mask)?;
+    let out = self.out.forward(&wv)?;
+    Ok((out, (k, v)))
+  }
+
+  /// The manual scaled-dot-product attention (`whisper.py:361-375`).
+  ///
+  /// `q` is `(B, T_q, n_state)`, `k` / `v` are `(B, T_kv, n_state)`. Splits
+  /// the heads, applies the `head_dim ** -0.25` scale to BOTH q and k,
+  /// computes `softmax(q @ kᵀ + mask)`, and recombines the heads.
+  ///
+  /// # Errors
+  /// Propagates the reshape / transpose / matmul / softmax / add errors.
+  fn qkv_attention(&self, q: &Array, k: &Array, v: &Array, mask: Option<&Array>) -> Result<Array> {
+    let q_shape = q.shape();
+    let n_batch = q_shape[0] as i32;
+    let n_ctx = q_shape[1] as i32;
+    let n_state = q_shape[2];
+    let n_head = self.n_head as i32;
+    let head_dim = (n_state / self.n_head) as i32;
+    // scale = (n_state // n_head) ** -0.25, applied to BOTH q and k.
+    let scale = (n_state as f64 / self.n_head as f64).powf(-0.25) as f32;
+    let scale_arr = Array::full::<f32>(&[0i32; 0], scale)?;
+
+    // q: (B, T_q, n_state) -> (B, T_q, H, D) -> (B, H, T_q, D), then * scale.
+    let k_ctx = k.shape()[1] as i32;
+    let q = q
+      .reshape(&[n_batch, n_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 1, 3])?
+      .multiply(&scale_arr)?;
+    // k: (B, T_kv, n_state) -> (B, T_kv, H, D) -> (B, H, D, T_kv) (transposed
+    // for q @ k), then * scale.
+    let k = k
+      .reshape(&[n_batch, k_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 3, 1])?
+      .multiply(&scale_arr)?;
+    // v: (B, T_kv, n_state) -> (B, T_kv, H, D) -> (B, H, T_kv, D).
+    let v = v
+      .reshape(&[n_batch, k_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 1, 3])?;
+
+    // qk = q @ k -> (B, H, T_q, T_kv).
+    let mut qk = q.matmul(&k)?;
+    if let Some(m) = mask {
+      // Offset-aware additive causal mask. With a warm self-attention cache the
+      // key axis is `k_ctx = offset + T_q` (the cached positions plus the new
+      // tokens), so the new queries sit at absolute positions `offset ..
+      // offset + T_q`. Slice the precomputed `(n_text_ctx, n_text_ctx)` causal
+      // mask to the ROWS of those query positions (`offset .. offset + T_q`) and
+      // the COLUMNS of all keys (`0 .. k_ctx`), giving a `(T_q, k_ctx)` block
+      // that broadcasts against `qk`'s `(B, H, T_q, k_ctx)` and masks each new
+      // token against exactly the keys at or before its absolute position. The
+      // offset is `k_ctx - T_q` (`k_ctx >= T_q`, the cache only grows); for a
+      // fresh cache `offset == 0`, recovering the cold-start `mask[:T_q, :T_q]`.
+      let offset = k_ctx - n_ctx;
+      let m_slice = ops::indexing::slice(m, &[offset, 0], &[offset + n_ctx, k_ctx], &[1, 1])?;
+      qk = qk.add(&m_slice)?;
+    }
+
+    // w = softmax(qk, axis=-1, precise=True).
+    let w = ops::misc::softmax_axis(&qk, -1, true)?;
+
+    // out = (w @ v).transpose(0, 2, 1, 3).reshape(B, T_q, n_state).
+    let out =
+      w.matmul(&v)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[n_batch, n_ctx, n_state as i32])?;
+    Ok(out)
+  }
+}
+
+/// The per-block KV cache: `(self_attn_kv, cross_attn_kv)`.
+///
+/// Mirrors the reference's `kv_cache = (kv, cross_kv)` tuple threaded through
+/// [`ResidualAttentionBlock`] (`whisper.py:395-406`):
+/// - `.0` — the self-attention `(k, v)` (grows by one step each decode call);
+/// - `.1` — the cross-attention `(k, v)` (the encoder K/V, computed once on the
+///   first decode step and reused verbatim thereafter).
+///
+/// Both arms are `None` on the first call (the encoder's self-attention-only
+/// blocks never use cross-attention, so `.1` stays `None` there).
+pub(crate) type BlockKvCache = (Option<KvPair>, Option<KvPair>);
+
+/// A Whisper transformer block — `ResidualAttentionBlock` (`whisper.py:378-406`).
+///
+/// Pre-norm residual structure:
+/// 1. `x = x + attn(attn_ln(x), mask, self_kv_cache)` — masked self-attention;
+/// 2. (decoder only) `x = x + cross_attn(cross_attn_ln(x), xa, cross_kv_cache)`
+///    — cross-attention over the encoder states `xa`;
+/// 3. `x = x + mlp2(gelu(mlp1(mlp_ln(x))))` — the position-wise MLP, hidden
+///    width `4 * n_state`, exact (`approx="none"`) GELU.
+///
+/// `cross_attn` / `cross_attn_ln` are `Some` only for decoder blocks
+/// (`cross_attention=True`); the encoder builds the block without them.
+#[derive(Debug)]
+pub(crate) struct ResidualAttentionBlock {
+  attn: MultiHeadAttention,
+  attn_ln: LayerNorm,
+  /// Cross-attention over the encoder states — `Some` for decoder blocks only.
+  cross_attn: Option<MultiHeadAttention>,
+  /// LayerNorm before cross-attention — present iff [`Self::cross_attn`] is.
+  cross_attn_ln: Option<LayerNorm>,
+  /// First MLP projection `n_state -> 4 * n_state`.
+  mlp1: Linear,
+  /// Second MLP projection `4 * n_state -> n_state`.
+  mlp2: Linear,
+  /// LayerNorm before the MLP.
+  mlp_ln: LayerNorm,
+}
+
+impl ResidualAttentionBlock {
+  /// Construct from the already-built sub-modules. `cross` is
+  /// `Some((cross_attn, cross_attn_ln))` for a decoder block
+  /// (`cross_attention=True`), `None` for an encoder block.
+  pub(crate) fn new(
+    attn: MultiHeadAttention,
+    attn_ln: LayerNorm,
+    cross: Option<(MultiHeadAttention, LayerNorm)>,
+    mlp1: Linear,
+    mlp2: Linear,
+    mlp_ln: LayerNorm,
+  ) -> Self {
+    let (cross_attn, cross_attn_ln) = match cross {
+      Some((ca, cln)) => (Some(ca), Some(cln)),
+      None => (None, None),
+    };
+    Self {
+      attn,
+      attn_ln,
+      cross_attn,
+      cross_attn_ln,
+      mlp1,
+      mlp2,
+      mlp_ln,
+    }
+  }
+
+  /// `true` for a decoder block (carries cross-attention), `false` for an
+  /// encoder block.
+  #[cfg(test)]
+  pub(crate) fn has_cross_attention(&self) -> bool {
+    self.cross_attn.is_some()
+  }
+
+  /// Run the block. Faithful port of `ResidualAttentionBlock.__call__`
+  /// (`whisper.py:395-406`).
+  ///
+  /// - `x`: the input `(B, T, n_state)`.
+  /// - `xa`: the encoder states `(B, T_kv, n_state)` for cross-attention; `None`
+  ///   for an encoder block (or a decoder block whose cross-attn is absent).
+  /// - `mask`: the additive causal mask for self-attention (`None` in the
+  ///   encoder).
+  /// - `kv_cache`: the incoming `(self_kv, cross_kv)` cache; `None` on the first
+  ///   step.
+  ///
+  /// Returns `(x, (self_kv, cross_kv))` — the block output and the updated
+  /// cache to thread into the next decode step. The reference's `cross_qk`
+  /// (cross-attention weights, for word-timing DTW) is dropped here; that is a
+  /// deferred feature.
+  ///
+  /// # Errors
+  /// Propagates the LayerNorm / attention / MLP op errors.
+  pub(crate) fn forward(
+    &self,
+    x: &Array,
+    xa: Option<&Array>,
+    mask: Option<&Array>,
+    kv_cache: Option<&BlockKvCache>,
+  ) -> Result<(Array, BlockKvCache)> {
+    let (self_kv_in, cross_kv_in) = match kv_cache {
+      Some((s, c)) => (s.as_ref(), c.as_ref()),
+      None => (None, None),
+    };
+
+    // 1. Self-attention: `x = x + attn(attn_ln(x), mask=mask, kv_cache=kv)`.
+    let normed = self.attn_ln.forward(x)?;
+    let (attn_out, self_kv) = self.attn.forward(&normed, None, mask, self_kv_in)?;
+    let mut x = x.add(&attn_out)?;
+
+    // 2. Cross-attention (decoder blocks only): `x = x + cross_attn(
+    //    cross_attn_ln(x), xa, kv_cache=cross_kv)`.
+    let cross_kv = match (&self.cross_attn, &self.cross_attn_ln) {
+      (Some(cross_attn), Some(cross_attn_ln)) => {
+        let normed = cross_attn_ln.forward(&x)?;
+        let (cross_out, cross_kv) = cross_attn.forward(&normed, xa, None, cross_kv_in)?;
+        x = x.add(&cross_out)?;
+        Some(cross_kv)
+      }
+      // No cross-attention (encoder block): preserve any incoming cross cache
+      // untouched (in practice always `None` for the encoder).
+      _ => match cross_kv_in {
+        Some((ck, cv)) => Some((ck.try_clone()?, cv.try_clone()?)),
+        None => None,
+      },
+    };
+
+    // 3. MLP: `x = x + mlp2(gelu(mlp1(mlp_ln(x))))`.
+    let mlp_in = self.mlp_ln.forward(&x)?;
+    let hidden = gelu(&self.mlp1.forward(&mlp_in)?)?;
+    let mlp_out = self.mlp2.forward(&hidden)?;
+    let x = x.add(&mlp_out)?;
+
+    Ok((x, (Some(self_kv), cross_kv)))
+  }
+}
+
+/// Whisper sinusoidal positional embedding (`whisper.py:319-325`).
+///
+/// `inv_timescales = exp(-log(max_timescale) / (channels/2 - 1) *
+/// arange(channels/2))`; `scaled_time = arange(length)[:, None] *
+/// inv_timescales[None, :]`; returns `concat([sin(scaled_time),
+/// cos(scaled_time)], axis=1)` of shape `(length, channels)`.
+///
+/// `channels` must be even (the reference asserts `channels % 2 == 0`).
+/// `max_timescale` is `10000` in Whisper.
+///
+/// # Errors
+/// - [`crate::Error::InvariantViolation`] if `channels` is odd or `< 2`, or
+///   `length == 0`;
+/// - propagates the arange / exp / matmul / concat op errors.
+pub(crate) fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Result<Array> {
+  use crate::error::{Error, InvariantViolationPayload};
+  if channels < 2 || !channels.is_multiple_of(2) {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "sinusoids: channels",
+      "must be even and >= 2",
+    )));
+  }
+  if length == 0 {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "sinusoids: length",
+      "must be > 0",
+    )));
+  }
+  let half = channels / 2;
+  let length_i32 = length as i32;
+  let half_i32 = half as i32;
+
+  // log_timescale_increment = log(max_timescale) / (half - 1).
+  let log_inc = max_timescale.ln() / (half as f64 - 1.0);
+  // inv_timescales = exp(-log_inc * arange(half)) — shape (half,).
+  let ar = Array::arange::<f32>(0.0, half as f64, 1.0)?;
+  let neg_inc = Array::full::<f32>(&[0i32; 0], (-log_inc) as f32)?;
+  let inv_timescales = ar.multiply(&neg_inc)?.exp()?;
+
+  // scaled_time = arange(length)[:, None] * inv_timescales[None, :] — outer
+  // product (length, half). Build via reshape + broadcast:
+  // (length, 1) * (1, half).
+  let t = Array::arange::<f32>(0.0, length as f64, 1.0)?.reshape(&[length_i32, 1])?;
+  let inv_row = inv_timescales.reshape(&[1, half_i32])?;
+  let scaled_time = t.multiply(&inv_row)?;
+
+  // concat([sin, cos], axis=1) -> (length, channels).
+  let s = scaled_time.sin()?;
+  let c = scaled_time.cos()?;
+  concatenate(&[&s, &c], 1)
+}
+
+#[cfg(test)]
+mod tests;

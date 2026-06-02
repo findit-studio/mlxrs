@@ -35,15 +35,16 @@ pub mod load;
 pub mod model;
 /// Concrete STT model implementations (feature-gated per architecture).
 ///
-/// Unlike the autoregressive [`AutoregressiveStt`](model::AutoregressiveStt)
-/// family trait — which encoder/decoder models implement (whisper, parakeet,
-/// …) — the models here are the small number of non-AR / CTC architectures,
-/// which fit the [`CtcModel`](model::CtcModel) family (or expose an inherent
-/// CTC API) rather than that trait's `encode` + per-token `decode_step` +
-/// KV-cache shape. Each is behind
-/// its own cargo feature.
-#[cfg(feature = "wav2vec2")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
+/// Hosts both family shapes the trait architecture spans: the CTC / non-AR
+/// architectures (wav2vec2), which fit the [`CtcModel`](model::CtcModel)
+/// family (or expose an inherent CTC API), and the autoregressive
+/// encoder/decoder ones (whisper), which implement
+/// [`AutoregressiveStt`](model::AutoregressiveStt) (`encode` + per-token
+/// `decode_step` + KV cache) and run their own
+/// [`Transcribe`](model::Transcribe) procedure. Each is behind its own cargo
+/// feature.
+#[cfg(any(feature = "wav2vec2", feature = "whisper"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "wav2vec2", feature = "whisper"))))]
 pub mod models;
 pub mod serializers;
 /// Streaming STT — incremental encoder + orchestration. Ports
