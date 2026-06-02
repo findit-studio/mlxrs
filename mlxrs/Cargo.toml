@@ -30,6 +30,7 @@ vlm                  = ["lm", "dep:image"]
 lfm2-vl              = ["vlm"]                                                     # LFM2 hybrid conv+attention LM + (later) the LFM2.5-VL vision-language wrapper
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
+siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]        # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
 unstable-ops-overload = []
 gguf                 = []
 

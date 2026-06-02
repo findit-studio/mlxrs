@@ -430,12 +430,10 @@ pub fn pool(
 /// in swift `Pooling.callAsFunction`'s order (steps 2–4 of [`pool`]).
 ///
 /// This is the shared tail [`pool`] runs after the strategy reduction. It is
-/// factored out so callers that already hold a pooled vector — notably
-/// [`encode`](super::encode::encode) when a model emits a trained
-/// [`pooled_output`](super::model::EmbeddingModelOutput::pooled_output) for
-/// the [`Cls`](PoolingStrategy::Cls) / [`None`](PoolingStrategy::None) paths
-/// (swift `inputs.pooledOutput ?? …`) — apply the *same* normalize / dimension
-/// / layer-norm steps without re-deriving a pooled vector from hidden states.
+/// factored out so a caller that already holds a pooled vector — a model whose
+/// own forward emits a trained pooler head — can apply the *same* normalize /
+/// dimension / layer-norm steps without re-deriving a pooled vector from hidden
+/// states.
 ///
 /// `pooled` is consumed: when no transform applies it is returned unchanged
 /// (no copy), matching the by-value `pool` tail.

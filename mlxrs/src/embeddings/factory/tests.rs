@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
-use crate::embeddings::model::EmbeddingModelOutput;
+use crate::embeddings::{Embedding, Padding, TextEmbedder, TextEncoding};
 
 /// A minimal `config.json` for the mock architecture. `model_type` is the
 /// registry-dispatch key; `mock_extra` is a model-specific key the
@@ -26,29 +26,50 @@ fn mock_config_json(model_type: &str) -> String {
   )
 }
 
-/// A trivial [`EmbeddingModel`] the mock constructor returns. `forward`
-/// returns a fixed `(batch, seq, hidden)` zero hidden-state (dispatch is
-/// what these tests prove, not the encoder math).
+/// A trivial [`EmbeddingModel`] the mock constructor returns. It implements the
+/// model-owned [`TextEmbedder`] directly (→ a fixed `(batch, hidden)` zero
+/// embedding — dispatch is what these tests prove, not the encoder math) and so
+/// answers the umbrella's [`as_text_embedder`](EmbeddingModel::as_text_embedder).
 struct MockLoadedEmbedding {
   hidden: usize,
 }
 
-impl EmbeddingModel for MockLoadedEmbedding {
-  fn forward(&self, input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
-    let (batch, seq) = match input_ids.shape().as_slice() {
-      [b, s] => (*b, *s),
+impl TextEmbedder for MockLoadedEmbedding {
+  fn text_encoding(&self) -> TextEncoding {
+    TextEncoding::new(
+      true,
+      Some(512),
+      Padding::DynamicRightPad { pad_token_id: 0 },
+    )
+  }
+
+  fn embed_text(&self, input_ids: &Array, _attention_mask: &Array) -> Result<Embedding> {
+    let batch = match input_ids.shape().as_slice() {
+      [b, _seq] => *b,
       _ => {
         let shape = input_ids.shape();
         return Err(Error::RankMismatch(RankMismatchPayload::new(
-          "MockLoadedEmbedding::forward expects rank-2 (batch, seq) ids",
+          "MockLoadedEmbedding expects rank-2 (batch, seq) ids",
           shape.len() as u32,
           shape,
         )));
       }
     };
-    let data = vec![0.0_f32; batch * seq * self.hidden];
-    let last_hidden_state = Array::from_slice::<f32>(&data, &(batch, seq, self.hidden))?;
-    Ok(EmbeddingModelOutput::from_hidden_state(last_hidden_state))
+    let data = vec![0.0_f32; batch * self.hidden];
+    Ok(Embedding::new(Array::from_slice::<f32>(
+      &data,
+      &(batch, self.hidden),
+    )?))
+  }
+}
+
+impl EmbeddingModel for MockLoadedEmbedding {
+  fn as_text_embedder(&self) -> Option<&dyn TextEmbedder> {
+    Some(self)
+  }
+
+  fn as_any(&self) -> &dyn std::any::Any {
+    self
   }
 }
 
@@ -58,7 +79,9 @@ impl EmbeddingModel for MockLoadedEmbedding {
 /// and return a [`MockLoadedEmbedding`].
 fn mock_constructor() -> EmbeddingModelConstructor {
   Box::new(
-    |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>> {
+    |loaded: &LoadedEmbeddingModel,
+     _pooling: Option<&StPoolingConfig>|
+     -> Result<Box<dyn EmbeddingModel>> {
       assert!(
         !loaded.weights.is_empty(),
         "constructor should receive the loaded weights"
@@ -157,11 +180,17 @@ fn load_dispatches_to_registered_mock_and_returns_context() {
   // No `1_Pooling/config.json` was written → pooling is None.
   assert!(ctx.pooling.is_none());
 
-  // The constructed model is the mock: drive one forward to confirm wiring.
+  // The constructed model is the mock: drive one text embedding through the
+  // umbrella's universal text capability to confirm wiring (hidden = 4).
   let ids = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1usize, 3)).unwrap();
-  let out = ctx.model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 3, 4]);
+  let emb = ctx
+    .model
+    .as_text_embedder()
+    .expect("the mock answers the universal text capability")
+    .embed_text(&ids, &mask)
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, 4]);
 
   // The tokenizer loaded from the same directory.
   let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
@@ -194,6 +223,74 @@ fn pooling_config_is_loaded_when_present() {
   let pooling = ctx.pooling.expect("pooling config should be parsed");
   assert_eq!(pooling.strategy(), crate::embeddings::PoolingStrategy::Mean);
   assert_eq!(pooling.dimension(), Some(4));
+}
+
+#[test]
+fn parsed_pooling_config_is_threaded_into_the_constructor() {
+  // The core of the #2 finding: the parsed `1_Pooling/config.json` must REACH
+  // the constructor (so a sentence-encoder can bake its PoolingConfig), not only
+  // land in `ctx.pooling` after construction. A capturing constructor records
+  // the `Option<&StPoolingConfig>` it received; the test asserts it saw the
+  // parsed Mean / dimension-4 config.
+  use std::sync::{Arc, Mutex};
+
+  let dir = fresh_dir("pooling-threaded");
+  write_model_dir(&dir, "mockemb");
+  write_pooling_config(&dir);
+
+  let seen: Arc<Mutex<Option<StPoolingConfig>>> = Arc::new(Mutex::new(None));
+  let captured = Arc::clone(&seen);
+  let capturing: EmbeddingModelConstructor = Box::new(
+    move |_loaded: &LoadedEmbeddingModel,
+          pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>> {
+      *captured.lock().unwrap() = pooling.copied();
+      Ok(Box::new(MockLoadedEmbedding { hidden: 4 }))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("mockemb", capturing);
+  let config = EmbeddingModelConfiguration::from_directory(&dir);
+
+  load(&config, &registry).expect("load with pooling config");
+
+  let received = seen
+    .lock()
+    .unwrap()
+    .expect("constructor must receive Some(pooling)");
+  assert_eq!(
+    received.strategy(),
+    crate::embeddings::PoolingStrategy::Mean
+  );
+  assert_eq!(received.dimension(), Some(4));
+}
+
+#[test]
+fn absent_pooling_config_threads_none_into_the_constructor() {
+  // Symmetric to the above: with NO `1_Pooling/config.json`, the constructor
+  // receives `None` (not a fabricated default).
+  use std::sync::{Arc, Mutex};
+
+  let dir = fresh_dir("pooling-none");
+  write_model_dir(&dir, "mockemb");
+
+  let saw_some: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+  let flag = Arc::clone(&saw_some);
+  let capturing: EmbeddingModelConstructor = Box::new(
+    move |_loaded: &LoadedEmbeddingModel,
+          pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>> {
+      *flag.lock().unwrap() = pooling.is_some();
+      Ok(Box::new(MockLoadedEmbedding { hidden: 4 }))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("mockemb", capturing);
+  let config = EmbeddingModelConfiguration::from_directory(&dir);
+
+  load(&config, &registry).expect("load without pooling config");
+  assert!(
+    !*saw_some.lock().unwrap(),
+    "constructor must receive None when no 1_Pooling/config.json is present"
+  );
 }
 
 #[test]
@@ -1461,12 +1558,16 @@ fn create_invokes_registered_constructor() {
   let loaded =
     LoadedEmbeddingModel::new("mockemb".to_owned(), mock_config_json("mockemb"), weights);
   let model = registry
-    .create(&loaded)
+    .create(&loaded, None)
     .expect("registered type must construct");
   let ids = Array::from_slice::<i32>(&[0, 1], &(1usize, 2)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0], &(1usize, 2)).unwrap();
-  let out = model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 2, 4]);
+  let emb = model
+    .as_text_embedder()
+    .expect("the mock answers the universal text capability")
+    .embed_text(&ids, &mask)
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, 4]);
 }
 
 #[test]
@@ -1482,7 +1583,7 @@ fn create_rejects_unregistered_model_type() {
     Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
   );
   let loaded = LoadedEmbeddingModel::new("nope".to_owned(), mock_config_json("nope"), weights);
-  let Err(err) = registry.create(&loaded) else {
+  let Err(err) = registry.create(&loaded, None) else {
     panic!("an unregistered model_type must be a recoverable error");
   };
   let Error::UnknownEnumValue(payload) = &err else {

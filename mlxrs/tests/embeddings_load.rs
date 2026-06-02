@@ -19,9 +19,9 @@ use std::{
 use mlxrs::{
   Array, Error,
   embeddings::{
-    EmbeddingModel, EmbeddingModelConfiguration, EmbeddingModelConstructor, EmbeddingModelOutput,
-    EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingModel, PoolingStrategy, load,
-    remap_model_type,
+    Embedding, EmbeddingModel, EmbeddingModelConfiguration, EmbeddingModelConstructor,
+    EmbeddingModelTypeRegistry, EmbeddingWeights, LoadedEmbeddingModel, Padding, PoolingStrategy,
+    StPoolingConfig, TextEmbedder, TextEncoding, load, remap_model_type,
   },
   error::{FileOp, RankMismatchPayload},
   io,
@@ -41,37 +41,56 @@ fn config_json(model_type: &str) -> String {
   format!(r#"{{"model_type": "{model_type}", "hidden_size": 4, "vocab_size": 5}}"#)
 }
 
-/// A trivial public-surface [`EmbeddingModel`] the mock constructor returns.
+/// A trivial public-surface [`EmbeddingModel`] the mock constructor returns. It
+/// implements the model-owned [`TextEmbedder`] directly (→ a fixed `(batch, 4)`
+/// zero embedding) and so answers the umbrella's
+/// [`as_text_embedder`](EmbeddingModel::as_text_embedder).
 struct MockEmbedding;
 
-impl EmbeddingModel for MockEmbedding {
-  fn forward(
-    &self,
-    input_ids: &Array,
-    _attention_mask: &Array,
-  ) -> Result<EmbeddingModelOutput, Error> {
-    let (batch, seq) = match input_ids.shape().as_slice() {
-      [b, s] => (*b, *s),
+impl TextEmbedder for MockEmbedding {
+  fn text_encoding(&self) -> TextEncoding {
+    TextEncoding::new(
+      true,
+      Some(512),
+      Padding::DynamicRightPad { pad_token_id: 0 },
+    )
+  }
+
+  fn embed_text(&self, input_ids: &Array, _attention_mask: &Array) -> Result<Embedding, Error> {
+    let batch = match input_ids.shape().as_slice() {
+      [b, _seq] => *b,
       _ => {
         let shape = input_ids.shape();
         return Err(Error::RankMismatch(RankMismatchPayload::new(
-          "MockEmbedding::forward expects rank-2 (batch, seq) ids",
+          "MockEmbedding expects rank-2 (batch, seq) ids",
           shape.len() as u32,
           shape,
         )));
       }
     };
     let hidden = 4usize;
-    let data = vec![0.0_f32; batch * seq * hidden];
-    Ok(EmbeddingModelOutput::from_hidden_state(
-      Array::from_slice::<f32>(&data, &(batch, seq, hidden)).unwrap(),
+    let data = vec![0.0_f32; batch * hidden];
+    Ok(Embedding::new(
+      Array::from_slice::<f32>(&data, &(batch, hidden)).unwrap(),
     ))
+  }
+}
+
+impl EmbeddingModel for MockEmbedding {
+  fn as_text_embedder(&self) -> Option<&dyn TextEmbedder> {
+    Some(self)
+  }
+
+  fn as_any(&self) -> &dyn std::any::Any {
+    self
   }
 }
 
 fn mock_constructor() -> EmbeddingModelConstructor {
   Box::new(
-    |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
+    |loaded: &LoadedEmbeddingModel,
+     _pooling: Option<&StPoolingConfig>|
+     -> Result<Box<dyn EmbeddingModel>, Error> {
       assert!(!loaded.weights_ref().is_empty());
       Ok(Box::new(MockEmbedding))
     },
@@ -126,8 +145,13 @@ fn load_produces_context_via_public_surface() {
 
   let ids = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
   let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1usize, 3)).unwrap();
-  let out = ctx.model.forward(&ids, &mask).unwrap();
-  assert_eq!(out.last_hidden_state().shape(), vec![1, 3, 4]);
+  let emb = ctx
+    .model
+    .as_text_embedder()
+    .expect("the mock answers the universal text capability")
+    .embed_text(&ids, &mask)
+    .unwrap();
+  assert_eq!(emb.array().shape(), vec![1, 4]);
 
   let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
   assert_eq!(tok_ids.len(), 3);
@@ -818,7 +842,9 @@ fn capturing_constructor(
   slot: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) -> EmbeddingModelConstructor {
   Box::new(
-    move |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
       let mut keys: Vec<String> = loaded.weights_ref().keys().cloned().collect();
       keys.sort();
       *slot.lock().unwrap() = keys;
