@@ -123,6 +123,11 @@ harness = false
 required-features = ["vlm"]
 
 [[bench]]
+name = "simd_siglip_normalize"
+harness = false
+required-features = ["vlm"]
+
+[[bench]]
 name = "simd_pcm_decode"
 harness = false
 required-features = ["audio"]

@@ -49,6 +49,15 @@
 //!   destination scatter is gather-bound (NEON has no scatter), so the
 //!   SIMD win is bounded by the per-tile load width. Ships
 //!   unconditionally on aarch64.
+//! - SigLIP2 NaFlex patchify-normalize fused RGBA → RGB widen + affine
+//!   (`embeddings/siglip2_naflex/processing.rs`). Class: `Exact`. The
+//!   `rgba_to_rgb_affine` submodule holds the dispatcher, the scalar
+//!   reference, and the 16-pixel-tile `vld4q_u8` 4-way de-interleave +
+//!   non-fused `vmulq_f32` + `vaddq_f32` (`x * scale + bias`, two
+//!   roundings) + `vst3q_f32` 3-way interleave kernel (alpha dropped
+//!   structurally — the A plane is loaded but never stored). Ships
+//!   unconditionally on aarch64. Generic in `(scale, bias)`; the
+//!   patchify wires `scale = 1/127.5, bias = -1.0`.
 
 #[doc(hidden)]
 pub mod bgr_widen;
@@ -57,11 +66,20 @@ pub mod pad_canvas_fill;
 #[doc(hidden)]
 pub mod rgb_widen;
 #[doc(hidden)]
+pub mod rgba_to_rgb_affine;
+#[doc(hidden)]
 pub mod rotate_buf;
 
 pub(crate) use bgr_widen::bgr_widen;
 pub(crate) use pad_canvas_fill::pad_canvas_fill;
 pub(crate) use rgb_widen::rgb_widen;
+// `rgba_to_rgb_affine`'s only consumer is the SigLIP2 NaFlex
+// patchify-normalize, so gate the `pub(crate) use` on that feature —
+// under `vlm` alone the re-export would be unused and trip the
+// workspace `-D warnings` gate (the kernel module itself stays
+// available via its public submodule path).
+#[cfg(feature = "siglip2-naflex")]
+pub(crate) use rgba_to_rgb_affine::rgba_to_rgb_affine;
 // `rotate_buf::rotate_buf_u8` is re-exported via the public submodule
 // (no `pub(crate) use` here yet — the caller wiring lands separately,
 // and re-exporting an unused symbol triggers the workspace `-D
