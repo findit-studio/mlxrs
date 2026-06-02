@@ -153,199 +153,46 @@ fn validate_rejects_non_positive_dimension() {
 }
 
 #[test]
-fn validate_rejects_oversize_layer_count() {
-  let json = BASE_CONFIG_JSON.replace(
-    r#""num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-    r#""num_hidden_layers": 100000,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-  );
+fn validate_accepts_large_but_positive_dimensions() {
+  // `mlxrs` is a library: a merely *large* (but positive, non-overflowing)
+  // field is NOT rejected — the consuming application owns input bounding.
+  // A vocab / hidden / intermediate / position / layer / patch count far above
+  // any real SigLIP2 checkpoint still validates as long as it stays positive
+  // and the derived `patch_feature_dim` (`3 * patch_size^2`) does not overflow
+  // `i32`. (`patch_size = 1000` ⇒ `3 * 1_000_000 = 3_000_000`, well within
+  // `i32`; `num_patches` is set explicitly so the `(image_size/patch_size)^2`
+  // fallback is not exercised.)
+  let json = BASE_CONFIG_JSON
+    .replace(r#""vocab_size": 32000"#, r#""vocab_size": 2000000"#)
+    .replace(
+      r#""max_position_embeddings": 64"#,
+      r#""max_position_embeddings": 1048576"#,
+    )
+    .replace(r#""patch_size": 16"#, r#""patch_size": 1000"#);
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::CapExceeded(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_max_position_embeddings() {
-  // A hostile `max_position_embeddings` sizes the text position table; the
-  // cardinality cap rejects an over-cap value (here 1 << 20).
-  let json = BASE_CONFIG_JSON.replace(
-    r#""max_position_embeddings": 64"#,
-    r#""max_position_embeddings": 1048576"#,
-  );
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::CapExceeded(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_text_vocab_size() {
-  // A hostile `vocab_size` sizes the token-embedding table rows; the width cap
-  // (`1 << 20`) rejects an over-cap value as `OutOfRange` (positivity alone is
-  // not a DoS boundary for an attacker-controlled checkpoint).
-  let json = BASE_CONFIG_JSON.replace(r#""vocab_size": 32000"#, r#""vocab_size": 1048577"#);
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_text_hidden_size() {
-  // A hostile text `hidden_size` names a matmul / embedding axis; the width cap
-  // rejects it before any tensor is shaped. `1048584` is over-cap (and the
-  // width check runs before the divisibility check, so divisibility is moot).
-  let json = BASE_CONFIG_JSON.replace(
-    r#""hidden_size": 768,
-    "intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-    r#""hidden_size": 1048584,
-    "intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-  );
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_text_intermediate_size() {
-  // A hostile text `intermediate_size` names the feed-forward matmul axis.
-  let json = BASE_CONFIG_JSON.replace(
-    r#""intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-    r#""intermediate_size": 1048577,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "unmodeled_text_key": "ignored""#,
-  );
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_text_projection_size() {
-  // `projection_size` (the contrastive head's output width) is `Option`;
-  // an explicit over-cap value must be rejected by the width cap. A standalone
-  // text config keeps the other defaults realistic.
-  let t = TextConfig::from_json(r#"{ "projection_size": 1048577 }"#).unwrap();
-  assert_eq!(t.projection_size(), 1_048_577);
-  let err = t.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_vision_hidden_size() {
-  // A hostile vision `hidden_size` names the ViT matmul axis.
-  let json = BASE_CONFIG_JSON.replace(
-    r#""hidden_size": 768,
-    "intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "vision_use_head": true"#,
-    r#""hidden_size": 1048584,
-    "intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "vision_use_head": true"#,
-  );
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_vision_intermediate_size() {
-  // A hostile vision `intermediate_size` names the ViT feed-forward axis.
-  let json = BASE_CONFIG_JSON.replace(
-    r#""intermediate_size": 3072,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "vision_use_head": true"#,
-    r#""intermediate_size": 1048577,
-    "num_attention_heads": 12,
-    "num_hidden_layers": 12,
-    "layer_norm_eps": 1e-6,
-    "vision_use_head": true"#,
-  );
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_vision_patch_size() {
-  // A hostile `patch_size` (the Conv2d kernel / flattened-patch stride) is
-  // bounded by the width cap directly (before the `patch_feature_dim` product).
-  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 1048577"#);
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_patch_feature_dim() {
-  // `patch_size` within the per-field cap but whose derived
-  // `num_channels * patch_size^2` product exceeds the width cap must still be
-  // rejected: 3 * 1000^2 = 3_000_000 > 1_048_576, while patch_size 1000 alone
-  // passes the per-field width check. (num_patches is set explicitly to 256 so
-  // the `(image_size/patch_size)^2` fallback is not exercised.)
-  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 1000"#);
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
-}
-
-#[test]
-fn validate_rejects_oversize_pixel_values_product() {
-  // `patch_size = 591` keeps `patch_feature_dim = 3 * 591^2 = 1_047_843` just
-  // under the `1 << 20` width cap, and `max_num_patches = 256` is within the
-  // cardinality cap — each per-axis bound is satisfied — yet their product
-  // `268_247_808` exceeds the `1 << 26` `MAX_PIXEL_ELEMENTS` cap (the per-image
-  // `pixel_values` buffer would be ~1 GiB of f32). The product guard must
-  // reject it with a typed `CapExceeded` (`num_patches` is set explicitly so
-  // only the `patch_size` change is under test).
-  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 591"#);
-  let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
-  // Sanity: each per-axis cap is individually satisfied at patch_size 591.
+  assert_eq!(cfg.text_config.vocab_size, 2_000_000);
+  assert_eq!(cfg.text_config.max_position_embeddings, 1_048_576);
   assert_eq!(
     cfg.vision_config.patch_feature_dim().unwrap(),
-    3 * 591 * 591
+    3 * 1000 * 1000
   );
-  assert_eq!(cfg.vision_config.max_num_patches(), 256);
-  let err = cfg.validate().unwrap_err();
-  match err {
-    Error::CapExceeded(p) => {
-      assert_eq!(p.cap(), 1 << 26, "cap value");
-      assert_eq!(p.observed(), 256 * 3 * 591 * 591, "observed product");
-    }
-    _ => panic!("expected CapExceeded for the pixel_values product, got {err}"),
-  }
+  // No magnitude rejection: the only checks are positivity, divisibility,
+  // model_type, RGB channels, and the overflow guard.
+  cfg.validate().unwrap();
 }
 
 #[test]
-fn validate_rejects_oversize_image_size() {
-  // A hostile `image_size` would inflate the `(image_size/patch_size)^2`
-  // num_patches fallback; the cardinality cap rejects an over-cap value.
-  let json = BASE_CONFIG_JSON.replace(r#""image_size": 256"#, r#""image_size": 1048576"#);
+fn validate_rejects_patch_feature_dim_overflow() {
+  // The soundness floor stays: a `patch_size` whose `3 * patch_size^2` wraps
+  // `i32` must error (a wrapped width would be UB downstream), not validate.
+  // `patch_size = 30000` ⇒ `patch_size^2 = 900_000_000`, and `* 3` overflows
+  // `i32` (`> 2.1e9`). `patch_feature_dim()` is overflow-checked, so `validate`
+  // surfaces a typed `ArithmeticOverflow`. (`num_patches` is set explicitly so
+  // only the `patch_size` change is under test.)
+  let json = BASE_CONFIG_JSON.replace(r#""patch_size": 16"#, r#""patch_size": 30000"#);
   let cfg = Siglip2NaflexConfig::from_json(&json).unwrap();
   let err = cfg.validate().unwrap_err();
-  assert!(matches!(err, Error::CapExceeded(_)), "got {err}");
+  assert!(matches!(err, Error::ArithmeticOverflow(_)), "got {err}");
 }
 
 #[test]

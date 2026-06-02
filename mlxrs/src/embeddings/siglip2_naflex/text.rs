@@ -105,10 +105,10 @@ impl TextTower {
       &[max_pos, hidden],
     )?;
 
-    // `num_hidden_layers` is bounded by `MAX_CARDINALITY` in `validate`, but
-    // reserve fallibly so even a within-cap heavyweight per-layer `Vec` the
-    // allocator cannot satisfy is a recoverable [`Error::AllocFailure`] rather
-    // than `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
+    // `num_hidden_layers` is required positive in `validate`, but reserve
+    // fallibly so even a heavyweight per-layer `Vec` the allocator cannot
+    // satisfy is a recoverable [`Error::AllocFailure`] rather than
+    // `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
     let mut layers: Vec<EncoderLayer> = Vec::new();
     reserve_or_error(
       &mut layers,

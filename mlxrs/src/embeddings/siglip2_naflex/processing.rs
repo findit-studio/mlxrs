@@ -54,7 +54,6 @@
 
 use crate::{
   array::Array,
-  embeddings::siglip2_naflex::config::MAX_PIXEL_ELEMENTS,
   error::{
     ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
     LengthMismatchPayload, OutOfRangePayload, Result,
@@ -85,10 +84,10 @@ const RGBA_CHANNELS: u32 = 4;
 const MAX_SOURCE_DIM: usize = 1 << 16;
 
 /// Total-element cap on the decoded source RGB buffer
-/// (`width * height * channels` bytes, ~512 MiB). Independent of the output
-/// patch budget ([`MAX_PIXEL_ELEMENTS`]): the source can dwarf the resized
-/// output (a large image downscaled to a few patches), so it carries its own
-/// magnitude bound so a hostile caller cannot force an unbounded source clone.
+/// (`width * height * channels` bytes, ~512 MiB). Bounds the `usize`
+/// byte-count arithmetic so `width * height * 3` cannot wrap (a wrapped
+/// length would be UB), keeping the per-axis cap and this product cap as the
+/// soundness floor on the source-clone sizing.
 const MAX_SOURCE_PIXELS: usize = 1 << 29;
 
 /// Tolerance for the [`patch_grid`] binary-search termination. Mirrors
@@ -209,9 +208,8 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
 ///   [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`] /
 ///   [`Error::LengthMismatch`].
 /// - the `pixel_values` element count `max_num_patches * (3 * patch_size^2)`
-///   exceeds the `MAX_PIXEL_ELEMENTS` product cap (a hostile
-///   `patch_size`/`max_num_patches` pair each within its own cap but whose
-///   product is oversized) → [`Error::CapExceeded`].
+///   overflows `usize` (the allocation-size arithmetic is overflow-checked so
+///   a wrapped size cannot reach the allocator) → [`Error::ArithmeticOverflow`].
 /// - the selected grid `H_p * W_p` exceeds `max_num_patches` (an
 ///   adversarial dimension whose feasible scale range is below the search
 ///   floor) → [`Error::CapExceeded`].
@@ -280,14 +278,13 @@ pub fn preprocess(
   }
 
   // Per-patch flattened width = C * P^2; the `pixel_values` element count is
-  // `max_num_patches * per_patch`. Both factors can be within their own config
-  // cap yet their product oversized (a `patch_size` near 591 keeps `per_patch`
-  // just under the width cap while `max_num_patches = 4096` passes the
-  // cardinality cap → ~4.29e9 f32 / ~16 GiB). Compute both (overflow-checked so
-  // a hostile config cannot wrap the allocation size) and cap the product by
-  // `MAX_PIXEL_ELEMENTS` BEFORE any allocation — this also bounds the
-  // intermediate resize buffer, whose `h_p*w_p*patch_size^2*3 <= total_floats`.
-  // Mirrors `VisionConfig::validate` (the exported entry bypasses it).
+  // `max_num_patches * per_patch`. Compute both with overflow-checked
+  // arithmetic so a hostile config cannot wrap the allocation size (a wrapped
+  // size would be UB) — a wrap surfaces as a typed `ArithmeticOverflow`. The
+  // resulting `total_floats` then sizes a *fallible* reservation
+  // (`reserve_or_error` → typed `AllocFailure`), so a within-`usize` but
+  // heavyweight request is a recoverable error, never an abort: `mlxrs` is a
+  // library and the consuming application owns input bounding.
   let p = patch_size as usize;
   let per_patch = p
     .checked_mul(p)
@@ -314,14 +311,6 @@ pub fn preprocess(
         ],
       ))
     })?;
-  if total_floats as u64 > MAX_PIXEL_ELEMENTS as u64 {
-    return Err(Error::CapExceeded(CapExceededPayload::new(
-      "siglip2 preprocess: pixel_values element count (max_num_patches * patch_feature_dim)",
-      "MAX_PIXEL_ELEMENTS",
-      MAX_PIXEL_ELEMENTS as u64,
-      total_floats as u64,
-    )));
-  }
 
   // 1. Target patch grid (the authoritative oracle formula).
   let (h_p, w_p) = patch_grid(height, width, patch_size, max_num_patches);
@@ -460,11 +449,10 @@ pub fn preprocess(
         let src_off = src_y * src_row_stride + src_x * src_c;
         let dst_off = out_offset + r * row_bytes;
         // `x / 127.5 - 1.0` == `(x/255 - 0.5)/0.5` (SigLIP mean/std 0.5).
-        // A tight per-row scalar loop over `row_pixels` pixels, reading the
-        // 3 leading RGB bytes of each 4-byte RGBA source pixel (alpha dropped).
-        // See the module-level SIMD note: this reuses the same per-row
-        // shape as the NEON resize already covered; it is not a separate
-        // hot loop worth its own kernel (the resize dominates).
+        // Per-row RGBA → RGB widen + affine over `row_pixels` pixels, reading
+        // the 3 leading RGB bytes of each 4-byte RGBA source pixel and dropping
+        // alpha, via the NEON-accelerated `simd::vlm::rgba_to_rgb_affine`
+        // dispatcher (scalar fallback off aarch64).
         normalize_row_rgba(
           &resized_buf[src_off..src_off + row_pixels * src_c],
           &mut pixel_values[dst_off..dst_off + row_bytes],
@@ -506,27 +494,23 @@ pub fn preprocess(
 /// Normalize one contiguous RGBA byte row into a 3-channel RGB f32 row via
 /// `x / 127.5 - 1.0`, dropping the alpha byte of each 4-byte source pixel.
 ///
-/// This is the SigLIP `(x/255 - 0.5) / 0.5` rescale in the FMA-friendly form.
-/// `src` is `[RGBA, RGBA, …]` (`p * RGBA_CHANNELS` bytes); `dst` is the matching
+/// This is the SigLIP `(x/255 - 0.5) / 0.5` rescale as the non-fused
+/// `x * (1/127.5) - 1.0` (multiply then subtract — bit-for-bit the original
+/// per-pixel normalize, no fused-multiply-add ~1-ULP drift). `src` is
+/// `[RGBA, RGBA, …]` (`p * RGBA_CHANNELS` bytes); `dst` is the matching
 /// `[RGB, RGB, …]` (`p * RGB_CHANNELS` f32). The resize emits RGBA8, so reading
 /// the leading 3 bytes of each pixel is byte-identical to a `to_rgb8()` drop of
 /// the alpha channel (no color-space conversion) — the e2e pixel parity holds.
+///
+/// Delegates to the NEON-accelerated [`crate::simd::vlm::rgba_to_rgb_affine`]
+/// dispatcher (16-pixel `vld4q_u8` + `vmulq_f32` + `vaddq_f32` + `vst3q_f32`
+/// tile on aarch64, scalar fallback elsewhere); the NEON and scalar arms are
+/// bit-identical.
 #[inline]
 fn normalize_row_rgba(src: &[u8], dst: &mut [f32]) {
-  const RGB: usize = RGB_CHANNELS as usize;
-  const RGBA: usize = RGBA_CHANNELS as usize;
-  debug_assert_eq!(src.len() % RGBA, 0);
-  debug_assert_eq!(dst.len() % RGB, 0);
-  debug_assert_eq!(src.len() / RGBA, dst.len() / RGB);
   const SCALE: f32 = 1.0 / 127.5;
-  // Per-pixel: copy the 3 RGB bytes, skip alpha. The chunked iteration keeps
-  // the bounds-checks hoisted to the chunk boundary (the lengths are an exact
-  // multiple of the pixel widths by construction).
-  for (src_px, dst_px) in src.chunks_exact(RGBA).zip(dst.chunks_exact_mut(RGB)) {
-    for ch in 0..RGB {
-      dst_px[ch] = f32::from(src_px[ch]) * SCALE - 1.0;
-    }
-  }
+  const BIAS: f32 = -1.0;
+  crate::simd::vlm::rgba_to_rgb_affine(src, dst, SCALE, BIAS);
 }
 
 #[cfg(all(test, feature = "siglip2-naflex"))]

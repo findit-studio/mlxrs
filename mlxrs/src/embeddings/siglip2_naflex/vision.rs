@@ -69,7 +69,7 @@ use crate::{
   array::Array,
   dtype::Dtype,
   embeddings::siglip2_naflex::{
-    config::{MAX_CARDINALITY, MAX_CONFIG_DIM, VisionConfig},
+    config::VisionConfig,
     processing::NaflexInputs,
     shared::{
       EncoderLayer, LayerDims, Mlp, build_layer_norm, dim_i32, expect_shape, linear, take,
@@ -84,7 +84,7 @@ use crate::{
     attention::{Mask, scaled_dot_product_attention},
     norm::LayerNorm,
   },
-  model_validation::{Extent, checked_mul, require_positive, reserve_or_error},
+  model_validation::{checked_mul, require_positive, reserve_or_error},
   ops,
 };
 
@@ -219,14 +219,16 @@ pub struct VisionTower {
   /// The attention-pool head, present iff `config.vision_use_head`.
   head: Option<AttentionPoolHead>,
   hidden: i32,
-  /// The loaded config's runtime patch budget (`max_num_patches`), as a
-  /// cap-proven [`Extent`]. [`forward`](Self::forward) pins the runtime input's
-  /// patch count to this before any embed / interp / attention (untrusted
-  /// `NaflexInputs` has no validating constructor).
-  max_num_patches: Extent,
-  /// The loaded config's per-patch feature width (`P^2 * C`) as an [`Extent`];
-  /// `forward` pins the runtime `pixel_values` last axis to it.
-  patch_feature_dim: Extent,
+  /// The loaded config's runtime patch budget (`max_num_patches`).
+  /// [`forward`](Self::forward) pins the runtime input's patch count to this
+  /// before any embed / interp / attention (untrusted `NaflexInputs` has no
+  /// validating constructor), so a hand-built input cannot exceed the loaded
+  /// budget. This is a structural runtime-vs-config consistency check, not a
+  /// magnitude cap.
+  max_num_patches: usize,
+  /// The loaded config's per-patch feature width (`P^2 * C`); `forward` pins
+  /// the runtime `pixel_values` last axis to it.
+  patch_feature_dim: usize,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -260,20 +262,12 @@ impl VisionTower {
     let eps = dims.eps;
     let num_positions = config.num_patches()?;
     let patch_feat = config.patch_feature_dim()?; // P^2 * C
-    // The loaded config's runtime budget, as cap-proven `Extent`s — `forward`
-    // pins the untrusted runtime `NaflexInputs` against these. `config.validate`
-    // above already bounded both, so these `Extent`s are the type-level proof a
-    // stored budget cannot be over-cap.
-    let max_num_patches = Extent::new(
-      "VisionConfig: max_num_patches",
-      config.max_num_patches() as usize,
-      MAX_CARDINALITY as usize,
-    )?;
-    let patch_feature_dim = Extent::new(
-      "VisionConfig: patch_feature_dim",
-      patch_feat as usize,
-      MAX_CONFIG_DIM as usize,
-    )?;
+    // The loaded config's runtime budget — `forward` pins the untrusted
+    // runtime `NaflexInputs` against these. `config.validate` above already
+    // required both positive (and overflow-checked `patch_feat`), so these are
+    // positive dimensions the runtime input is checked against.
+    let max_num_patches = config.max_num_patches() as usize;
+    let patch_feature_dim = patch_feat as usize;
 
     // ── patch embedding (the Conv2d-as-Linear kernel) ──
     let patch_weight_raw = take(weights, "embeddings.patch_embedding.weight")?;
@@ -300,10 +294,10 @@ impl VisionTower {
     let pos_grid_side = isqrt_exact(num_positions, "VisionConfig: num_patches")?;
 
     // ── encoder layers ──
-    // `num_hidden_layers` is bounded by `MAX_CARDINALITY` in `validate`, but
-    // reserve fallibly so even a within-cap heavyweight per-layer `Vec` the
-    // allocator cannot satisfy is a recoverable [`Error::AllocFailure`] rather
-    // than `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
+    // `num_hidden_layers` is required positive in `validate`, but reserve
+    // fallibly so even a heavyweight per-layer `Vec` the allocator cannot
+    // satisfy is a recoverable [`Error::AllocFailure`] rather than
+    // `with_capacity`'s abort (the merged LFM2 / Wav2Vec2 pattern).
     let mut layers: Vec<EncoderLayer> = Vec::new();
     reserve_or_error(
       &mut layers,
@@ -363,7 +357,7 @@ impl VisionTower {
     // trailing junk axis (a `(patch_dim, huge)` mask) that a leading-dim-only
     // check waves through into the position-embed scatter / the O(patch^2)
     // SDPA. Checking the full runtime shapes here (rank + every dim) — against
-    // the stored config `Extent`s — rejects all of those as crisp typed errors
+    // the stored config budget — rejects all of those as crisp typed errors
     // up front, rather than relying on a downstream op's incidental broadcast.
     let pv_shape = inputs.pixel_values.shape();
     // `pixel_values` is rank-2 `(patch_dim, patch_feature_dim)`. Read the patch
@@ -381,11 +375,11 @@ impl VisionTower {
     // Cap the runtime patch count against the loaded budget BEFORE pinning the
     // exact shape, so an over-cap patch dim surfaces as the dedicated
     // `CapExceeded` (the DoS boundary) rather than a generic shape mismatch.
-    if patch_dim > self.max_num_patches.get() {
+    if patch_dim > self.max_num_patches {
       return Err(Error::CapExceeded(CapExceededPayload::new(
         "siglip2 vision: runtime patch count vs loaded max_num_patches",
         "max_num_patches",
-        self.max_num_patches.get() as u64,
+        self.max_num_patches as u64,
         patch_dim as u64,
       )));
     }
@@ -395,7 +389,7 @@ impl VisionTower {
     expect_runtime_shape(
       &pv_shape,
       "siglip2 vision: pixel_values shape (patch_dim, patch_feature_dim)",
-      &[patch_dim, self.patch_feature_dim.get()],
+      &[patch_dim, self.patch_feature_dim],
     )?;
     // `pixel_attention_mask` is exactly rank-1 `(patch_dim,)` — a trailing junk
     // axis (`(patch_dim, huge)`) or a length mismatch is rejected here, not by

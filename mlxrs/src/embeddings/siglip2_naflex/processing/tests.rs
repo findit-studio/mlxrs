@@ -285,24 +285,23 @@ fn rejects_non_rgb_channels() {
 }
 
 #[test]
-fn rejects_pixel_values_product_over_cap() {
-  // `patch_size = 591` keeps `patch_feature_dim = 3 * 591^2 = 1_047_843` just
-  // under the `1 << 20` width cap, and `max_num_patches = 256` is a real,
-  // within-cardinality budget — yet their product `268_247_808` exceeds the
-  // `1 << 26` `MAX_PIXEL_ELEMENTS` product cap (~1 GiB of f32). The guard must
-  // fire as a typed `CapExceeded` BEFORE the (infallible-in-the-old-code)
-  // allocation, never aborting. The `rgb` slice is a cheap 16x16x3 (the cap
-  // check runs after the length check but before `patch_grid`/resize, so no
-  // large buffer is ever sized).
+fn preprocess_pixel_values_size_overflow_is_typed_error() {
+  // The soundness floor stays: when the `pixel_values` element count
+  // `max_num_patches * (3 * patch_size^2)` would wrap `usize`, the
+  // overflow-checked arithmetic surfaces a typed `ArithmeticOverflow` BEFORE
+  // any allocation (a wrapped size would be UB). At `patch_size = u32::MAX`,
+  // `patch_size^2` fits `usize` on a 64-bit target but the subsequent
+  // `* channels` (3) overflows. The `rgb` slice is a cheap 16x16x3 — the
+  // overflow check runs after the source-length check but before
+  // `patch_grid`/resize, so no large buffer is ever sized. (A large but
+  // non-overflowing product is NOT rejected for magnitude — `mlxrs` is a
+  // library; it instead drives a fallible reservation.)
   let rgb = vec![0u8; (16 * 16 * 3) as usize];
-  let err = preprocess(&rgb, 16, 16, 591, CHANNELS, M).unwrap_err();
-  match err {
-    Error::CapExceeded(p) => {
-      assert_eq!(p.cap(), 1 << 26, "cap value");
-      assert_eq!(p.observed(), 256 * 3 * 591 * 591, "observed product");
-    }
-    _ => panic!("expected CapExceeded, got {err}"),
-  }
+  let err = preprocess(&rgb, 16, 16, u32::MAX, CHANNELS, M).unwrap_err();
+  assert!(
+    matches!(err, Error::ArithmeticOverflow(_)),
+    "expected ArithmeticOverflow, got {err}"
+  );
 }
 
 #[test]
