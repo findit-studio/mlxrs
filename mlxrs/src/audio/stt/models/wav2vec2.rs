@@ -1,11 +1,26 @@
-//! Wav2Vec2 CTC speech recognizer (`facebook/wav2vec2-base-960h`).
+//! Wav2Vec2 CTC speech recognizer (the `wav2vec2` / `hubert` CTC family).
 //!
 //! Port of mlx-audio's `Wav2Vec2ForCTC` — the backbone in
 //! [`stt/models/wav2vec/wav2vec.py`][wav2vec] (feature encoder + feature
 //! projection + transformer encoder) composed with the CTC head + greedy
 //! decode + waveform normalization in [`stt/models/mms/mms.py`][mms]. MMS
-//! *is* Wav2Vec2ForCTC; `base-960h` is the same architecture minus the MMS
-//! language-adapter logic (which is dropped here).
+//! *is* Wav2Vec2ForCTC; the MMS language-adapter logic is dropped here.
+//!
+//! The port is generic over the family the way the reference's `ModelConfig`
+//! is: the builders read every width / count / conv-stack field from the
+//! config, so the `base`, `large`, and `large-960h-lv60-self`-style variants
+//! (and the `hubert` checkpoints, which share the plain self-attention
+//! transformer) all load. Both encoder arms the reference ships are mirrored:
+//!
+//! - **post-norm** ([`Wav2Vec2Encoder`][enc] / [`Wav2Vec2EncoderLayer`][el],
+//!   `do_stable_layer_norm = false`) — the encoder `LayerNorm` is applied
+//!   *before* the layer stack, and each layer is
+//!   `h = layer_norm(h + attn(h)); h = final_layer_norm(h + ff(h))`;
+//! - **stable-layer-norm** (pre-norm) ([`Wav2Vec2EncoderStableLayerNorm`][senc]
+//!   / [`Wav2Vec2EncoderLayerStableLayerNorm`][sel],
+//!   `do_stable_layer_norm = true`) — the encoder `LayerNorm` is applied
+//!   *after* the layer stack, and each layer is
+//!   `h = h_in + attn(layer_norm(h_in)); h = h + ff(final_layer_norm(h))`.
 //!
 //! The model is **not** autoregressive, so it does not implement the
 //! [`crate::audio::stt::model::AutoregressiveStt`] trait (encoder + per-token
@@ -18,16 +33,45 @@
 //! - [`Wav2Vec2Ctc::transcribe`] — waveform → decoded `String`
 //!   (normalize → forward → greedy CTC collapse → vocabulary map).
 //!
-//! ## Architecture (`base-960h`)
+//! ## Activation
 //!
-//! `hidden=768, layers=12, heads=12, intermediate=3072, vocab=32`,
-//! conv stack `dim=(512,)*7, stride=(5,2,2,2,2,2,2), kernel=(10,3,3,3,3,2,2),
-//! bias=False`, positional conv `kernel=128, groups=16`,
-//! `feat_extract_norm="group"`, `do_stable_layer_norm=False`,
-//! `hidden_act="gelu"` (exact). 1 s of audio → ~49 frames.
+//! mlx-audio hardcodes `nn.GELU()` (the exact, `approx="none"` GELU) at every
+//! block and ignores the config activation fields. This port instead dispatches
+//! on `hidden_act` (the transformer feed-forward) and `feat_extract_activation`
+//! (the feature-encoder convs), mapping the HF activation names — `gelu` to the
+//! exact GELU (so a `gelu` checkpoint is identical to the reference),
+//! `gelu_new` / `gelu_pytorch_tanh` to the tanh-approx GELU, and `silu` /
+//! `swish` to SiLU. See [`Activation`].
+//!
+//! ## Out of scope
+//!
+//! The `feat_extract_norm = "layer"` feature-encoder arm, the MMS language
+//! adapters, the post-encoder conv adapter / per-layer attention adapter
+//! (`add_adapter` / `adapter_attn_dim`), the HuBERT-only no-LayerNorm feature
+//! projection (`feat_proj_layer_norm = false`) and batch-norm positional conv
+//! (`conv_pos_batch_norm = true`) arms, Conformer relative-position attention,
+//! sharded-checkpoint loading, and a configurable CTC blank are **not** wired;
+//! a config that needs one of them is rejected by
+//! [`Wav2Vec2Config::validate`] with a typed error. (Both HuBERT flag defaults
+//! — `feat_proj_layer_norm = true`, `conv_pos_batch_norm = false` — match the
+//! wired graph, so a default HuBERT checkpoint is faithfully supported; only the
+//! non-default arm is rejected.)
+//!
+//! **WavLM** is likewise deferred: its defining feature is gated
+//! relative-position-bias attention, which this phase does not implement, and
+//! it has no plain-attention variant. So a `wavlm` checkpoint cannot be run
+//! faithfully through the plain self-attention path here (its relative-position
+//! tensors would go unconsumed = silent corruption); `validate` therefore
+//! **rejects** `model_type == "wavlm"` rather than silently accepting a model
+//! this phase cannot serve. WavLM is unlocked once gated relative-position-bias
+//! attention is wired (a later phase).
 //!
 //! [wav2vec]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py
 //! [mms]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/mms/mms.py
+//! [enc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L511-L574
+//! [el]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L436-L465
+//! [senc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L577-L644
+//! [sel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L468-L508
 
 use std::collections::HashMap;
 
@@ -36,17 +80,17 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   error::{
-    CapExceededPayload, Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload,
-    MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, RankMismatchPayload,
-    Result, ShapePairMismatchPayload,
+    Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload,
+    MalformedDataPayload, MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload,
+    ParsePayload, RankMismatchPayload, Result, ShapePairMismatchPayload, UnknownEnumValuePayload,
   },
   lm::nn::{
     attention::{Mask, scaled_dot_product_attention},
     norm::{GroupNorm, LayerNorm},
   },
   model_validation::{
-    checked_mul, insert_unique, pin_bool, pin_f64, pin_i32, pin_i32_slice, pin_str,
-    require_divisible, require_positive,
+    checked_mul, insert_unique, pin_bool, pin_str, require_divisible, require_positive,
+    reserve_or_error,
   },
   ops,
 };
@@ -67,7 +111,11 @@ use crate::{
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Wav2Vec2Config {
-  /// Architecture id (`config.json` `model_type`, e.g. `"wav2vec2"`).
+  /// Architecture id (`config.json` `model_type`). Accepted: `"wav2vec2"` and
+  /// `"hubert"` — the family that shares the plain self-attention transformer
+  /// this port wires (HuBERT reuses the wav2vec2 encoder architecture). WavLM
+  /// is **rejected** by [`Wav2Vec2Config::validate`]: it needs gated
+  /// relative-position-bias attention, deferred to a later phase.
   #[serde(default = "default_model_type")]
   model_type: String,
   /// Vocabulary size — the CTC head's output width / logits last axis.
@@ -88,19 +136,23 @@ pub struct Wav2Vec2Config {
   /// `eps` shared by every `LayerNorm` and the L0 `GroupNorm`.
   #[serde(default = "default_layer_norm_eps")]
   pub layer_norm_eps: f32,
-  /// Feature-encoder normalization scheme. `base-960h` is `"group"` (the
-  /// only scheme this port supports — see [`Wav2Vec2Config::is_group_norm`]).
+  /// Feature-encoder normalization scheme. `"group"` (the `base`/`large`
+  /// default) is the only scheme this port wires — see
+  /// [`Wav2Vec2Config::is_group_norm`]; the `"layer"` arm (used by
+  /// `large-960h-lv60-self`) is out of scope and rejected by
+  /// [`Wav2Vec2Config::validate`].
   #[serde(default = "default_feat_extract_norm")]
   pub feat_extract_norm: String,
-  /// Hidden activation. `base-960h` is `"gelu"` — the only activation this
-  /// port wires (every block hardcodes GELU), so a deviating value is
-  /// rejected by [`Wav2Vec2Config::validate`].
+  /// Hidden (transformer feed-forward) activation. Dispatched on by
+  /// [`Activation::resolve`]: `"gelu"` (the exact GELU, matching the
+  /// reference), `"gelu_new"` / `"gelu_pytorch_tanh"` (tanh-approx GELU), or
+  /// `"silu"` / `"swish"`. An unsupported name is rejected by
+  /// [`Wav2Vec2Config::validate`].
   #[serde(default = "default_hidden_act")]
   pub hidden_act: String,
-  /// Feature-encoder conv activation. `base-960h` is `"gelu"` — every
-  /// feature-encoder conv layer hardcodes GELU, so a deviating value would
-  /// silently run a different feature encoder and is rejected by
-  /// [`Wav2Vec2Config::validate`].
+  /// Feature-encoder conv activation. Dispatched on by [`Activation::resolve`]
+  /// exactly as [`Wav2Vec2Config::hidden_act`]; an unsupported name is rejected
+  /// by [`Wav2Vec2Config::validate`].
   #[serde(default = "default_feat_extract_activation")]
   pub feat_extract_activation: String,
   /// Per-conv-layer output channel widths (length `num_feat_extract_layers`).
@@ -112,8 +164,9 @@ pub struct Wav2Vec2Config {
   /// Per-conv-layer kernel size.
   #[serde(default = "default_conv_kernel")]
   pub conv_kernel: Vec<i32>,
-  /// Whether the feature-encoder convolutions carry a bias (`base-960h`:
-  /// `false`).
+  /// Whether the feature-encoder convolutions carry a bias (`base`/`large`:
+  /// `false`). When `true`, every feature-encoder conv layer loads and adds its
+  /// `conv.bias`.
   #[serde(default)]
   pub conv_bias: bool,
   /// Positional-conv-embedding kernel size (even → one trailing frame is
@@ -127,8 +180,8 @@ pub struct Wav2Vec2Config {
   #[serde(default = "default_num_feat_extract_layers")]
   pub num_feat_extract_layers: i32,
   /// Whether the encoder uses the stable-layer-norm (pre-norm) arm.
-  /// `base-960h`: `false` (post-norm). The pre-norm arm is **not** ported
-  /// (see module docs).
+  /// `base`/`large`: `false` (post-norm); `large-960h-lv60-self`-style
+  /// checkpoints: `true`. Both arms are wired (see the module docs).
   #[serde(default)]
   pub do_stable_layer_norm: bool,
   /// Whether a convolutional adapter network is stacked on top of the encoder.
@@ -154,6 +207,29 @@ pub struct Wav2Vec2Config {
   /// [`Wav2Vec2Config::validate`].
   #[serde(default = "default_pad_token_id")]
   pub pad_token_id: i32,
+  /// Whether the feature projection applies a `LayerNorm` to the feature
+  /// encoder's output before the linear projection. A **HuBERT** config field
+  /// (`HubertConfig.feat_proj_layer_norm`, default `true`); the wav2vec2 config
+  /// has no such field and always applies the LayerNorm. This port wires the
+  /// `true` arm only — the feature projection unconditionally applies the
+  /// LayerNorm — so a `false` value (HuBERT's no-LayerNorm projection arm) would
+  /// load and feed the projection an un-normalized input through a graph that
+  /// still normalizes: a silently wrong forward. Pinned to `true` by
+  /// [`Wav2Vec2Config::validate`]; the no-LayerNorm arm is out of scope.
+  #[serde(default = "default_feat_proj_layer_norm")]
+  pub feat_proj_layer_norm: bool,
+  /// Whether the positional conv embedding uses batch-norm instead of the
+  /// weight-norm reparametrization. A **HuBERT** config field
+  /// (`HubertConfig.conv_pos_batch_norm`, default `false`); the wav2vec2 config
+  /// has no such field and always uses weight-norm. This port wires the `false`
+  /// (weight-norm) arm only — the positional conv embedding reconstructs the
+  /// fused kernel from the `weight_g` / `weight_v` pair — so a `true` value
+  /// selects a different module (a `BatchNorm1d` over a plain conv, whose
+  /// checkpoint carries no `weight_g` / `weight_v`): the builder would fail to
+  /// find those keys, or, worse, run the wrong graph. Pinned to `false` by
+  /// [`Wav2Vec2Config::validate`]; the batch-norm arm is out of scope.
+  #[serde(default)]
+  pub conv_pos_batch_norm: bool,
 }
 
 #[cfg(feature = "wav2vec2")]
@@ -224,52 +300,47 @@ fn default_num_feat_extract_layers() -> i32 {
 fn default_pad_token_id() -> i32 {
   0
 }
+#[cfg(feature = "wav2vec2")]
+fn default_feat_proj_layer_norm() -> bool {
+  // HuBERT default; the wav2vec2 graph always applies the projection LayerNorm.
+  true
+}
 
-// ── base-960h architecture constants ──
+// ── architecture invariants ──
 //
-// This port wires `facebook/wav2vec2-base-960h`'s *exact* graph: the builders
-// read every weight tensor by its fixed key and infer each layer's shape from
-// the checkpoint tensor (not from these fields), and `ConvLayer`/`Attention`/
-// the CTC head hardcode the base-960h topology. A config whose architecture
-// fields deviate would therefore be loaded into the wrong (or a silently
-// bias-less) graph. `validate` pins each architecture-defining field to its
-// base-960h value so a deviating checkpoint fails fast with a typed error
-// before any tensor is built — rather than loading and running silently wrong.
-// These mirror the `default_*` fns above (the single source of truth for the
-// `base-960h` values); the `base_960h_constants_match_defaults` test guards
-// against the two drifting.
+// The port is generic over the family: the builders read every width / count /
+// conv-stack field from the (validated) config and each layer's shape from the
+// checkpoint tensor. `validate` therefore no longer pins the *dimensions* to a
+// single variant — it enforces only the structural invariants the wired graph
+// genuinely requires (positivity, divisibility, conv-array length consistency,
+// a supported activation / feature-norm scheme, the absent adapters, and the
+// CTC blank id) — so the `base` / `large` / stable-LN variants, and the
+// `hubert` checkpoints sharing the plain self-attention transformer, all load.
+
+/// `model_type` values this port accepts — the family that shares the plain
+/// self-attention transformer graph wired here: `wav2vec2` and `hubert`
+/// (HuBERT reuses the wav2vec2 encoder architecture). WavLM is **not** accepted:
+/// its defining feature is gated relative-position-bias attention, which this
+/// phase does not implement, and it has no plain-attention variant — so a wavlm
+/// checkpoint would run its relative-position tensors through the plain
+/// self-attention path unconsumed (silent transcription corruption). WavLM is
+/// deferred until gated relative-position-bias attention is wired.
 #[cfg(feature = "wav2vec2")]
-const BASE_960H_MODEL_TYPE: &str = "wav2vec2";
+const SUPPORTED_MODEL_TYPES: &[&str] = &["wav2vec2", "hubert"];
+
+/// Backbone key prefixes [`sanitize`] strips — one per supported `*ForCTC`
+/// checkpoint family. `Wav2Vec2ForCTC` nests the backbone under `wav2vec2.`,
+/// `HubertForCTC` under `hubert.` (HuBERT reuses the wav2vec2 encoder, so the
+/// post-strip keys are identical); `lm_head` stays top-level in both. Kept in
+/// lock-step with [`SUPPORTED_MODEL_TYPES`] (no `wavlm.`, since WavLM is not
+/// served this phase).
 #[cfg(feature = "wav2vec2")]
-const BASE_960H_HIDDEN_ACT: &str = "gelu";
+const SUPPORTED_BACKBONE_PREFIXES: &[&str] = &["wav2vec2.", "hubert."];
+
+/// CTC blank-token id this port hardcodes (`pad_token_id`). Greedy decoding
+/// drops exactly this id, so `validate` pins the config's `pad_token_id` to it.
 #[cfg(feature = "wav2vec2")]
-const BASE_960H_FEAT_EXTRACT_ACTIVATION: &str = "gelu";
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_PAD_TOKEN_ID: i32 = 0;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_LAYER_NORM_EPS: f32 = 1e-5;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_VOCAB_SIZE: i32 = 32;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_HIDDEN_SIZE: i32 = 768;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_NUM_HIDDEN_LAYERS: i32 = 12;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_NUM_ATTENTION_HEADS: i32 = 12;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_INTERMEDIATE_SIZE: i32 = 3072;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_NUM_CONV_POS_EMBEDDINGS: i32 = 128;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_NUM_CONV_POS_EMBEDDING_GROUPS: i32 = 16;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_NUM_FEAT_EXTRACT_LAYERS: i32 = 7;
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_CONV_DIM: [i32; 7] = [512, 512, 512, 512, 512, 512, 512];
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_CONV_STRIDE: [i32; 7] = [5, 2, 2, 2, 2, 2, 2];
-#[cfg(feature = "wav2vec2")]
-const BASE_960H_CONV_KERNEL: [i32; 7] = [10, 3, 3, 3, 3, 2, 2];
+const PAD_TOKEN_ID: i32 = 0;
 
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
@@ -297,193 +368,198 @@ impl Wav2Vec2Config {
   }
 
   /// `true` when `feat_extract_norm == "group"` — the only feature-encoder
-  /// normalization scheme this port supports (`base-960h`). The `"layer"`
-  /// (stable-layer-norm) variant used by `large-960h-lv60` is intentionally
-  /// not ported.
+  /// normalization scheme this port wires. The `"layer"` variant used by
+  /// `large-960h-lv60-self` is out of scope (see the module docs).
   #[inline(always)]
   pub fn is_group_norm(&self) -> bool {
     self.feat_extract_norm == "group"
   }
 
-  /// Reject any config this port cannot run **exactly**, with a typed error,
-  /// **before** any tensor is allocated or any weight is read.
+  /// Reject any config this port cannot run, with a typed error, **before**
+  /// any tensor is allocated or any weight is read.
   ///
-  /// This port wires `facebook/wav2vec2-base-960h`'s exact architecture and
-  /// nothing else: the builders read every weight tensor by its fixed key and
-  /// take each layer's shape from the checkpoint tensor, while the (bias-free)
-  /// feature-encoder conv layers, the attention, the post-norm encoder, and the
-  /// CTC head hardcode the base-960h topology.
-  /// A config that deviates in *any* architecture-defining field would
-  /// otherwise be loaded into the wrong — or a silently bias-less — graph and
-  /// produce incorrect output without erroring. `validate` is the single gate
-  /// (called at the top of [`Wav2Vec2Ctc::from_weights`], and eagerly in
-  /// [`Wav2Vec2Ctc::load`] so a mismatch fails before the weights file is even
-  /// read) that pins every such field to its base-960h value.
+  /// The port is generic over the family: the builders read every width /
+  /// count / conv-stack field from this config and each layer's shape from the
+  /// checkpoint tensor. `validate` therefore enforces only the **structural
+  /// invariants** the wired graph genuinely requires — not a single variant's
+  /// magnitudes — so the `base` / `large` / stable-LN variants and the
+  /// `hubert` checkpoints that share the plain self-attention transformer all
+  /// pass. It is the single gate (called at the top of
+  /// [`Wav2Vec2Ctc::from_weights`], and eagerly in [`Wav2Vec2Ctc::load`] so a
+  /// mismatch fails before the weights file is even read).
   ///
-  /// Rejected (each as a typed error, never a panic or a silent mis-load):
-  /// - `feat_extract_norm != "group"` ([`Error::UnknownEnumValue`]) — only the
-  ///   group-norm feature-encoder arm is wired;
-  /// - `hidden_act != "gelu"` / `feat_extract_activation != "gelu"`
-  ///   ([`Error::UnknownEnumValue`]) — every transformer block and every
-  ///   feature-encoder conv hardcodes GELU, so a deviating activation would run
-  ///   a different graph silently;
-  /// - `do_stable_layer_norm == true` ([`Error::InvariantViolation`]) — only
-  ///   the post-norm arm is wired;
-  /// - `add_adapter == true` ([`Error::InvariantViolation`]) — the post-encoder
-  ///   convolutional adapter stack (which re-shapes the CTC head's input to
-  ///   `output_hidden_size`) is not wired;
-  /// - `adapter_attn_dim` set ([`Error::InvariantViolation`]) — the per-layer
-  ///   attention adapter (whose output is added to the hidden states) is not
-  ///   wired, so a non-`null` value would add a missing graph term silently;
-  /// - `conv_bias == true` ([`Error::InvariantViolation`]) — the feature-encoder
-  ///   conv layers store no bias and never add one, so a biased checkpoint
-  ///   would run silently wrong;
+  /// Rejected (each a typed error, never a panic or a silent mis-load):
+  /// - `model_type` not one of the supported family ids (`wav2vec2`,
+  ///   `hubert`) ([`Error::UnknownEnumValue`]) — `wavlm` is **rejected** here
+  ///   (its gated relative-position-bias attention is not wired this phase);
+  /// - `feat_extract_norm != "group"` ([`Error::UnknownEnumValue`]) — the
+  ///   `"layer"` feature-encoder arm is out of scope;
+  /// - `hidden_act` / `feat_extract_activation` not a supported activation
+  ///   ([`Error::UnknownEnumValue`], via [`Activation::resolve`]);
+  /// - `add_adapter == true` / `adapter_attn_dim` set
+  ///   ([`Error::InvariantViolation`]) — the post-encoder conv adapter stack
+  ///   and the per-layer attention adapter are out of scope;
+  /// - `feat_proj_layer_norm == false` / `conv_pos_batch_norm == true`
+  ///   ([`Error::InvariantViolation`]) — the HuBERT-only no-LayerNorm
+  ///   feature-projection arm and batch-norm positional-conv arm are out of
+  ///   scope (the wired graph applies the projection LayerNorm and reconstructs
+  ///   a weight-normalized positional conv); both HF defaults match the wired
+  ///   graph, so default HuBERT and every wav2vec2 checkpoint pass;
   /// - `pad_token_id != 0` ([`Error::OutOfRange`]) — greedy CTC decoding drops
-  ///   exactly id `0` (the hardcoded `CTC_BLANK`), so a different declared blank
+  ///   exactly id `0` (the hardcoded CTC blank), so a different declared blank
   ///   would collapse the argmax against the wrong token;
-  /// - `model_type != "wav2vec2"` ([`Error::UnknownEnumValue`]);
-  /// - any of `hidden_size`, `num_hidden_layers`, `num_attention_heads`,
-  ///   `intermediate_size`, `vocab_size`, `num_conv_pos_embeddings`,
-  ///   `num_conv_pos_embedding_groups`, `num_feat_extract_layers`, or the
-  ///   `conv_dim` / `conv_stride` / `conv_kernel` arrays not matching the
-  ///   base-960h architecture ([`Error::InvariantViolation`] for the scalars,
-  ///   [`Error::LengthMismatch`] for a wrong-length conv array, and
-  ///   [`Error::OutOfRange`] naming the first deviating conv element) — pinning
-  ///   the counts to their exact base-960h value also bounds them (a hostile or
-  ///   corrupt `num_hidden_layers` can never reach the per-layer allocation
-  ///   loop).
+  /// - a non-positive `hidden_size` / `num_attention_heads` /
+  ///   `intermediate_size` / `vocab_size` / `num_conv_pos_embeddings`
+  ///   ([`Error::OutOfRange`]); `hidden_size` not divisible by
+  ///   `num_attention_heads` or by `num_conv_pos_embedding_groups`
+  ///   ([`Error::DivisibilityConstraint`]);
+  /// - a non-positive `num_hidden_layers` / `num_feat_extract_layers`
+  ///   ([`Error::OutOfRange`]) — each sizes an eager per-layer `Vec`, reserved
+  ///   fallibly by the builder;
+  /// - a non-finite or non-positive `layer_norm_eps`
+  ///   ([`Error::NonFiniteScalar`] / [`Error::OutOfRange`]);
+  /// - a `conv_dim` / `conv_stride` / `conv_kernel` array whose length is not
+  ///   **exactly** `num_feat_extract_layers` ([`Error::LengthMismatch`]) — a
+  ///   too-long array would desync the feature encoder (`n` layers, output
+  ///   width `conv_dim[n-1]`) from the projection (which reads `conv_dim.last()`)
+  ///   — or carrying a non-positive element ([`Error::OutOfRange`]).
   pub fn validate(&self) -> Result<()> {
-    // Feature-encoder normalization scheme: only the group-norm arm is wired.
+    // model_type: the family sharing the plain self-attention transformer
+    // (wav2vec2 + hubert). `wavlm` is rejected — its gated
+    // relative-position-bias attention is not wired this phase.
+    pin_str(
+      "Wav2Vec2Config: model_type",
+      self.model_type.as_str(),
+      SUPPORTED_MODEL_TYPES,
+    )?;
+    // Feature-encoder normalization scheme: only the group-norm arm is wired
+    // (the "layer" arm is out of scope for this phase).
     pin_str(
       "Wav2Vec2Config: feat_extract_norm",
       self.feat_extract_norm.as_str(),
       &["group"],
     )?;
-    // Hidden activation: every block hardcodes GELU, so a deviating value
-    // would run a different (unsupported) graph silently.
-    pin_str(
-      "Wav2Vec2Config: hidden_act",
-      self.hidden_act.as_str(),
-      &[BASE_960H_HIDDEN_ACT],
-    )?;
-    // Feature-encoder conv activation: every `ConvLayer` hardcodes GELU too, so
-    // a deviating value would silently run a different feature encoder.
-    pin_str(
+    // Activations: resolve both names against the supported set. The resolved
+    // values are recomputed at build time; resolving here makes an unsupported
+    // activation fail fast (before any tensor) with the same typed error.
+    Activation::resolve(&self.hidden_act, "Wav2Vec2Config: hidden_act")?;
+    Activation::resolve(
+      &self.feat_extract_activation,
       "Wav2Vec2Config: feat_extract_activation",
-      self.feat_extract_activation.as_str(),
-      &[BASE_960H_FEAT_EXTRACT_ACTIVATION],
     )?;
-    // Only the base-960h post-norm arm is wired.
-    pin_bool(
-      "Wav2Vec2Config: do_stable_layer_norm",
-      self.do_stable_layer_norm,
-      false,
-    )?;
-    // The post-encoder convolutional adapter stack is not wired: when `true`,
-    // HF re-shapes the encoder output (to `output_hidden_size`) before the CTC
-    // head, a graph this port does not build, so the head would read the wrong
-    // dimension and run silently wrong.
+    // The post-encoder convolutional adapter stack is out of scope: when
+    // `true`, HF re-shapes the encoder output (to `output_hidden_size`) before
+    // the CTC head, a graph this port does not build.
     pin_bool("Wav2Vec2Config: add_adapter", self.add_adapter, false)?;
-    // The per-attention-block adapter is not wired: when `adapter_attn_dim` is
-    // set, HF adds a `Wav2Vec2AttnAdapterLayer` to every encoder layer whose
-    // output is *added* to the hidden states — an extra term this port omits.
-    // Only the absent (`None`) form is supported.
+    // The per-attention-block adapter is out of scope: when `adapter_attn_dim`
+    // is set, HF adds a `Wav2Vec2AttnAdapterLayer` to every encoder layer whose
+    // output is *added* to the hidden states. Only the absent (`None`) form is
+    // supported.
     if self.adapter_attn_dim.is_some() {
       return Err(Error::InvariantViolation(InvariantViolationPayload::new(
         "Wav2Vec2Config: adapter_attn_dim",
         "must be absent (null) — the per-layer attention adapter is not wired",
       )));
     }
-    // `ConvLayer` has no bias field and `forward` calls `conv1d` without
-    // adding one, so a `conv_bias == true` checkpoint would load (the bias
-    // tensors becoming unconsumed, silently-dropped keys) and run wrong.
-    pin_bool("Wav2Vec2Config: conv_bias", self.conv_bias, false)?;
-    pin_str(
-      "Wav2Vec2Config: model_type",
-      self.model_type.as_str(),
-      &[BASE_960H_MODEL_TYPE],
-    )?;
-    // Architecture-defining scalars: the port builds exactly the base-960h
-    // graph and reads weight shapes from the checkpoint, so any deviation is a
-    // different (unsupported) architecture. Pinning the *counts*
-    // (num_hidden_layers / num_feat_extract_layers) to their exact value also
-    // bounds them, so an oversized count is rejected here, before the
-    // per-layer allocation loops in the builders.
-    pin_i32(
-      "Wav2Vec2Config: hidden_size",
-      self.hidden_size,
-      BASE_960H_HIDDEN_SIZE,
-    )?;
-    pin_i32(
-      "Wav2Vec2Config: num_hidden_layers",
-      self.num_hidden_layers,
-      BASE_960H_NUM_HIDDEN_LAYERS,
-    )?;
-    pin_i32(
-      "Wav2Vec2Config: num_attention_heads",
-      self.num_attention_heads,
-      BASE_960H_NUM_ATTENTION_HEADS,
-    )?;
-    pin_i32(
-      "Wav2Vec2Config: intermediate_size",
-      self.intermediate_size,
-      BASE_960H_INTERMEDIATE_SIZE,
-    )?;
-    pin_i32(
-      "Wav2Vec2Config: vocab_size",
-      self.vocab_size,
-      BASE_960H_VOCAB_SIZE,
-    )?;
     // CTC blank id: greedy decode hardcodes `CTC_BLANK = 0`, so a checkpoint
     // declaring a different blank would collapse the per-frame argmax against
-    // the wrong token. Pin it to the base-960h value (`0`).
-    pin_i32(
-      "Wav2Vec2Config: pad_token_id",
-      self.pad_token_id,
-      BASE_960H_PAD_TOKEN_ID,
+    // the wrong token. Pin it to the wired value (`0`); a configurable blank is
+    // out of scope.
+    if self.pad_token_id != PAD_TOKEN_ID {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Wav2Vec2Config: pad_token_id",
+        "must equal the hardcoded CTC blank id (0)",
+        format_smolstr!("{} (expected {})", self.pad_token_id, PAD_TOKEN_ID),
+      )));
+    }
+    // HuBERT-only feature-projection / positional-conv graph arms. These two
+    // flags exist on `HubertConfig` (the wav2vec2 config has neither and always
+    // takes the wired arm); both HF defaults match the wired graph, so a
+    // default HuBERT (and every wav2vec2) checkpoint passes. Only the
+    // non-default arm — not implemented this phase — is rejected.
+    //
+    // `feat_proj_layer_norm` (HuBERT default `true`): the wired
+    // `FeatureProjection` unconditionally applies the LayerNorm, so the
+    // no-LayerNorm (`false`) arm would feed the projection an un-normalized
+    // input through a graph that still normalizes — a silently wrong forward.
+    pin_bool(
+      "Wav2Vec2Config: feat_proj_layer_norm",
+      self.feat_proj_layer_norm,
+      true,
     )?;
-    pin_i32(
+    // `conv_pos_batch_norm` (HuBERT default `false`): the wired
+    // `PositionalConvEmbedding` reconstructs the fused kernel from the
+    // weight-norm `weight_g` / `weight_v` pair, so the batch-norm (`true`) arm
+    // selects a different module (a `BatchNorm1d` over a plain conv whose
+    // checkpoint carries no `weight_g` / `weight_v`).
+    pin_bool(
+      "Wav2Vec2Config: conv_pos_batch_norm",
+      self.conv_pos_batch_norm,
+      false,
+    )?;
+    // Width dimensions: positivity + the divisibility the wired graph needs
+    // (per-head split; grouped positional conv). These bound every width a
+    // later step divides by or uses to size work.
+    require_positive("Wav2Vec2Config: hidden_size", self.hidden_size)?;
+    require_positive(
+      "Wav2Vec2Config: num_attention_heads",
+      self.num_attention_heads,
+    )?;
+    require_positive("Wav2Vec2Config: intermediate_size", self.intermediate_size)?;
+    require_positive("Wav2Vec2Config: vocab_size", self.vocab_size)?;
+    require_positive(
       "Wav2Vec2Config: num_conv_pos_embeddings",
       self.num_conv_pos_embeddings,
-      BASE_960H_NUM_CONV_POS_EMBEDDINGS,
     )?;
-    pin_i32(
+    require_positive(
       "Wav2Vec2Config: num_conv_pos_embedding_groups",
       self.num_conv_pos_embedding_groups,
-      BASE_960H_NUM_CONV_POS_EMBEDDING_GROUPS,
     )?;
-    pin_i32(
+    require_divisible(
+      "Wav2Vec2Config: hidden_size",
+      self.hidden_size,
+      "Wav2Vec2Config: num_attention_heads",
+      self.num_attention_heads,
+    )?;
+    require_divisible(
+      "Wav2Vec2Config: hidden_size",
+      self.hidden_size,
+      "Wav2Vec2Config: num_conv_pos_embedding_groups",
+      self.num_conv_pos_embedding_groups,
+    )?;
+    // Layer counts size eager per-layer `Vec`s: each must be positive (a zero
+    // or negative count is malformed). The builder reserves the `Vec`s fallibly,
+    // so a large positive count surfaces as a typed allocation error, not a cap.
+    require_positive("Wav2Vec2Config: num_hidden_layers", self.num_hidden_layers)?;
+    require_positive(
       "Wav2Vec2Config: num_feat_extract_layers",
       self.num_feat_extract_layers,
-      BASE_960H_NUM_FEAT_EXTRACT_LAYERS,
     )?;
-    // `eps` shared by every LayerNorm and the L0 GroupNorm: a deviating value
-    // silently runs a numerically different graph. Compared in f64 (the f32
-    // field widened losslessly against the same-widened reference constant).
-    pin_f64(
-      "Wav2Vec2Config: layer_norm_eps",
-      f64::from(self.layer_norm_eps),
-      f64::from(BASE_960H_LAYER_NORM_EPS),
-    )?;
-    // The conv stack arrays: pin each to the base-960h shape/values. (Only
-    // `conv_dim[0]` and `conv_stride[i]` are actually consumed by the port —
-    // `conv_kernel` is implied by each checkpoint tensor — but a deviation in
-    // any of the three is a different architecture, so all three are pinned.)
-    pin_i32_slice(
-      "Wav2Vec2Config: conv_dim",
-      &self.conv_dim,
-      &BASE_960H_CONV_DIM,
-    )?;
-    pin_i32_slice(
-      "Wav2Vec2Config: conv_stride",
-      &self.conv_stride,
-      &BASE_960H_CONV_STRIDE,
-    )?;
-    pin_i32_slice(
-      "Wav2Vec2Config: conv_kernel",
-      &self.conv_kernel,
-      &BASE_960H_CONV_KERNEL,
-    )?;
+    // `eps` shared by every LayerNorm and the L0 GroupNorm: must be a finite,
+    // positive scalar (it varies across the family, so it is not pinned to a
+    // magnitude). A non-finite value would drive a non-finite denominator.
+    if !self.layer_norm_eps.is_finite() {
+      return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+        "Wav2Vec2Config: layer_norm_eps",
+        f64::from(self.layer_norm_eps),
+      )));
+    }
+    if self.layer_norm_eps <= 0.0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Wav2Vec2Config: layer_norm_eps",
+        "must be a positive finite scalar (> 0)",
+        format_smolstr!("{}", self.layer_norm_eps),
+      )));
+    }
+    // Conv-stack arrays: each length must EQUAL `num_feat_extract_layers`
+    // exactly (a longer array would desync the feature encoder from the
+    // projection, which reads `conv_dim.last()`) and carry only positive
+    // entries (widths, kernels, strides the conv stack consumes).
+    // `num_feat_extract_layers` is positive (checked above), so the cast fits.
+    let n = self.num_feat_extract_layers as usize;
+    check_conv_array("Wav2Vec2Config: conv_dim", &self.conv_dim, n)?;
+    check_conv_array("Wav2Vec2Config: conv_stride", &self.conv_stride, n)?;
+    check_conv_array("Wav2Vec2Config: conv_kernel", &self.conv_kernel, n)?;
     Ok(())
   }
 
@@ -503,17 +579,121 @@ impl Wav2Vec2Config {
   }
 }
 
+/// Validate a `conv_dim` / `conv_stride` / `conv_kernel` config array: its
+/// length must **equal** `n` (`num_feat_extract_layers`) exactly, and every
+/// entry must be positive.
+///
+/// The exact-length requirement is the faithful invariant — the reference's
+/// `conv_dim` / `conv_stride` / `conv_kernel` arrays each have one entry per
+/// feature-extractor layer (their length *is* `num_feat_extract_layers`). A
+/// too-short array would index past the end; a too-long one would silently
+/// desync the feature encoder from the projection — the encoder builds `n`
+/// layers (so its output width is `conv_dim[n-1]`) while
+/// [`build_feature_projection`] reads `conv_dim.last()` (a *later* trailing
+/// entry), so they would expect different channel counts. A length mismatch in
+/// either direction is therefore [`Error::LengthMismatch`]; a non-positive
+/// element is [`Error::OutOfRange`] naming the index and value. (The builder
+/// consumes `conv_dim[i]` as the conv output width, `conv_dim[i-1]` as the
+/// input width, `conv_stride[i]` as the stride, and `conv_kernel[i]` for the
+/// pinned weight shape — each must be a positive integer.)
+#[cfg(feature = "wav2vec2")]
+fn check_conv_array(field: &'static str, array: &[i32], n: usize) -> Result<()> {
+  if array.len() != n {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      field,
+      n,
+      array.len(),
+    )));
+  }
+  for (i, &v) in array.iter().enumerate() {
+    if v <= 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        field,
+        "every conv-stack entry must be a positive integer (> 0)",
+        format_smolstr!("element {i} = {v}"),
+      )));
+    }
+  }
+  Ok(())
+}
+
+// ───────────────────────────── activation ─────────────────────────────
+
+/// The element-wise activation a [`Wav2Vec2Config`] selects, resolved from an
+/// HF activation name.
+///
+/// mlx-audio hardcodes `nn.GELU()` (the exact GELU) at every block and ignores
+/// the config's `hidden_act` / `feat_extract_activation`; this port instead
+/// honours them, mapping the HF names exactly. `"gelu"` resolves to the exact
+/// GELU, so a `gelu` checkpoint (every `base`/`large` wav2vec2/hubert CTC
+/// model) is bit-for-bit the reference's behaviour.
+#[cfg(feature = "wav2vec2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+  /// The exact GELU (`mlx.nn.GELU(approx="none")`) — HF `"gelu"`.
+  Gelu,
+  /// The `tanh` approximation of GELU (`mlx.nn.gelu_approx`) — HF `"gelu_new"`
+  /// / `"gelu_pytorch_tanh"`.
+  GeluApprox,
+  /// SiLU / Swish (`x · σ(x)`) — HF `"silu"` / `"swish"`.
+  Silu,
+}
+
+/// HF activation names this port supports, for the [`Error::UnknownEnumValue`]
+/// `supported` list. Mirrors the [`Activation::resolve`] match arms.
+#[cfg(feature = "wav2vec2")]
+const SUPPORTED_ACTIVATIONS: &[&str] = &["gelu", "gelu_new", "gelu_pytorch_tanh", "silu", "swish"];
+
+#[cfg(feature = "wav2vec2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
+impl Activation {
+  /// Resolve an HF activation name to an [`Activation`], or reject an
+  /// unsupported name with [`Error::UnknownEnumValue`] (carrying `field`, the
+  /// offending value, and the supported-activation list).
+  ///
+  /// The name mapping follows HF transformers' `ACT2FN`: `"gelu"` is the exact
+  /// GELU; `"gelu_new"` and `"gelu_pytorch_tanh"` are the tanh approximation;
+  /// `"silu"` and `"swish"` are SiLU.
+  pub fn resolve(name: &str, field: &'static str) -> Result<Self> {
+    match name {
+      "gelu" => Ok(Self::Gelu),
+      "gelu_new" | "gelu_pytorch_tanh" => Ok(Self::GeluApprox),
+      "silu" | "swish" => Ok(Self::Silu),
+      other => Err(Error::UnknownEnumValue(UnknownEnumValuePayload::new(
+        field,
+        other,
+        SUPPORTED_ACTIVATIONS,
+      ))),
+    }
+  }
+
+  /// Apply the activation to `x`, dispatching to the dtype-preserving
+  /// primitives in [`crate::lm::nn::activations`]. Returns a new lazy
+  /// [`Array`] (no implicit eval).
+  fn forward(&self, x: &Array) -> Result<Array> {
+    use crate::lm::nn::activations;
+    match self {
+      Self::Gelu => activations::gelu(x),
+      Self::GeluApprox => activations::gelu_approx(x),
+      Self::Silu => activations::silu(x),
+    }
+  }
+}
+
 // ───────────────────────────── sanitize ─────────────────────────────
 
-/// Rewrite an HF Wav2Vec2ForCTC checkpoint into the layout this port loads —
-/// the Rust analogue of mlx-audio's `Model.sanitize` ([mms.py:107-128][san],
-/// plus the backbone's `wav2vec2.`-prefix strip from
-/// [wav2vec.py:723][san-bb]). Pure key/axis bookkeeping, no MLX evaluation
+/// Rewrite an HF `*ForCTC` checkpoint (`Wav2Vec2ForCTC` / `HubertForCTC`) into
+/// the layout this port loads — the Rust analogue of mlx-audio's
+/// `Model.sanitize` ([mms.py:107-128][san], plus the backbone's prefix strip
+/// from [wav2vec.py:723][san-bb]). Pure key/axis bookkeeping, no MLX evaluation
 /// beyond the lazy `swapaxes`.
 ///
 /// Rules (applied per `(key, value)`):
-/// 1. Strip a leading `wav2vec2.` backbone prefix (HF nests the encoder under
-///    it while `lm_head` stays top-level).
+/// 1. Strip a leading supported backbone prefix (`wav2vec2.` for
+///    Wav2Vec2ForCTC, `hubert.` for HubertForCTC) — each `*ForCTC` nests the
+///    encoder under its backbone name while `lm_head` stays top-level. A key
+///    carries at most one, so whichever leads is stripped.
 /// 2. `*.conv.weight` and `*.conv.weight_v` / `*.conv.weight_g`:
 ///    `swapaxes(1, 2)` (HF conv weight `(out, in, k)` → MLX channels-last
 ///    `(out, k, in)`).
@@ -527,7 +707,7 @@ impl Wav2Vec2Config {
 /// 6. **Reject a duplicate** destination key with [`Error::KeyCollision`]
 ///    (via [`crate::model_validation::insert_unique`]) rather than silently
 ///    overwriting — e.g. a checkpoint carrying both the prefixed and
-///    unprefixed form of a key (rule 1), or both
+///    unprefixed form of a key (rule 1, e.g. `hubert.<x>` and `<x>`), or both
 ///    `parametrizations.weight.original0` and a legacy `weight_g` (rule 3),
 ///    which would otherwise let an arbitrary (per-run nondeterministic)
 ///    survivor win since the source is a `HashMap`.
@@ -539,11 +719,17 @@ impl Wav2Vec2Config {
 pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array>> {
   let mut out = HashMap::with_capacity(weights.len());
   for (mut k, mut v) in weights {
-    // 1. Backbone prefix: HF Wav2Vec2ForCTC nests the encoder under
-    //    `wav2vec2.` while `lm_head` is top-level. `replacen(.., 1)` only
-    //    touches the leading occurrence.
-    if let Some(stripped) = k.strip_prefix("wav2vec2.") {
-      k = stripped.to_string();
+    // 1. Backbone prefix: each `*ForCTC` nests the encoder under its backbone
+    //    name (`wav2vec2.` for Wav2Vec2ForCTC, `hubert.` for HubertForCTC —
+    //    HuBERT reuses the wav2vec2 encoder) while `lm_head` stays top-level.
+    //    Strip whichever supported prefix leads (a key cannot carry two), so
+    //    the unprefixed `feature_extractor.*` / `encoder.*` keys the builders
+    //    expect are produced regardless of the backbone the checkpoint used.
+    for prefix in SUPPORTED_BACKBONE_PREFIXES {
+      if let Some(stripped) = k.strip_prefix(prefix) {
+        k = stripped.to_string();
+        break;
+      }
     }
 
     // 2 + 3. Conv weight axis swaps and weight-norm parametrization renames.
@@ -567,10 +753,10 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
     // 6. Insert, rejecting a duplicate destination key with a typed error
     //    rather than letting an arbitrary survivor silently overwrite the
     //    other. Two source keys can collide here — e.g. a checkpoint carrying
-    //    both the prefixed `wav2vec2.<x>` and unprefixed `<x>` forms (rule 1),
-    //    or both `parametrizations.weight.original0` and the legacy `weight_g`
-    //    (rule 3) — and the source is a `HashMap`, so the surviving tensor
-    //    would otherwise be per-run nondeterministic.
+    //    both a prefixed `wav2vec2.<x>` / `hubert.<x>` and the unprefixed `<x>`
+    //    form (rule 1), or both `parametrizations.weight.original0` and the
+    //    legacy `weight_g` (rule 3) — and the source is a `HashMap`, so the
+    //    surviving tensor would otherwise be per-run nondeterministic.
     insert_unique(&mut out, k, v, "Wav2Vec2 sanitize")?;
   }
   Ok(out)
@@ -584,11 +770,11 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
 const CTC_BLANK: u32 = 0;
 
 // The greedy decoder hardcodes `CTC_BLANK` while `validate` pins the config's
-// `pad_token_id` to `BASE_960H_PAD_TOKEN_ID`; the two encode the same blank id
-// and must agree. This const assertion makes a future edit to either fail to
-// compile rather than let a pinned-but-unused blank silently drift.
+// `pad_token_id` to `PAD_TOKEN_ID`; the two encode the same blank id and must
+// agree. This const assertion makes a future edit to either fail to compile
+// rather than let a pinned-but-unused blank silently drift.
 #[cfg(feature = "wav2vec2")]
-const _: () = assert!(CTC_BLANK == BASE_960H_PAD_TOKEN_ID as u32);
+const _: () = assert!(CTC_BLANK == PAD_TOKEN_ID as u32);
 
 /// Greedy CTC collapse of a single per-frame argmax sequence — pure Rust over
 /// `&[u32]`, the inner loop of mlx-audio's `Model._ctc_decode`
@@ -641,16 +827,6 @@ pub struct Vocab {
   id_to_token: Vec<Option<String>>,
 }
 
-/// Upper bound on a `vocab.json` token id, gating the `id → token` slot
-/// allocation. The id table is a dense `Vec` indexed by id, so a single
-/// enormous id (e.g. `i64::MAX`) would otherwise drive a multi-exabyte
-/// `vec![None; len]` and abort the process. `base-960h` has 32 ids and the
-/// largest real Wav2Vec2/MMS character vocabularies are a few thousand; this
-/// cap is far above any legitimate vocabulary while still rejecting a hostile
-/// or corrupt id before allocation.
-#[cfg(feature = "wav2vec2")]
-const MAX_VOCAB_ID: i64 = 1 << 20;
-
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
 impl Vocab {
@@ -667,9 +843,11 @@ impl Vocab {
   /// - a **negative** id is rejected ([`Error::OutOfRange`]); a non-empty map
   ///   whose ids are *all* negative is [`Error::MalformedData`] (distinct from
   ///   the legitimately empty `{}` map, which yields an empty [`Vocab`]);
-  /// - an id exceeding the internal `MAX_VOCAB_ID` cap is rejected
-  ///   ([`Error::CapExceeded`]) **before** the `id → token` table is
-  ///   allocated, so an enormous id can never drive an out-of-memory abort;
+  /// - the `id → token` table is a dense `Vec` sized by the largest id, so its
+  ///   one allocation is **fallible**: a within-range id whose slot count
+  ///   exceeds available memory surfaces as [`Error::AllocFailure`] rather than
+  ///   the abort `vec![None; len]` would raise. Bounding a legitimately large
+  ///   vocabulary is the caller's concern, not the library's;
   /// - two distinct tokens claiming the **same** id is rejected
   ///   ([`Error::MalformedData`]); the source is a `HashMap`, so silently
   ///   overwriting one slot would pick an arbitrary (per-run nondeterministic)
@@ -696,19 +874,25 @@ impl Vocab {
         "vocab.json has entries but every token id is negative",
       )));
     }
-    // Cap the maximum id BEFORE allocating the dense table so an enormous id
-    // cannot drive a multi-exabyte allocation / OOM abort.
-    if max_id > MAX_VOCAB_ID {
-      return Err(Error::CapExceeded(CapExceededPayload::new(
-        "Vocab::from_json: token id",
-        "MAX_VOCAB_ID",
-        MAX_VOCAB_ID as u64,
-        max_id as u64,
-      )));
-    }
-    // `max_id` is in `0..=MAX_VOCAB_ID`, so `+ 1` fits usize on every target.
-    let len = max_id as usize + 1;
-    let mut id_to_token: Vec<Option<String>> = vec![None; len];
+    // `max_id >= 0` here. Slot count is `max_id + 1`. The dense table is the
+    // only allocation sized from untrusted input, so it is made fallible rather
+    // than capped: an id too large to index a `Vec` on this target, or a slot
+    // count that exhausts memory, surfaces as a typed `AllocFailure` instead of
+    // the abort `vec![None; len]` would raise. (Bounding a legitimately large
+    // vocabulary is the caller's concern.)
+    let len = usize::try_from(max_id)
+      .ok()
+      .and_then(|m| m.checked_add(1))
+      .ok_or_else(|| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          "Vocab::from_json: token id",
+          "must be representable as a Vec index on this target",
+          format_smolstr!("{max_id}"),
+        ))
+      })?;
+    let mut id_to_token: Vec<Option<String>> = Vec::new();
+    reserve_or_error(&mut id_to_token, "id_to_token slots", len)?;
+    id_to_token.resize(len, None);
     for (token, id) in map {
       if id < 0 {
         return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -717,7 +901,7 @@ impl Vocab {
           format_smolstr!("{id}"),
         )));
       }
-      // `0 <= id <= max_id <= MAX_VOCAB_ID`, so the index is in bounds.
+      // `0 <= id <= max_id`, so the index is in bounds.
       let slot = &mut id_to_token[id as usize];
       if slot.is_some() {
         // Two distinct tokens claim the same id. The source is a `HashMap`, so
@@ -801,24 +985,25 @@ fn take(weights: &mut HashMap<String, Array>, key: &str) -> Result<Array> {
 }
 
 /// Assert a checkpoint tensor's shape (rank + every dimension) equals the
-/// `expected` shape the base-960h architecture requires, before it is stored
-/// or fed to any op.
+/// `expected` shape the (validated) config implies, before it is stored or fed
+/// to any op.
 ///
 /// `from_weights` reads each layer's shape from the checkpoint, not from the
 /// config, so a corrupt / hostile tensor that survives the config gate could
 /// otherwise run a *different* graph (a conv weight with a different kernel
 /// axis → a different receptive field) or drive an oversized allocation (an
 /// `lm_head.weight` with a huge output dim → huge logits). Pinning every
-/// consumed tensor to its exact base-960h shape closes that whole dimension:
-/// a mismatch fails fast with a typed error here, before any forward op.
+/// consumed tensor to the shape the config implies closes that whole
+/// dimension: a mismatch fails fast with a typed error here, before any
+/// forward op.
 ///
-/// The expected dims are computed from the (already-`validate`d, hence pinned
-/// to base-960h) [`Wav2Vec2Config`] and are non-negative by construction. The
-/// rank is checked by the length comparison, so this single helper covers both
-/// the rank and the exact-shape requirements. On mismatch returns an
-/// [`Error::ShapePairMismatch`] carrying both full shapes, wrapped in an
-/// [`Error::LayerKeyed`] naming the offending tensor `key` (the dynamic per-
-/// layer key the `&'static` `descriptor` cannot carry).
+/// The expected dims are computed from the (already-`validate`d)
+/// [`Wav2Vec2Config`]'s width / count / conv-stack fields and are non-negative
+/// by construction. The rank is checked by the length comparison, so this
+/// single helper covers both the rank and the exact-shape requirements. On
+/// mismatch returns an [`Error::ShapePairMismatch`] carrying both full shapes,
+/// wrapped in an [`Error::LayerKeyed`] naming the offending tensor `key` (the
+/// dynamic per-layer key the `&'static` `descriptor` cannot carry).
 #[cfg(feature = "wav2vec2")]
 fn expect_shape(
   tensor: &Array,
@@ -867,43 +1052,58 @@ fn take_shaped(
 // ───────────────────────── feature encoder ─────────────────────────
 
 /// A single feature-encoder convolution layer. Conv weight is channels-last
-/// `(out, k, in)` (post-sanitize); `base-960h` convs are bias-free. L0
-/// additionally carries an affine [`GroupNorm`] (`num_groups == dims`,
-/// pytorch-compatible); L1-6 are conv → GELU only.
+/// `(out, k, in)` (post-sanitize); the optional `bias` `(out,)` is present iff
+/// `config.conv_bias`. The L0 `Wav2Vec2GroupNormConvLayer` additionally carries
+/// an affine [`GroupNorm`] (`num_groups == dims`, pytorch-compatible); the
+/// remaining `Wav2Vec2NoLayerNormConvLayer`s are conv → activation only.
 #[cfg(feature = "wav2vec2")]
 struct ConvLayer {
   weight: Array,
+  /// `Some(bias)` iff `config.conv_bias` — `nn.Conv1d(bias=config.conv_bias)`.
+  bias: Option<Array>,
   stride: i32,
-  /// `Some` for L0 (`Wav2Vec2GroupNormConvLayer`), `None` for L1-6
-  /// (`Wav2Vec2NoLayerNormConvLayer`).
+  /// `Some` for L0 (`Wav2Vec2GroupNormConvLayer`), `None` for the
+  /// `Wav2Vec2NoLayerNormConvLayer`s.
   group_norm: Option<GroupNorm>,
+  /// The `feat_extract_activation` (resolved once at build).
+  activation: Activation,
 }
 
 #[cfg(feature = "wav2vec2")]
 impl ConvLayer {
-  /// `conv(x.swapaxes(-2,-1)) → [group_norm] → swapaxes(-2,-1) → gelu`.
+  /// `conv(x.swapaxes(-2,-1)) (+ bias) → [group_norm] → swapaxes(-2,-1) → act`.
   ///
   /// Input/output are `(B, C, L)` (channels-second). MLX conv1d is
   /// channels-last, so the layer transposes to `(B, L, C)` around the conv
   /// (and around the GroupNorm, which normalizes over the last/feature axis),
   /// exactly as the reference's `hidden_states.swapaxes(-2, -1)` bracketing.
+  /// The bias is added in the channels-last `(B, L', C_out)` layout (the
+  /// `(out,)` bias broadcasts over the last axis), before the GroupNorm —
+  /// matching `nn.Conv1d`'s fused bias followed by the layer norm.
   fn forward(&self, x: &Array) -> Result<Array> {
     // (B, C_in, L) → (B, L, C_in)
     let xt = ops::shape::swapaxes(x, -2, -1)?;
     // channels-last conv → (B, L', C_out)
     let mut h = ops::conv::conv1d(&xt, &self.weight, self.stride, 0, 1, 1)?;
+    // `nn.Conv1d(bias=True)` folds the bias into the conv; here it is an
+    // explicit add over the channels-last feature (last) axis.
+    if let Some(bias) = &self.bias {
+      h = h.add(bias)?;
+    }
     // GroupNorm (L0 only) runs in channels-last layout (feature = last axis).
     if let Some(gn) = &self.group_norm {
       h = gn.forward(&h)?;
     }
     // back to (B, C_out, L')
     let h = ops::shape::swapaxes(&h, -2, -1)?;
-    crate::lm::nn::activations::gelu(&h)
+    self.activation.forward(&h)
   }
 }
 
-/// The feature encoder: `input[:, None]` → 7 conv layers → `(B, 512, T')`.
-/// Ports `Wav2Vec2FeatureEncoder` ([wav2vec.py:250-276][fe]).
+/// The feature encoder: `input[:, None]` → `num_feat_extract_layers` conv
+/// layers → `(B, conv_dim[-1], T')`. Ports the `feat_extract_norm == "group"`
+/// arm of `Wav2Vec2FeatureEncoder` ([wav2vec.py:250-276][fe]) — the L0
+/// `Wav2Vec2GroupNormConvLayer` followed by `Wav2Vec2NoLayerNormConvLayer`s.
 ///
 /// [fe]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L250-L276
 #[cfg(feature = "wav2vec2")]
@@ -957,7 +1157,13 @@ impl FeatureProjection {
 /// `except_dim=1` the kernel axis — see [`reconstruct_wn_weight`]). The fused
 /// kernel is **reconstructed once at load**, so the forward pass is a plain
 /// grouped conv. SamePad then crops the single trailing frame produced by the
-/// even (128) kernel, and GELU follows.
+/// even (128) kernel, and the `feat_extract_activation` follows.
+///
+/// HF's `Wav2Vec2PositionalConvEmbedding` applies
+/// `ACT2FN[config.feat_extract_activation]` after the conv + SamePad — the same
+/// activation the feature-encoder convs use — so the activation is resolved
+/// from `feat_extract_activation` (not hardcoded GELU): a checkpoint declaring,
+/// say, `silu` / `gelu_new` runs a consistent graph rather than a hybrid one.
 ///
 /// [pos]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L218-L247
 #[cfg(feature = "wav2vec2")]
@@ -969,6 +1175,10 @@ struct PositionalConvEmbedding {
   padding: i32,
   /// Frames to crop from the end (SamePad): `1` for an even kernel, else `0`.
   num_pad_remove: i32,
+  /// The `feat_extract_activation` (resolved once at build) — HF applies
+  /// `ACT2FN[config.feat_extract_activation]` here, matching the feature
+  /// encoder. Not hardcoded GELU.
+  activation: Activation,
 }
 
 #[cfg(feature = "wav2vec2")]
@@ -1002,7 +1212,9 @@ impl PositionalConvEmbedding {
       stop[1] -= self.num_pad_remove;
       h = ops::indexing::slice(&h, &start, &stop, &strides)?;
     }
-    crate::lm::nn::activations::gelu(&h)
+    // HF applies `ACT2FN[config.feat_extract_activation]` here (the same
+    // activation the feature-encoder convs use), not an unconditional GELU.
+    self.activation.forward(&h)
   }
 }
 
@@ -1044,11 +1256,12 @@ fn reconstruct_wn_weight(weight_g: &Array, weight_v: &Array) -> Result<Array> {
 
 /// Multi-head self-attention (`Wav2Vec2Attention`, [wav2vec.py:293-393][att]).
 ///
-/// `q/k/v/out` are biased `Linear(768, 768)`. The query is **pre-scaled** by
-/// `head_dim**-0.5` and SDPA is then called with `scale = 1.0` (matching the
+/// `q/k/v/out` are biased `Linear(hidden, hidden)`. The query is **pre-scaled**
+/// by `head_dim**-0.5` and SDPA is then called with `scale = 1.0` (matching the
 /// reference's `query_states = self.q_proj(h) * self.scaling` followed by
-/// `scaled_dot_product_attention(..., scale=1.0)`). `base-960h` runs with no
-/// attention mask.
+/// `scaled_dot_product_attention(..., scale=1.0)`). The CTC inherent path runs
+/// the encoder over a single (un-padded) utterance, so no attention mask is
+/// applied.
 ///
 /// [att]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L293-L393
 #[cfg(feature = "wav2vec2")]
@@ -1075,9 +1288,14 @@ impl Attention {
     let bsz = dim_i32(&shape, 0, "Attention: batch")?;
     let tgt_len = dim_i32(&shape, 1, "Attention: seq")?;
 
-    // q pre-scaled by head_dim**-0.5; SDPA scale is then 1.0.
+    // q pre-scaled by head_dim**-0.5; SDPA scale is then 1.0. The scale
+    // constant is cast to q's dtype (mirroring the activation helpers'
+    // dtype-matched scalars) so an F16/BF16 checkpoint keeps F16/BF16 through
+    // attention — a bare F32 scalar would promote half-precision q to F32 under
+    // MLX type promotion, breaking mixed-precision numerics and inflating
+    // memory / the KV-cache.
     let q = linear(hidden_states, &self.q_weight, Some(&self.q_bias))?;
-    let scale = scalar_f32(self.scaling)?;
+    let scale = scalar_like(self.scaling, &q)?;
     let q = q.multiply(&scale)?;
     let k = linear(hidden_states, &self.k_weight, Some(&self.k_bias))?;
     let v = linear(hidden_states, &self.v_weight, Some(&self.v_bias))?;
@@ -1111,8 +1329,9 @@ impl Attention {
 
 // ───────────────────────── feed-forward ─────────────────────────
 
-/// `Linear(768 → 3072) → GELU → Linear(3072 → 768)`
-/// (`Wav2Vec2FeedForward`, [wav2vec.py:396-417][ff]).
+/// `Linear(hidden → intermediate) → act → Linear(intermediate → hidden)`
+/// (`Wav2Vec2FeedForward`, [wav2vec.py:396-417][ff]), where `act` is the
+/// resolved `hidden_act`.
 ///
 /// [ff]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L396-L417
 #[cfg(feature = "wav2vec2")]
@@ -1121,6 +1340,8 @@ struct FeedForward {
   intermediate_bias: Array,
   output_weight: Array,
   output_bias: Array,
+  /// The `hidden_act` (resolved once at build).
+  activation: Activation,
 }
 
 #[cfg(feature = "wav2vec2")]
@@ -1131,18 +1352,16 @@ impl FeedForward {
       &self.intermediate_weight,
       Some(&self.intermediate_bias),
     )?;
-    let h = crate::lm::nn::activations::gelu(&h)?;
+    let h = self.activation.forward(&h)?;
     linear(&h, &self.output_weight, Some(&self.output_bias))
   }
 }
 
 // ───────────────────────── encoder layer ─────────────────────────
 
-/// A post-norm transformer encoder layer (`Wav2Vec2EncoderLayer`,
-/// [wav2vec.py:436-465][el]):
-/// `h = h + attn(h); h = layer_norm(h); h = h + ff(h); h = final_layer_norm(h)`.
-///
-/// [el]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L436-L465
+/// The per-layer transformer block, common to both encoder arms (their weights
+/// are identical; only the block ordering and the encoder-level `LayerNorm`
+/// placement differ — see [`EncoderLayer::forward`] / [`EncoderLayer::forward_stable`]).
 #[cfg(feature = "wav2vec2")]
 struct EncoderLayer {
   attention: Attention,
@@ -1153,6 +1372,11 @@ struct EncoderLayer {
 
 #[cfg(feature = "wav2vec2")]
 impl EncoderLayer {
+  /// **Post-norm** ordering (`Wav2Vec2EncoderLayer`, [wav2vec.py:453-465][el]):
+  /// `h = layer_norm(h_in + attn(h_in)); h = final_layer_norm(h + ff(h))` — the
+  /// LayerNorms follow the residual adds.
+  ///
+  /// [el]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L453-L465
   fn forward(&self, hidden_states: &Array) -> Result<Array> {
     let attn = self.attention.forward(hidden_states)?;
     let h = hidden_states.add(&attn)?;
@@ -1161,17 +1385,54 @@ impl EncoderLayer {
     let h = h.add(&ff)?;
     self.final_layer_norm.forward(&h)
   }
+
+  /// **Stable-layer-norm** (pre-norm) ordering
+  /// (`Wav2Vec2EncoderLayerStableLayerNorm`, [wav2vec.py:489-508][sel]):
+  /// `h = h_in + attn(layer_norm(h_in)); h = h + ff(final_layer_norm(h))` — the
+  /// LayerNorms precede their sub-layers, inside the residual.
+  ///
+  /// [sel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L489-L508
+  fn forward_stable(&self, hidden_states: &Array) -> Result<Array> {
+    let normed = self.layer_norm.forward(hidden_states)?;
+    let attn = self.attention.forward(&normed)?;
+    let h = hidden_states.add(&attn)?;
+    let ff = self
+      .feed_forward
+      .forward(&self.final_layer_norm.forward(&h)?)?;
+    h.add(&ff)
+  }
 }
 
 // ───────────────────────── encoder ─────────────────────────
 
-/// The transformer encoder (`Wav2Vec2Encoder`, non-stable arm,
-/// [wav2vec.py:511-574][enc]): positional conv embedding added to the hidden
-/// states, a `LayerNorm`, then the stack of [`EncoderLayer`]s.
+/// The transformer encoder. Mirrors mlx-audio's two distinct encoder classes —
+/// the post-norm `Wav2Vec2Encoder` ([wav2vec.py:511-574][enc]) and the pre-norm
+/// `Wav2Vec2EncoderStableLayerNorm` ([wav2vec.py:577-644][senc]) — as two arms
+/// selected by `config.do_stable_layer_norm` (`Wav2Vec2Model.__init__`,
+/// [wav2vec.py:663-666][sel]).
+///
+/// Both arms add the positional conv embedding to the hidden states and run the
+/// same stack of [`EncoderLayer`]s; they differ in **where the encoder-level
+/// `LayerNorm` sits** and in the per-layer block ordering:
+/// - [`Encoder::PostNorm`]: `LayerNorm` is applied **before** the layer stack,
+///   and each layer uses [`EncoderLayer::forward`] (post-norm);
+/// - [`Encoder::StableLayerNorm`]: `LayerNorm` is applied **after** the layer
+///   stack, and each layer uses [`EncoderLayer::forward_stable`] (pre-norm).
 ///
 /// [enc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L511-L574
+/// [senc]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L577-L644
+/// [sel]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/wav2vec/wav2vec.py#L663-L666
 #[cfg(feature = "wav2vec2")]
-struct Encoder {
+enum Encoder {
+  /// `do_stable_layer_norm == false` — `Wav2Vec2Encoder`.
+  PostNorm(EncoderInner),
+  /// `do_stable_layer_norm == true` — `Wav2Vec2EncoderStableLayerNorm`.
+  StableLayerNorm(EncoderInner),
+}
+
+/// The fields shared by both encoder arms (their weight layout is identical).
+#[cfg(feature = "wav2vec2")]
+struct EncoderInner {
   pos_conv_embed: PositionalConvEmbedding,
   layer_norm: LayerNorm,
   layers: Vec<EncoderLayer>,
@@ -1180,19 +1441,35 @@ struct Encoder {
 #[cfg(feature = "wav2vec2")]
 impl Encoder {
   fn forward(&self, hidden_states: &Array) -> Result<Array> {
-    let pos = self.pos_conv_embed.forward(hidden_states)?;
-    let mut h = hidden_states.add(&pos)?;
-    h = self.layer_norm.forward(&h)?;
-    for layer in &self.layers {
-      h = layer.forward(&h)?;
+    match self {
+      // Post-norm (`Wav2Vec2Encoder.__call__`): pos-embed add → LayerNorm →
+      // layer stack. The encoder LayerNorm runs BEFORE the layers.
+      Self::PostNorm(inner) => {
+        let pos = inner.pos_conv_embed.forward(hidden_states)?;
+        let mut h = hidden_states.add(&pos)?;
+        h = inner.layer_norm.forward(&h)?;
+        for layer in &inner.layers {
+          h = layer.forward(&h)?;
+        }
+        Ok(h)
+      }
+      // Stable-LN (`Wav2Vec2EncoderStableLayerNorm.__call__`): pos-embed add →
+      // layer stack → LayerNorm. The encoder LayerNorm runs AFTER the layers.
+      Self::StableLayerNorm(inner) => {
+        let pos = inner.pos_conv_embed.forward(hidden_states)?;
+        let mut h = hidden_states.add(&pos)?;
+        for layer in &inner.layers {
+          h = layer.forward_stable(&h)?;
+        }
+        inner.layer_norm.forward(&h)
+      }
     }
-    Ok(h)
   }
 }
 
 // ───────────────────────── model ─────────────────────────
 
-/// Wav2Vec2 CTC speech recognizer (`facebook/wav2vec2-base-960h`).
+/// Wav2Vec2 CTC speech recognizer (the `wav2vec2` / `hubert` CTC family).
 ///
 /// See the [module docs](self) for the architecture and public API.
 #[cfg(feature = "wav2vec2")]
@@ -1254,27 +1531,28 @@ impl Wav2Vec2Ctc {
   /// map (run [`sanitize`] first), and an optional [`Vocab`] (for
   /// [`Wav2Vec2Ctc::transcribe`]).
   ///
-  /// Only the `feat_extract_norm == "group"` / `do_stable_layer_norm == false`
-  /// arm (i.e. `base-960h`) is supported; any other config is rejected.
-  /// Every weight key the architecture needs must be present, else
-  /// [`Error::MissingKey`].
+  /// The config is gated by [`Wav2Vec2Config::validate`] first (so an
+  /// unsupported scheme / out-of-scope adapter / malformed dimension is
+  /// rejected before any tensor is built); then the matching encoder arm
+  /// (post-norm or stable-layer-norm) is wired from the family's width / count
+  /// / conv-stack fields. Every weight key the architecture needs must be
+  /// present, else [`Error::MissingKey`].
   ///
-  /// Beyond the config gate, **every consumed tensor's shape is pinned to its
-  /// exact base-960h dimensions** before it is stored or
-  /// fed to any op: a corrupt or hostile checkpoint that passes config
-  /// validation but carries a wrong-shaped tensor — a conv weight with a
-  /// different kernel axis (a different receptive field), or an `lm_head.weight`
-  /// with a huge output dim (a huge-logits allocation) — is rejected here with a
-  /// typed [`Error::ShapePairMismatch`] (wrapped in [`Error::LayerKeyed`] naming
-  /// the tensor), before any forward pass.
+  /// Beyond the config gate, **every consumed tensor's shape is pinned to the
+  /// dimensions the validated config implies** before it is stored or fed to
+  /// any op: a checkpoint that passes config validation but carries a
+  /// wrong-shaped tensor — a conv weight with a different kernel axis
+  /// (a different receptive field), or an `lm_head.weight` with a huge output
+  /// dim (a huge-logits allocation) — is rejected here with a typed
+  /// [`Error::ShapePairMismatch`] (wrapped in [`Error::LayerKeyed`] naming the
+  /// tensor), before any forward pass.
   pub fn from_weights(
     config: Wav2Vec2Config,
     mut weights: HashMap<String, Array>,
     vocab: Vocab,
   ) -> Result<Self> {
-    // Single config-validation gate: reject any unsupported architecture arm
-    // (non-"group" feat_extract_norm, or the pre-norm stable-layer-norm arm)
-    // BEFORE any tensor is built.
+    // Single config-validation gate: reject any unsupported / out-of-scope arm
+    // and any malformed dimension BEFORE any tensor is built.
     config.validate()?;
 
     let feature_encoder = build_feature_encoder(&config, &mut weights)?;
@@ -1349,11 +1627,11 @@ impl Wav2Vec2Ctc {
 
   /// Transcribe a raw 16 kHz mono waveform to text.
   ///
-  /// Mirrors mlx-audio's `Model.generate` for `base-960h`: zero-mean /
-  /// unit-variance normalize the waveform (`(x - mean) / sqrt(var + 1e-7)`,
-  /// HF's `zero_mean_unit_var_norm`), forward to logits, greedy CTC collapse,
-  /// then map the token ids through the vocabulary. Requires the model to have
-  /// been built with a non-empty [`Vocab`]; otherwise returns an error.
+  /// Mirrors mlx-audio's `Model.generate`: zero-mean / unit-variance normalize
+  /// the waveform (`(x - mean) / sqrt(var + 1e-7)`, HF's
+  /// `zero_mean_unit_var_norm`), forward to logits, greedy CTC collapse, then
+  /// map the token ids through the vocabulary. Requires the model to have been
+  /// built with a non-empty [`Vocab`]; otherwise returns an error.
   ///
   /// `waveform` is `(T,)` or `(B, T)`; only the first batch element's
   /// transcript is returned (matching the reference's `decoded[0]`).
@@ -1399,9 +1677,9 @@ impl Wav2Vec2Ctc {
   /// the model still loads and [`Wav2Vec2Ctc::forward`] works, but
   /// `transcribe` then errors.
   ///
-  /// Only the single-file `model.safetensors` layout (the `base-960h`
-  /// checkpoint) is handled here; sharded checkpoints are not (a missing file
-  /// is a clear [`Error::MissingKey`]).
+  /// Only the single-file `model.safetensors` layout is handled here; sharded
+  /// checkpoints are out of scope (a missing file is a clear
+  /// [`Error::MissingKey`]).
   pub fn load(path: &str) -> Result<Self> {
     let dir = crate::audio::load::get_model_path(path)?;
     let config_json = crate::audio::load::load_config(&dir)?;
@@ -1437,9 +1715,9 @@ impl Wav2Vec2Ctc {
 
 /// Zero-mean / unit-variance waveform normalization, HF's
 /// `zero_mean_unit_var_norm`: `(x - mean(x, -1)) / sqrt(var(x, -1) + 1e-7)`
-/// (the `sqrt(var + eps)` form, not mms.py's `std + eps`, per the `base-960h`
-/// feature extractor). Operates per row over the last axis. Promotes a `(T,)`
-/// input to `(1, T)` first.
+/// (the `sqrt(var + eps)` form HF's feature extractor uses, not mms.py's
+/// `std + eps`). Operates per row over the last axis. Promotes a `(T,)` input
+/// to `(1, T)` first.
 #[cfg(feature = "wav2vec2")]
 fn normalize_waveform(waveform: &Array) -> Result<Array> {
   let x = match waveform.ndim() {
@@ -1448,7 +1726,10 @@ fn normalize_waveform(waveform: &Array) -> Result<Array> {
   };
   let mean = ops::reduction::mean_axes(&x, &[-1], true)?;
   let var = ops::reduction::var_axes(&x, &[-1], true, 0)?;
-  let eps = scalar_f32(1e-7)?;
+  // Cast the eps to the waveform's dtype so a half-precision input is not
+  // silently promoted to F32 here (a bare F32 scalar would, under MLX type
+  // promotion); the reference's `var + 1e-7` keeps the operand dtype.
+  let eps = scalar_like(1e-7, &var)?;
   let denom = var.add(&eps)?.sqrt()?;
   let centered = x.subtract(&mean)?;
   centered.divide(&denom)
@@ -1456,13 +1737,20 @@ fn normalize_waveform(waveform: &Array) -> Result<Array> {
 
 // ───────────────────────── builders ─────────────────────────
 
-/// Read `feature_extractor.conv_layers.{i}.*` into the 7-layer
-/// [`FeatureEncoder`].
+/// Read `feature_extractor.conv_layers.{i}.*` into the
+/// `num_feat_extract_layers`-layer [`FeatureEncoder`] (the `"group"` arm: an L0
+/// `Wav2Vec2GroupNormConvLayer` then `Wav2Vec2NoLayerNormConvLayer`s). Each
+/// layer carries the resolved `feat_extract_activation` and, when
+/// `config.conv_bias`, its `conv.bias`.
 #[cfg(feature = "wav2vec2")]
 fn build_feature_encoder(
   config: &Wav2Vec2Config,
   weights: &mut HashMap<String, Array>,
 ) -> Result<FeatureEncoder> {
+  // `validate` (run by `from_weights` before any builder) already pinned
+  // `num_feat_extract_layers` positive and the conv arrays to exactly that
+  // length with positive entries; re-derive the count and re-check the arrays
+  // cover `n` here defensively (the builder must never index past the end).
   let n = config.num_feat_extract_layers;
   if n <= 0 {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -1486,7 +1774,12 @@ fn build_feature_encoder(
         .min(config.conv_kernel.len()),
     )));
   }
-  let mut conv_layers = Vec::with_capacity(n_usize);
+  let activation = Activation::resolve(
+    &config.feat_extract_activation,
+    "Wav2Vec2Config: feat_extract_activation",
+  )?;
+  let mut conv_layers = Vec::new();
+  reserve_or_error(&mut conv_layers, "feature-encoder conv layers", n_usize)?;
   for i in 0..n_usize {
     let prefix = format!("feature_extractor.conv_layers.{i}");
     // Post-sanitize channels-last conv weight is (out, k, in): out = conv_dim[i],
@@ -1499,9 +1792,21 @@ fn build_feature_encoder(
       "feature-encoder conv weight (out, k, in)",
       &[config.conv_dim[i], config.conv_kernel[i], in_ch],
     )?;
+    // `nn.Conv1d(bias=config.conv_bias)`: the bias `(out,)` exists iff
+    // `conv_bias`. Pin its shape to the conv output width.
+    let bias = if config.conv_bias {
+      Some(take_shaped(
+        weights,
+        &format!("{prefix}.conv.bias"),
+        "feature-encoder conv bias (conv_dim[i])",
+        &[config.conv_dim[i]],
+      )?)
+    } else {
+      None
+    };
     let stride = config.conv_stride[i];
     // L0 carries an affine pytorch-compatible GroupNorm with
-    // num_groups == dims == conv_dim[0]; L1-6 have no norm.
+    // num_groups == dims == conv_dim[0]; the rest have no norm.
     let group_norm = if i == 0 {
       let dims = config.conv_dim[0];
       let gn_weight = take_shaped(
@@ -1528,8 +1833,10 @@ fn build_feature_encoder(
     };
     conv_layers.push(ConvLayer {
       weight,
+      bias,
       stride,
       group_norm,
+      activation,
     });
   }
   Ok(FeatureEncoder { conv_layers })
@@ -1619,12 +1926,21 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
     "positional conv bias (hidden_size)",
     &[config.hidden_size],
   )?;
+  // HF's Wav2Vec2PositionalConvEmbedding applies
+  // `ACT2FN[config.feat_extract_activation]` — the same activation the feature
+  // encoder uses (resolved by the same dispatch ConvLayer/FeedForward use), not
+  // a hardcoded GELU.
+  let pos_activation = Activation::resolve(
+    &config.feat_extract_activation,
+    "Wav2Vec2Config: feat_extract_activation",
+  )?;
   let pos_conv_embed = PositionalConvEmbedding {
     weight: pos_weight,
     bias: pos_bias,
     groups: config.num_conv_pos_embedding_groups,
     padding: kernel / 2,
     num_pad_remove: if kernel % 2 == 0 { 1 } else { 0 },
+    activation: pos_activation,
   };
 
   let ln_weight = take_shaped(
@@ -1651,7 +1967,8 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
   }
   let head_dim = config.head_dim()?;
   let scaling = (head_dim as f32).powf(-0.5);
-  // Per-layer expected shapes (all base-960h, pinned by `validate`): every
+  let activation = Activation::resolve(&config.hidden_act, "Wav2Vec2Config: hidden_act")?;
+  // Per-layer expected shapes (derived from the validated config): every
   // attention projection is a square (hidden_size, hidden_size) Linear with a
   // (hidden_size,) bias; the LayerNorms are (hidden_size,); the feed-forward is
   // (intermediate_size, hidden_size) + (hidden_size, intermediate_size) Linears
@@ -1659,7 +1976,8 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
   let hs = config.hidden_size;
   let inter = config.intermediate_size;
   let attn_proj = [hs, hs];
-  let mut layers = Vec::with_capacity(num_layers as usize);
+  let mut layers = Vec::new();
+  reserve_or_error(&mut layers, "encoder layers", num_layers as usize)?;
   for i in 0..num_layers {
     let prefix = format!("encoder.layers.{i}");
     let attention = Attention {
@@ -1753,6 +2071,7 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
         "feed_forward output bias (hidden_size)",
         &[hs],
       )?,
+      activation,
     };
     let fln_weight = take_shaped(
       weights,
@@ -1775,10 +2094,19 @@ fn build_encoder(config: &Wav2Vec2Config, weights: &mut HashMap<String, Array>) 
     });
   }
 
-  Ok(Encoder {
+  // Select the encoder arm by `do_stable_layer_norm` (the reference's
+  // `Wav2Vec2Model.__init__` choice between `Wav2Vec2Encoder` and
+  // `Wav2Vec2EncoderStableLayerNorm`). The weights are identical; only the
+  // forward ordering / encoder-LayerNorm placement differ.
+  let inner = EncoderInner {
     pos_conv_embed,
     layer_norm,
     layers,
+  };
+  Ok(if config.do_stable_layer_norm {
+    Encoder::StableLayerNorm(inner)
+  } else {
+    Encoder::PostNorm(inner)
   })
 }
 
@@ -1804,12 +2132,19 @@ fn dim_i32(shape: &[usize], axis: usize, context: &'static str) -> Result<i32> {
   })
 }
 
-/// Build a rank-0 `f32` scalar Array of `value` (for broadcasting against a
-/// lazy `Array`). Rank-0 so it NumPy-broadcasts against any rank without
-/// lifting the operand.
+/// Build a rank-0 constant of `value`, cast to `like`'s dtype — the
+/// dtype-preserving scalar the activation helpers in
+/// [`crate::lm::nn::activations`] use.
+///
+/// A scale / constant built as a bare F32 promotes an F16/BF16 operand to F32
+/// under MLX type promotion; casting it to the operand dtype first keeps a
+/// half-precision activation half-precision (preserving the checkpoint's
+/// mixed-precision numerics and not inflating memory). Rank-0 (empty shape) so
+/// it NumPy-broadcasts against any operand rank without lifting it.
 #[cfg(feature = "wav2vec2")]
-fn scalar_f32(value: f32) -> Result<Array> {
-  Array::full::<f32>(&[0i32; 0], value)
+fn scalar_like(value: f32, like: &Array) -> Result<Array> {
+  let dtype = like.dtype()?;
+  ops::misc::astype(&Array::full::<f32>(&[0i32; 0], value)?, dtype)
 }
 
 #[cfg(all(test, feature = "wav2vec2"))]
