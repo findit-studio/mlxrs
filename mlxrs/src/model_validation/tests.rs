@@ -479,3 +479,78 @@ fn take_if_rejects_required_absent_and_forbidden_present() {
   }
   assert!(m.is_empty());
 }
+
+// ──────────────────────────── 7. resource extents ──────────────────────────
+
+#[test]
+fn extent_caps_at_construction() {
+  assert_eq!(Extent::new("dim", 768, 1 << 20).unwrap().get(), 768);
+  // Exact cap boundary is accepted.
+  assert_eq!(Extent::new("dim", 1024, 1024).unwrap().get(), 1024);
+  match Extent::new("dim", 1025, 1024).unwrap_err() {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap(), 1024);
+      assert_eq!(p.observed(), 1025);
+    }
+    other => panic!("expected CapExceeded, got {other:?}"),
+  }
+}
+
+#[test]
+fn elem_count_products_and_bounds() {
+  let d = |v| Extent::new("d", v, usize::MAX).unwrap();
+  // Empty product is 1.
+  assert_eq!(elem_count("buf", &[], 1).unwrap(), 1);
+  // Product within the total cap.
+  assert_eq!(elem_count("buf", &[d(3), d(4), d(5)], 64).unwrap(), 60);
+  // Product over the total cap → CapExceeded (each per-axis dim would pass; the
+  // product is the quantity per-axis caps do not bound).
+  match elem_count("buf", &[d(8), d(8)], 32).unwrap_err() {
+    Error::CapExceeded(p) => {
+      assert_eq!(p.cap(), 32);
+      assert_eq!(p.observed(), 64);
+    }
+    other => panic!("expected CapExceeded, got {other:?}"),
+  }
+}
+
+#[test]
+fn elem_count_rejects_overflow_before_cap() {
+  // Two extents whose product overflows usize: each is within its (usize::MAX)
+  // cap, but the product wraps — the checked product reports overflow rather
+  // than comparing a meaningless wrapped value against the cap.
+  let huge = Extent::new("a", usize::MAX, usize::MAX).unwrap();
+  let two = Extent::new("b", 2, usize::MAX).unwrap();
+  match elem_count("buf", &[huge, two], usize::MAX).unwrap_err() {
+    Error::ArithmeticOverflow(_) => {}
+    other => panic!("expected ArithmeticOverflow, got {other:?}"),
+  }
+}
+
+#[test]
+fn alloc_filled_fills_and_handles_zero() {
+  assert_eq!(alloc_filled("buf", 7u8, 3).unwrap(), vec![7u8, 7, 7]);
+  assert!(alloc_filled::<u32>("buf", 0, 0).unwrap().is_empty());
+  let v = alloc_filled("buf", 1i32, 5).unwrap();
+  assert_eq!(v.len(), 5);
+  assert!(v.iter().all(|&x| x == 1));
+}
+
+#[test]
+fn alloc_filled_never_invokes_clone_for_a_copy_type() {
+  // `Copy` does not force a canonical `Clone`: a `Copy` type may carry a manual
+  // `Clone` with arbitrary code. `alloc_filled` fills via `resize_with` (a
+  // `Copy` of the value), never `Clone::clone`, so the hostile clone below is
+  // never called even for n > 1 — proving the no-user-code fill contract.
+  #[derive(Copy)]
+  struct Hostile(u8);
+  #[allow(clippy::non_canonical_clone_impl)]
+  impl Clone for Hostile {
+    fn clone(&self) -> Self {
+      panic!("alloc_filled must never call Clone::clone");
+    }
+  }
+  let v = alloc_filled("hostile", Hostile(7), 4).unwrap();
+  assert_eq!(v.len(), 4);
+  assert!(v.iter().all(|h| h.0 == 7));
+}

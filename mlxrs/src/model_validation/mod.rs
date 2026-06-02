@@ -31,6 +31,10 @@
 //! 5. **Key collision** — [`insert_unique`] for sanitize / weight-key maps.
 //! 6. **Config-gated optional weight** — [`require_if_present`] /
 //!    [`take_if`].
+//! 7. **Resource extents** — [`Extent`] / [`elem_count`] / [`alloc_filled`]:
+//!    lift the bounds / arithmetic / alloc helpers into types so an unbounded
+//!    product or an infallible model-buffer allocation is *unwritable* rather
+//!    than caught per call site.
 //!
 //! Every helper returns `Result<()>` or `Result<T>` with a typed
 //! [`crate::error`] variant that names the offending field. None panics; the
@@ -668,6 +672,133 @@ pub fn take_if<V>(
       flag_name, key,
     ))),
   }
+}
+
+// ════════════════════════════ 7. resource extents ══════════════════════════
+//
+// The bounds / arithmetic / alloc helpers above are correct but applied
+// MANUALLY at each call site, so every new buffer / product / entry point is a
+// fresh chance to forget one. These types lift them into the type system: a
+// config stores `Extent`s (a dimension cannot exceed its cap because the only
+// constructor enforces it), a buffer is sized only through `elem_count` (a
+// checked product against a total-element cap — the quantity per-axis caps
+// miss), and a model-sized buffer is allocated only through `alloc_filled`
+// (always fallible). The unsafe path — an unbounded product, an infallible
+// `vec![_; n]`, a runtime dimension exceeding the loaded config — becomes
+// unwritable rather than caught.
+
+/// A validated dimension: a size capped **at construction**, so an over-cap
+/// dimension cannot exist in a built config.
+///
+/// [`Extent::new`] is the only constructor and it enforces the cap, so a stored
+/// `Extent` is itself proof that its value is within bounds — a config that
+/// holds `Extent`s (rather than bare `usize`) cannot represent an oversized
+/// dimension, and the per-axis bound no longer depends on remembering to call a
+/// guard at each use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Extent(usize);
+
+impl Extent {
+  /// Construct an `Extent`, enforcing `value <= cap`. Returns
+  /// [`Error::CapExceeded`] (naming `field`) otherwise.
+  ///
+  /// The cap is a **magnitude** bound only; pair with [`require_positive`] /
+  /// [`require_cardinality`] where a dimension must additionally be non-zero.
+  ///
+  /// ```
+  /// use mlxrs::model_validation::Extent;
+  /// assert_eq!(Extent::new("hidden", 768, 1 << 20).unwrap().get(), 768);
+  /// assert!(Extent::new("hidden", 1 << 21, 1 << 20).is_err());
+  /// ```
+  pub fn new(field: &'static str, value: usize, cap: usize) -> Result<Self> {
+    if value > cap {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        field,
+        field,
+        cap as u64,
+        value as u64,
+      )));
+    }
+    Ok(Self(value))
+  }
+
+  /// The validated dimension.
+  #[inline(always)]
+  pub const fn get(self) -> usize {
+    self.0
+  }
+}
+
+/// The only buffer-sizing path: the checked product of `dims` against a total
+/// element cap `total_cap`. Returns a count proven both overflow-free and
+/// `<= total_cap`.
+///
+/// Each [`Extent`] is already individually capped; this bounds the **product** —
+/// the quantity that actually sizes the buffer and that per-axis caps do not
+/// constrain (e.g. a `4096 x 4096` grid, each axis within a per-axis cap, still
+/// sizes a 16M-element buffer). Returns [`Error::ArithmeticOverflow`] if the
+/// running product overflows `usize`, or [`Error::CapExceeded`] (naming `field`)
+/// if it exceeds `total_cap`. An empty `dims` is the empty product `1`.
+///
+/// ```
+/// use mlxrs::model_validation::{Extent, elem_count};
+/// let dims = [Extent::new("h", 4, 16).unwrap(), Extent::new("w", 4, 16).unwrap()];
+/// assert_eq!(elem_count("buf", &dims, 64).unwrap(), 16);
+/// assert!(elem_count("buf", &dims, 8).is_err()); // product 16 > cap 8
+/// ```
+pub fn elem_count(field: &'static str, dims: &[Extent], total_cap: usize) -> Result<usize> {
+  let mut product: usize = 1;
+  for d in dims {
+    product = product.checked_mul(d.get()).ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        field,
+        "usize",
+        [("running_product", product as u64), ("dim", d.get() as u64)],
+      ))
+    })?;
+  }
+  if product > total_cap {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      field,
+      field,
+      total_cap as u64,
+      product as u64,
+    )));
+  }
+  Ok(product)
+}
+
+/// The only model-buffer allocator: fallibly allocate a `Vec<T>` of `n` copies
+/// of `value`, turning an allocator failure into a typed [`Error::AllocFailure`]
+/// (via [`reserve_or_error`]) instead of the abort a bare `vec![value; n]` /
+/// `Vec::with_capacity(n)` would raise.
+///
+/// `n` is expected to come from [`elem_count`] (a bounded count); a bare
+/// `vec![_; n]` for a model-sized buffer is the banned idiom this replaces. The
+/// reservation is exact, so the fill cannot reallocate.
+///
+/// `T: Copy` **plus a `resize_with(n, || value)` fill** is deliberate: the fill
+/// must run **no user code** that could itself panic or heap-allocate outside
+/// [`reserve_or_error`]. `Copy` alone is not enough — a `Copy` type may still
+/// carry a hostile manual `Clone`, and a `Clone`-based `Vec::resize` would call
+/// it — so each element is produced by **copying** `value` through the closure,
+/// never invoking `Clone`. The model buffers this sizes (`u8` / `f32` / `i32`
+/// host scratch) are all `Copy`.
+///
+/// ```
+/// use mlxrs::model_validation::alloc_filled;
+/// assert_eq!(alloc_filled("buf", 0u8, 4).unwrap(), vec![0u8; 4]);
+/// assert!(alloc_filled::<u8>("buf", 0, 0).unwrap().is_empty());
+/// ```
+pub fn alloc_filled<T: Copy>(field: &'static str, value: T, n: usize) -> Result<Vec<T>> {
+  let mut buf: Vec<T> = Vec::new();
+  reserve_or_error(&mut buf, field, n)?;
+  // `resize_with` produces each element from the closure (a `Copy` of `value`),
+  // never calling `Clone::clone` — so even a `Copy` type with a hostile manual
+  // `Clone` impl cannot run arbitrary code here. The reservation above is the
+  // only allocation; the fill stays within the reserved (exact) capacity.
+  buf.resize_with(n, || value);
+  Ok(buf)
 }
 
 #[cfg(test)]
