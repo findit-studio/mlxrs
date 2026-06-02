@@ -1,5 +1,5 @@
 use super::*;
-use crate::Dtype;
+use crate::{Dtype, Error};
 
 fn to_vec(a: &Array) -> Vec<f32> {
   a.try_clone().unwrap().to_vec::<f32>().unwrap()
@@ -62,6 +62,269 @@ fn embedding_as_linear_weight_tied() {
   let x = arr(&[1.0, 1.0], &[1, 2]);
   let y = to_vec(&emb.as_linear(&x).unwrap());
   assert_eq!(y, vec![3.0, 7.0, 11.0]);
+}
+
+// ---- QuantizedEmbedding construction validation ---------------------
+
+/// The affine group size the quantized-embedding fixtures use — a valid mlx
+/// group size (`mlx/ops.cpp:4740`) that divides the fixture's `n_state`.
+const EMB_QGROUP: i32 = 64;
+/// 8-bit affine — the `whisper-large-v3-turbo-8bit` embedding scheme.
+const EMB_QBITS: i32 = 8;
+
+/// A real affine `(packed uint32 weight, scales, biases)` embedding triple of
+/// shape `(n_vocab, n_state)`, produced by the actual `ops::quantized::quantize`
+/// — the exact on-disk layout an mlx-community quantized checkpoint ships for a
+/// quantized `nn.Embedding`. `n_state` must be a whole multiple of `EMB_QGROUP`.
+fn affine_embedding_triple(n_vocab: usize, n_state: usize) -> (Array, Array, Array) {
+  let mut data = Vec::with_capacity(n_vocab * n_state);
+  for v in 0..n_vocab {
+    for s in 0..n_state {
+      data.push(((v * 5 + s) as f32) * 0.001);
+    }
+  }
+  let dense = Array::from_slice::<f32>(&data, &(n_vocab, n_state)).unwrap();
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, EMB_QGROUP, EMB_QBITS, "affine", None).unwrap();
+  (
+    w_q,
+    scales,
+    biases.expect("affine produces per-group biases"),
+  )
+}
+
+/// A well-formed affine quantized embedding constructs (the positive boundary
+/// for the new validation: a correct triple is NOT rejected) and runs both the
+/// gather forward and the weight-tied `as_linear` projection to finite values.
+#[test]
+fn quantized_embedding_accepts_valid_affine_triple() {
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let emb = Embedding::quantized(w_q, scales, Some(biases), EMB_QGROUP, EMB_QBITS, "affine")
+    .expect("a well-formed affine quantized embedding must construct");
+  assert!(emb.is_quantized());
+  // forward (dequantize-gather) and as_linear (quantized_matmul) both run.
+  let ids = Array::from_slice::<i32>(&[0, 3], &[2]).unwrap();
+  let rows = emb.forward(&ids).unwrap();
+  assert_eq!(rows.shape(), vec![2, EMB_QGROUP as usize]);
+  for v in to_vec(&rows) {
+    assert!(v.is_finite(), "dequantized embedding row non-finite: {v}");
+  }
+  let x = Array::ones::<f32>(&(1usize, EMB_QGROUP as usize)).unwrap();
+  let logits = emb.as_linear(&x).unwrap();
+  assert_eq!(logits.shape(), vec![1, 8]);
+  for v in to_vec(&logits) {
+    assert!(v.is_finite(), "quantized logit non-finite: {v}");
+  }
+}
+
+/// MISSING `.biases` for an `affine` quantized embedding is rejected at
+/// construction (affine REQUIRES the per-group biases — `mlx.quantize` always
+/// writes them) — a typed `InvariantViolation`, not a deferred mlx-c
+/// `dequantize` failure on the first gather.
+#[test]
+fn quantized_embedding_rejects_affine_without_biases() {
+  let (w_q, scales, _biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let err = Embedding::quantized(w_q, scales, None, EMB_QGROUP, EMB_QBITS, "affine").unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for affine embedding with missing .biases, got {err:?}"
+  );
+}
+
+/// STALE `.biases` on a scale-only (`mxfp4` / fp) quantized embedding is
+/// rejected — the fp modes are scale-only (`fp_quantize` writes no biases), so a
+/// lingering `.biases` from a prior affine quantization is a malformed
+/// checkpoint, caught at load rather than confusing the mlx-c `dequantize`.
+#[test]
+fn quantized_embedding_rejects_scale_only_with_stale_biases() {
+  // The arrays' metadata is all that is read; reuse a real affine packed weight
+  // / scales, and pass a stale `biases` under the scale-only `mxfp4` mode.
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let err =
+    Embedding::quantized(w_q, scales, Some(biases), EMB_QGROUP, EMB_QBITS, "mxfp4").unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for scale-only embedding with stale .biases, got {err:?}"
+  );
+}
+
+/// A `.biases` whose SHAPE differs from `.scales` is rejected — `affine_quantize`
+/// writes `biases` and `scales` with the identical `(n_vocab, n_groups)` shape,
+/// so a divergent `biases` shape is a malformed checkpoint (it would otherwise
+/// reach the per-row `dequantize` with a mismatched gather).
+#[test]
+fn quantized_embedding_rejects_wrong_shaped_biases() {
+  let (w_q, scales, _biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  // Biases of a DIFFERENT vocab (4 rows instead of 8): a real affine triple's
+  // biases of the wrong leading dim, so the shape disagrees with `scales`.
+  let (_w2, _s2, wrong_biases) = affine_embedding_triple(4, EMB_QGROUP as usize);
+  let err = Embedding::quantized(
+    w_q,
+    scales,
+    Some(wrong_biases),
+    EMB_QGROUP,
+    EMB_QBITS,
+    "affine",
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::ShapePairMismatch(_) | Error::RankMismatch(_)),
+    "expected a shape/rank mismatch for a wrong-shaped .biases, got {err:?}"
+  );
+}
+
+/// A `.scales` with a CORRECT rank (2) and leading dim (n_vocab) but a wrong
+/// TRAILING (per-group) dim is rejected — the packed weight recovers `n_state =
+/// packed * 32 / bits` while the scales recover `n_state = scales.shape(-1) *
+/// group_size`, and the two must agree (mlx's invariant). Pairing the
+/// `EMB_QGROUP`-grouped packed weight (scales `(n_vocab, 1)`) with group_size-32
+/// scales (`(n_vocab, 2)`) under the declared `EMB_QGROUP` makes the scales
+/// recover a different width than the weight — the constructor catches it at
+/// load rather than deferring to a deep `dequantize` / `quantized_matmul`
+/// failure on the first gather / logit projection.
+#[test]
+fn quantized_embedding_rejects_wrong_scales_trailing_dim() {
+  let (w_q, _scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  // Re-quantize the SAME `(8, EMB_QGROUP)` dense at group_size 32 to get scales
+  // with a different trailing per-group count (`(8, 2)`) but the matching
+  // leading dim (8).
+  let mut data = Vec::with_capacity(8 * EMB_QGROUP as usize);
+  for v in 0..8usize {
+    for s in 0..EMB_QGROUP as usize {
+      data.push(((v * 5 + s) as f32) * 0.001);
+    }
+  }
+  let dense = Array::from_slice::<f32>(&data, &(8usize, EMB_QGROUP as usize)).unwrap();
+  let (_w32, wrong_scales, _b32) =
+    crate::ops::quantized::quantize(&dense, 32, EMB_QBITS, "affine", None).unwrap();
+  assert_eq!(
+    wrong_scales.shape(),
+    vec![8, 2],
+    "fixture: group_size-32 scales"
+  );
+  let err = Embedding::quantized(
+    w_q,
+    wrong_scales,
+    Some(biases),
+    EMB_QGROUP,
+    EMB_QBITS,
+    "affine",
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::ShapePairMismatch(_)),
+    "expected ShapePairMismatch for a wrong scales trailing dim, got {err:?}"
+  );
+}
+
+/// A non-`uint32` packed weight (a dense `f32` table) is rejected — the
+/// quantized embedding's `dequantize` / `quantized_matmul` require the
+/// `uint32`-packed layout.
+#[test]
+fn quantized_embedding_rejects_non_u32_weight() {
+  let dense = arr(&vec![0.001_f32; 8 * EMB_QGROUP as usize], &[8, EMB_QGROUP]);
+  let (_w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let err = Embedding::quantized(
+    dense, // f32, not uint32
+    scales,
+    Some(biases),
+    EMB_QGROUP,
+    EMB_QBITS,
+    "affine",
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for a non-uint32 quantized embedding weight, got {err:?}"
+  );
+}
+
+/// An unknown `mode` tag is rejected (a typo must not reach mlx-c).
+#[test]
+fn quantized_embedding_rejects_unknown_mode() {
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let err =
+    Embedding::quantized(w_q, scales, Some(biases), EMB_QGROUP, EMB_QBITS, "garbage").unwrap_err();
+  assert!(
+    matches!(err, Error::UnknownEnumValue(_)),
+    "expected UnknownEnumValue for an unrecognized embedding mode, got {err:?}"
+  );
+}
+
+/// A non-positive `group_size` is rejected before it could divide / reach mlx-c.
+#[test]
+fn quantized_embedding_rejects_zero_group_size() {
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let err = Embedding::quantized(w_q, scales, Some(biases), 0, EMB_QBITS, "affine").unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a zero group_size, got {err:?}"
+  );
+}
+
+/// The affine scale/bias dtype rule (mlx's
+/// `issubdtype(result_type(scales, biases), floating)`) is deferred to mlx-c at
+/// op-time, so construction does NOT validate it: an affine embedding triple
+/// with INTEGER `scales` and FLOATING `biases` constructs OK. (mlx ITSELF
+/// accepts this triple — the pair promotes to floating.) The cast changes only
+/// the scales dtype.
+#[test]
+fn quantized_embedding_accepts_affine_integer_scales_floating_biases() {
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let int_scales = scales.astype(Dtype::I32).unwrap();
+  let got = Embedding::quantized(
+    w_q,
+    int_scales,
+    Some(biases),
+    EMB_QGROUP,
+    EMB_QBITS,
+    "affine",
+  );
+  assert!(
+    got.is_ok(),
+    "expected integer-scales + floating-biases affine embedding to construct, got {got:?}"
+  );
+}
+
+/// The mirror case: FLOATING `scales` with INTEGER `biases`. Construction does
+/// not validate the affine scale/bias dtype (it is deferred to mlx-c at
+/// op-time), so this triple constructs OK. (mlx ITSELF accepts it — the pair
+/// promotes to floating.)
+#[test]
+fn quantized_embedding_accepts_affine_floating_scales_integer_biases() {
+  let (w_q, scales, biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  let int_biases = biases.astype(Dtype::I32).unwrap();
+  let got = Embedding::quantized(
+    w_q,
+    scales,
+    Some(int_biases),
+    EMB_QGROUP,
+    EMB_QBITS,
+    "affine",
+  );
+  assert!(
+    got.is_ok(),
+    "expected floating-scales + integer-biases affine embedding to construct, got {got:?}"
+  );
+}
+
+/// The `fp` modes require `scales.dtype() == uint8`. Reuse a real affine packed
+/// weight + scales (gs=`EMB_QGROUP`, bits=`EMB_QBITS`) under `mxfp4` with NO
+/// biases: the width identity still holds, so the triple is shape-correct, but
+/// the affine scales are floating — the fp-mode uint8 rule must reject them at
+/// construction rather than deferring to the first gather / logit projection.
+#[test]
+fn quantized_embedding_rejects_fp_mode_non_uint8_scales() {
+  let (w_q, scales, _biases) = affine_embedding_triple(8, EMB_QGROUP as usize);
+  assert!(
+    scales.dtype().unwrap() != Dtype::U8,
+    "fixture: affine scales are floating, not uint8"
+  );
+  let err = Embedding::quantized(w_q, scales, None, EMB_QGROUP, EMB_QBITS, "mxfp4").unwrap_err();
+  assert!(
+    matches!(err, Error::UnsupportedDtype(_)),
+    "expected UnsupportedDtype for non-uint8 fp-mode embedding scales, got {err:?}"
+  );
 }
 
 // ---- sinusoids ------------------------------------------------------
@@ -565,9 +828,24 @@ fn mha_forward_no_qk_core_matches_qk_returning_core() {
 #[test]
 fn linear_embedding_weight_accessors() {
   let lin = Linear::new(arr(&[1.0, 2.0], &[1, 2]), None);
-  assert_eq!(lin.weight_ref().dtype().unwrap(), Dtype::F32);
+  assert!(!lin.is_quantized());
+  assert_eq!(
+    lin
+      .weight_ref()
+      .expect("dense Linear has a weight")
+      .dtype()
+      .unwrap(),
+    Dtype::F32
+  );
   let emb = Embedding::new(arr(&[1.0, 2.0, 3.0, 4.0], &[2, 2]));
-  assert_eq!(emb.weight_ref().shape(), vec![2, 2]);
+  assert!(!emb.is_quantized());
+  assert_eq!(
+    emb
+      .weight_ref()
+      .expect("dense Embedding has a weight")
+      .shape(),
+    vec![2, 2]
+  );
 }
 
 // ---- ResidualAttentionBlock -----------------------------------------

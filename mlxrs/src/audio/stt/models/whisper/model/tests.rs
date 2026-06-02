@@ -55,6 +55,35 @@ fn sanitize_hf_strips_model_prefix_and_remaps_keys() {
 }
 
 #[test]
+fn sanitize_hf_carries_scales_biases_siblings_through_remap() {
+  // A quantized HF checkpoint stores `<layer>.weight` (packed) alongside
+  // `<layer>.scales` / `<layer>.biases`. The HF→MLX key-remap keys on the
+  // `<module>.` prefix (not the `.weight` leaf), so the `.scales` / `.biases`
+  // siblings must land on the SAME remapped layer as their `.weight` — else a
+  // quantized checkpoint would lose its scales/biases and fail to load.
+  let mut w = HashMap::new();
+  for leaf in ["weight", "scales", "biases"] {
+    w.insert(
+      format!("model.encoder.layers.0.self_attn.q_proj.{leaf}"),
+      Array::zeros::<f32>(&(2usize, 2usize)).unwrap(),
+    );
+    w.insert(
+      format!("model.decoder.embed_tokens.{leaf}"),
+      Array::zeros::<f32>(&(4usize, 2usize)).unwrap(),
+    );
+  }
+  let out = sanitize_map(w);
+  // q_proj → attn.query: all three siblings remapped together.
+  assert!(out.contains_key("encoder.blocks.0.attn.query.weight"));
+  assert!(out.contains_key("encoder.blocks.0.attn.query.scales"));
+  assert!(out.contains_key("encoder.blocks.0.attn.query.biases"));
+  // embed_tokens → token_embedding: the (tied) quantized embedding triple too.
+  assert!(out.contains_key("decoder.token_embedding.weight"));
+  assert!(out.contains_key("decoder.token_embedding.scales"));
+  assert!(out.contains_key("decoder.token_embedding.biases"));
+}
+
+#[test]
 fn sanitize_hf_drops_encoder_embed_positions() {
   let mut w = HashMap::new();
   w.insert(
@@ -963,6 +992,1162 @@ fn transcribe_without_tokenizer_is_typed_error() {
     matches!(err, Error::InvariantViolation(_)),
     "expected InvariantViolation without a tokenizer, got {err:?}"
   );
+}
+
+// ───────────────────── quantized-checkpoint loading ─────────────────────
+//
+// No local 8-bit whisper checkpoint is available
+// (`MLXRS_WHISPER_MODEL_DIR`/`models/` carry only a dense `whisper-large-v3`),
+// so the quantized load path is covered by a SYNTHETIC quantized checkpoint:
+// a tiny config whose `n_state` is divisible by the affine `group_size` (mlx
+// requires `group_size ∈ {32, 64, 128}`, `mlx/ops.cpp:4740`), with every
+// attention/MLP `Linear` weight and the token-embedding weight replaced by the
+// real `ops::quantized::quantize` `(weight, scales, biases)` triple — the exact
+// on-disk layout an mlx-community 8-bit checkpoint ships. The model must then
+// construct (building `QuantizedLinear` / quantized `Embedding` layers) and run
+// a full encode + decode forward to finite logits.
+
+/// The affine group size the synthetic quantized fixtures use (a valid
+/// mlx group size — `mlx/ops.cpp:4740`).
+const QGROUP: i32 = 64;
+/// 8-bit affine — the `whisper-large-v3-turbo-8bit` scheme.
+const QBITS: i32 = 8;
+
+/// Tiny dims whose width (`n_state = QGROUP = 64`) is divisible by the affine
+/// `group_size`, so every quantized weight's last axis (`n_state`,
+/// `4*n_state`) is a whole number of groups. `n_audio_ctx` stays the fixed
+/// `N_FRAMES / 2`.
+fn quant_dims() -> ModelDimensions {
+  let n_state = QGROUP as usize; // 64
+  ModelDimensions::new(
+    TINY.n_mels,
+    TINY.n_audio_ctx,
+    n_state,
+    TINY.n_head,
+    1, // n_audio_layer
+    TINY.n_vocab,
+    TINY.n_text_ctx,
+    n_state,
+    TINY.n_head,
+    1, // n_text_layer
+  )
+  .unwrap()
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`), mirroring how an mlx-community
+/// quantized checkpoint stores a quantized `Linear` / `Embedding`. The
+/// `<prefix>.bias` (dense output bias), if any, is left untouched.
+fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .expect("dense weight present");
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QGROUP, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Build a synthetic MLX-format quantized Whisper checkpoint: the dense
+/// `quant_dims()` weights, then every attention/MLP `Linear` weight and the
+/// token-embedding weight quantized to the 8-bit affine triple. Conv weights,
+/// LayerNorms, and the positional embedding stay dense (the `class_predicate`
+/// in `whisper.py:674-676` only quantizes `nn.Linear` / `nn.Embedding`).
+fn quant_weights() -> HashMap<String, Array> {
+  let n = QGROUP as usize; // n_state = 64
+  let mut w = HashMap::new();
+
+  // conv front-end + encoder ln_post (DENSE).
+  w.insert(
+    "encoder.conv1.weight".to_string(),
+    Array::ones::<f32>(&(n, 3usize, TINY.n_mels)).unwrap(),
+  );
+  w.insert("encoder.conv1.bias".to_string(), zeros1(n));
+  w.insert(
+    "encoder.conv2.weight".to_string(),
+    Array::ones::<f32>(&(n, 3usize, n)).unwrap(),
+  );
+  w.insert("encoder.conv2.bias".to_string(), zeros1(n));
+  put_block(&mut w, "encoder.blocks.0", n, false);
+  put_ln(&mut w, "encoder.ln_post", n);
+
+  // decoder embeddings + block + final ln (DENSE first).
+  w.insert(
+    "decoder.token_embedding.weight".to_string(),
+    ones2(TINY.n_vocab, n),
+  );
+  w.insert(
+    "decoder.positional_embedding".to_string(),
+    ones2(TINY.n_text_ctx, n),
+  );
+  put_block(&mut w, "decoder.blocks.0", n, true);
+  put_ln(&mut w, "decoder.ln", n);
+
+  // Now quantize every Linear projection and the token embedding.
+  for stack in ["encoder.blocks.0", "decoder.blocks.0"] {
+    // self-attention projections.
+    for p in ["query", "key", "value", "out"] {
+      quantize_weight_in_place(&mut w, &format!("{stack}.attn.{p}"));
+    }
+    // MLP projections.
+    quantize_weight_in_place(&mut w, &format!("{stack}.mlp1"));
+    quantize_weight_in_place(&mut w, &format!("{stack}.mlp2"));
+  }
+  // decoder cross-attention projections.
+  for p in ["query", "key", "value", "out"] {
+    quantize_weight_in_place(&mut w, &format!("decoder.blocks.0.cross_attn.{p}"));
+  }
+  // the weight-tied token embedding (an `nn.Embedding`, also quantized).
+  quantize_weight_in_place(&mut w, "decoder.token_embedding");
+
+  w
+}
+
+/// The parsed global 8-bit affine quantization config for the synthetic
+/// checkpoint (the analogue of the `config.json` `quantization` block).
+fn quant_config() -> crate::lm::quant::PerLayerQuantization {
+  crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(
+    QGROUP, QBITS,
+  ))
+}
+
+#[test]
+fn from_weights_quantized_builds_quantized_layers() {
+  // With a quantization config and a checkpoint whose Linear/Embedding weights
+  // carry `.scales`/`.biases`, the model builds quantized layers (and still
+  // builds — a packed `uint32` weight of a DIFFERENT shape than the dense
+  // `(out, in)` would otherwise be rejected by the dense shape gate).
+  let model = WhisperModel::from_weights_quantized(
+    quant_dims(),
+    quant_weights(),
+    Dtype::F32,
+    Some(&quant_config()),
+  )
+  .unwrap();
+  assert_eq!(model.dims().n_text_state(), QGROUP as usize);
+}
+
+#[test]
+fn from_weights_quantized_runs_forward_to_finite_logits() {
+  // The real GOAL contract on a synthetic stand-in: an 8-bit checkpoint loads
+  // AND runs a full encode + decode forward to FINITE logits (the quantized
+  // attention/MLP `quantized_matmul` and the quantized weight-tied logit head
+  // all execute through mlx-c).
+  let model = WhisperModel::from_weights_quantized(
+    quant_dims(),
+    quant_weights(),
+    Dtype::F32,
+    Some(&quant_config()),
+  )
+  .unwrap();
+
+  // The mel front-end is dense; the encoder's attention/MLP are quantized.
+  let mel = tiny_mel();
+  let enc = model.encode(&mel).unwrap();
+  assert_eq!(enc.shape(), vec![1, TINY.n_audio_ctx, QGROUP as usize]);
+
+  // Decode a couple of steps through the quantized decoder + quantized
+  // weight-tied logit head.
+  let mut cache = model.new_cache();
+  let mut logits = model.decode_step(&mut cache, &enc, &[0u32]).unwrap();
+  assert_eq!(logits.shape(), vec![TINY.n_vocab]);
+  for v in logits.to_vec::<f32>().unwrap() {
+    assert!(
+      v.is_finite(),
+      "quantized decode produced a non-finite logit: {v}"
+    );
+  }
+
+  let mut logits2 = model.decode_step(&mut cache, &enc, &[0u32, 1u32]).unwrap();
+  assert_eq!(logits2.shape(), vec![TINY.n_vocab]);
+  for v in logits2.to_vec::<f32>().unwrap() {
+    assert!(v.is_finite(), "quantized warm-step logit non-finite: {v}");
+  }
+}
+
+#[test]
+fn from_weights_quantized_dense_checkpoint_unchanged() {
+  // A NON-quantized checkpoint loads identically whether or not a quantization
+  // config is threaded (the `.scales` sibling is the load-bearing signal; a
+  // dense checkpoint has none, so the dense path runs regardless).
+  let with_cfg =
+    WhisperModel::from_weights_quantized(dims(), tiny_weights(), Dtype::F32, Some(&quant_config()))
+      .unwrap();
+  // Produces logits exactly like the plain `from_weights` path.
+  let mel = tiny_mel();
+  let enc = with_cfg.encode(&mel).unwrap();
+  let mut cache = with_cfg.new_cache();
+  let logits = with_cfg.decode_step(&mut cache, &enc, &[0u32]).unwrap();
+  assert_eq!(logits.shape(), vec![TINY.n_vocab]);
+}
+
+#[test]
+fn from_weights_quantized_scales_without_config_errors() {
+  // Weights say quantized (`.scales` present) but no quantization config
+  // resolved scheme params → a typed InvariantViolation, not a silent wrong
+  // load. (Passing `None` for `quantization` means the dense path is taken,
+  // which then hits the packed `uint32` weight with the dense `(out, in)`
+  // shape gate — also a typed error. To exercise the explicit
+  // scales-but-no-params guard, thread an empty per-layer config with no
+  // global default so `quantization_for` returns None for the quantized
+  // layer.)
+  let empty_cfg =
+    crate::lm::quant::PerLayerQuantization::new(None, std::collections::HashMap::new());
+  let err = WhisperModel::from_weights_quantized(
+    quant_dims(),
+    quant_weights(),
+    Dtype::F32,
+    Some(&empty_cfg),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for `.scales` present but no resolved params, got {err:?}"
+  );
+}
+
+/// Replace `<prefix>.{weight,scales,biases}` in `w` with the 8-bit affine
+/// triple of an `(out, in)` dense ramp — for splicing a quantized layer of a
+/// DELIBERATELY WRONG logical shape into an otherwise-valid checkpoint. `in`
+/// must be a whole multiple of `QGROUP` so the affine quantize is well-formed.
+fn splice_quantized(w: &mut HashMap<String, Array>, prefix: &str, out: usize, in_features: usize) {
+  let mut data = Vec::with_capacity(out * in_features);
+  for o in 0..out {
+    for i in 0..in_features {
+      data.push(((o * 7 + i) as f32) * 0.001);
+    }
+  }
+  let dense = Array::from_slice::<f32>(&data, &(out, in_features)).unwrap();
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QGROUP, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_wrong_output_width_linear() {
+  // A quantized attention `query` whose packed weight unpacks to the WRONG
+  // logical output dim must be rejected at load time (the quantized path now
+  // reaches the same config-shape gate the dense `take_shaped` enforces),
+  // before any forward sizes the projection from the checkpoint tensor.
+  let mut w = quant_weights();
+  // Config expects (n_state, n_state) = (64, 64); splice a (96, 64) instead.
+  splice_quantized(&mut w, "encoder.blocks.0.attn.query", 96, QGROUP as usize);
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "expected a keyed shape error for a wrong-output-width quantized Linear, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_wrong_input_width_linear() {
+  // A quantized projection whose packed weight unpacks to the WRONG logical
+  // INPUT width (the `quantized_matmul` contraction dim) is rejected too — a
+  // valid multiple of `group_size` (128) that disagrees with the config's 64.
+  let mut w = quant_weights();
+  splice_quantized(
+    &mut w,
+    "encoder.blocks.0.attn.value",
+    QGROUP as usize,
+    2 * QGROUP as usize,
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "expected a keyed shape error for a wrong-input-width quantized Linear, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_wrong_vocab_width_embedding() {
+  // A quantized token embedding whose packed table unpacks to the WRONG vocab
+  // dim (leading axis) is rejected — the weight-tied logit head would otherwise
+  // emit `n_vocab` sized by the tensor, not the validated config.
+  let mut w = quant_weights();
+  // Config expects (n_vocab, n_state) = (8, 64); splice (16, 64).
+  splice_quantized(&mut w, "decoder.token_embedding", 16, QGROUP as usize);
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "expected a keyed shape error for a wrong-vocab quantized embedding, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_wrong_state_width_embedding() {
+  // A quantized token embedding whose packed table unpacks to the WRONG state
+  // (input) width is rejected — (n_vocab=8, 128) vs the config's (8, 64).
+  let mut w = quant_weights();
+  splice_quantized(
+    &mut w,
+    "decoder.token_embedding",
+    TINY.n_vocab,
+    2 * QGROUP as usize,
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "expected a keyed shape error for a wrong-state quantized embedding, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_affine_embedding_without_biases() {
+  // A quantized token embedding under an `affine` config that is MISSING its
+  // `.biases` sibling must be rejected at load time (affine requires per-group
+  // biases): the builder's embedding path now runs the `Embedding::quantized`
+  // structural gate, so the malformed triple is a typed error before any forward
+  // reaches the mlx-c `dequantize` / weight-tied `quantized_matmul`.
+  let mut w = quant_weights();
+  // The token embedding is affine-quantized by `quant_weights`; drop its
+  // `.biases` to model a malformed (or scale-only-with-affine-config) checkpoint.
+  w.remove("decoder.token_embedding.biases")
+    .expect("affine token-embedding biases present");
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for an affine quantized embedding missing .biases, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_mis_shaped_embedding_biases() {
+  // A quantized token embedding whose `.biases` shape disagrees with `.scales`
+  // is rejected at load — `affine_quantize` writes both with the identical
+  // `(n_vocab, n_groups)` shape, so a divergent `.biases` is a malformed
+  // checkpoint the builder's `Embedding::quantized` gate catches before the
+  // first per-row `dequantize`.
+  let mut w = quant_weights();
+  // Replace the token-embedding `.biases` with a wrong-shaped one (a (1,) vector
+  // in place of the `(n_vocab, n_groups)` per-group biases).
+  w.insert(
+    "decoder.token_embedding.biases".to_string(),
+    Array::from_slice::<f32>(&[0.5], &(1usize,)).unwrap(),
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::ShapePairMismatch(_) | Error::RankMismatch(_)),
+    "expected a shape/rank mismatch for a mis-shaped quantized embedding .biases, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_ignores_stale_bias_on_keyless_projection() {
+  // The Whisper attention `key` projection is built `bias = false`. The dense
+  // path leaves any stray `<prefix>.bias` unused; the quantized path must be
+  // consistent and NOT adopt it (a wrongly-adopted bias of the wrong length
+  // would otherwise be rejected by `QuantizedLinear::from_parts`' length gate,
+  // failing the load). A deliberately wrong-length stray `key.bias` therefore
+  // distinguishes the two: it must STILL load (the bias is ignored).
+  let mut w = quant_weights();
+  // `key` out dim is n_state = 64; splice a stray length-1 bias the dense path
+  // would ignore. If the quantized path adopted it, the length check would fire.
+  w.insert(
+    "encoder.blocks.0.attn.key.bias".to_string(),
+    Array::from_slice::<f32>(&[3.5], &(1usize,)).unwrap(),
+  );
+  let model =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .expect("a stray bias on the bias=false key projection must be ignored, not adopted");
+  // And the model still runs a forward to finite logits (the key projection
+  // carries no bias, exactly as the dense path).
+  let enc = model.encode(&tiny_mel()).unwrap();
+  let mut cache = model.new_cache();
+  let mut logits = model.decode_step(&mut cache, &enc, &[0u32]).unwrap();
+  for v in logits.to_vec::<f32>().unwrap() {
+    assert!(
+      v.is_finite(),
+      "stale-bias-ignored decode logit non-finite: {v}"
+    );
+  }
+}
+
+#[test]
+fn from_weights_quantized_rejects_missing_query_bias() {
+  // A quantized attention `query` projection is built `bias = true`. mlx's
+  // `QuantizedLinear.from_linear` preserves the source `Linear.bias`, so a
+  // faithful quantized checkpoint carries `query.bias`; one missing it is
+  // malformed and must FAIL fast with the SAME typed `MissingKey` the dense
+  // path returns — not load a silently biasless projection that corrupts logits.
+  let mut w = quant_weights();
+  w.remove("encoder.blocks.0.attn.query.bias")
+    .expect("query.bias present in the faithful quantized checkpoint");
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(&err, Error::MissingKey(p) if p.key().contains("encoder.blocks.0.attn.query.bias")),
+    "expected MissingKey(query.bias) for a quantized biasful projection missing its bias, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_missing_mlp1_bias() {
+  // Same arity contract on the MLP: the `mlp1` linear is `bias = true`, so a
+  // quantized checkpoint missing `mlp1.bias` is malformed and fails fast with
+  // the typed `MissingKey`, identical to the dense path.
+  let mut w = quant_weights();
+  w.remove("encoder.blocks.0.mlp1.bias")
+    .expect("mlp1.bias present in the faithful quantized checkpoint");
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  assert!(
+    matches!(&err, Error::MissingKey(p) if p.key().contains("encoder.blocks.0.mlp1.bias")),
+    "expected MissingKey(mlp1.bias) for a quantized biasful MLP linear missing its bias, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_wrong_shape_bias() {
+  // A quantized biasful projection whose dense `<prefix>.bias` has the wrong
+  // shape is rejected at load with the SAME keyed `ShapePairMismatch` the dense
+  // path returns — the bias is validated `(out,)` before it reaches the
+  // constructor, never broadcast silently across every output channel.
+  let mut w = quant_weights();
+  // `value` out dim is n_state = 64; ship a wrong-length (1,) bias.
+  w.insert(
+    "encoder.blocks.0.attn.value.bias".to_string(),
+    Array::from_slice::<f32>(&[0.25], &(1usize,)).unwrap(),
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&quant_config()))
+      .unwrap_err();
+  match &err {
+    Error::LayerKeyed(p) => {
+      assert_eq!(p.layer(), "encoder.blocks.0.attn.value.bias");
+      assert!(matches!(p.inner(), Error::ShapePairMismatch(_)));
+    }
+    other => panic!(
+      "expected LayerKeyed(ShapePairMismatch) for a wrong-shape quantized bias, got {other:?}"
+    ),
+  }
+}
+
+// ───────────── HF-format per-layer quantization override ─────────────────
+//
+// An HF-format quantized checkpoint ships RAW HF weight keys
+// (`model.encoder.layers.0.self_attn.q_proj.weight`) AND a quantization config
+// whose per-layer override keys are RAW HF paths. `sanitize` remaps the weight
+// keys into MLX-style prefixes (`encoder.blocks.0.attn.query`), and the builder
+// resolves the per-layer scheme against those SANITIZED prefixes — so the
+// per-layer config keys must be normalized through the same HF→MLX transform
+// (`normalize_quant_keys`) or a per-layer override silently misses and the
+// builder falls back to the GLOBAL scheme. These tests build HF checkpoints
+// where one layer is quantized with params that DIFFER from the global and
+// assert the override is honored after sanitize (the layer loads under its own
+// `group_size`/`bits`, which its packed `(weight, scales)` shapes require).
+
+/// The override `group_size` one Linear is quantized at (≠ the global
+/// [`QGROUP`] = 64). A valid mlx affine group size that still divides the tiny
+/// `n_state` = 64 width (`mlx/ops.cpp:4740`).
+const QGROUP_OVERRIDE: i32 = 32;
+/// The override `bits` the token embedding is quantized at (≠ the global
+/// [`QBITS`] = 8).
+const QBITS_OVERRIDE: i32 = 4;
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` affine triple at EXPLICIT `(group_size, bits)` —
+/// the parameterized form of [`quantize_weight_in_place`], for splicing a layer
+/// quantized under a per-layer override that differs from the global scheme.
+fn quantize_weight_in_place_with(
+  w: &mut HashMap<String, Array>,
+  prefix: &str,
+  group_size: i32,
+  bits: i32,
+) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .expect("dense weight present");
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, group_size, bits, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Insert one HF-named attention sub-module (`q_proj`/`k_proj`/`v_proj`/
+/// `out_proj`) under the HF `<prefix>` (e.g.
+/// `model.encoder.layers.0.self_attn`). `k_proj` carries no bias (Whisper's
+/// `bias = false` key projection), matching [`put_attn`]'s MLX layout.
+fn put_attn_hf(w: &mut HashMap<String, Array>, prefix: &str, n: usize) {
+  for p in ["q_proj", "v_proj", "out_proj"] {
+    w.insert(format!("{prefix}.{p}.weight"), ones2(n, n));
+    w.insert(format!("{prefix}.{p}.bias"), zeros1(n));
+  }
+  w.insert(format!("{prefix}.k_proj.weight"), ones2(n, n));
+}
+
+/// Insert one HF-named residual block under the HF `<prefix>` (e.g.
+/// `model.decoder.layers.0`), the HF-leaf-named twin of [`put_block`]: the
+/// `self_attn` (+ `self_attn_layer_norm`), the `fc1`/`fc2` MLP (+
+/// `final_layer_norm`), and — for the decoder — the `encoder_attn` cross
+/// attention (+ `encoder_attn_layer_norm`).
+fn put_block_hf(w: &mut HashMap<String, Array>, prefix: &str, n: usize, cross: bool) {
+  put_attn_hf(w, &format!("{prefix}.self_attn"), n);
+  put_ln(w, &format!("{prefix}.self_attn_layer_norm"), n);
+  if cross {
+    put_attn_hf(w, &format!("{prefix}.encoder_attn"), n);
+    put_ln(w, &format!("{prefix}.encoder_attn_layer_norm"), n);
+  }
+  w.insert(format!("{prefix}.fc1.weight"), ones2(4 * n, n));
+  w.insert(format!("{prefix}.fc1.bias"), zeros1(4 * n));
+  w.insert(format!("{prefix}.fc2.weight"), ones2(n, 4 * n));
+  w.insert(format!("{prefix}.fc2.bias"), zeros1(n));
+  put_ln(w, &format!("{prefix}.final_layer_norm"), n);
+}
+
+/// The HF-format quantizable layer prefixes (the post-sanitize MLX twins are in
+/// [`quant_weights`]): every `Linear` projection plus the token embedding.
+fn hf_quant_prefixes() -> Vec<String> {
+  let mut prefixes = Vec::new();
+  for (stack, cross) in [
+    ("model.encoder.layers.0", false),
+    ("model.decoder.layers.0", true),
+  ] {
+    for p in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      prefixes.push(format!("{stack}.self_attn.{p}"));
+    }
+    prefixes.push(format!("{stack}.fc1"));
+    prefixes.push(format!("{stack}.fc2"));
+    if cross {
+      for p in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+        prefixes.push(format!("{stack}.encoder_attn.{p}"));
+      }
+    }
+  }
+  prefixes.push("model.decoder.embed_tokens".to_string());
+  prefixes
+}
+
+/// Build a synthetic **HF-format** quantized Whisper checkpoint (raw HF weight
+/// keys), structurally the HF twin of [`quant_weights`]: the conv front-end is
+/// in HF `(out, in, kernel)` layout, and every quantizable layer is quantized
+/// to the global [`QGROUP`]/[`QBITS`] affine triple — EXCEPT the layer at
+/// `override_hf_prefix`, which is quantized at `(override_gs, override_bits)`
+/// (the per-layer override). The returned map is what an HF-named mixed-quant
+/// checkpoint ships before `sanitize`.
+fn hf_quant_weights(
+  override_hf_prefix: &str,
+  override_gs: i32,
+  override_bits: i32,
+) -> HashMap<String, Array> {
+  let n = QGROUP as usize; // n_state = 64
+  let mut w = HashMap::new();
+
+  // conv front-end (HF `(out, in, kernel)` layout) + encoder ln (HF name).
+  w.insert(
+    "model.encoder.conv1.weight".to_string(),
+    Array::ones::<f32>(&(n, TINY.n_mels, 3usize)).unwrap(),
+  );
+  w.insert("model.encoder.conv1.bias".to_string(), zeros1(n));
+  w.insert(
+    "model.encoder.conv2.weight".to_string(),
+    Array::ones::<f32>(&(n, n, 3usize)).unwrap(),
+  );
+  w.insert("model.encoder.conv2.bias".to_string(), zeros1(n));
+  put_block_hf(&mut w, "model.encoder.layers.0", n, false);
+  put_ln(&mut w, "model.encoder.layer_norm", n);
+
+  // decoder embeddings (HF names) + block + final ln. The HF encoder positional
+  // embedding is present and DROPPED by sanitize (recomputed via sinusoids).
+  w.insert(
+    "model.decoder.embed_tokens.weight".to_string(),
+    ones2(TINY.n_vocab, n),
+  );
+  w.insert(
+    "model.encoder.embed_positions.weight".to_string(),
+    ones2(TINY.n_audio_ctx, n),
+  );
+  w.insert(
+    "model.decoder.embed_positions.weight".to_string(),
+    ones2(TINY.n_text_ctx, n),
+  );
+  put_block_hf(&mut w, "model.decoder.layers.0", n, true);
+  put_ln(&mut w, "model.decoder.layer_norm", n);
+
+  // Quantize every Linear + the token embedding. The override layer takes its
+  // per-layer params; all others take the global scheme.
+  for prefix in hf_quant_prefixes() {
+    if prefix == override_hf_prefix {
+      quantize_weight_in_place_with(&mut w, &prefix, override_gs, override_bits);
+    } else {
+      quantize_weight_in_place_with(&mut w, &prefix, QGROUP, QBITS);
+    }
+  }
+  w
+}
+
+/// A global-affine [`PerLayerQuantization`] (global [`QGROUP`]/[`QBITS`]) plus a
+/// single per-layer override keyed by the RAW HF path `hf_layer` →
+/// `(override_gs, override_bits)` — the analogue of an HF `config.json`
+/// `quantization` block carrying a per-layer entry.
+fn hf_quant_config_with_override(
+  hf_layer: &str,
+  override_gs: i32,
+  override_bits: i32,
+) -> crate::lm::quant::PerLayerQuantization {
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    hf_layer.to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(
+      override_gs,
+      override_bits,
+    )),
+  );
+  crate::lm::quant::PerLayerQuantization::new(
+    Some(crate::lm::quant::Quantization::affine(QGROUP, QBITS)),
+    per_layer,
+  )
+}
+
+#[test]
+fn normalize_quant_keys_remaps_hf_per_layer_paths_to_sanitized() {
+  // The per-layer override map's RAW HF keys are normalized into the SANITIZED
+  // MLX namespace the builder resolves against — a Linear path and the token
+  // embedding path, the two cases the regression tests below exercise end to
+  // end. An already-MLX config is returned unchanged (idempotent).
+  let cfg = hf_quant_config_with_override(
+    "model.encoder.layers.0.self_attn.q_proj",
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  let normalized = normalize_quant_keys(&cfg).unwrap();
+  // The HF Linear path now resolves under its sanitized MLX prefix.
+  assert_eq!(
+    normalized.quantization_for("encoder.blocks.0.attn.query"),
+    Some(crate::lm::quant::Quantization::affine(
+      QGROUP_OVERRIDE,
+      QBITS
+    )),
+    "HF q_proj override must resolve against the sanitized attn.query prefix"
+  );
+  // The raw HF key no longer resolves to the override (it was remapped, not
+  // duplicated) — it falls back to the global default.
+  assert_eq!(
+    normalized.quantization_for("model.encoder.layers.0.self_attn.q_proj"),
+    Some(crate::lm::quant::Quantization::affine(QGROUP, QBITS)),
+    "the raw HF key must no longer carry the override after normalization"
+  );
+
+  // The token-embedding HF path maps onto the sanitized token_embedding prefix.
+  let emb_cfg = hf_quant_config_with_override("model.decoder.embed_tokens", QGROUP, QBITS_OVERRIDE);
+  let emb_norm = normalize_quant_keys(&emb_cfg).unwrap();
+  assert_eq!(
+    emb_norm.quantization_for("decoder.token_embedding"),
+    Some(crate::lm::quant::Quantization::affine(
+      QGROUP,
+      QBITS_OVERRIDE
+    )),
+    "HF embed_tokens override must resolve against the sanitized token_embedding prefix"
+  );
+
+  // An already-MLX config passes through unchanged: normalization is
+  // unconditional, and `remap_hf_key` is idempotent on MLX-native keys, so the
+  // map is preserved.
+  let mlx_cfg = quant_config();
+  let mlx_norm = normalize_quant_keys(&mlx_cfg).unwrap();
+  assert_eq!(
+    mlx_norm, mlx_cfg,
+    "an MLX-format config must pass through unchanged"
+  );
+}
+
+#[test]
+fn from_weights_quantized_honors_hf_per_layer_linear_override() {
+  // (a) ONE Linear (attention q_proj) carries a per-layer override whose
+  // `group_size` (32) differs from the global (64). The q_proj weight is
+  // quantized at group_size=32, so its `.scales` has `n_state / 32 = 2` groups;
+  // if the override were LOST and the builder fell back to the global
+  // group_size=64, `check_quantized_shape` would recover `2 * 64 = 128 ≠ 64`
+  // and reject the (valid) checkpoint. A successful build therefore proves the
+  // HF-keyed override is honored against the sanitized `attn.query` prefix.
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = hf_quant_weights(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = hf_quant_config_with_override(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let model = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg))
+    .expect("HF per-layer Linear override (group_size 32) must be honored after sanitize");
+  assert_eq!(model.dims().n_text_state(), QGROUP as usize);
+
+  // Control: WITHOUT the per-layer entry (global-only config), the q_proj — still
+  // quantized at group_size=32 on disk — is resolved at the global group_size=64
+  // and rejected. This pins that the override is genuinely load-bearing (the
+  // layer cannot load under the global scheme), so the positive build above is
+  // not a false pass from the global scheme coincidentally fitting.
+  let w_again = hf_quant_weights(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let global_only = quant_config();
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w_again, Dtype::F32, Some(&global_only))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "a group_size-32 q_proj resolved under the global group_size-64 must be rejected, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_honors_hf_per_layer_embedding_override() {
+  // (b) The token embedding (`decoder.embed_tokens`) carries a per-layer
+  // override whose `bits` (4) differ from the global (8). The embedding weight
+  // is packed at bits=4, so its `uint32` last dim is `n_state * 4 / 32 = 8`; if
+  // the override were lost and the builder fell back to bits=8,
+  // `check_quantized_shape` would recover `8 * 32 / 8 = 32 ≠ 64` and reject the
+  // valid weight-tied table. A successful build (and finite logits through the
+  // quantized weight-tied logit head) proves the HF-keyed embedding override is
+  // honored against the sanitized `decoder.token_embedding` prefix.
+  let hf_layer = "model.decoder.embed_tokens";
+  let w = hf_quant_weights(hf_layer, QGROUP, QBITS_OVERRIDE);
+  let cfg = hf_quant_config_with_override(hf_layer, QGROUP, QBITS_OVERRIDE);
+  let model = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg))
+    .expect("HF per-layer embedding override (bits 4) must be honored after sanitize");
+
+  // The quantized weight-tied logit head (the bits-4 embedding) runs to finite
+  // logits, confirming the override scheme drives the real forward, not just the
+  // load-time shape gate.
+  let enc = model.encode(&tiny_mel()).unwrap();
+  let mut cache = model.new_cache();
+  let mut logits = model.decode_step(&mut cache, &enc, &[0u32]).unwrap();
+  assert_eq!(logits.shape(), vec![TINY.n_vocab]);
+  for v in logits.to_vec::<f32>().unwrap() {
+    assert!(
+      v.is_finite(),
+      "bits-4 embedding-override logit non-finite: {v}"
+    );
+  }
+
+  // Control: the global-only config (bits=8) cannot load the bits-4 table.
+  let w_again = hf_quant_weights(hf_layer, QGROUP, QBITS_OVERRIDE);
+  let global_only = quant_config();
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w_again, Dtype::F32, Some(&global_only))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "a bits-4 token embedding resolved under the global bits-8 must be rejected, got {err:?}"
+  );
+}
+
+#[test]
+fn sanitize_hf_quant_weights_reproduces_mlx_quant_layer_set() {
+  // Independent oracle for the HF builder: `sanitize`-ing the HF-format
+  // checkpoint must yield exactly the same KEY SET as the MLX-format
+  // `quant_weights` fixture (the dropped encoder positional embedding aside),
+  // proving the HF leaf names + the override splice land on the sanitized MLX
+  // prefixes the builder consumes — independent of the quant resolution under
+  // test. (Both fixtures quantize the q_proj at the global scheme here, so the
+  // packed shapes match; only the KEY SET is asserted, not the tensor values.)
+  let hf = hf_quant_weights("model.encoder.layers.0.self_attn.q_proj", QGROUP, QBITS);
+  let (sanitized, is_hf) = sanitize(hf).unwrap();
+  assert!(is_hf, "a `model.`-prefixed checkpoint is HF format");
+
+  let mlx_keys: std::collections::BTreeSet<String> = quant_weights().into_keys().collect();
+  let sanitized_keys: std::collections::BTreeSet<String> = sanitized.into_keys().collect();
+  assert_eq!(
+    sanitized_keys, mlx_keys,
+    "sanitized HF quant checkpoint must match the MLX quant-checkpoint key set"
+  );
+}
+
+/// Build a [`PerLayerQuantization`] whose per-layer map carries BOTH the raw HF
+/// path and the already-sanitized MLX alias for the SAME layer — the raw key
+/// remaps onto the sanitized key, so the two collide post-normalization. Each
+/// alias gets its own override `(group_size, bits)`; passing equal params for
+/// both yields an identical (harmless) collision, unequal params a conflict.
+fn hf_quant_config_with_aliased_collision(
+  hf_layer: &str,
+  mlx_layer: &str,
+  hf_gs: i32,
+  hf_bits: i32,
+  mlx_gs: i32,
+  mlx_bits: i32,
+) -> crate::lm::quant::PerLayerQuantization {
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    hf_layer.to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(
+      hf_gs, hf_bits,
+    )),
+  );
+  per_layer.insert(
+    mlx_layer.to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(
+      mlx_gs, mlx_bits,
+    )),
+  );
+  crate::lm::quant::PerLayerQuantization::new(
+    Some(crate::lm::quant::Quantization::affine(QGROUP, QBITS)),
+    per_layer,
+  )
+}
+
+#[test]
+fn normalize_quant_keys_rejects_conflicting_aliased_per_layer_override() {
+  // A mixed config names the SAME layer twice — once by its raw HF path
+  // (`model.encoder.layers.0.self_attn.q_proj`, which `normalize_quant_keys`
+  // remaps onto `encoder.blocks.0.attn.query`) and once by that sanitized MLX
+  // alias directly — carrying DIFFERENT `group_size`s (64 vs 32). The two
+  // overrides for one layer disagree, so the per-layer scheme is ambiguous and
+  // normalization must fail closed with a typed `KeyCollision` naming the
+  // sanitized layer key — never silently pick an arbitrary `HashMap`-order
+  // survivor that could load the checkpoint with the wrong scheme.
+  let cfg = hf_quant_config_with_aliased_collision(
+    "model.encoder.layers.0.self_attn.q_proj",
+    "encoder.blocks.0.attn.query",
+    QGROUP,
+    QBITS,
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  let err = normalize_quant_keys(&cfg).unwrap_err();
+  match &err {
+    Error::KeyCollision(p) => {
+      assert_eq!(
+        p.key(),
+        "encoder.blocks.0.attn.query",
+        "the conflict error must name the colliding sanitized layer key"
+      );
+    }
+    other => panic!("expected Error::KeyCollision for a conflicting alias, got {other:?}"),
+  }
+
+  // The verdict is order-independent: the source map is iterated in an arbitrary
+  // order, but a conflicting collision ALWAYS errors. Re-running converges on the
+  // same typed error regardless of which alias the iterator visits first.
+  for _ in 0..8 {
+    let cfg = hf_quant_config_with_aliased_collision(
+      "model.encoder.layers.0.self_attn.q_proj",
+      "encoder.blocks.0.attn.query",
+      QGROUP,
+      QBITS,
+      QGROUP_OVERRIDE,
+      QBITS,
+    );
+    assert!(
+      matches!(normalize_quant_keys(&cfg), Err(Error::KeyCollision(_))),
+      "a conflicting aliased override must error on every iteration order"
+    );
+  }
+}
+
+#[test]
+fn normalize_quant_keys_accepts_identical_aliased_per_layer_override() {
+  // The same two aliases for one layer, but carrying IDENTICAL params (both
+  // group_size=32, bits=8) — a harmless duplicate. Normalization must converge
+  // on a SINGLE entry under the sanitized key with that scheme, with no error,
+  // independent of which alias the source iterator visits first.
+  for _ in 0..8 {
+    let cfg = hf_quant_config_with_aliased_collision(
+      "model.encoder.layers.0.self_attn.q_proj",
+      "encoder.blocks.0.attn.query",
+      QGROUP_OVERRIDE,
+      QBITS,
+      QGROUP_OVERRIDE,
+      QBITS,
+    );
+    let normalized = normalize_quant_keys(&cfg).unwrap();
+    // Exactly one surviving entry, keyed by the sanitized path.
+    assert_eq!(
+      normalized.per_layer_ref().len(),
+      1,
+      "identical aliases must collapse to one normalized entry"
+    );
+    assert_eq!(
+      normalized.quantization_for("encoder.blocks.0.attn.query"),
+      Some(crate::lm::quant::Quantization::affine(
+        QGROUP_OVERRIDE,
+        QBITS
+      )),
+      "the surviving entry must carry the (identical) override scheme"
+    );
+    // The raw HF key was remapped (not duplicated), so it falls back to global.
+    assert_eq!(
+      normalized.quantization_for("model.encoder.layers.0.self_attn.q_proj"),
+      Some(crate::lm::quant::Quantization::affine(QGROUP, QBITS)),
+      "the raw HF alias must not survive as a separate entry"
+    );
+  }
+}
+
+#[test]
+fn from_weights_quantized_loads_identical_aliased_per_layer_override() {
+  // End to end: a checkpoint whose config names one q_proj layer by BOTH its raw
+  // HF path and its sanitized MLX alias with IDENTICAL override params (32/8)
+  // loads cleanly — the harmless duplicate collapses to the single override and
+  // the layer loads under that scheme (its group_size-32 `.scales` would be
+  // rejected under the global group_size-64, so a successful build proves the
+  // override survived).
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = hf_quant_weights(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = hf_quant_config_with_aliased_collision(
+    hf_layer,
+    "encoder.blocks.0.attn.query",
+    QGROUP_OVERRIDE,
+    QBITS,
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  let model = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg))
+    .expect("identical aliased override must collapse and load under its scheme");
+  assert_eq!(model.dims().n_text_state(), QGROUP as usize);
+}
+
+#[test]
+fn from_weights_quantized_rejects_conflicting_aliased_per_layer_override() {
+  // End to end: the same aliased layer with CONFLICTING override params
+  // (HF=64/8 vs MLX-alias=32/8) is ambiguous; the quantized builder must surface
+  // the typed `KeyCollision` from normalization rather than load with an
+  // arbitrary scheme.
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = hf_quant_weights(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = hf_quant_config_with_aliased_collision(
+    hf_layer,
+    "encoder.blocks.0.attn.query",
+    QGROUP,
+    QBITS,
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg)).unwrap_err();
+  assert!(
+    matches!(err, Error::KeyCollision(_)),
+    "a conflicting aliased per-layer override must fail the quantized build, got {err:?}"
+  );
+}
+
+// ── config-key normalization is independent of the weight-map format ───────
+//
+// The config carries HF-named or MLX-named per-layer keys independently of how
+// the WEIGHTS are named: an MLX-native weight map (`is_hf_format == false`) can
+// still ship a `config.json` `quantization` block whose per-layer override keys
+// are raw HF paths. Because normalization runs unconditionally, the override
+// resolves to its sanitized layer and the collision check runs for EVERY
+// config, not only the HF-weight path — so a raw-HF override against MLX weights
+// is honored, a conflicting alias errors, and an identical alias converges.
+
+/// Build a synthetic **MLX-format** quantized Whisper checkpoint (already-MLX
+/// weight keys, no `model.` prefix → `is_hf_format == false`), structurally the
+/// MLX-named twin of [`hf_quant_weights`]: every quantizable layer is quantized
+/// to the global [`QGROUP`]/[`QBITS`] affine triple EXCEPT the layer at
+/// `override_mlx_prefix`, which is quantized at `(override_gs, override_bits)`.
+/// Identical to [`quant_weights`] but for the one parameterized override layer,
+/// so a per-layer override against MLX weights is genuinely load-bearing (its
+/// packed `(weight, scales)` shapes are rejected under the global scheme).
+fn mlx_quant_weights(
+  override_mlx_prefix: &str,
+  override_gs: i32,
+  override_bits: i32,
+) -> HashMap<String, Array> {
+  let mut w = quant_weights();
+  if override_gs != QGROUP || override_bits != QBITS {
+    // `quant_weights` already packed this layer at the global scheme; re-pack
+    // its DENSE matrix at the override scheme. Rebuild the dense `(out, in)`
+    // ones matrix the fixture started from (every quantizable Linear is square
+    // `n_state x n_state` except the MLP and the `n_vocab x n_state` embedding),
+    // dropping the global triple first so the override triple replaces it.
+    let n = QGROUP as usize;
+    let (out, in_features) = if override_mlx_prefix == "decoder.token_embedding" {
+      (TINY.n_vocab, n)
+    } else if override_mlx_prefix.ends_with(".mlp1") {
+      (4 * n, n)
+    } else if override_mlx_prefix.ends_with(".mlp2") {
+      (n, 4 * n)
+    } else {
+      (n, n)
+    };
+    w.remove(&format!("{override_mlx_prefix}.weight"));
+    w.remove(&format!("{override_mlx_prefix}.scales"));
+    w.remove(&format!("{override_mlx_prefix}.biases"));
+    w.insert(
+      format!("{override_mlx_prefix}.weight"),
+      ones2(out, in_features),
+    );
+    quantize_weight_in_place_with(&mut w, override_mlx_prefix, override_gs, override_bits);
+  }
+  w
+}
+
+/// A global-affine [`PerLayerQuantization`] plus a single per-layer override
+/// keyed by the RAW HF path `hf_layer` → `(override_gs, override_bits)`, but
+/// paired with an MLX-format weight map — exercising a config whose key
+/// namespace differs from the (MLX-named) weights.
+fn raw_hf_override_on_mlx_config(
+  hf_layer: &str,
+  override_gs: i32,
+  override_bits: i32,
+) -> crate::lm::quant::PerLayerQuantization {
+  hf_quant_config_with_override(hf_layer, override_gs, override_bits)
+}
+
+#[test]
+fn from_weights_quantized_honors_raw_hf_override_against_mlx_weights() {
+  // (1) MLX-format weights (`is_hf_format == false`) paired with a config whose
+  // per-layer override is keyed by the RAW HF path. Normalization runs
+  // regardless of the weight-map format, so the raw HF key
+  // (`model.encoder.layers.0.self_attn.q_proj`) is remapped onto the sanitized
+  // `encoder.blocks.0.attn.query` the builder resolves against — the q_proj
+  // loads under its group_size-32 override (its `.scales` has `n_state/32 = 2`
+  // groups, which the global group_size-64 would reject). A successful build
+  // proves the raw-HF override is honored through the non-HF-weight path.
+  let mlx_layer = "encoder.blocks.0.attn.query";
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = mlx_quant_weights(mlx_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = raw_hf_override_on_mlx_config(hf_layer, QGROUP_OVERRIDE, QBITS);
+  let model = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg))
+    .expect("a raw-HF per-layer override against MLX weights must resolve to the sanitized layer");
+  assert_eq!(model.dims().n_text_state(), QGROUP as usize);
+
+  // Control: the global-only config (group_size 64) cannot load the group_size-32
+  // q_proj — proving the override is load-bearing, not a coincidental global fit.
+  let w_again = mlx_quant_weights(mlx_layer, QGROUP_OVERRIDE, QBITS);
+  let global_only = quant_config();
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w_again, Dtype::F32, Some(&global_only))
+      .unwrap_err();
+  assert!(
+    matches!(err, Error::LayerKeyed(_)),
+    "a group_size-32 q_proj resolved under the global group_size-64 must be rejected, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_rejects_conflicting_alias_against_mlx_weights() {
+  // (2) MLX-format weights paired with a config naming the SAME layer twice —
+  // by its raw HF path AND its sanitized MLX alias — with CONFLICTING params
+  // (64 vs 32). Even though the weights are MLX-native, the unconditional
+  // normalization remaps the raw HF key onto the MLX alias, the collision check
+  // fires, and the ambiguous per-layer scheme is rejected with a typed
+  // `KeyCollision` rather than loading under an arbitrary survivor.
+  let mlx_layer = "encoder.blocks.0.attn.query";
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = mlx_quant_weights(mlx_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = hf_quant_config_with_aliased_collision(
+    hf_layer,
+    mlx_layer,
+    QGROUP,
+    QBITS,
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  let err =
+    WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg)).unwrap_err();
+  assert!(
+    matches!(err, Error::KeyCollision(_)),
+    "a conflicting alias against MLX weights must fail the quantized build, got {err:?}"
+  );
+
+  // Order-independent at the normalization layer: a conflicting alias errors on
+  // every source-map iteration order (MLX weights do not change the verdict).
+  for _ in 0..8 {
+    let cfg = hf_quant_config_with_aliased_collision(
+      hf_layer,
+      mlx_layer,
+      QGROUP,
+      QBITS,
+      QGROUP_OVERRIDE,
+      QBITS,
+    );
+    assert!(
+      matches!(normalize_quant_keys(&cfg), Err(Error::KeyCollision(_))),
+      "a conflicting aliased override must error on every iteration order"
+    );
+  }
+}
+
+#[test]
+fn from_weights_quantized_converges_identical_alias_against_mlx_weights() {
+  // (3) MLX-format weights paired with a config naming the same layer by its raw
+  // HF path AND its sanitized MLX alias with IDENTICAL params (32/8). The
+  // harmless duplicate collapses to one normalized entry and the layer loads
+  // under that single override scheme (its group_size-32 `.scales` would be
+  // rejected under the global group_size-64, so a successful build proves the
+  // override survived the collision merge).
+  let mlx_layer = "encoder.blocks.0.attn.query";
+  let hf_layer = "model.encoder.layers.0.self_attn.q_proj";
+  let w = mlx_quant_weights(mlx_layer, QGROUP_OVERRIDE, QBITS);
+  let cfg = hf_quant_config_with_aliased_collision(
+    hf_layer,
+    mlx_layer,
+    QGROUP_OVERRIDE,
+    QBITS,
+    QGROUP_OVERRIDE,
+    QBITS,
+  );
+  // The normalization collapses the alias pair to a single entry.
+  let normalized = normalize_quant_keys(&cfg).unwrap();
+  assert_eq!(
+    normalized.per_layer_ref().len(),
+    1,
+    "identical aliases must collapse to one normalized entry"
+  );
+  let model = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, Some(&cfg))
+    .expect("an identical alias against MLX weights must collapse and load under its scheme");
+  assert_eq!(model.dims().n_text_state(), QGROUP as usize);
+}
+
+#[test]
+fn remap_hf_key_is_idempotent_on_mlx_keys() {
+  // `normalize_quant_keys` normalizes UNCONDITIONALLY, so it must never corrupt
+  // an already-sanitized MLX config key: `remap_hf_key` applied to an MLX-native
+  // key (and to a `<key>.weight`, the form the config normalization feeds it)
+  // must yield that same key — no `model.` prefix to strip, no HF-form `KEY_MAP`
+  // left-hand side to match, and no MLX target that re-triggers another pattern.
+  let mlx_keys = [
+    "encoder.blocks.0.attn.query.weight",
+    "encoder.blocks.0.attn.key.weight",
+    "encoder.blocks.0.attn.value.weight",
+    "encoder.blocks.0.attn.out.weight",
+    "encoder.blocks.0.mlp1.weight",
+    "encoder.blocks.0.mlp2.weight",
+    "encoder.blocks.0.attn_ln.weight",
+    "encoder.blocks.0.mlp_ln.weight",
+    "encoder.ln_post.weight",
+    "decoder.blocks.0.cross_attn.query.weight",
+    "decoder.blocks.0.cross_attn_ln.weight",
+    "decoder.token_embedding.weight",
+    "decoder.positional_embedding",
+    "decoder.ln.weight",
+  ];
+  for key in mlx_keys {
+    assert_eq!(
+      remap_hf_key(key.to_string()).as_deref(),
+      Some(key),
+      "remap_hf_key must be a no-op on the already-sanitized MLX key {key}"
+    );
+    // Idempotent under a second application, so unconditional normalization of a
+    // config that already carries MLX paths never double-remaps.
+    let once = remap_hf_key(key.to_string()).unwrap();
+    assert_eq!(
+      remap_hf_key(once.clone()).as_deref(),
+      Some(once.as_str()),
+      "remap_hf_key must converge (idempotent) on the MLX key {key}"
+    );
+  }
 }
 
 // ─────────────────── sharded safetensors merge ────────────────────────────

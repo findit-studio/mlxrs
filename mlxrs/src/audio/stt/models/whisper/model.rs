@@ -138,9 +138,11 @@ use crate::{
     AutoregressiveStt, MelConfig, Segment, Task, Transcribe, TranscribeOptions, Transcription,
   },
   error::{
-    InvariantViolationPayload, LayerKeyedPayload, RankMismatchPayload, ShapePairMismatchPayload,
+    InvariantViolationPayload, KeyCollisionPayload, LayerKeyedPayload, RankMismatchPayload,
+    ShapePairMismatchPayload,
   },
-  lm::nn::norm::LayerNorm,
+  lm::{nn::norm::LayerNorm, quant::PerLayerQuantization},
+  nn::{MaybeQuantizedLinear, QuantizedLinear},
   tokenizer::Tokenizer,
 };
 
@@ -289,17 +291,82 @@ impl WhisperModel {
     weights: HashMap<String, Array>,
     dtype: Dtype,
   ) -> Result<Self> {
+    Self::from_weights_quantized(dims, weights, dtype, None)
+  }
+
+  /// Build a [`WhisperModel`] from a **raw** (pre-sanitize) weight map, the
+  /// dimensions, and an optional parsed quantization config — the
+  /// quantization-aware analogue of [`WhisperModel::from_weights`] (which is
+  /// just this with `quantization = None`).
+  ///
+  /// When `quantization` is `Some` AND a layer's `<prefix>.weight` carries the
+  /// sibling `<prefix>.scales` tensor in the (sanitized) checkpoint, that
+  /// projection is built as a quantized layer
+  /// ([`MaybeQuantizedLinear::Quantized`]) running
+  /// [`crate::ops::quantized::quantized_matmul`] — the weight-map analogue of
+  /// mlx-audio's whisper `class_predicate`
+  /// (`isinstance(m, (nn.Linear, nn.Embedding)) and f"{p}.scales" in weights`,
+  /// `mlx_audio/stt/models/whisper/whisper.py:674-676`), with the
+  /// `(group_size, bits, mode)` resolved per layer from `quantization`. A dense
+  /// projection (no `.scales` sibling) builds exactly as before, so a
+  /// non-quantized checkpoint loads identically whether or not a `quantization`
+  /// config is threaded.
+  ///
+  /// The [`sanitize`] HF→MLX key-remap carries the `.scales` / `.biases`
+  /// sibling tensors through unchanged (the rename patterns key on the
+  /// `<module>.` prefix, not the `.weight` leaf), so a HuggingFace-format
+  /// quantized checkpoint lands its quantized triples on the right layer.
+  ///
+  /// `quantization` is the parsed
+  /// [`crate::audio::load::LoadedAudioModel::quantization`] (the
+  /// `config.json` `quantization` block parsed by
+  /// [`crate::audio::load::apply_quantization`]). A model whose config has no
+  /// `quantization` block passes `None` here.
+  ///
+  /// # Errors
+  /// The [`WhisperModel::from_weights`] errors, plus:
+  /// - [`Error::InvariantViolation`] if a `<prefix>.scales` sibling is present
+  ///   but `quantization` resolved no scheme parameters for that layer (the
+  ///   weights say quantized, the config says dense);
+  /// - [`Error::MissingKey`] / [`Error::ShapePairMismatch`] if a quantized
+  ///   biasful projection is missing its required dense `<prefix>.bias` or
+  ///   carries one of the wrong shape (the quantized path enforces the same
+  ///   dense-bias arity the dense path does);
+  /// - propagates [`crate::nn::QuantizedLinear::from_parts`]'s structural
+  ///   validation of the quantized triple.
+  pub fn from_weights_quantized(
+    dims: ModelDimensions,
+    weights: HashMap<String, Array>,
+    dtype: Dtype,
+    quantization: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
     dims.validate()?;
     // Key-remap ONLY (no transpose / cast): renames are O(1) per key and never
-    // touch tensor data, so an oversized tensor is not materialized here.
+    // touch tensor data, so an oversized tensor is not materialized here. The
+    // remap carries `.scales` / `.biases` siblings through alongside `.weight`.
     let (weights, is_hf_format) = sanitize(weights)?;
-    // The builder shape-validates each consumed tensor against the config BEFORE
-    // transposing / casting it, so the materialization runs only on tensors
-    // already proven within the config caps.
+    // Normalize the per-layer quantization keys into the SAME namespace as the
+    // sanitized weight-lookup prefixes the builder resolves against: a config
+    // can carry raw HF paths (`model.encoder.layers.0.self_attn.q_proj`,
+    // `decoder.embed_tokens`) regardless of how the weights are named, but the
+    // builder calls `quantization_for` with the sanitized MLX prefix
+    // (`encoder.blocks.0.attn.query`, `decoder.token_embedding`). Without this a
+    // per-layer override would silently miss and fall back to the global scheme.
+    // Run unconditionally (independent of the weight-map format): `remap_hf_key`
+    // is idempotent, so MLX-named config keys pass through unchanged while HF
+    // keys become MLX names (mlx-lm / mlx-audio resolve the per-layer map
+    // against post-sanitize module paths, `mlx_lm/utils.py:349-352`).
+    let normalized_quant = quantization.map(normalize_quant_keys).transpose()?;
+    // The builder shape-validates each consumed dense tensor against the config
+    // BEFORE transposing / casting it, so the materialization runs only on
+    // tensors already proven within the config caps. A quantized layer's packed
+    // weight has a different (packed) shape, so it bypasses the dense shape
+    // check and is validated structurally by `QuantizedLinear::from_parts`.
     let mut builder = Builder {
       weights,
       is_hf_format,
       dtype,
+      quantization: normalized_quant.as_ref(),
     };
 
     let encoder = builder.build_encoder(&dims)?;
@@ -378,6 +445,35 @@ impl WhisperModel {
   pub fn load(dir: &std::path::Path, dims: ModelDimensions, dtype: Dtype) -> Result<Self> {
     let weights = load_all_safetensors(dir)?;
     Self::from_weights(dims, weights, dtype)
+  }
+
+  /// Load a Whisper model from a local model directory **with** an optional
+  /// parsed quantization config — the quantization-aware analogue of
+  /// [`WhisperModel::load`].
+  ///
+  /// Reads the `*.safetensors` under `dir`, then forwards to
+  /// [`WhisperModel::from_weights_quantized`]. The caller parses `dims` via
+  /// [`ModelDimensions::from_dict`] and `quantization` via
+  /// [`crate::audio::load::apply_quantization`] from the same `config.json`
+  /// body (both available on the [`crate::audio::load::LoadedAudioModel`]
+  /// bundle the STT [`crate::audio::stt::load::load`] factory hands the
+  /// constructor). An mlx-community 8-bit checkpoint (e.g.
+  /// `whisper-large-v3-turbo-8bit`) loads its quantized projections through
+  /// this entry; a dense checkpoint with `quantization = None` loads exactly
+  /// as [`WhisperModel::load`].
+  ///
+  /// # Errors
+  /// - [`Error::MissingKey`] if no `*.safetensors` is found under `dir`;
+  /// - propagates [`crate::io::load_safetensors`] /
+  ///   [`Self::from_weights_quantized`] errors.
+  pub fn load_quantized(
+    dir: &std::path::Path,
+    dims: ModelDimensions,
+    dtype: Dtype,
+    quantization: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
+    let weights = load_all_safetensors(dir)?;
+    Self::from_weights_quantized(dims, weights, dtype, quantization)
   }
 
   /// The model dimensions.
@@ -702,6 +798,139 @@ const KEY_MAP: &[(&str, Option<&str>)] = &[
   ("decoder.embed_tokens.", Some("decoder.token_embedding.")),
 ];
 
+/// The `.weight` suffix mlx stores dense Linear / Embedding matrices under.
+/// Appended to a per-layer quantization **path** so it remaps through the same
+/// `.<leaf>.`-boundary [`KEY_MAP`] patterns a `<path>.weight` key does, then
+/// stripped back off ([`normalize_quant_keys`]).
+const WEIGHT_SUFFIX: &str = ".weight";
+
+/// Apply the HuggingFace→MLX key remap to a single weight key — the per-key
+/// core of [`sanitize`], factored out so the per-layer quantization config can
+/// be renamed through the **exact same** transform its weights are
+/// ([`normalize_quant_keys`]).
+///
+/// Strips the leading `model.` prefix (present on HF checkpoints) and then
+/// applies the [`KEY_MAP`] substitutions in table order. Returns `None` for a
+/// key whose [`KEY_MAP`] target is `None` (dropped — e.g. the encoder
+/// positional embedding, recomputed via sinusoids); `Some(remapped)`
+/// otherwise.
+///
+/// Idempotent on an already-MLX key: a key with no `model.` prefix that matches
+/// no HF-form `KEY_MAP` pattern (the `.self_attn.q_proj.`-style left-hand
+/// sides) is returned unchanged, so running it twice — or running it over a
+/// config that already carries MLX-native paths — does not double-remap.
+fn remap_hf_key(mut key: String) -> Option<String> {
+  if let Some(stripped) = key.strip_prefix("model.") {
+    key = stripped.to_string();
+  }
+  for (old, new) in KEY_MAP {
+    if key.contains(old) {
+      // A `None` target drops the key entirely (the encoder positional
+      // embedding); `?` propagates that as this function's `None`.
+      let replacement = (*new)?;
+      key = key.replace(old, replacement);
+    }
+  }
+  Some(key)
+}
+
+/// Normalize a [`PerLayerQuantization`] config's per-layer override keys into
+/// the **same namespace** as the [`sanitize`]d weight-lookup prefixes, so an
+/// HF-format quantized checkpoint's per-layer overrides match the sanitized
+/// module paths the builder resolves against (mlx-lm / mlx-audio resolve the
+/// per-layer `quantization` map against the post-`sanitize` module-tree path
+/// `p`, `mlx_lm/utils.py:349-352`, `mlx_audio/utils.py:243-244`).
+///
+/// The builder calls [`PerLayerQuantization::quantization_for`] with the
+/// **sanitized** MLX prefix (e.g. `encoder.blocks.0.attn.query`,
+/// `decoder.token_embedding`), but the parsed config keys an HF checkpoint
+/// ships are raw HF paths (e.g.
+/// `model.encoder.layers.0.self_attn.q_proj`, `decoder.embed_tokens`). Without
+/// this remap a per-layer override (a different `group_size`/`bits` for one
+/// `Linear` or for the token embedding) silently misses and the builder falls
+/// back to the global scheme — rejecting a valid mixed-quant checkpoint at
+/// [`Builder::check_quantized_shape`], or loading it with the wrong scheme.
+///
+/// Each per-layer key is renamed through [`remap_hf_key`] by appending the
+/// [`WEIGHT_SUFFIX`] sentinel (the config key is a module **path**, but the
+/// `KEY_MAP` left-hand sides match on the `.<leaf>.` boundary, exactly as a
+/// `<path>.weight` key presents), remapping, then stripping the sentinel back
+/// off — yielding byte-identical naming to the weight remap. The global default
+/// and the `Skip`/`Quantize` override value are preserved verbatim.
+///
+/// Normalization is **unconditional** — it runs for every config regardless of
+/// the checkpoint's weight-map format, because the config carries HF-named or
+/// MLX-named keys independently of how the weights are named (an MLX-native
+/// weight map can still ship a config whose per-layer keys are raw HF paths).
+/// [`remap_hf_key`] is idempotent: an already-sanitized MLX key maps to itself
+/// (no `model.` prefix to strip, no `KEY_MAP` left-hand side to match) and an HF
+/// key maps to its MLX form. So normalizing every per-layer key is correct in
+/// both namespaces — HF keys become the MLX names the builder's lookups use, and
+/// MLX keys pass through unchanged — and the collision check below runs in every
+/// case, closing the key-namespace mismatch through every path rather than only
+/// the HF-weight path.
+///
+/// Two source paths can remap onto the **same** sanitized path (e.g. a mixed
+/// config carrying both the raw HF key `model.encoder.layers.0.self_attn.q_proj`
+/// and its already-sanitized MLX alias `encoder.blocks.0.attn.query` for one
+/// layer). The collision is resolved deterministically — never by an arbitrary
+/// `HashMap`-iteration-order survivor:
+/// - if the two overrides are **identical** (same `Skip`, or same
+///   `group_size`/`bits`/`mode` `Quantize`) the duplicate is harmless and one is
+///   kept;
+/// - if they **conflict** (`Skip` vs `Quantize`, or differing
+///   `group_size`/`bits`/`mode`) the config is ambiguous for that layer — a
+///   single coherent per-layer scheme is required — and an [`Error::KeyCollision`]
+///   naming the sanitized layer key is returned (fail fast, rather than load with
+///   an arbitrary scheme and trip `check_quantized_shape` unpredictably).
+///
+/// Because identical-value collisions converge and conflicting-value collisions
+/// always error, the result does not depend on the source-map iteration order.
+fn normalize_quant_keys(quant: &PerLayerQuantization) -> Result<PerLayerQuantization> {
+  let src = quant.per_layer_ref();
+  let mut per_layer: HashMap<String, crate::lm::quant::QuantizationOption> = HashMap::new();
+  crate::model_validation::reserve_or_error(
+    &mut per_layer,
+    "normalized per-layer quantization keys",
+    src.len(),
+  )?;
+  for (path, opt) in src {
+    // The config key is a module PATH (no `.weight`); append the weight
+    // sentinel so it remaps through the SAME `.<leaf>.`-boundary `KEY_MAP`
+    // patterns the weights do, then strip the sentinel back off. A `None`
+    // remap (a dropped key) cannot occur for a per-layer override path
+    // (`KEY_MAP`'s only `None` target is the encoder positional embedding,
+    // never a quantizable Linear/Embedding), but is handled defensively by
+    // skipping the entry.
+    let with_suffix = format!("{path}{WEIGHT_SUFFIX}");
+    let Some(remapped) = remap_hf_key(with_suffix) else {
+      continue;
+    };
+    let normalized = remapped
+      .strip_suffix(WEIGHT_SUFFIX)
+      .map(str::to_string)
+      .unwrap_or(remapped);
+    // Collision-aware, order-independent insert: if two source keys normalize
+    // to the same sanitized path, the surviving value must not depend on the
+    // source-map iteration order. An identical override is a harmless duplicate
+    // (keep the existing entry); a conflicting one makes the per-layer scheme
+    // for that layer ambiguous, so reject it with a typed error.
+    match per_layer.get(&normalized) {
+      Some(existing) if *existing == *opt => {}
+      Some(_) => {
+        return Err(Error::KeyCollision(KeyCollisionPayload::new(
+          "whisper per-layer quantization config",
+          normalized,
+        )));
+      }
+      None => {
+        per_layer.insert(normalized, *opt);
+      }
+    }
+  }
+  Ok(PerLayerQuantization::new(quant.quantization, per_layer))
+}
+
 /// Sanitize a raw checkpoint for the mlxrs Whisper modules by **key-remap
 /// only** — the renaming half of `Model.sanitize` (`whisper.py:539-606`),
 /// deliberately split from the tensor-data half (conv transpose + dtype cast):
@@ -739,26 +968,14 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<(HashMap<String, Arra
   crate::model_validation::reserve_or_error(&mut sanitized, "sanitized weights", weights.len())?;
   for (mut key, value) in weights {
     if is_hf_format {
-      if let Some(stripped) = key.strip_prefix("model.") {
-        key = stripped.to_string();
-      }
-
-      // Apply the key remap; a `None` target drops the key entirely.
-      let mut skip = false;
-      for (old, new) in KEY_MAP {
-        if key.contains(old) {
-          match new {
-            None => {
-              skip = true;
-              break;
-            }
-            Some(replacement) => key = key.replace(old, replacement),
-          }
-        }
-      }
-      if skip {
+      // Strip `model.` and apply `KEY_MAP`; a `None` target drops the key
+      // entirely (the same per-key transform `normalize_quant_keys` runs over
+      // the per-layer quantization config, so weights and config stay in one
+      // namespace).
+      let Some(remapped) = remap_hf_key(key) else {
         continue;
-      }
+      };
+      key = remapped;
     }
 
     // Reject a duplicate destination key instead of silently overwriting: the
@@ -814,7 +1031,7 @@ fn mlp_hidden_dim(n_state: usize) -> Result<i32> {
 /// config caps — an oversized tensor under a consumed key is rejected by the
 /// shape check ahead of any allocation it would size. Unconsumed tensors are
 /// never materialized; they are dropped with the builder.
-struct Builder {
+struct Builder<'q> {
   weights: HashMap<String, Array>,
   /// Whether the source checkpoint was HuggingFace format — the `conv1`/`conv2`
   /// weights then still carry the HF `(out, in, k)` layout and must be
@@ -825,9 +1042,15 @@ struct Builder {
   /// validated). A `uint32` tensor (quantized / indices) is left integer, as in
   /// the reference.
   dtype: Dtype,
+  /// The parsed per-layer quantization config, if the checkpoint is quantized.
+  /// Consulted by [`Self::linear`]: when `Some` AND the layer carries a
+  /// `<prefix>.scales` sibling, the projection is built quantized (the
+  /// `(group_size, bits, mode)` resolved per layer via
+  /// [`PerLayerQuantization::quantization_for`]); otherwise dense.
+  quantization: Option<&'q PerLayerQuantization>,
 }
 
-impl Builder {
+impl Builder<'_> {
   /// Pop a required weight by key, **still at its checkpoint dtype / layout**
   /// (un-cast, un-transposed). [`Error::MissingKey`] if absent (`MissingKey`
   /// carries the runtime key string, unlike the `&'static str` `MissingField`).
@@ -972,11 +1195,250 @@ impl Builder {
     Ok(())
   }
 
-  /// Build a [`Linear`] from `<prefix>.weight` `(out, in)` (+ optional
-  /// `<prefix>.bias` `(out,)`). `bias = false` for the Whisper attention `key`
-  /// projection. Both tensors are shape-validated against the config-derived
-  /// `(out, in)` before the [`Linear`] is built.
+  /// Validate a quantized layer's packed `<prefix>.weight` + `<prefix>.scales`
+  /// against the config-derived `(out, in_features)` BEFORE the quantized layer
+  /// is constructed — the quantized analogue of [`Self::check_shape`].
+  ///
+  /// The dense path pins every consumed tensor to its exact config shape via
+  /// [`Self::take_shaped`]; the quantized path must reach the same load-time
+  /// gate, because a corrupt quantized checkpoint could otherwise ship a packed
+  /// weight whose *logical* output or vocab dimension disagrees with the config,
+  /// and the first forward would then size projections / logits from the
+  /// checkpoint tensors instead of the validated config. The packed `uint32`
+  /// weight has a different shape than the dense `(out, in)`, so the recovery
+  /// mirrors mlx's quantized layout (`mlx/ops.cpp:107,131,4790-4792`):
+  ///
+  /// - the weight is rank-2 `uint32` `(out, in * bits / 32)`; its *logical*
+  ///   output dim is the leading axis and must equal `out`, and its *logical*
+  ///   input width — mlx's `w_inner_dims = w.shape(-1) * 32 / bits`, the
+  ///   dimension `quantized_matmul` contracts against — must equal `in_features`;
+  /// - the `scales` are rank-2 `(out, in / group_size)`; the leading axis must
+  ///   equal `out`, and `scales.shape(-1) * group_size` must equal `in_features`
+  ///   (mlx's `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+  ///   invariant). Validating both the packed-weight and the scales recovery
+  ///   here turns a malformed quantized checkpoint into a typed error at load
+  ///   time rather than an opaque mlx-c matmul failure on the first forward.
+  ///
+  /// `group_size` / `bits` are the per-layer-resolved scheme parameters; both
+  /// are checked `> 0` before they divide (a non-positive value is a malformed
+  /// config and a [`Error::OutOfRange`], never a panic). The per-mode value
+  /// tables remain mlx-c's; this only pins the structural relationship to the
+  /// config the dense gate also enforces.
+  ///
+  /// On mismatch returns an [`Error::ShapePairMismatch`] (or [`Error::RankMismatch`]
+  /// / [`Error::InvariantViolation`] for a wrong rank / dtype) wrapped in an
+  /// [`Error::LayerKeyed`] naming the offending `<prefix>.weight` /
+  /// `<prefix>.scales` key. Reads only `shape()` / `dtype()` metadata (no
+  /// materialization), so it is bounded regardless of the declared dims.
+  fn check_quantized_shape(
+    &self,
+    prefix: &str,
+    descriptor: &'static str,
+    out: i32,
+    in_features: i32,
+    group_size: i32,
+    bits: i32,
+  ) -> Result<()> {
+    // The scheme parameters divide the recovered widths; a non-positive value
+    // is a malformed config (`from_parts` also rejects it, but guard here so
+    // the divisions below cannot trap).
+    if bits <= 0 {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel: quantized layer bits",
+        "must be > 0",
+        smol_str::format_smolstr!("{bits}"),
+      )));
+    }
+    if group_size <= 0 {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel: quantized layer group_size",
+        "must be > 0",
+        smol_str::format_smolstr!("{group_size}"),
+      )));
+    }
+
+    // Packed weight `(out, in * bits / 32)`, `uint32`.
+    let weight_key = format!("{prefix}.weight");
+    let weight = self.weights.get(&weight_key).ok_or_else(|| {
+      Error::MissingKey(crate::error::MissingKeyPayload::new(
+        "WhisperModel: quantized weight not found in checkpoint",
+        weight_key.clone(),
+      ))
+    })?;
+    let w_shape = weight.shape();
+    if w_shape.len() != 2 {
+      let rank = w_shape.len() as u32;
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        &weight_key,
+        Error::RankMismatch(RankMismatchPayload::new(
+          "quantized weight must be rank-2 (out, in * bits / 32)",
+          rank,
+          w_shape,
+        )),
+      )));
+    }
+    if weight.dtype()? != Dtype::U32 {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        &weight_key,
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "quantized weight dtype",
+          "must be `uint32` (the packed-quantized-weight dtype)",
+        )),
+      )));
+    }
+    // Logical output dim is the leading axis; logical input width is mlx's
+    // `w_inner_dims = w.shape(-1) * 32 / bits` (the contraction dim). Compare in
+    // i64 so the recovery cannot overflow on a corrupt huge packed width.
+    let logical_in = (w_shape[1] as i64) * 32 / i64::from(bits);
+    if w_shape[0] as i64 != i64::from(out) || logical_in != i64::from(in_features) {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        &weight_key,
+        Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+          descriptor,
+          vec![out.max(0) as usize, in_features.max(0) as usize],
+          vec![w_shape[0], logical_in.max(0) as usize],
+        )),
+      )));
+    }
+
+    // Scales `(out, in / group_size)`: leading axis is `out`, and the per-group
+    // count recovers the same logical input width as the packed weight.
+    let scales_key = format!("{prefix}.scales");
+    let scales = self.weights.get(&scales_key).ok_or_else(|| {
+      Error::MissingKey(crate::error::MissingKeyPayload::new(
+        "WhisperModel: quantized scales not found in checkpoint",
+        scales_key.clone(),
+      ))
+    })?;
+    let s_shape = scales.shape();
+    if s_shape.len() != 2 {
+      let rank = s_shape.len() as u32;
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        &scales_key,
+        Error::RankMismatch(RankMismatchPayload::new(
+          "quantized scales must be rank-2 (out, in / group_size)",
+          rank,
+          s_shape,
+        )),
+      )));
+    }
+    let scales_in = (s_shape[1] as i64) * i64::from(group_size);
+    if s_shape[0] as i64 != i64::from(out) || scales_in != i64::from(in_features) {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        &scales_key,
+        Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+          "quantized scales (out, in / group_size) must match the config",
+          vec![out.max(0) as usize, in_features.max(0) as usize],
+          vec![s_shape[0], scales_in.max(0) as usize],
+        )),
+      )));
+    }
+
+    Ok(())
+  }
+
+  /// Build a [`Linear`] from `<prefix>.weight` (+ the dense `<prefix>.bias`
+  /// when the architecture `bias` flag is `true`).
+  ///
+  /// **Quantized path** — when the checkpoint carries a `<prefix>.scales`
+  /// sibling AND a quantization config is threaded: the projection is built
+  /// quantized via [`crate::nn::QuantizedLinear::from_parts`], running
+  /// [`crate::ops::quantized::quantized_matmul`] over the packed
+  /// `(weight, scales, biases)` triple with the per-layer-resolved
+  /// `(group_size, bits, mode)`. The packed `uint32` weight has shape
+  /// `(out, in * bits / 32)`, NOT the dense `(out, in)`, so it does **not** go
+  /// through the dense `take_shaped` config-shape check — its structural
+  /// consistency is validated by [`crate::nn::QuantizedLinear::from_parts`]
+  /// instead. This mirrors mlx-audio's whisper `class_predicate`
+  /// (`f"{p}.scales" in weights`), with the global `quantization` block's
+  /// scheme parameters (`whisper.py:674-676`).
+  ///
+  /// The dense output `<prefix>.bias` is loaded with the **same arity** the
+  /// dense path enforces: mlx's `QuantizedLinear.from_linear` preserves the
+  /// source `Linear.bias`, so a faithful quantized Whisper checkpoint carries
+  /// `query.bias` / `value.bias` / `out.bias` / `mlp1.bias` / `mlp2.bias`. When
+  /// the architecture `bias` flag is `true` this path therefore **requires**
+  /// `<prefix>.bias`, validates it as `(out,)`, casts it through the same
+  /// builder dtype path as the dense bias, and passes it as the explicit dense
+  /// bias to [`crate::nn::QuantizedLinear::from_parts`] — NOT via the
+  /// optional-bias [`MaybeQuantizedLinear::from_weights`] convenience, so a
+  /// quantized checkpoint missing a required bias fails fast with the same
+  /// typed [`Error::MissingKey`] / [`Error::ShapePairMismatch`] the dense path
+  /// returns, instead of silently loading a biasless projection.
+  ///
+  /// **Dense path** — otherwise: pops `<prefix>.weight` `(out, in)` (+ the
+  /// `<prefix>.bias` `(out,)` when `bias` is `true`), both shape-validated
+  /// against the config-derived extents BEFORE materialization, exactly as
+  /// before.
+  ///
+  /// `bias = false` for the Whisper attention `key` projection
+  /// (`whisper.py:333`); on both paths that projection carries no dense output
+  /// bias and any stray `<prefix>.bias` is dropped unused.
   fn linear(&mut self, prefix: &str, out: i32, in_features: i32, bias: bool) -> Result<Linear> {
+    // `<prefix>.scales` is the load-bearing "this layer is quantized" signal
+    // (mlx-audio whisper `class_predicate`). Only when it is present AND a
+    // quantization config is threaded do we take the quantized path.
+    let scales_key = format!("{prefix}.scales");
+    if self.quantization.is_some() && self.weights.contains_key(&scales_key) {
+      // Resolve the per-layer `(group_size, bits, mode)` from the config. A
+      // `quantization_for` of `None` (an explicit per-layer `Skip`, or no
+      // global default) next to a present `.scales` is a config/checkpoint
+      // inconsistency — a typed error, never a guessed scheme.
+      let Some(q) = self.quantization.and_then(|q| q.quantization_for(prefix)) else {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "WhisperModel: Linear carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
+          "a quantized Linear requires (group_size, bits, mode) from the config `quantization` block",
+        )));
+      };
+      // The quantized triple must reach the same config-shape gate the dense
+      // `take_shaped` enforces: the packed weight's logical `(out, in)` (and
+      // the scales' recovery) must equal the config-derived extents BEFORE
+      // construction, so a corrupt quantized checkpoint cannot size the
+      // projection from the tensor instead of the config.
+      self.check_quantized_shape(
+        prefix,
+        "quantized Linear weight (out, in)",
+        out,
+        in_features,
+        q.group_size,
+        q.bits,
+      )?;
+      // Load the dense output bias with the SAME arity as the dense branch: when
+      // the architecture `bias` flag is `true`, `take_shaped` REQUIRES
+      // `<prefix>.bias`, validates it `(out,)`, and casts it through the builder
+      // dtype path (a missing key → `Error::MissingKey`, a wrong shape →
+      // `Error::ShapePairMismatch`); when `false` (Whisper's attention `key`),
+      // any stray `<prefix>.bias` is dropped unused, exactly as the dense path
+      // leaves it. The loaded bias is passed as the explicit dense bias to
+      // `QuantizedLinear::from_parts` (not auto-detected by `from_weights`), so
+      // dense and quantized are arity-identical.
+      let dense_bias = if bias {
+        Some(self.take_shaped(&format!("{prefix}.bias"), "Linear bias (out,)", &[out])?)
+      } else {
+        self.weights.remove(&format!("{prefix}.bias"));
+        None
+      };
+      // Pop the packed triple by key (the same key-remap-free consume the dense
+      // path uses): the `uint32` weight, the `.scales`, and the per-group affine
+      // `.biases` (present iff `mode == "affine"`; `from_parts` enforces the
+      // mode/arity contract). `take` returns a typed `MissingKey` if absent.
+      let weight = self.take(&format!("{prefix}.weight"))?;
+      let scales = self.take(&format!("{prefix}.scales"))?;
+      let quant_biases = self.weights.remove(&format!("{prefix}.biases"));
+      let q = QuantizedLinear::from_parts(
+        weight,
+        scales,
+        quant_biases,
+        dense_bias,
+        q.group_size,
+        q.bits,
+        q.mode.as_str(),
+      )?;
+      return Ok(Linear::quantized(MaybeQuantizedLinear::Quantized(q)));
+    }
+
+    // Dense path (unchanged): shape-validate against the config-derived
+    // `(out, in)` before materialization.
     let weight = self.take_shaped(
       &format!("{prefix}.weight"),
       "Linear weight (out, in)",
@@ -988,6 +1450,67 @@ impl Builder {
       None
     };
     Ok(Linear::new(weight, b))
+  }
+
+  /// Build an [`Embedding`] from `<prefix>.weight`.
+  ///
+  /// **Quantized path** — when the checkpoint carries a `<prefix>.scales`
+  /// sibling AND a quantization config is threaded: the table is built
+  /// quantized ([`Embedding::quantized`], `mlx.nn.QuantizedEmbedding`), with
+  /// the packed `(weight, scales, biases)` triple popped from the map and the
+  /// `(group_size, bits, mode)` resolved per layer. The packed `uint32` weight
+  /// is `(n_vocab, n_state * bits / 32)`, NOT the dense `(n_vocab, n_state)`,
+  /// so it bypasses the dense `take_shaped` config-shape check. This mirrors
+  /// mlx-audio's whisper `class_predicate`, which quantizes `nn.Embedding`
+  /// (the weight-tied logit head) alongside `nn.Linear` (`whisper.py:674-676`).
+  ///
+  /// **Dense path** — otherwise: pops the `<prefix>.weight` `(n_vocab,
+  /// n_state)`, shape-validated against the config-derived extents.
+  fn embedding(
+    &mut self,
+    prefix: &str,
+    descriptor: &'static str,
+    n_vocab: i32,
+    n_state: i32,
+  ) -> Result<Embedding> {
+    let scales_key = format!("{prefix}.scales");
+    if self.quantization.is_some() && self.weights.contains_key(&scales_key) {
+      // Quantized embedding: resolve the per-layer scheme params, then pop the
+      // packed triple. A present `.scales` with no resolvable params (an
+      // explicit `Skip`, or no global default) is a config/checkpoint
+      // inconsistency surfaced as a typed error below.
+      let Some(q) = self.quantization.and_then(|q| q.quantization_for(prefix)) else {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "WhisperModel: embedding carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
+          "a quantized embedding requires (group_size, bits, mode) from the config `quantization` block",
+        )));
+      };
+      // Same load-time gate as the dense path: `check_quantized_shape` pins the
+      // packed table's logical `(n_vocab, n_state)` (and the scales' recovery)
+      // to the config-derived extents, and `Embedding::quantized` then validates
+      // the triple's structural consistency (mode/bias arity, the biases/scales
+      // shape match, the rank/dtype invariants) — the embedding analogue of the
+      // `QuantizedLinear::from_parts` gate the dense / quantized Linear path
+      // reaches. So a corrupt quantized embedding (wrong logical shape, OR a
+      // missing/stale/mis-shaped `.biases`) is a typed load-time error here,
+      // never an opaque mlx-c failure on the first gather / logit projection.
+      self.check_quantized_shape(prefix, descriptor, n_vocab, n_state, q.group_size, q.bits)?;
+      let weight = self.take(&format!("{prefix}.weight"))?;
+      let scales = self.take(&format!("{prefix}.scales"))?;
+      let biases = self.weights.remove(&format!("{prefix}.biases"));
+      return Embedding::quantized(
+        weight,
+        scales,
+        biases,
+        q.group_size,
+        q.bits,
+        q.mode.as_str(),
+      );
+    }
+
+    // Dense path: shape-validate against the config-derived (n_vocab, n_state).
+    let weight = self.take_shaped(&format!("{prefix}.weight"), descriptor, &[n_vocab, n_state])?;
+    Ok(Embedding::new(weight))
   }
 
   /// Build a [`LayerNorm`] from `<prefix>.{weight,bias}` (full affine, the
@@ -1130,11 +1653,12 @@ impl Builder {
     let n_ctx = dims.n_text_ctx() as i32;
     let mlp_hidden = mlp_hidden_dim(dims.n_text_state())?;
 
-    let token_embedding = Embedding::new(self.take_shaped(
-      "decoder.token_embedding.weight",
+    let token_embedding = self.embedding(
+      "decoder.token_embedding",
       "decoder token embedding (n_vocab, n_text_state)",
-      &[n_vocab, n_state],
-    )?);
+      n_vocab,
+      n_state,
+    )?;
     let positional_embedding = self.take_shaped(
       "decoder.positional_embedding",
       "decoder positional embedding (n_text_ctx, n_text_state)",
