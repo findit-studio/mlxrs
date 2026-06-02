@@ -14,97 +14,286 @@
 use crate::{
   Array, Result,
   lm::nn::{activations::gelu, norm::LayerNorm},
+  nn::MaybeQuantizedLinear,
   ops::{self, shape::concatenate},
 };
 
-/// A dense linear projection `y = x @ Wᵀ (+ b)`.
+/// A Whisper linear projection `y = x @ Wᵀ (+ b)` — quantize-aware.
 ///
-/// Mirrors `mlx.nn.Linear`: `weight` is stored `(out_features, in_features)`
-/// and the forward transposes it, so `y = x @ weight.T + bias`. `bias` is
-/// optional — Whisper's `key` projection is constructed `bias=False`
+/// Mirrors `mlx.nn.Linear` (`weight` stored `(out_features, in_features)`, the
+/// forward transposes it) for a dense checkpoint, and `mlx.nn.QuantizedLinear`
+/// for an mlx-community quantized checkpoint (e.g. `whisper-large-v3-turbo-8bit`).
+/// The two cases share one [`forward`](Self::forward) call site via the shared
+/// [`MaybeQuantizedLinear`], so the Whisper attention / MLP code is unchanged
+/// whether the weights are dense or quantized.
+///
+/// `bias` is optional — Whisper's `key` projection is constructed `bias=False`
 /// (`whisper.py:333`), every other projection carries a bias.
 #[derive(Debug)]
 pub(crate) struct Linear {
-  /// `(out_features, in_features)` weight (the `mlx.nn.Linear` layout).
-  weight: Array,
-  /// Optional `(out_features,)` bias. `None` for Whisper's `key` projection.
-  bias: Option<Array>,
+  /// The dense-or-quantized projection. Built by the model `Builder` (either
+  /// directly from a shape-validated dense `(weight, bias)` via [`Self::new`],
+  /// or from the checkpoint's quantized `(weight, scales, biases)` triple via
+  /// [`Self::quantized`]).
+  inner: MaybeQuantizedLinear,
 }
 
 impl Linear {
-  /// Construct from a `(out_features, in_features)` `weight` and an optional
-  /// `(out_features,)` `bias`.
+  /// Construct a **dense** projection from a `(out_features, in_features)`
+  /// `weight` and an optional `(out_features,)` `bias`.
   pub(crate) fn new(weight: Array, bias: Option<Array>) -> Self {
-    Self { weight, bias }
-  }
-
-  /// `y = x @ weightᵀ (+ bias)`. `x` is `(..., in_features)`; the result is
-  /// `(..., out_features)`.
-  ///
-  /// # Errors
-  /// Propagates the transpose / matmul / add op errors.
-  pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-    let wt = self.weight.transpose()?;
-    let y = x.matmul(&wt)?;
-    match &self.bias {
-      Some(b) => y.add(b),
-      None => Ok(y),
+    Self {
+      inner: MaybeQuantizedLinear::Dense(crate::nn::Linear::new(weight, bias)),
     }
   }
 
-  /// The `(out_features, in_features)` weight (test / introspection).
+  /// Wrap an already-built [`MaybeQuantizedLinear`] (the quantized path: the
+  /// model `Builder` constructs it via
+  /// [`MaybeQuantizedLinear::from_weights`] from the checkpoint's
+  /// `(weight, scales, biases)` triple).
+  pub(crate) fn quantized(inner: MaybeQuantizedLinear) -> Self {
+    Self { inner }
+  }
+
+  /// `y = x @ weightᵀ (+ bias)` (dense) or `quantized_matmul(...) (+ bias)`
+  /// (quantized). `x` is `(..., in_features)`; the result is
+  /// `(..., out_features)`.
+  ///
+  /// # Errors
+  /// Propagates the transpose / matmul / quantized-matmul / add op errors.
+  pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
+    self.inner.forward(x)
+  }
+
+  /// `true` if this projection was loaded from a quantized checkpoint.
   #[cfg(test)]
-  pub(crate) fn weight_ref(&self) -> &Array {
-    &self.weight
+  pub(crate) fn is_quantized(&self) -> bool {
+    self.inner.is_quantized()
+  }
+
+  /// The dense `(out_features, in_features)` weight (test / introspection).
+  /// `None` for a quantized projection (whose packed weight has a different
+  /// shape / dtype).
+  #[cfg(test)]
+  pub(crate) fn weight_ref(&self) -> Option<&Array> {
+    match &self.inner {
+      MaybeQuantizedLinear::Dense(l) => Some(l.weight_ref()),
+      MaybeQuantizedLinear::Quantized(_) => None,
+    }
   }
 }
 
-/// A token embedding table `weight` of shape `(n_vocab, n_state)`, with a
-/// weight-tied [`Embedding::as_linear`] projection.
+/// The packed quantized embedding table — the `(weight, scales, biases)`
+/// triple plus the `group_size` / `bits` / `mode` scheme parameters, mirroring
+/// `mlx.nn.QuantizedEmbedding` (`mlx/python/mlx/nn/layers/quantized.py:99-196`).
 ///
-/// Mirrors `mlx.nn.Embedding`: [`Embedding::forward`] gathers rows by integer
-/// id; [`Embedding::as_linear`] reuses the SAME `weight` as a linear
-/// projection `x @ weightᵀ` (the Whisper decoder's weight-tied logit head —
-/// `whisper.py` `TextDecoder.__call__` ends with
+/// Used when an mlx-community quantized whisper checkpoint (e.g.
+/// `whisper-large-v3-turbo-8bit`) ships a quantized `decoder.token_embedding`
+/// (the `class_predicate` in `whisper.py:674-676` quantizes both `nn.Linear`
+/// AND `nn.Embedding`).
+///
+/// All fields are private; the triple's structural consistency (mode/bias
+/// arity, the `biases`/`scales` shape match, the rank / dtype invariants) is
+/// validated at construction by [`Embedding::quantized`], the embedding
+/// analogue of [`crate::nn::QuantizedLinear::from_parts`], so the scheme
+/// parameters cannot be silently mutated apart from the arrays they describe.
+#[derive(Debug)]
+struct QuantizedEmbedding {
+  /// Packed `(n_vocab, packed_n_state)` quantized table (`uint32`).
+  weight: Array,
+  /// Per-group `scales` `(n_vocab, n_groups)`.
+  scales: Array,
+  /// Per-group affine `biases` (`None` for scale-only `fp` modes).
+  biases: Option<Array>,
+  group_size: i32,
+  bits: i32,
+  mode: String,
+}
+
+/// A token embedding table of shape `(n_vocab, n_state)`, with a weight-tied
+/// [`Embedding::as_linear`] projection — quantize-aware.
+///
+/// Mirrors `mlx.nn.Embedding` for a dense checkpoint and
+/// `mlx.nn.QuantizedEmbedding` for a quantized one: [`Embedding::forward`]
+/// gathers rows by integer id; [`Embedding::as_linear`] reuses the SAME table
+/// as a linear projection `x @ weightᵀ` (the Whisper decoder's weight-tied
+/// logit head — `whisper.py` `TextDecoder.__call__` ends with
 /// `self.token_embedding.as_linear(x)`).
 #[derive(Debug)]
 pub(crate) struct Embedding {
-  /// `(n_vocab, n_state)` embedding table.
-  weight: Array,
+  inner: EmbeddingInner,
+}
+
+#[derive(Debug)]
+enum EmbeddingInner {
+  /// `(n_vocab, n_state)` dense embedding table.
+  Dense(Array),
+  /// Quantized embedding table.
+  Quantized(QuantizedEmbedding),
 }
 
 impl Embedding {
-  /// Construct from a `(n_vocab, n_state)` embedding table.
+  /// Construct from a `(n_vocab, n_state)` dense embedding table.
   pub(crate) fn new(weight: Array) -> Self {
-    Self { weight }
+    Self {
+      inner: EmbeddingInner::Dense(weight),
+    }
+  }
+
+  /// Construct a **quantized** embedding from the checkpoint's packed
+  /// `(weight, scales, biases)` triple and the scheme parameters — mirroring
+  /// `mlx.nn.QuantizedEmbedding`. Used when the checkpoint quantizes
+  /// `decoder.token_embedding`.
+  ///
+  /// The embedding analogue of [`crate::nn::QuantizedLinear::from_parts`]: the
+  /// `(weight, scales, biases, group_size, bits, mode)` triple is validated by
+  /// the shared [`crate::nn::quantized::validate_quantized_triple`] at LOAD time
+  /// — the ONE place mlx's construct-relevant contract is mirrored, so this
+  /// constructor and [`crate::nn::QuantizedLinear::from_parts`] cannot drift
+  /// apart. A malformed quantized embedding (one whose `biases` arity / shape /
+  /// dtype disagrees with the `mode` and `scales`, a non-`uint32` weight, or a
+  /// scales trailing dim that does not recover `n_state`) is a typed error here
+  /// rather than an opaque mlx-c rejection on the first [`Self::forward`]
+  /// `dequantize` or [`Self::as_linear`] `quantized_matmul`. The validated
+  /// contract (rank / `uint32` weight / the scales leading-dim + width identity /
+  /// per-mode bias arity / the `fp`-mode `uint8` scale dtype; the `affine`
+  /// scale/bias dtype rule is deferred to mlx-c at op-time) is documented on
+  /// [`crate::nn::quantized::validate_quantized_triple`]; the embedding has NO
+  /// separate dense output bias — its `biases` IS the per-group affine bias — so
+  /// the linear-only dense-bias check from `from_parts` does not apply here. The
+  /// `affine` arity rule is the `biases = biases[0] if biases else None` contract
+  /// `mlx.nn.QuantizedEmbedding.__init__` encodes (`quantized.py:134-137`).
+  ///
+  /// Reads only `shape()` / `dtype()` metadata (no materialization / eval), so
+  /// it is bounded regardless of the declared dims.
+  ///
+  /// # Errors
+  /// - [`Error::RankMismatch`] if `weight` / `scales` / `biases` have the wrong
+  ///   rank;
+  /// - [`Error::InvariantViolation`] if `weight` is not `uint32`, or the
+  ///   mode/bias arity is violated;
+  /// - [`Error::ShapePairMismatch`] if `scales`' leading / trailing dim or
+  ///   `biases`' shape disagree;
+  /// - [`Error::UnknownEnumValue`] for an unrecognized `mode`;
+  /// - [`Error::OutOfRange`] if `bits` / `group_size` are not positive;
+  /// - [`Error::UnsupportedDtype`] if a `fp`-mode `scales` is not `uint8`. (The
+  ///   `affine` scale/bias dtype rule is deferred to mlx-c at op-time.)
+  pub(crate) fn quantized(
+    weight: Array,
+    scales: Array,
+    biases: Option<Array>,
+    group_size: i32,
+    bits: i32,
+    mode: impl Into<String>,
+  ) -> Result<Self> {
+    let mode = mode.into();
+
+    // The mlx quantized-triple contract — rank / `uint32` weight / the scales
+    // leading-dim + width identity / per-mode bias arity / `fp`-mode `uint8`
+    // scale dtype — in ONE shared place, identical to the one
+    // `QuantizedLinear::from_parts` runs (the `affine` scale/bias dtype rule is
+    // deferred to mlx-c at op-time). The embedding has no separate dense output
+    // bias, so there is no further per-constructor check.
+    crate::nn::quantized::validate_quantized_triple(
+      "Embedding::quantized",
+      &weight,
+      &scales,
+      biases.as_ref(),
+      group_size,
+      bits,
+      &mode,
+    )?;
+
+    Ok(Self {
+      inner: EmbeddingInner::Quantized(QuantizedEmbedding {
+        weight,
+        scales,
+        biases,
+        group_size,
+        bits,
+        mode,
+      }),
+    })
   }
 
   /// Gather embedding rows: `weight[ids]` — gather along axis 0 (the vocab
-  /// axis), mirroring `mlx.nn.Embedding.__call__`'s `self.weight[x]`. `ids`
-  /// is an integer [`Array`] of any shape `S`; the result is `S ++
-  /// (n_state,)`. (Plain `take` would flatten the table — `take_axis(.., 0)`
-  /// is the row-gather.)
+  /// axis), mirroring `mlx.nn.Embedding.__call__`'s `self.weight[x]` (dense)
+  /// and `mlx.nn.QuantizedEmbedding.__call__`'s
+  /// `dequantize(weight[x], scales[x], biases[x], ...)` (quantized). `ids` is
+  /// an integer [`Array`] of any shape `S`; the result is `S ++ (n_state,)`.
+  /// (Plain `take` would flatten the table — `take_axis(.., 0)` is the
+  /// row-gather.)
   ///
   /// # Errors
-  /// Propagates the gather (`take_axis`) op error.
+  /// Propagates the gather (`take_axis`) / dequantize op errors.
   pub(crate) fn forward(&self, ids: &Array) -> Result<Array> {
-    self.weight.take_axis(ids, 0)
+    match &self.inner {
+      EmbeddingInner::Dense(weight) => weight.take_axis(ids, 0),
+      EmbeddingInner::Quantized(q) => {
+        // `mlx.nn.QuantizedEmbedding.__call__`: gather the packed rows + the
+        // per-row scales / biases by id, then dequantize the gathered rows.
+        let w_rows = q.weight.take_axis(ids, 0)?;
+        let s_rows = q.scales.take_axis(ids, 0)?;
+        let b_rows = match &q.biases {
+          Some(b) => Some(b.take_axis(ids, 0)?),
+          None => None,
+        };
+        ops::quantized::dequantize(
+          &w_rows,
+          &s_rows,
+          b_rows.as_ref(),
+          q.group_size,
+          q.bits,
+          &q.mode,
+          None,
+          None,
+        )
+      }
+    }
   }
 
-  /// Weight-tied linear projection `x @ weightᵀ` (the decoder logit head).
-  /// `x` is `(..., n_state)`; the result is `(..., n_vocab)`.
+  /// Weight-tied linear projection `x @ weightᵀ` (the decoder logit head),
+  /// mirroring `mlx.nn.Embedding.as_linear` (dense) and
+  /// `mlx.nn.QuantizedEmbedding.as_linear`'s
+  /// `quantized_matmul(x, weight, scales, biases, transpose=True, ...)`
+  /// (quantized). `x` is `(..., n_state)`; the result is `(..., n_vocab)`.
   ///
   /// # Errors
-  /// Propagates the transpose / matmul op errors.
+  /// Propagates the transpose / matmul / quantized-matmul op errors.
   pub(crate) fn as_linear(&self, x: &Array) -> Result<Array> {
-    let wt = self.weight.transpose()?;
-    x.matmul(&wt)
+    match &self.inner {
+      EmbeddingInner::Dense(weight) => {
+        let wt = weight.transpose()?;
+        x.matmul(&wt)
+      }
+      EmbeddingInner::Quantized(q) => ops::quantized::quantized_matmul(
+        x,
+        &q.weight,
+        &q.scales,
+        q.biases.as_ref(),
+        true,
+        q.group_size,
+        q.bits,
+        &q.mode,
+      ),
+    }
   }
 
-  /// The `(n_vocab, n_state)` embedding table (test / introspection).
+  /// `true` if this embedding was loaded from a quantized checkpoint.
   #[cfg(test)]
-  pub(crate) fn weight_ref(&self) -> &Array {
-    &self.weight
+  pub(crate) fn is_quantized(&self) -> bool {
+    matches!(self.inner, EmbeddingInner::Quantized(_))
+  }
+
+  /// The dense `(n_vocab, n_state)` embedding table (test / introspection).
+  /// `None` for a quantized embedding (whose packed table has a different
+  /// shape / dtype).
+  #[cfg(test)]
+  pub(crate) fn weight_ref(&self) -> Option<&Array> {
+    match &self.inner {
+      EmbeddingInner::Dense(weight) => Some(weight),
+      EmbeddingInner::Quantized(_) => None,
+    }
   }
 }
 

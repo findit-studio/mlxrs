@@ -21,6 +21,13 @@ pub mod ffi;
 pub mod io;
 pub mod memory;
 pub mod model_validation;
+/// Shared neural-network layers reusable by every model family (`lm` /
+/// `vlm` / `audio` / `embeddings`) — the dense + quantized linear layers and
+/// the quantize-aware [`nn::MaybeQuantizedLinear`] a model loads either a
+/// dense or a quantized checkpoint through. Distinct from the LM-scoped
+/// [`lm::nn`] primitives (RoPE / fast-SDPA attention / MoE switch layers).
+/// Always compiled (no feature gate) so `embeddings` can reach it too.
+pub mod nn;
 pub mod ops;
 pub mod shape;
 /// Hand-written `core::arch` SIMD kernels for the host-CPU numeric
