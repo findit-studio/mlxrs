@@ -471,6 +471,96 @@ fn mha_warm_cache_single_token_unchanged() {
   }
 }
 
+/// The normal-decode path ([`MultiHeadAttention::forward`]) runs the no-`qk`
+/// attention core ([`MultiHeadAttention::qkv_attention_no_qk`]) — which never
+/// returns the pre-softmax score tensor — yet produces output BYTE-IDENTICAL
+/// to the `qk`-returning core reached through
+/// [`MultiHeadAttention::forward_with_qk`]. Asserts the split is purely a
+/// score-buffer-lifetime change with zero behavioral drift, on BOTH the
+/// masked self-attention path (what `ResidualAttentionBlock::forward` drives)
+/// and the cross-attention path. NON-identity projections so the recombined
+/// output and the softmax mixing are nontrivial. n_state=4, n_head=2.
+#[test]
+fn mha_forward_no_qk_core_matches_qk_returning_core() {
+  let n_state = 4usize;
+  // Distinct, non-identity q/k/v/out projections (so `out` is a real mix, not
+  // a pass-through that would mask a divergence between the two cores).
+  let wq = arr(
+    &[
+      0.5, 0.1, 0.0, -0.2, 0.3, 0.4, 0.2, 0.0, 0.1, -0.3, 0.6, 0.2, 0.0, 0.2, -0.1, 0.7,
+    ],
+    &[4, 4],
+  );
+  let wk = arr(
+    &[
+      0.2, -0.1, 0.3, 0.0, 0.1, 0.5, -0.2, 0.4, 0.0, 0.3, 0.2, -0.1, 0.4, 0.0, 0.1, 0.3,
+    ],
+    &[4, 4],
+  );
+  let wv = arr(
+    &[
+      0.3, 0.0, -0.2, 0.1, 0.0, 0.4, 0.1, -0.3, 0.2, -0.1, 0.5, 0.0, -0.1, 0.2, 0.0, 0.6,
+    ],
+    &[4, 4],
+  );
+  let wo = arr(
+    &[
+      0.4, 0.1, -0.1, 0.0, 0.2, 0.3, 0.0, 0.1, -0.2, 0.0, 0.5, 0.1, 0.1, -0.2, 0.2, 0.4,
+    ],
+    &[4, 4],
+  );
+  let mha = MultiHeadAttention::new(
+    2,
+    Linear::new(wq, None),
+    Linear::new(wk, None),
+    Linear::new(wv, None),
+    Linear::new(wo, None),
+  );
+
+  // Self-attention with a causal mask (the path normal decode reaches).
+  let x = arr(
+    &[
+      0.1, -0.2, 0.3, 0.4, 1.0, -1.0, 0.5, -0.5, -0.3, 0.7, -0.2, 0.9,
+    ],
+    &[1, 3, n_state as i32],
+  );
+  let mask = full_causal_mask(3);
+  let (out_plain, (k_plain, v_plain)) = mha.forward(&x, None, Some(&mask), None).unwrap();
+  let (out_qk, (k_qk, v_qk), qk) = mha.forward_with_qk(&x, None, Some(&mask), None).unwrap();
+  // The plain path's output is identical to the qk-returning path's output.
+  assert_eq!(
+    to_vec(&out_plain),
+    to_vec(&out_qk),
+    "no-qk self-attn output must equal the qk-returning output byte-for-byte"
+  );
+  // The returned (k, v) are identical too (same projection path).
+  assert_eq!(to_vec(&k_plain), to_vec(&k_qk), "self-attn k identical");
+  assert_eq!(to_vec(&v_plain), to_vec(&v_qk), "self-attn v identical");
+  // The qk-returning path surfaces the (B, H, T, T_kv) score tensor; the plain
+  // path's signature cannot return it (so it never escapes that path).
+  assert_eq!(
+    qk.shape(),
+    vec![1, 2, 3, 3],
+    "cross-qk score shape (B,H,T,T_kv)"
+  );
+
+  // Cross-attention path: same equivalence.
+  let xa = arr(
+    &[
+      0.2, 0.4, -0.1, 0.3, 0.5, -0.2, 0.1, 0.0, -0.3, 0.6, 0.2, 0.1,
+    ],
+    &[1, 3, n_state as i32],
+  );
+  let xq = arr(&[0.7, -0.4, 0.2, 0.1], &[1, 1, n_state as i32]);
+  let (cross_plain, _) = mha.forward(&xq, Some(&xa), None, None).unwrap();
+  let (cross_qk, _, _) = mha.forward_with_qk(&xq, Some(&xa), None, None).unwrap();
+  assert_eq!(
+    to_vec(&cross_plain),
+    to_vec(&cross_qk),
+    "no-qk cross-attn output must equal the qk-returning output byte-for-byte"
+  );
+}
+
 /// Introspection accessors compile and return the stored weights.
 #[test]
 fn linear_embedding_weight_accessors() {

@@ -362,3 +362,59 @@ fn decoder_context_checked_before_embedding_at_offset() {
   let one = Array::from_slice::<i32>(&[0], &[1, 1]).unwrap();
   assert!(dec.forward(&one, &xa, Some(&cache)).is_ok());
 }
+
+/// Cross-attention weight extraction (`forward_with_cross_qk`): a multi-block
+/// decoder returns one cross-attention `qk` per block, each shaped
+/// `(B, n_head, T, T_kv)` (the per-head attention scores over the encoder
+/// frames), and the logits are byte-identical to the plain `forward` (the
+/// extraction is a pure add-on, the normal decode path is unchanged).
+#[test]
+fn decoder_forward_with_cross_qk_returns_per_layer_weights() {
+  let n_vocab = 5usize;
+  let n_state = 4usize;
+  let n_head = 2usize;
+  let n_ctx = 8usize;
+  // Two real cross-attention blocks so the per-layer list has length 2.
+  let blocks = vec![
+    identity_decoder_block(n_state, n_head),
+    identity_decoder_block(n_state, n_head),
+  ];
+  let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
+
+  // tokens (B=1, T=3); encoder states (B=1, T_kv=2, n_state).
+  let t = 3usize;
+  let t_kv = 2usize;
+  let tokens = Array::from_slice::<i32>(&[2, 0, 4], &[1, t as i32]).unwrap();
+  let xa = arr(
+    &[0.3, -0.1, 0.5, 0.2, 0.7, -0.4, 0.1, 0.9],
+    &[1, t_kv as i32, n_state as i32],
+  );
+
+  let (logits, cache, cross_qk) = dec.forward_with_cross_qk(&tokens, &xa, None).unwrap();
+  assert_eq!(logits.shape(), vec![1, t, n_vocab], "logits shape");
+  assert_eq!(cache.len(), 2, "one cache entry per block");
+
+  // One cross-qk per decoder block, each `Some` (every block has cross-attn),
+  // shaped (B=1, n_head, T, T_kv).
+  assert_eq!(cross_qk.len(), 2, "one cross-qk per decoder block");
+  for (i, qk) in cross_qk.iter().enumerate() {
+    let qk = qk
+      .as_ref()
+      .unwrap_or_else(|| panic!("block {i} cross-qk must be Some"));
+    assert_eq!(
+      qk.shape(),
+      vec![1, n_head, t, t_kv],
+      "block {i} cross-qk shape (B, H, T, T_kv)"
+    );
+  }
+
+  // The logits match the plain `forward` exactly — extraction changes nothing
+  // on the normal path.
+  let (logits_plain, _) = dec.forward(&tokens, &xa, None).unwrap();
+  let a = to_vec(&logits);
+  let b = to_vec(&logits_plain);
+  assert_eq!(
+    a, b,
+    "forward_with_cross_qk logits must equal forward logits"
+  );
+}

@@ -171,8 +171,16 @@ impl MultiHeadAttention {
   ///
   /// Returns `(output, (k, v))` — the projected output `(B, T_q, n_state)` and
   /// the (full) `(k, v)` to store back in the cache. The reference's third
-  /// `qk` return (attention weights, for word-timing DTW) is dropped here;
-  /// that is a deferred feature.
+  /// `qk` return (the attention weights, for word-timing DTW) is dropped on
+  /// this path; [`Self::forward_with_qk`] is the variant that surfaces it.
+  ///
+  /// This is the path normal decode reaches (through
+  /// [`ResidualAttentionBlock::forward`]); it runs the no-`qk` attention core
+  /// ([`Self::qkv_attention_no_qk`]), which drops the pre-softmax score tensor
+  /// the instant the softmax weights are formed, so no `(B, H, T_q, T_kv)`
+  /// score buffer is constructed-and-returned only to be discarded. The
+  /// `qk`-returning core ([`Self::qkv_attention`]) is reserved for
+  /// [`Self::forward_with_qk`] / the cross-`qk` collection path.
   ///
   /// # Errors
   /// Propagates the projection / reshape / transpose / matmul / softmax errors.
@@ -184,10 +192,62 @@ impl MultiHeadAttention {
     kv_cache: Option<&KvPair>,
   ) -> Result<(Array, KvPair)> {
     let q = self.query.forward(x)?;
+    let (k, v) = self.project_kv(x, xa, kv_cache)?;
+    let wv = self.qkv_attention_no_qk(&q, &k, &v, mask)?;
+    let out = self.out.forward(&wv)?;
+    Ok((out, (k, v)))
+  }
 
-    let (k, v) = match (xa, kv_cache) {
-      // Self-attention: project k/v from x, concatenating any cached k/v
-      // along the time axis (axis 1).
+  /// Run attention and also surface the pre-`v` attention weights `qk` — the
+  /// full three-tuple return of `MultiHeadAttention.__call__`
+  /// (`whisper.py:337-359`), where `qk = softmax(q @ kᵀ * scale)` before the
+  /// `@ v` multiply.
+  ///
+  /// Identical to [`Self::forward`] except it returns the third `qk` tensor
+  /// `(B, H, T_q, T_kv)` (the per-head attention weights over the keys),
+  /// mirroring the reference's `return self.out(wv), (k, v), qk`. The cross-
+  /// attention `qk` is the input the later word-timestamp DTW alignment
+  /// consumes; this method only extracts and exposes it (the alignment itself
+  /// is a later phase).
+  ///
+  /// # Errors
+  /// Propagates the projection / reshape / transpose / matmul / softmax errors.
+  pub(crate) fn forward_with_qk(
+    &self,
+    x: &Array,
+    xa: Option<&Array>,
+    mask: Option<&Array>,
+    kv_cache: Option<&KvPair>,
+  ) -> Result<(Array, KvPair, Array)> {
+    let q = self.query.forward(x)?;
+    let (k, v) = self.project_kv(x, xa, kv_cache)?;
+    let (wv, qk) = self.qkv_attention(&q, &k, &v, mask)?;
+    let out = self.out.forward(&wv)?;
+    Ok((out, (k, v), qk))
+  }
+
+  /// Project (and cache-merge) the attention key/value pair from the query
+  /// input `x` / cross-attention source `xa` / incoming cache — the shared
+  /// `(k, v)` derivation used by BOTH [`Self::forward`] and
+  /// [`Self::forward_with_qk`].
+  ///
+  /// - self-attention (`xa is None`): project `(k, v)` from `x`, concatenating
+  ///   any cached `(k, v)` along the time axis (axis 1);
+  /// - cross-attention, first step (`xa is Some`, no cache): project `(k, v)`
+  ///   from the encoder states `xa`;
+  /// - cross-attention, cached (`xa is Some`, cache present): reuse the cached
+  ///   encoder `(k, v)` verbatim, ignoring this step's `xa` — matching the
+  ///   reference decoder, which projects the cross-attention `(k, v)` from the
+  ///   first step's encoder states and reuses it for the rest of the decode.
+  ///   The library trusts that a warm cache is threaded with the same
+  ///   utterance's `xa`; reusing one cache across different utterances is
+  ///   caller misuse the library does not detect (it would decode against the
+  ///   first utterance's features). See `WhisperModel`'s threat-model note.
+  ///
+  /// # Errors
+  /// Propagates the projection / concatenate / clone errors.
+  fn project_kv(&self, x: &Array, xa: Option<&Array>, kv_cache: Option<&KvPair>) -> Result<KvPair> {
+    match (xa, kv_cache) {
       (None, cache) => {
         let mut k = self.key.forward(x)?;
         let mut v = self.value.forward(x)?;
@@ -195,39 +255,37 @@ impl MultiHeadAttention {
           k = concatenate(&[ck, &k], 1)?;
           v = concatenate(&[cv, &v], 1)?;
         }
-        (k, v)
+        Ok((k, v))
       }
-      // Cross-attention, first step: project k/v from the encoder states `xa`.
       (Some(xa), None) => {
         let k = self.key.forward(xa)?;
         let v = self.value.forward(xa)?;
-        (k, v)
+        Ok((k, v))
       }
-      // Cross-attention, cached: reuse the encoder k/v verbatim, ignoring this
-      // step's `xa` — matching the reference decoder, which projects the
-      // cross-attention k/v from the first step's encoder states and reuses it
-      // for the rest of the decode. The library trusts that a warm cache is
-      // threaded with the same utterance's `xa`; reusing one cache across
-      // different utterances is caller misuse the library does not detect (it
-      // would decode against the first utterance's features). See
-      // `WhisperModel`'s threat-model note.
-      (Some(_), Some((ck, cv))) => (ck.try_clone()?, cv.try_clone()?),
-    };
-
-    let wv = self.qkv_attention(&q, &k, &v, mask)?;
-    let out = self.out.forward(&wv)?;
-    Ok((out, (k, v)))
+      (Some(_), Some((ck, cv))) => Ok((ck.try_clone()?, cv.try_clone()?)),
+    }
   }
 
-  /// The manual scaled-dot-product attention (`whisper.py:361-375`).
+  /// Head-split `q` / `k` / `v` and form the scaled, masked PRE-softmax scores
+  /// `qk` `(B, H, T_q, T_kv)` — the shared front half of the manual
+  /// scaled-dot-product attention (`whisper.py:361-375`), used by both the
+  /// no-`qk` and `qk`-returning cores.
   ///
-  /// `q` is `(B, T_q, n_state)`, `k` / `v` are `(B, T_kv, n_state)`. Splits
-  /// the heads, applies the `head_dim ** -0.25` scale to BOTH q and k,
-  /// computes `softmax(q @ kᵀ + mask)`, and recombines the heads.
+  /// `q` is `(B, T_q, n_state)`, `k` / `v` are `(B, T_kv, n_state)`. Applies
+  /// the `head_dim ** -0.25` scale to BOTH q and k and adds the offset-aware
+  /// causal `mask` (if any). Returns `(qk, v_heads, n_batch, n_ctx, n_state)`:
+  /// the pre-softmax scores, the head-split `v` `(B, H, T_kv, D)`, and the
+  /// dims needed to recombine the heads back to `(B, T_q, n_state)`.
   ///
   /// # Errors
-  /// Propagates the reshape / transpose / matmul / softmax / add errors.
-  fn qkv_attention(&self, q: &Array, k: &Array, v: &Array, mask: Option<&Array>) -> Result<Array> {
+  /// Propagates the reshape / transpose / matmul / add errors.
+  fn attention_scores(
+    &self,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+  ) -> Result<(Array, Array, i32, i32, usize)> {
     let q_shape = q.shape();
     let n_batch = q_shape[0] as i32;
     let n_ctx = q_shape[1] as i32;
@@ -272,16 +330,84 @@ impl MultiHeadAttention {
       let m_slice = ops::indexing::slice(m, &[offset, 0], &[offset + n_ctx, k_ctx], &[1, 1])?;
       qk = qk.add(&m_slice)?;
     }
+    Ok((qk, v, n_batch, n_ctx, n_state))
+  }
 
+  /// Recombine `softmax(qk) @ v` back to `(B, T_q, n_state)` — the shared back
+  /// half of the manual scaled-dot-product attention. `w` is the post-softmax
+  /// weights `(B, H, T_q, T_kv)`, `v` the head-split values `(B, H, T_kv, D)`.
+  ///
+  /// # Errors
+  /// Propagates the matmul / transpose / reshape errors.
+  fn combine_heads(
+    w: &Array,
+    v: &Array,
+    n_batch: i32,
+    n_ctx: i32,
+    n_state: usize,
+  ) -> Result<Array> {
+    // out = (w @ v).transpose(0, 2, 1, 3).reshape(B, T_q, n_state).
+    w.matmul(v)?
+      .transpose_axes(&[0, 2, 1, 3])?
+      .reshape(&[n_batch, n_ctx, n_state as i32])
+  }
+
+  /// The manual scaled-dot-product attention WITHOUT surfacing `qk`
+  /// (`whisper.py:361-375`) — the core normal decode reaches through
+  /// [`Self::forward`].
+  ///
+  /// Splits the heads, applies the `head_dim ** -0.25` scale to BOTH q and k,
+  /// computes `softmax(q @ kᵀ + mask)`, recombines the heads, and returns ONLY
+  /// the output `(B, T_q, n_state)`. The pre-softmax score tensor `qk`
+  /// `(B, H, T_q, T_kv)` is dropped the instant the softmax weights are formed
+  /// (it is neither returned nor retained past the softmax), so this path never
+  /// constructs-and-returns a score buffer only to discard it. The
+  /// `qk`-returning [`Self::qkv_attention`] is used solely for the cross-`qk`
+  /// collection path.
+  ///
+  /// # Errors
+  /// Propagates the reshape / transpose / matmul / softmax / add errors.
+  fn qkv_attention_no_qk(
+    &self,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+  ) -> Result<Array> {
+    let (qk, v, n_batch, n_ctx, n_state) = self.attention_scores(q, k, v, mask)?;
+    // w = softmax(qk, axis=-1, precise=True); the pre-softmax scores are no
+    // longer needed once `w` is formed, so drop `qk` here — it does not escape.
+    let w = ops::misc::softmax_axis(&qk, -1, true)?;
+    drop(qk);
+    Self::combine_heads(&w, &v, n_batch, n_ctx, n_state)
+  }
+
+  /// The manual scaled-dot-product attention RETURNING `qk`
+  /// (`whisper.py:361-375`) — used only by [`Self::forward_with_qk`] / the
+  /// cross-`qk` collection path.
+  ///
+  /// Identical core to [`Self::qkv_attention_no_qk`], but also returns the
+  /// per-head PRE-softmax scores `qk` `(B, H, T_q, T_kv)` (`q @ kᵀ * scale`,
+  /// masked — the reference's second `qkv_attention` return). The scores are
+  /// the alignment signal the later word-timestamp DTW consumes.
+  ///
+  /// # Errors
+  /// Propagates the reshape / transpose / matmul / softmax / add errors.
+  fn qkv_attention(
+    &self,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+  ) -> Result<(Array, Array)> {
+    let (qk, v, n_batch, n_ctx, n_state) = self.attention_scores(q, k, v, mask)?;
     // w = softmax(qk, axis=-1, precise=True).
     let w = ops::misc::softmax_axis(&qk, -1, true)?;
-
-    // out = (w @ v).transpose(0, 2, 1, 3).reshape(B, T_q, n_state).
-    let out =
-      w.matmul(&v)?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[n_batch, n_ctx, n_state as i32])?;
-    Ok(out)
+    let out = Self::combine_heads(&w, &v, n_batch, n_ctx, n_state)?;
+    // Return the PRE-softmax `qk` scores `(B, H, T_q, T_kv)` alongside the
+    // output, exactly as the reference `qkv_attention` returns `out, qk` (the
+    // scaled-and-masked scores, not the post-softmax `w`).
+    Ok((out, qk))
   }
 }
 
@@ -371,8 +497,15 @@ impl ResidualAttentionBlock {
   ///
   /// Returns `(x, (self_kv, cross_kv))` — the block output and the updated
   /// cache to thread into the next decode step. The reference's `cross_qk`
-  /// (cross-attention weights, for word-timing DTW) is dropped here; that is a
-  /// deferred feature.
+  /// (the cross-attention weights, for word-timing DTW) is dropped on this
+  /// path; [`Self::forward_with_cross_qk`] is the variant that surfaces it.
+  ///
+  /// This is a true no-`qk` path: the cross-attention runs through the plain
+  /// [`MultiHeadAttention::forward`], which drops the `(B, H, T_q, T_kv)`
+  /// attention-score tensor INSIDE the attention (before the residual / MLP),
+  /// rather than materializing it and holding it live across the MLP the way
+  /// [`Self::forward_with_cross_qk`] must. So an ordinary decode (which never
+  /// reads the weights) does not raise peak memory by the score tensor.
   ///
   /// # Errors
   /// Propagates the LayerNorm / attention / MLP op errors.
@@ -393,8 +526,8 @@ impl ResidualAttentionBlock {
     let (attn_out, self_kv) = self.attn.forward(&normed, None, mask, self_kv_in)?;
     let mut x = x.add(&attn_out)?;
 
-    // 2. Cross-attention (decoder blocks only): `x = x + cross_attn(
-    //    cross_attn_ln(x), xa, kv_cache=cross_kv)`.
+    // 2. Cross-attention (decoder blocks only) — the plain `forward`, so the
+    //    score tensor is freed inside the attention, never held across the MLP.
     let cross_kv = match (&self.cross_attn, &self.cross_attn_ln) {
       (Some(cross_attn), Some(cross_attn_ln)) => {
         let normed = cross_attn_ln.forward(&x)?;
@@ -417,6 +550,70 @@ impl ResidualAttentionBlock {
     let x = x.add(&mlp_out)?;
 
     Ok((x, (Some(self_kv), cross_kv)))
+  }
+
+  /// Run the block and also surface the cross-attention weights `cross_qk` —
+  /// the full three-tuple return of `ResidualAttentionBlock.__call__`
+  /// (`whisper.py:395-406`), where the self-attention `qk` is dropped (`y, kv,
+  /// _ = self.attn(...)`) and the cross-attention `qk` is returned.
+  ///
+  /// Returns `(x, (self_kv, cross_kv), cross_qk)`. `cross_qk` is `Some(qk)`
+  /// `(B, H, T_q, T_kv)` for a decoder block (one carrying cross-attention),
+  /// and `None` for an encoder block (no cross-attention) — mirroring the
+  /// reference's `cross_qk = None` default that stays `None` unless the block
+  /// has a `cross_attn`. Only the cross-attention `qk` is surfaced because the
+  /// word-timestamp DTW aligns text positions to audio frames via the cross-
+  /// attention pattern (the self-attention weights are not part of that).
+  ///
+  /// # Errors
+  /// Propagates the LayerNorm / attention / MLP op errors.
+  pub(crate) fn forward_with_cross_qk(
+    &self,
+    x: &Array,
+    xa: Option<&Array>,
+    mask: Option<&Array>,
+    kv_cache: Option<&BlockKvCache>,
+  ) -> Result<(Array, BlockKvCache, Option<Array>)> {
+    let (self_kv_in, cross_kv_in) = match kv_cache {
+      Some((s, c)) => (s.as_ref(), c.as_ref()),
+      None => (None, None),
+    };
+
+    // 1. Self-attention: `x = x + attn(attn_ln(x), mask=mask, kv_cache=kv)`.
+    //    The self-attention `qk` is dropped (`_` in the reference).
+    let normed = self.attn_ln.forward(x)?;
+    let (attn_out, self_kv) = self.attn.forward(&normed, None, mask, self_kv_in)?;
+    let mut x = x.add(&attn_out)?;
+
+    // 2. Cross-attention (decoder blocks only): `x = x + cross_attn(
+    //    cross_attn_ln(x), xa, kv_cache=cross_kv)`. Surface its `qk` weights.
+    let (cross_kv, cross_qk) = match (&self.cross_attn, &self.cross_attn_ln) {
+      (Some(cross_attn), Some(cross_attn_ln)) => {
+        let normed = cross_attn_ln.forward(&x)?;
+        let (cross_out, cross_kv, cross_qk) =
+          cross_attn.forward_with_qk(&normed, xa, None, cross_kv_in)?;
+        x = x.add(&cross_out)?;
+        (Some(cross_kv), Some(cross_qk))
+      }
+      // No cross-attention (encoder block): preserve any incoming cross cache
+      // untouched (in practice always `None` for the encoder), and report no
+      // cross-attention weights.
+      _ => {
+        let cross_kv = match cross_kv_in {
+          Some((ck, cv)) => Some((ck.try_clone()?, cv.try_clone()?)),
+          None => None,
+        };
+        (cross_kv, None)
+      }
+    };
+
+    // 3. MLP: `x = x + mlp2(gelu(mlp1(mlp_ln(x))))`.
+    let mlp_in = self.mlp_ln.forward(&x)?;
+    let hidden = gelu(&self.mlp1.forward(&mlp_in)?)?;
+    let mlp_out = self.mlp2.forward(&hidden)?;
+    let x = x.add(&mlp_out)?;
+
+    Ok((x, (Some(self_kv), cross_kv), cross_qk))
   }
 }
 

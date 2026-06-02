@@ -224,68 +224,133 @@ const NEG_ONE_U32: u32 = u32::MAX;
 
 // ───────────────────────── logit filters ──────────────────────────────────
 
-/// A logit filter — `LogitFilter` (`decoding.py:333-346`). Applies in-place
-/// to the single-row logits buffer given the current token history.
+/// A logit filter — `LogitFilter` (`decoding.py:333-346`). Applies to the
+/// single-row logits **on device** given the current token history, returning
+/// the masked logits as a new [`Array`] (the reference's `return logits +
+/// mask`, where the mask is `-inf` at suppressed positions).
 ///
-/// `logits` is the `(n_vocab,)` row (mutated in place — the reference's
-/// `logits + mask` where the mask is `-inf` at suppressed positions; an
-/// in-place `+= -inf` is identical). `tokens` is the full decoded history
-/// (sot sequence + sampled tokens), `sample_begin` the index of the first
-/// sampled (post-sot) token.
+/// `logits` is the `(n_vocab,)` row (kept on device — never copied to the
+/// host). `tokens` is the full decoded history (sot sequence + sampled
+/// tokens, already host-side integers the decode loop owns), `sample_begin`
+/// the index of the first sampled (post-sot) token. Each filter precomputes
+/// its constant mask(s) once at construction and adds them on device, so the
+/// per-step cost is an `add` (and, for the timestamp rules, the on-device
+/// probability-mass comparison) — no host round-trip of the `n_vocab` row.
 trait LogitFilter {
-  /// Apply the filter to the `(n_vocab,)` logits row in place.
-  fn apply(&self, logits: &mut [f32], tokens: &[u32]);
+  /// Apply the filter to the `(n_vocab,)` logits row, returning the masked row.
+  ///
+  /// # Errors
+  /// Propagates the device add / mask-construction / reduction op errors.
+  fn apply(&self, logits: &Array, tokens: &[u32]) -> Result<Array>;
+}
+
+/// Build a `(n_vocab,)` additive mask Array — `0.0` everywhere except `-inf`
+/// at each id in `ids` (the device equivalent of the reference's numpy
+/// `mask = np.zeros(n_vocab); mask[ids] = -inf`). Out-of-range ids are skipped
+/// (matching the CPU path's `get_mut` guard).
+///
+/// The `-inf` entries mark which slots [`overwrite_masked`] forces to `-inf`;
+/// the suppression is applied as a boolean OVERWRITE (`select`), not an add, so
+/// it is bit-equivalent to the reference's in-place `logits[ids] = -inf` for any
+/// prior logit value — a `+inf` or `NaN` at a suppressed slot still becomes
+/// `-inf`, where an additive `+ (-inf)` would have produced `NaN`.
+fn scatter_neg_inf_mask(n_vocab: usize, ids: &[u32]) -> Result<Array> {
+  let mut buf = vec![0.0_f32; n_vocab];
+  for &id in ids {
+    if let Some(slot) = buf.get_mut(id as usize) {
+      *slot = f32::NEG_INFINITY;
+    }
+  }
+  let n = i32::try_from(n_vocab).map_err(|_| dim_overflow("n_vocab"))?;
+  Array::from_slice::<f32>(&buf, &[n])
+}
+
+/// Apply an additive `0.0` / `-inf` suppression `mask` to `logits` as an
+/// OVERWRITE rather than an add: every slot the mask marks `-inf` is forced to a
+/// real `-inf` in the output, every other slot keeps its `logits` value.
+///
+/// This is the device equivalent of the reference's in-place assignment
+/// `logits[ids] = -inf` (numpy / `mx` indexed store), and is bit-equivalent to
+/// it for ALL inputs — including non-finite ones. An additive `logits + mask`
+/// only matches the assignment for finite logits: at a suppressed slot a `+inf`
+/// logit would give `(+inf) + (-inf) = NaN` and a `NaN` logit would give `NaN`,
+/// either of which then poisons the downstream `argmax` / `logsumexp` / chosen
+/// log-prob. The boolean overwrite sets the slot to `-inf` regardless of the
+/// prior value, so the masked region is never `NaN`.
+///
+/// `mask` is `(n_vocab,)`; the masked-slot predicate is `isneginf(mask)` (its
+/// only non-zero entries are `-inf`), and `select(cond, -inf, logits)` keeps the
+/// whole `n_vocab` row on device.
+///
+/// # Errors
+/// Propagates the predicate / `full` / `select` op errors.
+fn overwrite_masked(logits: &Array, mask: &Array) -> Result<Array> {
+  // `true` exactly at the slots the mask marks `-inf` (the suppressed ids).
+  let suppressed = ops::comparison::isneginf(mask)?;
+  // A rank-0 `-inf` that `select` broadcasts over the masked slots; the
+  // unmasked slots keep their original `logits` value.
+  let neg_inf = Array::full::<f32>(&[0i32; 0], f32::NEG_INFINITY)?;
+  ops::logical::select(&suppressed, &neg_inf, logits)
 }
 
 /// Suppress blank outputs at the first sampled position — `SuppressBlank`
-/// (`decoding.py:349-359`): at `tokens.len() == sample_begin`, set the logits
-/// of the space token(s) and eot to `-inf`.
+/// (`decoding.py:349-359`): at `tokens.len() == sample_begin`, force the space
+/// token(s) and eot to `-inf` via a precomputed suppression mask.
 struct SuppressBlank {
   sample_begin: usize,
-  /// The ids masked to `-inf` at the first sampled position: `encode(" ")`
-  /// plus eot.
-  blank_ids: Vec<u32>,
+  /// The precomputed `(n_vocab,)` suppression mask: `-inf` at `encode(" ") +
+  /// [eot]`, `0` elsewhere — built once (`decoding.py:352-354`). Applied as a
+  /// boolean OVERWRITE ([`overwrite_masked`]), not an add, so a non-finite logit
+  /// at a suppressed slot still becomes `-inf` (matching the reference's
+  /// `logits[ids] = -inf` for all inputs).
+  mask: Array,
 }
 
 impl SuppressBlank {
   /// Build from the tokenizer: `mask[encode(" ") + [eot]] = -inf`
-  /// (`decoding.py:353`).
-  fn new(tokenizer: &HFTokenizerWrapper<'_>, sample_begin: usize) -> Result<Self> {
+  /// (`decoding.py:353`), precomputed as a device Array.
+  fn new(tokenizer: &HFTokenizerWrapper<'_>, sample_begin: usize, n_vocab: usize) -> Result<Self> {
     let mut blank_ids = tokenizer.encode(" ")?;
     blank_ids.push(tokenizer.eot());
     Ok(Self {
       sample_begin,
-      blank_ids,
+      mask: scatter_neg_inf_mask(n_vocab, &blank_ids)?,
     })
   }
 }
 
 impl LogitFilter for SuppressBlank {
-  fn apply(&self, logits: &mut [f32], tokens: &[u32]) {
+  fn apply(&self, logits: &Array, tokens: &[u32]) -> Result<Array> {
     if tokens.len() == self.sample_begin {
-      for &id in &self.blank_ids {
-        if let Some(slot) = logits.get_mut(id as usize) {
-          *slot = f32::NEG_INFINITY;
-        }
-      }
+      overwrite_masked(logits, &self.mask)
+    } else {
+      logits.try_clone()
     }
   }
 }
 
 /// Suppress a fixed id set at every step — `SuppressTokens`
-/// (`decoding.py:362-369`): `mask[suppress_tokens] = -inf`, applied
-/// unconditionally.
+/// (`decoding.py:362-369`): force each suppressed id to `-inf` unconditionally.
 struct SuppressTokens {
-  ids: Vec<u32>,
+  /// The precomputed `(n_vocab,)` suppression mask: `-inf` at each suppressed
+  /// id. Applied as a boolean OVERWRITE ([`overwrite_masked`]), not an add, so a
+  /// non-finite logit at a suppressed slot still becomes `-inf`.
+  mask: Array,
+}
+
+impl SuppressTokens {
+  /// Build the precomputed `(n_vocab,)` `-inf` mask over `ids`
+  /// (`decoding.py:364-366`).
+  fn new(ids: &[u32], n_vocab: usize) -> Result<Self> {
+    Ok(Self {
+      mask: scatter_neg_inf_mask(n_vocab, ids)?,
+    })
+  }
 }
 
 impl LogitFilter for SuppressTokens {
-  fn apply(&self, logits: &mut [f32], _tokens: &[u32]) {
-    for &id in &self.ids {
-      if let Some(slot) = logits.get_mut(id as usize) {
-        *slot = f32::NEG_INFINITY;
-      }
-    }
+  fn apply(&self, logits: &Array, _tokens: &[u32]) -> Result<Array> {
+    overwrite_masked(logits, &self.mask)
   }
 }
 
@@ -297,6 +362,12 @@ impl LogitFilter for SuppressTokens {
 /// `max_initial_timestamp` cap. Finally, if the summed probability over all
 /// timestamp tokens exceeds the max single text-token probability, it forces a
 /// timestamp by masking every non-timestamp token.
+///
+/// The token-history-driven part of the mask is built host-side from the
+/// `tokens` slice (the reference's `mask = np.zeros(...); mask[...] = -inf`),
+/// then the probability-mass rule is evaluated **on device** against the
+/// logits (so the `n_vocab` row never leaves the device); both are added to
+/// the logits.
 struct ApplyTimestampRules {
   sample_begin: usize,
   timestamp_begin: u32,
@@ -307,6 +378,8 @@ struct ApplyTimestampRules {
   eot: u32,
   /// `round(max_initial_timestamp / precision)`; `None` disables the cap.
   max_initial_timestamp_index: Option<usize>,
+  /// `n_vocab` — the logits-row width the host mask buffer is sized to.
+  n_vocab: usize,
 }
 
 impl ApplyTimestampRules {
@@ -314,6 +387,7 @@ impl ApplyTimestampRules {
     tokenizer: &HFTokenizerWrapper<'_>,
     sample_begin: usize,
     max_initial_timestamp_index: Option<usize>,
+    n_vocab: usize,
   ) -> Self {
     Self {
       sample_begin,
@@ -321,18 +395,23 @@ impl ApplyTimestampRules {
       no_timestamps: tokenizer.no_timestamps(),
       eot: tokenizer.eot(),
       max_initial_timestamp_index,
+      n_vocab,
     }
   }
-}
 
-impl LogitFilter for ApplyTimestampRules {
-  fn apply(&self, logits: &mut [f32], tokens: &[u32]) {
-    let n_vocab = logits.len();
+  /// Build the **deterministic** additive `(n_vocab,)` mask from the token
+  /// history alone — every rule of `ApplyTimestampRules.apply`
+  /// (`decoding.py:384-426`) except the final probability-mass rule (which
+  /// needs the logit values). Returns the host buffer (`0.0` / `-inf` per
+  /// position), matching the reference's `mask = np.zeros(...)` exactly.
+  fn deterministic_mask(&self, tokens: &[u32]) -> Vec<f32> {
+    let n_vocab = self.n_vocab;
     let ts_begin = self.timestamp_begin as usize;
     let eot = self.eot as usize;
+    let mut mask = vec![0.0_f32; n_vocab];
 
     // suppress <|notimestamps|> (`decoding.py:386-387`).
-    if let Some(slot) = logits.get_mut(self.no_timestamps as usize) {
+    if let Some(slot) = mask.get_mut(self.no_timestamps as usize) {
       *slot = f32::NEG_INFINITY;
     }
 
@@ -350,10 +429,10 @@ impl LogitFilter for ApplyTimestampRules {
     if last_was_timestamp {
       if penultimate_was_timestamp {
         // Must be a non-timestamp next: mask all timestamp tokens.
-        mask_range(logits, ts_begin, n_vocab);
+        mask_range(&mut mask, ts_begin, n_vocab);
       } else {
         // Cannot be a normal text token: mask `[0, eot)`.
-        mask_range(logits, 0, eot);
+        mask_range(&mut mask, 0, eot);
       }
     }
 
@@ -380,47 +459,115 @@ impl LogitFilter for ApplyTimestampRules {
       } else {
         last_ts + 1
       };
-      mask_range(logits, ts_begin, timestamp_last);
+      mask_range(&mut mask, ts_begin, timestamp_last);
     }
 
     // First sampled position: force a timestamp and apply the
     // `max_initial_timestamp` cap (`decoding.py:417-426`).
     if tokens.len() == self.sample_begin {
-      mask_range(logits, 0, ts_begin);
+      mask_range(&mut mask, 0, ts_begin);
       if let Some(idx) = self.max_initial_timestamp_index {
         let last_allowed = ts_begin + idx;
-        mask_range(logits, last_allowed + 1, n_vocab);
+        mask_range(&mut mask, last_allowed + 1, n_vocab);
       }
     }
 
-    // If the total probability over timestamps exceeds the max single
-    // text-token probability, force a timestamp (`decoding.py:428-441`).
-    // `logprobs = logits - logsumexp(logits)`; compare in log space:
-    // `logsumexp(logits[ts_begin:]) > max(logits[:ts_begin])` (the shared
-    // `- logsumexp(logits)` normalizer cancels in the comparison).
-    if ts_begin <= n_vocab {
-      let timestamp_logsumexp = logsumexp_slice(&logits[ts_begin.min(n_vocab)..]);
-      let max_text = max_slice(&logits[..ts_begin.min(n_vocab)]);
-      if timestamp_logsumexp > max_text {
-        mask_range(logits, 0, ts_begin);
-      }
-    }
+    mask
   }
 }
 
-/// Set `logits[lo..hi]` to `-inf` (a numpy `mask[lo:hi] = -inf` slice),
+impl LogitFilter for ApplyTimestampRules {
+  fn apply(&self, logits: &Array, tokens: &[u32]) -> Result<Array> {
+    let n_vocab = self.n_vocab;
+    let ts_begin = self.timestamp_begin as usize;
+    let n = i32::try_from(n_vocab).map_err(|_| dim_overflow("n_vocab"))?;
+
+    // Apply the deterministic (token-history) mask FIRST, exactly as the CPU
+    // path masks the logits in place before the probability-mass rule reads
+    // them. The deterministic buffer is built host-side from the token slice
+    // (`0.0` / `-inf` per position), uploaded once, and applied as a boolean
+    // OVERWRITE (`select`), not an add — so a suppressed slot becomes a real
+    // `-inf` for ANY prior logit (a `+inf` / `NaN` logit would become `NaN`
+    // under an additive `+ (-inf)`, poisoning the probability-mass `logsumexp`
+    // and `max` below). The timestamp region the pair / monotonicity rules
+    // already forbade is therefore `-inf` when the probability-mass rule reads
+    // it (its `logsumexp` over an all-`-inf` region is `-inf`, never re-opening
+    // text tokens).
+    let det = self.deterministic_mask(tokens);
+    let det_mask = Array::from_slice::<f32>(&det, &[n])?;
+    let masked = overwrite_masked(logits, &det_mask)?;
+
+    // The probability-mass rule, ON DEVICE (`decoding.py:428-441`): if the
+    // summed probability over timestamps exceeds the max single text-token
+    // probability, force a timestamp by masking `[0, timestamp_begin)`. The
+    // reference computes the full log-probability row FIRST and slices it
+    // AFTER:
+    //   logprobs            = logits - logsumexp(logits, axis=-1)
+    //   timestamp_logprob   = logprobs[timestamp_begin:].logsumexp(axis=-1)
+    //   max_text_token_logprob = logprobs[:timestamp_begin].max(axis=-1)
+    //   force               = timestamp_logprob > max_text_token_logprob
+    // This is mirrored LITERALLY here rather than via the algebraically
+    // cancelled `logsumexp(masked[ts_begin:]) > max(masked[:ts_begin])`. The
+    // two agree for FINITE rows (the shared `- logsumexp(logits)` normalizer
+    // cancels), but NOT for non-finite ones: with a `+inf` timestamp logit the
+    // full-row `logsumexp(logits)` is `+inf`, so its `logprobs` slot is
+    // `+inf - +inf = NaN`; `timestamp_logprob` is then NaN and `NaN > max_text`
+    // is FALSE (no force) — whereas the cancelled form sees `+inf > max_text`
+    // and wrongly masks every text token. Computing `logprobs` literally
+    // reproduces the reference for ALL inputs, including `+inf` and `NaN`.
+    // The comparison reads the **already-deterministically-masked** logits
+    // (matching the CPU in-place order) and yields a rank-0 bool that `where`
+    // broadcasts over the `[0, ts_begin)` region — the whole `n_vocab` row
+    // stays on device.
+    //
+    // Reference precision: this rule runs in FLOAT32. In the mlx-audio reference
+    // (`decoding.py:430-436`) `logprobs` and its `logsumexp` / `max` are all in
+    // the dtype of `logits` — and the per-step logits are float32 because
+    // `Inference.logits` returns `logits.astype(mx.float32)` (`decoding.py:175`)
+    // before the filter chain. Upstream openai-whisper likewise computes
+    // `logprobs = F.log_softmax(logits.float(), dim=-1)` (float32) then its
+    // `logsumexp` / `max`. The device F32 `logsumexp` / `max` / `greater` below
+    // therefore match the reference precision exactly; they are NOT widened to
+    // f64 (which would diverge from both references on a knife-edge row).
+    let ts_b = ts_begin.min(n_vocab);
+    let ts_b_i = i32::try_from(ts_b).map_err(|_| dim_overflow("timestamp_begin"))?;
+    if ts_b == 0 || ts_b >= n_vocab {
+      // No text region or no timestamp region — the rule is inert.
+      return Ok(masked);
+    }
+    // logprobs = masked - logsumexp(masked) over the full vocab axis, in F32.
+    // `masked` is rank-1 `(n_vocab,)`, so the rank-0 `logsumexp` broadcasts.
+    let row_lse = ops::reduction::logsumexp(&masked, false)?; // rank-0
+    let logprobs = ops::arithmetic::subtract(&masked, &row_lse)?;
+    let ts_slice = ops::indexing::slice(&logprobs, &[ts_b_i], &[n], &[1])?;
+    let text_slice = ops::indexing::slice(&logprobs, &[0], &[ts_b_i], &[1])?;
+    let ts_lse = ops::reduction::logsumexp(&ts_slice, false)?; // rank-0
+    let text_max = ops::reduction::max(&text_slice, false)?; // rank-0
+    let force = ops::comparison::greater(&ts_lse, &text_max)?; // rank-0 bool
+
+    // masked[:ts_begin] = where(force, -inf, masked[:ts_begin]).
+    let head = ops::indexing::slice(&masked, &[0], &[ts_b_i], &[1])?;
+    let neg_inf = Array::full::<f32>(&[ts_b_i], f32::NEG_INFINITY)?;
+    let new_head = ops::logical::select(&force, &neg_inf, &head)?;
+    ops::indexing::slice_update(&masked, &new_head, &[0], &[ts_b_i], &[1])
+  }
+}
+
+/// Set `mask[lo..hi]` to `-inf` (a numpy `mask[lo:hi] = -inf` slice),
 /// clamping `hi` to the buffer length.
-fn mask_range(logits: &mut [f32], lo: usize, hi: usize) {
-  let hi = hi.min(logits.len());
+fn mask_range(mask: &mut [f32], lo: usize, hi: usize) {
+  let hi = hi.min(mask.len());
   if lo < hi {
-    for slot in &mut logits[lo..hi] {
+    for slot in &mut mask[lo..hi] {
       *slot = f32::NEG_INFINITY;
     }
   }
 }
 
 /// `log(sum(exp(x)))` over a slice, in `f64` for stability (numpy's
-/// `logsumexp`). Empty ⇒ `-inf`.
+/// `logsumexp`). Empty (or all `-inf`) ⇒ `-inf`. Used by the once-per-utterance
+/// [`detect_language`] masking (not the per-step decode, which reduces on
+/// device).
 fn logsumexp_slice(xs: &[f32]) -> f64 {
   let mut max = f64::NEG_INFINITY;
   for &x in xs {
@@ -440,27 +587,17 @@ fn logsumexp_slice(xs: &[f32]) -> f64 {
   max + sum.ln()
 }
 
-/// Max over a slice in `f64`. Empty ⇒ `-inf`.
-fn max_slice(xs: &[f32]) -> f64 {
-  let mut max = f64::NEG_INFINITY;
-  for &x in xs {
-    let x = x as f64;
-    if x > max {
-      max = x;
-    }
-  }
-  max
-}
-
 // ───────────────────────── greedy decoder ─────────────────────────────────
 
 /// The greedy token decoder — `GreedyDecoder` (`decoding.py:302-330`),
 /// single-sequence.
 ///
 /// Selects the next token (argmax for `temperature == 0`, else a categorical
-/// draw), accumulates the chosen token's log-probability, and reports
-/// completion on eot. State across steps is the running `sum_logprob` and the
-/// per-call PRNG key (advanced by splitting, mirroring mlx's keyed RNG).
+/// draw) **on device**, accumulates the chosen token's log-probability, and
+/// reports completion on eot. State across steps is the running `sum_logprob`
+/// and the per-call PRNG key (advanced by splitting, mirroring mlx's keyed
+/// RNG). Only two scalars per step leave the device — the chosen token id and
+/// its log-probability — never the `n_vocab` logits row.
 struct GreedyDecoder {
   temperature: f32,
   eot: u32,
@@ -482,28 +619,31 @@ impl GreedyDecoder {
 
   /// Select the next token from the `(n_vocab,)` logits row and update
   /// `sum_logprob` — `GreedyDecoder.update` (`decoding.py:307-325`),
-  /// single-sequence.
+  /// single-sequence, computed on device.
   ///
-  /// - `logits`: the (already logit-filtered) `(n_vocab,)` row.
+  /// - `logits`: the (already logit-filtered) `(n_vocab,)` row on device.
   /// - `last_token`: the previously-emitted token (the reference's
   ///   `tokens[:, -1]` — used to gate the logprob accumulation + the eot
   ///   "stick" behavior).
   ///
   /// Returns `(next_token, completed)`.
-  fn update(&mut self, logits: &[f32], last_token: u32) -> Result<(u32, bool)> {
+  fn update(&mut self, logits: &Array, last_token: u32) -> Result<(u32, bool)> {
+    // Next token: `argmax` (`temperature == 0`) or a categorical draw, both on
+    // device. argmax along the last axis ties to the lowest index, matching the
+    // CPU path and mlx.
     let next = if self.temperature == 0.0 {
-      argmax_slice(logits)
+      let mut idx = ops::misc::argmax(logits, Some(-1), false)?;
+      idx.item::<u32>()?
     } else {
       self.categorical(logits)?
     };
 
     // `logprobs = logits - logsumexp(logits)`; accumulate the chosen token's
-    // logprob unless the previous token was eot (`decoding.py:315-318`).
-    let lse = logsumexp_slice(logits);
-    let chosen_logprob = logits
-      .get(next as usize)
-      .map_or(f64::NEG_INFINITY, |&l| l as f64 - lse);
+    // logprob unless the previous token was eot (`decoding.py:315-318`). The
+    // logsumexp + the chosen-logit gather run on device; only the resulting
+    // scalar logprob is read back.
     if last_token != self.eot {
+      let chosen_logprob = self.chosen_logprob(logits, next)?;
       self.sum_logprob += chosen_logprob;
     }
 
@@ -518,38 +658,32 @@ impl GreedyDecoder {
     Ok((next, completed))
   }
 
+  /// `logprobs[next] = logits[next] - logsumexp(logits)` — the chosen token's
+  /// log-probability, computed on device, read back as one scalar. Returns
+  /// `-inf` if `next` is out of range (the CPU path's `get` fallback).
+  fn chosen_logprob(&self, logits: &Array, next: u32) -> Result<f64> {
+    let v = logits.shape().first().copied().unwrap_or(0);
+    if (next as usize) >= v {
+      return Ok(f64::NEG_INFINITY);
+    }
+    let next_i = i32::try_from(next).map_err(|_| dim_overflow("next token"))?;
+    let chosen = ops::indexing::slice(logits, &[next_i], &[next_i + 1], &[1])?;
+    let lse = ops::reduction::logsumexp(logits, true)?; // rank-1 (1,)
+    let mut logprob = ops::arithmetic::subtract(&chosen, &lse)?;
+    Ok(logprob.item::<f32>()? as f64)
+  }
+
   /// A temperature-scaled categorical draw, advancing the PRNG key
   /// (`decoding.py:297-299`/`:312-313`: `random.categorical(logits / temp)`).
-  fn categorical(&mut self, logits: &[f32]) -> Result<u32> {
-    let n = i32::try_from(logits.len()).map_err(|_| {
-      Error::OutOfRange(OutOfRangePayload::new(
-        "GreedyDecoder::categorical: n_vocab",
-        "must fit in i32",
-        format_smolstr!("{}", logits.len()),
-      ))
-    })?;
-    let row = Array::from_slice::<f32>(logits, &[n])?;
+  /// `logits` is the `(n_vocab,)` row already on device.
+  fn categorical(&mut self, logits: &Array) -> Result<u32> {
     // Advance the key (mlx's keyed RNG: split, use one half, keep the other).
     let (next_key, sub) = ops::random::split(&self.key)?;
     self.key = next_key;
-    let mut sampled = crate::lm::sample::categorical_sampling(&row, self.temperature, &sub)?;
+    let mut sampled = crate::lm::sample::categorical_sampling(logits, self.temperature, &sub)?;
     let token: u32 = sampled.item::<u32>()?;
     Ok(token)
   }
-}
-
-/// `argmax` over a slice, returning the index of the first maximal element
-/// (ties → lowest index, matching mlx `argmax`). Empty ⇒ `0`.
-fn argmax_slice(xs: &[f32]) -> u32 {
-  let mut best = 0_u32;
-  let mut best_val = f32::NEG_INFINITY;
-  for (i, &x) in xs.iter().enumerate() {
-    if x > best_val {
-      best_val = x;
-      best = i as u32;
-    }
-  }
-  best
 }
 
 // ───────────────────────── decoding task ──────────────────────────────────
@@ -622,13 +756,18 @@ impl<'a> DecodingTask<'a> {
       })?;
 
     // Logit filters (`decoding.py:484-508`).
+    let n_vocab = dims.n_vocab();
     let mut logit_filters: Vec<Box<dyn LogitFilter + 'a>> = Vec::new();
     if options.suppress_blank {
-      logit_filters.push(Box::new(SuppressBlank::new(tokenizer, sample_begin)?));
+      logit_filters.push(Box::new(SuppressBlank::new(
+        tokenizer,
+        sample_begin,
+        n_vocab,
+      )?));
     }
     let suppress_ids = get_suppress_tokens(tokenizer, &options.suppress_tokens)?;
     if !suppress_ids.is_empty() {
-      logit_filters.push(Box::new(SuppressTokens { ids: suppress_ids }));
+      logit_filters.push(Box::new(SuppressTokens::new(&suppress_ids, n_vocab)?));
     }
     if !options.without_timestamps {
       // precision = CHUNK_LENGTH / n_audio_ctx (≈ 0.02 s); the max initial
@@ -652,6 +791,7 @@ impl<'a> DecodingTask<'a> {
         tokenizer,
         sample_begin,
         max_initial_timestamp_index,
+        n_vocab,
       )));
     }
 
@@ -754,9 +894,10 @@ impl<'a> DecodingTask<'a> {
       return Ok((tokens, decoder.sum_logprob, no_speech_prob));
     }
 
-    // First sampled token (`sample_len >= 1`): the last-position logits row.
-    let mut last_row = last_position_row(&logits3d)?;
-    self.apply_filters(&mut last_row, &tokens);
+    // First sampled token (`sample_len >= 1`): the last-position logits row,
+    // kept on device through the filters + the greedy update.
+    let last_row = last_position_row(&logits3d)?;
+    let last_row = self.apply_filters(&last_row, &tokens)?;
     let last_token = *tokens.last().unwrap_or(&self.tokenizer.sot());
     let (mut next, mut completed) = decoder.update(&last_row, last_token)?;
     tokens.push(next);
@@ -773,8 +914,8 @@ impl<'a> DecodingTask<'a> {
         .decode_tokens(&input, audio_features, cache_ref)?;
       cache = Some(new_cache);
 
-      let mut row = last_position_row(&logits3d)?;
-      self.apply_filters(&mut row, &tokens);
+      let row = last_position_row(&logits3d)?;
+      let row = self.apply_filters(&row, &tokens)?;
       let last_token = *tokens.last().unwrap_or(&self.tokenizer.eot());
       let (n, c) = decoder.update(&row, last_token)?;
       next = n;
@@ -787,11 +928,17 @@ impl<'a> DecodingTask<'a> {
     Ok((tokens, decoder.sum_logprob, no_speech_prob))
   }
 
-  /// Apply every logit filter, in order, to the `(n_vocab,)` row.
-  fn apply_filters(&self, row: &mut [f32], tokens: &[u32]) {
+  /// Apply every logit filter, in order, to the `(n_vocab,)` row on device,
+  /// returning the masked row.
+  ///
+  /// # Errors
+  /// Propagates the per-filter device op errors.
+  fn apply_filters(&self, row: &Array, tokens: &[u32]) -> Result<Array> {
+    let mut row = row.try_clone()?;
     for filter in &self.logit_filters {
-      filter.apply(row, tokens);
+      row = filter.apply(&row, tokens)?;
     }
+    Ok(row)
   }
 
   /// `P(<|nospeech|>)` at the sot position from the first forward's
@@ -863,8 +1010,15 @@ fn arr_row(tokens: &[u32]) -> Result<Array> {
 }
 
 /// Extract the last-position logits row `(n_vocab,)` from a `(1, T, n_vocab)`
-/// decoder output as a `Vec<f32>` (the reference's `logits[:, -1]`).
-fn last_position_row(logits3d: &Array) -> Result<Vec<f32>> {
+/// decoder output as a device [`Array`] (the reference's `logits[:, -1]`).
+///
+/// The row stays on device — it is **not** copied to the host. The greedy
+/// argmax / categorical draw and the logit filters all operate on it on
+/// device, so the per-step `n_vocab` round-trip the old `to_vec` path incurred
+/// is gone (only the final chosen token id + its log-probability are read
+/// back, one scalar each). Cast to `F32` to match `Inference.logits`'s
+/// `.astype(mx.float32)`.
+fn last_position_row(logits3d: &Array) -> Result<Array> {
   let shape = logits3d.shape();
   if shape.len() != 3 {
     return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
@@ -877,11 +1031,10 @@ fn last_position_row(logits3d: &Array) -> Result<Vec<f32>> {
   let last = i32::try_from(t.saturating_sub(1)).map_err(|_| dim_overflow("T"))?;
   let vi = i32::try_from(v).map_err(|_| dim_overflow("n_vocab"))?;
   let row = ops::indexing::slice(logits3d, &[0, last, 0], &[1, last + 1, vi], &[1, 1, 1])?;
-  // → (n_vocab,), F32, contiguous.
+  // → (n_vocab,), F32, contiguous — kept on device.
   let row = row.reshape(&[vi])?;
   let row = ops::misc::astype(&row, Dtype::F32)?;
-  let mut row = ops::shape::contiguous(&row, false)?;
-  row.to_vec::<f32>()
+  ops::shape::contiguous(&row, false)
 }
 
 /// A dimension exceeding `i32::MAX`.
@@ -931,8 +1084,11 @@ pub fn detect_language<'a>(
   // Single `sot` forward, fresh cache.
   let sot = arr_row(&[tokenizer.sot()])?;
   let (logits3d, _cache) = model.decode_tokens(&sot, audio_features, None)?;
-  // logits[:, 0] → the only (first) position's row.
-  let mut row = last_position_row(&logits3d)?;
+  // logits[:, 0] → the only (first) position's row. Language detection runs
+  // once (not per decode step), so reading this row to the host here is fine —
+  // it is the masking + softmax over a small language-token set, not the hot
+  // per-step path the device filters replace.
+  let mut row = last_position_row(&logits3d)?.to_vec::<f32>()?;
   let n_vocab = row.len();
 
   // Reject any language token id outside the model's actual vocabulary BEFORE
