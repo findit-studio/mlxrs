@@ -94,6 +94,26 @@ pub trait CtcModel {
   /// Map a collapsed id sequence to text via the model's vocabulary. Called
   /// once by the driver after blank-collapse + run-length dedup.
   fn decode_ids(&self, ids: &[u32]) -> String;
+
+  /// Reject a transcription this model cannot render to text, BEFORE the
+  /// encoder forward — the empty-vocabulary class guard, enforced once at the
+  /// shared chokepoint.
+  ///
+  /// [`super::generate::greedy_ctc_transcribe`] calls this at its start (ahead
+  /// of the waveform validation and the forward), so EVERY route through the
+  /// driver — a model's own [`Transcribe`] impl and a
+  /// direct `greedy_ctc_transcribe(&model, …)` (the [`CtcModel`] path) alike —
+  /// passes through this one guard. A model whose [`Self::decode_ids`] maps an
+  /// id sequence to text only when it carries a non-empty vocabulary overrides
+  /// this to reject the un-renderable case with a typed error, rather than the
+  /// driver silently succeeding with empty text on a model loaded without its
+  /// `vocab.json`.
+  ///
+  /// The default is `Ok(())`: a model whose `decode_ids` is total over every id
+  /// sequence (a self-contained detokenizer, a test mock) needs no guard.
+  fn ensure_decodable(&self) -> Result<()> {
+    Ok(())
+  }
 }
 
 /// The autoregressive encoder/decoder family: an audio encoder feeding a

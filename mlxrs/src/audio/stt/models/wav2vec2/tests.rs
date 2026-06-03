@@ -386,7 +386,7 @@ fn config_parses_base_960h_defaults_and_ignores_unknown() {
   // Minimal config carrying an unmodeled key — must parse, ignore the extra
   // key, and fall back to base-960h defaults for absent fields.
   let json = r#"{ "model_type": "wav2vec2", "future_unknown_key": 123 }"#;
-  let config = Wav2Vec2Config::from_json(json).unwrap();
+  let config = Config::from_json(json).unwrap();
   assert_eq!(config.model_type(), "wav2vec2");
   assert_eq!(config.hidden_size, 768);
   assert_eq!(config.num_hidden_layers, 12);
@@ -415,8 +415,7 @@ fn config_parses_base_960h_defaults_and_ignores_unknown() {
 
 #[test]
 fn config_head_dim() {
-  let config =
-    Wav2Vec2Config::from_json(r#"{"hidden_size": 768, "num_attention_heads": 12}"#).unwrap();
+  let config = Config::from_json(r#"{"hidden_size": 768, "num_attention_heads": 12}"#).unwrap();
   assert_eq!(config.head_dim().unwrap(), 64);
 }
 
@@ -424,7 +423,7 @@ fn config_head_dim() {
 fn config_validate_accepts_base_960h() {
   // The base-960h defaults (feat_extract_norm == "group",
   // do_stable_layer_norm == false) are the one supported arm.
-  let config = Wav2Vec2Config::from_json(r#"{"model_type": "wav2vec2"}"#).unwrap();
+  let config = Config::from_json(r#"{"model_type": "wav2vec2"}"#).unwrap();
   assert!(config.validate().is_ok());
 }
 
@@ -432,7 +431,7 @@ fn config_validate_accepts_base_960h() {
 fn config_validate_rejects_out_of_scope_arms() {
   // (a) The "layer" feature-encoder arm is out of scope -> UnknownEnumValue,
   // and the payload carries the rejected value + the supported set.
-  let layer = Wav2Vec2Config::from_json(r#"{"feat_extract_norm": "layer"}"#).unwrap();
+  let layer = Config::from_json(r#"{"feat_extract_norm": "layer"}"#).unwrap();
   match layer.validate() {
     Err(Error::UnknownEnumValue(p)) => {
       assert_eq!(p.value(), "layer");
@@ -444,7 +443,7 @@ fn config_validate_rejects_out_of_scope_arms() {
   // (b) The stable-layer-norm arm is now SUPPORTED: a `do_stable_layer_norm`
   // config (otherwise default) must validate (the both-directions check that
   // the relaxation actually took effect, not just that the rejection moved).
-  let stable = Wav2Vec2Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
+  let stable = Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
   assert!(stable.do_stable_layer_norm);
   assert!(
     stable.validate().is_ok(),
@@ -456,7 +455,7 @@ fn config_validate_rejects_out_of_scope_arms() {
 fn config_validate_accepts_conv_bias() {
   // `conv_bias == true` is now wired (every ConvLayer loads and adds its
   // conv.bias), so a `conv_bias` config (otherwise default) must validate.
-  let biased = Wav2Vec2Config::from_json(r#"{"conv_bias": true}"#).unwrap();
+  let biased = Config::from_json(r#"{"conv_bias": true}"#).unwrap();
   assert!(biased.conv_bias);
   assert!(
     biased.validate().is_ok(),
@@ -472,16 +471,16 @@ fn config_validate_accepts_large_positive_layer_count() {
   // pathological count surfaces later as a typed allocation error, never a
   // magnitude cap here. (`validate` itself does no allocation, so this check is
   // cheap regardless of the count.)
-  let deep = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
+  let deep = Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
   assert!(
     deep.validate().is_ok(),
     "a large positive num_hidden_layers must validate (no magnitude cap)"
   );
   // A zero / negative count is still rejected as malformed (OutOfRange) — that
   // is a positivity/soundness check, not a magnitude cap.
-  let zero = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 0}"#).unwrap();
+  let zero = Config::from_json(r#"{"num_hidden_layers": 0}"#).unwrap();
   assert!(matches!(zero.validate(), Err(Error::OutOfRange(_))));
-  let negative = Wav2Vec2Config::from_json(r#"{"num_feat_extract_layers": -1}"#).unwrap();
+  let negative = Config::from_json(r#"{"num_feat_extract_layers": -1}"#).unwrap();
   assert!(matches!(negative.validate(), Err(Error::OutOfRange(_))));
 }
 
@@ -490,7 +489,7 @@ fn config_validate_relaxes_dimensions_but_enforces_structure() {
   // A wider hidden_size is no longer rejected as a "deviation" — it is a valid
   // larger variant. The full large config (1024 hidden, 16 heads, 24 layers,
   // 4096 intermediate, stable-LN) must validate.
-  let large = Wav2Vec2Config::from_json(
+  let large = Config::from_json(
     r#"{"hidden_size": 1024, "num_attention_heads": 16, "num_hidden_layers": 24,
         "intermediate_size": 4096, "do_stable_layer_norm": true}"#,
   )
@@ -504,7 +503,7 @@ fn config_validate_relaxes_dimensions_but_enforces_structure() {
   // divisible by num_attention_heads is a DivisibilityConstraint (the per-head
   // split would not be exact), and a non-positive width is OutOfRange.
   let indivisible =
-    Wav2Vec2Config::from_json(r#"{"hidden_size": 1000, "num_attention_heads": 12}"#).unwrap();
+    Config::from_json(r#"{"hidden_size": 1000, "num_attention_heads": 12}"#).unwrap();
   match indivisible.validate() {
     Err(Error::DivisibilityConstraint(p)) => {
       assert!(
@@ -517,7 +516,7 @@ fn config_validate_relaxes_dimensions_but_enforces_structure() {
       panic!("expected DivisibilityConstraint for an indivisible hidden_size, got {other:?}")
     }
   }
-  let nonpos = Wav2Vec2Config::from_json(r#"{"hidden_size": 0}"#).unwrap();
+  let nonpos = Config::from_json(r#"{"hidden_size": 0}"#).unwrap();
   assert!(matches!(nonpos.validate(), Err(Error::OutOfRange(_))));
 }
 
@@ -526,7 +525,7 @@ fn config_validate_relaxes_conv_arrays_but_enforces_length_and_positivity() {
   // A conv-stack array whose values merely DIFFER from base-960h (but are
   // positive and the right length) is now accepted — different strides are a
   // different valid variant, not a rejection.
-  let diff_stride = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#).unwrap();
+  let diff_stride = Config::from_json(r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#).unwrap();
   assert!(
     diff_stride.validate().is_ok(),
     "a conv_stride array with positive entries of the right length must validate"
@@ -534,7 +533,7 @@ fn config_validate_relaxes_conv_arrays_but_enforces_length_and_positivity() {
 
   // (a) An array shorter than num_feat_extract_layers is still LengthMismatch
   // (the builder would index past the end).
-  let short = Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#).unwrap();
+  let short = Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#).unwrap();
   match short.validate() {
     Err(Error::LengthMismatch(p)) => {
       assert!(
@@ -550,7 +549,7 @@ fn config_validate_relaxes_conv_arrays_but_enforces_length_and_positivity() {
 
   // (b) A non-positive conv entry is still OutOfRange naming the index + value
   // (a zero / negative width, kernel, or stride is structurally invalid).
-  let nonpos = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 0, 2, 2, 2, 2, 2]}"#).unwrap();
+  let nonpos = Config::from_json(r#"{"conv_stride": [5, 0, 2, 2, 2, 2, 2]}"#).unwrap();
   match nonpos.validate() {
     Err(Error::OutOfRange(p)) => {
       assert!(
@@ -579,7 +578,7 @@ fn config_validate_rejects_conv_array_longer_than_num_feat_extract_layers() {
   // be rejected with a typed LengthMismatch naming the field and the
   // expected/actual lengths.
   let long_dim =
-    Wav2Vec2Config::from_json(r#"{"conv_dim": [512, 512, 512, 512, 512, 512, 512, 128]}"#).unwrap();
+    Config::from_json(r#"{"conv_dim": [512, 512, 512, 512, 512, 512, 512, 128]}"#).unwrap();
   assert_eq!(long_dim.conv_dim.len(), 8);
   assert_eq!(long_dim.num_feat_extract_layers, 7);
   match long_dim.validate() {
@@ -601,14 +600,12 @@ fn config_validate_rejects_conv_array_longer_than_num_feat_extract_layers() {
 
   // The same exact-length rule applies to conv_stride and conv_kernel: a
   // trailing extra entry on either is likewise rejected.
-  let long_stride =
-    Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 2, 2, 2, 2, 2, 2, 2]}"#).unwrap();
+  let long_stride = Config::from_json(r#"{"conv_stride": [5, 2, 2, 2, 2, 2, 2, 2]}"#).unwrap();
   assert!(matches!(
     long_stride.validate(),
     Err(Error::LengthMismatch(_))
   ));
-  let long_kernel =
-    Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 2, 2]}"#).unwrap();
+  let long_kernel = Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 2, 2]}"#).unwrap();
   assert!(matches!(
     long_kernel.validate(),
     Err(Error::LengthMismatch(_))
@@ -619,7 +616,7 @@ fn config_validate_rejects_conv_array_longer_than_num_feat_extract_layers() {
   // equality, not a one-sided floor) — 8-entry arrays with
   // num_feat_extract_layers = 8 must validate. (The matching transformer dims
   // are kept default; only the conv stack + layer count change.)
-  let exact = Wav2Vec2Config::from_json(
+  let exact = Config::from_json(
     r#"{"num_feat_extract_layers": 8,
         "conv_dim": [512, 512, 512, 512, 512, 512, 512, 512],
         "conv_stride": [5, 2, 2, 2, 2, 2, 2, 2],
@@ -638,13 +635,13 @@ fn config_validate_rejects_non_positive_or_non_finite_layer_norm_eps() {
   // magnitude — a different positive finite value (e.g. the lv60 1e-5, or any
   // other positive eps) is accepted. Only a non-finite or non-positive value
   // is rejected (it would drive a non-finite / degenerate denominator).
-  let smaller = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e-6}"#).unwrap();
+  let smaller = Config::from_json(r#"{"layer_norm_eps": 1e-6}"#).unwrap();
   assert!(
     smaller.validate().is_ok(),
     "a different positive finite eps must validate (eps is not pinned)"
   );
   // Zero eps is OutOfRange.
-  let zero = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 0.0}"#).unwrap();
+  let zero = Config::from_json(r#"{"layer_norm_eps": 0.0}"#).unwrap();
   match zero.validate() {
     Err(Error::OutOfRange(p)) => {
       assert!(
@@ -656,7 +653,7 @@ fn config_validate_rejects_non_positive_or_non_finite_layer_norm_eps() {
     other => panic!("expected OutOfRange for a zero layer_norm_eps, got {other:?}"),
   }
   // Negative eps is OutOfRange.
-  let neg = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": -1e-5}"#).unwrap();
+  let neg = Config::from_json(r#"{"layer_norm_eps": -1e-5}"#).unwrap();
   assert!(matches!(neg.validate(), Err(Error::OutOfRange(_))));
 }
 
@@ -667,7 +664,7 @@ fn config_validate_rejects_non_finite_layer_norm_eps() {
   // over-range literal is caught at parse time (serde) or at validate time
   // (the helper's NonFiniteScalar branch, when the f64→f32 cast saturates to
   // infinity), the config must be rejected — never produce a usable model.
-  match Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e40}"#) {
+  match Config::from_json(r#"{"layer_norm_eps": 1e40}"#) {
     Err(Error::Parse(_)) => {}
     Ok(cfg) => {
       // Parsed: the cast saturated to a non-finite f32; validate rejects it.
@@ -686,7 +683,7 @@ fn config_validate_rejects_non_finite_layer_norm_eps() {
 fn config_validate_rejects_unsupported_hidden_act() {
   // An activation the port does not wire (e.g. relu) is rejected with a typed
   // UnknownEnumValue carrying the offending value and the supported set.
-  let relu = Wav2Vec2Config::from_json(r#"{"hidden_act": "relu"}"#).unwrap();
+  let relu = Config::from_json(r#"{"hidden_act": "relu"}"#).unwrap();
   assert_eq!(relu.hidden_act, "relu");
   match relu.validate() {
     Err(Error::UnknownEnumValue(p)) => {
@@ -704,7 +701,7 @@ fn config_validate_rejects_unsupported_hidden_act() {
 fn config_validate_rejects_unsupported_feat_extract_activation() {
   // Same dispatch for the feature-encoder activation: an unsupported name is a
   // typed UnknownEnumValue carrying the value + supported set.
-  let relu = Wav2Vec2Config::from_json(r#"{"feat_extract_activation": "relu"}"#).unwrap();
+  let relu = Config::from_json(r#"{"feat_extract_activation": "relu"}"#).unwrap();
   assert_eq!(relu.feat_extract_activation, "relu");
   match relu.validate() {
     Err(Error::UnknownEnumValue(p)) => {
@@ -724,10 +721,9 @@ fn config_validate_rejects_unsupported_feat_extract_activation() {
 fn config_validate_accepts_supported_activations() {
   // Every supported HF activation name on both fields validates.
   for act in ["gelu", "gelu_new", "gelu_pytorch_tanh", "silu", "swish"] {
-    let hidden = Wav2Vec2Config::from_json(&format!(r#"{{"hidden_act": "{act}"}}"#)).unwrap();
+    let hidden = Config::from_json(&format!(r#"{{"hidden_act": "{act}"}}"#)).unwrap();
     assert!(hidden.validate().is_ok(), "hidden_act={act} must validate");
-    let feat =
-      Wav2Vec2Config::from_json(&format!(r#"{{"feat_extract_activation": "{act}"}}"#)).unwrap();
+    let feat = Config::from_json(&format!(r#"{{"feat_extract_activation": "{act}"}}"#)).unwrap();
     assert!(
       feat.validate().is_ok(),
       "feat_extract_activation={act} must validate"
@@ -798,7 +794,7 @@ fn config_validate_rejects_add_adapter() {
   // CTC head's input dim) that this port does not wire, so the head would read
   // the wrong dimension. `validate` must reject it with a typed
   // InvariantViolation naming the field, BEFORE any tensor is built.
-  let cfg = Wav2Vec2Config::from_json(r#"{"add_adapter": true}"#).unwrap();
+  let cfg = Config::from_json(r#"{"add_adapter": true}"#).unwrap();
   assert!(cfg.add_adapter);
   match cfg.validate() {
     Err(Error::InvariantViolation(p)) => {
@@ -818,7 +814,7 @@ fn config_validate_rejects_adapter_attn_dim() {
   // added to the hidden states) that this port omits, so a non-null value
   // would silently drop a graph term. Only the absent (`None`) form is
   // supported; a set value is a typed InvariantViolation naming the field.
-  let cfg = Wav2Vec2Config::from_json(r#"{"adapter_attn_dim": 16}"#).unwrap();
+  let cfg = Config::from_json(r#"{"adapter_attn_dim": 16}"#).unwrap();
   assert_eq!(cfg.adapter_attn_dim, Some(16));
   match cfg.validate() {
     Err(Error::InvariantViolation(p)) => {
@@ -832,7 +828,7 @@ fn config_validate_rejects_adapter_attn_dim() {
   }
   // An explicit `null` is equivalent to absent and validates (the base-960h
   // form), so a checkpoint that spells out the default is still accepted.
-  let explicit_null = Wav2Vec2Config::from_json(r#"{"adapter_attn_dim": null}"#).unwrap();
+  let explicit_null = Config::from_json(r#"{"adapter_attn_dim": null}"#).unwrap();
   assert_eq!(explicit_null.adapter_attn_dim, None);
   assert!(explicit_null.validate().is_ok());
 }
@@ -843,7 +839,7 @@ fn config_validate_rejects_deviating_pad_token_id() {
   // declaring a different `pad_token_id` would collapse the argmax against the
   // wrong token. `validate` must reject it with a typed OutOfRange naming the
   // field + the offending and expected (0) values.
-  let cfg = Wav2Vec2Config::from_json(r#"{"pad_token_id": 1}"#).unwrap();
+  let cfg = Config::from_json(r#"{"pad_token_id": 1}"#).unwrap();
   assert_eq!(cfg.pad_token_id, 1);
   match cfg.validate() {
     Err(Error::OutOfRange(p)) => {
@@ -870,7 +866,7 @@ fn config_validate_rejects_non_default_feat_proj_layer_norm() {
   // rejected with a typed InvariantViolation naming the field, BEFORE any
   // tensor is built — never silently run the normalizing graph on a config that
   // asked for the un-normalized one.
-  let cfg = Wav2Vec2Config::from_json(r#"{"feat_proj_layer_norm": false}"#).unwrap();
+  let cfg = Config::from_json(r#"{"feat_proj_layer_norm": false}"#).unwrap();
   assert!(!cfg.feat_proj_layer_norm);
   match cfg.validate() {
     Err(Error::InvariantViolation(p)) => {
@@ -885,7 +881,7 @@ fn config_validate_rejects_non_default_feat_proj_layer_norm() {
   // The default (`true`, the wired arm) validates — the HF default for HuBERT
   // and the implicit value for every wav2vec2 config — proving the gate rejects
   // only the non-default arm, not the supported one.
-  let default_true = Wav2Vec2Config::from_json(r#"{"feat_proj_layer_norm": true}"#).unwrap();
+  let default_true = Config::from_json(r#"{"feat_proj_layer_norm": true}"#).unwrap();
   assert!(default_true.feat_proj_layer_norm);
   assert!(
     default_true.validate().is_ok(),
@@ -893,7 +889,7 @@ fn config_validate_rejects_non_default_feat_proj_layer_norm() {
   );
   // Absent (the common case: wav2vec2 configs never carry the field, HuBERT
   // defaults it true) falls back to the wired arm and validates.
-  let absent = Wav2Vec2Config::from_json("{}").unwrap();
+  let absent = Config::from_json("{}").unwrap();
   assert!(
     absent.feat_proj_layer_norm,
     "feat_proj_layer_norm must default to true when absent"
@@ -910,7 +906,7 @@ fn config_validate_rejects_non_default_conv_pos_batch_norm() {
   // no weight_g/weight_v) that is not implemented this phase. A `true` value
   // must be rejected with a typed InvariantViolation naming the field, BEFORE
   // any tensor is built.
-  let cfg = Wav2Vec2Config::from_json(r#"{"conv_pos_batch_norm": true}"#).unwrap();
+  let cfg = Config::from_json(r#"{"conv_pos_batch_norm": true}"#).unwrap();
   assert!(cfg.conv_pos_batch_norm);
   match cfg.validate() {
     Err(Error::InvariantViolation(p)) => {
@@ -924,14 +920,14 @@ fn config_validate_rejects_non_default_conv_pos_batch_norm() {
   }
   // The default (`false`, the weight-norm arm) validates — the HF default for
   // HuBERT and the implicit value for every wav2vec2 config.
-  let default_false = Wav2Vec2Config::from_json(r#"{"conv_pos_batch_norm": false}"#).unwrap();
+  let default_false = Config::from_json(r#"{"conv_pos_batch_norm": false}"#).unwrap();
   assert!(!default_false.conv_pos_batch_norm);
   assert!(
     default_false.validate().is_ok(),
     "the default conv_pos_batch_norm = false (the weight-norm arm) must validate"
   );
   // Absent falls back to the wired (weight-norm) arm and validates.
-  let absent = Wav2Vec2Config::from_json("{}").unwrap();
+  let absent = Config::from_json("{}").unwrap();
   assert!(
     !absent.conv_pos_batch_norm,
     "conv_pos_batch_norm must default to false when absent"
@@ -990,7 +986,7 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
     r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 3]}"#,
   ];
   for json in accepted {
-    let cfg = Wav2Vec2Config::from_json(json).unwrap();
+    let cfg = Config::from_json(json).unwrap();
     assert!(
       cfg.validate().is_ok(),
       "a valid family variant must pass validate(), but this one was rejected: {json}"
@@ -1029,7 +1025,7 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
     r#"{"conv_stride": [5, 0, 2, 2, 2, 2, 2]}"#,
   ];
   for json in rejected {
-    let cfg = Wav2Vec2Config::from_json(json).unwrap();
+    let cfg = Config::from_json(json).unwrap();
     assert!(
       cfg.validate().is_err(),
       "an out-of-scope / invalid config must be rejected by validate(), but this one passed: {json}"
@@ -1039,7 +1035,7 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
   // The all-default baseline must itself validate, proving the rejections are
   // caused by the override, not a baseline that already fails.
   assert!(
-    Wav2Vec2Config::from_json("{}").unwrap().validate().is_ok(),
+    Config::from_json("{}").unwrap().validate().is_ok(),
     "the all-default config must pass validate()"
   );
 }
@@ -1048,7 +1044,7 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
 fn defaults_match_base_960h_and_validate() {
   // The serde `default_*` fns describe `facebook/wav2vec2-base-960h`, and the
   // default config must pass validate() (the all-default checkpoint loads).
-  let defaults = Wav2Vec2Config::from_json("{}").unwrap();
+  let defaults = Config::from_json("{}").unwrap();
   assert!(
     defaults.validate().is_ok(),
     "the all-default (base-960h) config must pass validate()"
@@ -1356,17 +1352,17 @@ fn base_960h_weights() -> HashMap<String, Array> {
   w
 }
 
-fn base_960h_config() -> Wav2Vec2Config {
-  Wav2Vec2Config::from_json("{}").unwrap()
+fn base_960h_config() -> Config {
+  Config::from_json("{}").unwrap()
 }
 
 /// Assert a `from_weights` result is the shape gate's typed rejection — an
 /// [`Error::LayerKeyed`] naming `key` whose inner error is an
 /// [`Error::ShapePairMismatch`] — and return that inner payload for further
-/// shape assertions. `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so the
+/// shape assertions. `Model` is not `Debug` (it holds `Array`s), so the
 /// `Ok` arm is reported without formatting the model.
 fn expect_shape_rejection(
-  result: Result<Wav2Vec2Ctc>,
+  result: Result<Model<Standard>>,
   key: &str,
 ) -> crate::error::ShapePairMismatchPayload {
   match result {
@@ -1387,7 +1383,7 @@ fn from_weights_accepts_correctly_shaped_base_960h() {
   // The complete, correctly-shaped base-960h weight set must build a model
   // (the both-directions baseline for the drift rejections below). Construction
   // is lazy, so this never materializes the ~hundreds-of-MB graph.
-  let model = Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default());
+  let model = Model::from_weights(base_960h_config(), base_960h_weights(), Vocab::default());
   assert!(
     model.is_ok(),
     "a fully base-960h-shaped weight set must build a model"
@@ -1404,10 +1400,10 @@ fn forward_rejects_over_cap_waveform_length() {
   // conv stack, with a recoverable typed `OutOfRange` (so the ~3.8 MB zeros
   // input below never reaches any forward allocation).
   let model =
-    Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
+    Model::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
 
   // One sample over the cap: rejected at the guard (a shape read), not run.
-  let over_cap = zeros(&[(Wav2Vec2Ctc::MAX_INPUT_SAMPLES + 1) as i32]);
+  let over_cap = zeros(&[(Model::<Standard>::MAX_INPUT_SAMPLES + 1) as i32]);
   let err = model.forward(&over_cap);
   assert!(
     matches!(err, Err(Error::OutOfRange(_))),
@@ -1417,7 +1413,7 @@ fn forward_rejects_over_cap_waveform_length() {
   // A normal 1 s waveform (16 000 samples) is well under the cap, so the guard
   // must NOT trip: `forward` builds its lazy graph and returns without the cap
   // error (the result is left lazy — no eval — so this stays cheap).
-  let one_second = zeros(&[Wav2Vec2Ctc::SAMPLE_RATE as i32]);
+  let one_second = zeros(&[Model::<Standard>::SAMPLE_RATE as i32]);
   assert!(
     !matches!(model.forward(&one_second), Err(Error::OutOfRange(_))),
     "a 1 s waveform must not be rejected by the length cap"
@@ -1429,8 +1425,8 @@ fn forward_rejects_over_cap_batched_waveform() {
   // Last axis == cap, but a batch dimension pushes the TOTAL over the cap: the
   // old per-axis check missed this; the total-element cap catches it.
   let model =
-    Wav2Vec2Ctc::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
-  let over = zeros(&[2, Wav2Vec2Ctc::MAX_INPUT_SAMPLES as i32]);
+    Model::from_weights(base_960h_config(), base_960h_weights(), Vocab::default()).unwrap();
+  let over = zeros(&[2, Model::<Standard>::MAX_INPUT_SAMPLES as i32]);
   assert!(matches!(model.forward(&over), Err(Error::OutOfRange(_))));
 }
 
@@ -1444,7 +1440,7 @@ fn from_weights_rejects_wrong_lm_head_output_dim() {
   let mut weights = base_960h_weights();
   // 1,000,000 output rows instead of vocab_size (32); inner dim still correct.
   weights.insert("lm_head.weight".to_string(), zeros(&[1_000_000, 768]));
-  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let result = Model::from_weights(base_960h_config(), weights, Vocab::default());
   let sp = expect_shape_rejection(result, "lm_head.weight");
   // The expected shape is the base-960h (vocab_size, hidden_size); the observed
   // is the hostile oversized one. Both computed here, not by the code under test.
@@ -1464,7 +1460,7 @@ fn from_weights_rejects_wrong_conv_kernel_size() {
     "feature_extractor.conv_layers.0.conv.weight".to_string(),
     zeros(&[512, 7, 1]),
   );
-  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let result = Model::from_weights(base_960h_config(), weights, Vocab::default());
   let sp = expect_shape_rejection(result, "feature_extractor.conv_layers.0.conv.weight");
   assert_eq!(sp.expected(), &[512usize, 10, 1]);
   assert_eq!(sp.actual(), &[512usize, 7, 1]);
@@ -1480,7 +1476,7 @@ fn from_weights_rejects_wrong_rank_tensor() {
     "encoder.layers.0.attention.q_proj.weight".to_string(),
     zeros(&[768, 768, 1]),
   );
-  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let result = Model::from_weights(base_960h_config(), weights, Vocab::default());
   let sp = expect_shape_rejection(result, "encoder.layers.0.attention.q_proj.weight");
   // Rank pinned: expected the rank-2 (hidden, hidden), observed the rank-3 drift.
   assert_eq!(sp.expected(), &[768usize, 768]);
@@ -1497,7 +1493,7 @@ fn from_weights_rejects_wrong_pos_conv_weight_v() {
     "encoder.pos_conv_embed.conv.weight_v".to_string(),
     zeros(&[768, 64, 48]),
   );
-  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let result = Model::from_weights(base_960h_config(), weights, Vocab::default());
   let sp = expect_shape_rejection(result, "encoder.pos_conv_embed.conv.weight_v");
   assert_eq!(sp.expected(), &[768usize, 128, 48]);
   assert_eq!(sp.actual(), &[768usize, 64, 48]);
@@ -1513,7 +1509,7 @@ fn from_weights_rejects_wrong_feed_forward_dim() {
     "encoder.layers.3.feed_forward.intermediate_dense.weight".to_string(),
     zeros(&[4096, 768]),
   );
-  let result = Wav2Vec2Ctc::from_weights(base_960h_config(), weights, Vocab::default());
+  let result = Model::from_weights(base_960h_config(), weights, Vocab::default());
   let sp = expect_shape_rejection(
     result,
     "encoder.layers.3.feed_forward.intermediate_dense.weight",
@@ -1562,10 +1558,7 @@ fn load_rejects_missing_local_directory() {
   // A non-existent local path is a clear MissingKey, never a panic / network
   // attempt.
   let missing = format!("/nonexistent/mlxrs_wav2vec2_{}/model", std::process::id());
-  assert!(matches!(
-    Wav2Vec2Ctc::load(&missing),
-    Err(Error::MissingKey(_))
-  ));
+  assert!(matches!(Model::load(&missing), Err(Error::MissingKey(_))));
 }
 
 #[test]
@@ -1576,9 +1569,9 @@ fn load_errors_when_safetensors_absent() {
   let _ = std::fs::remove_dir_all(&dir);
   std::fs::create_dir_all(&dir).unwrap();
   std::fs::write(dir.join("config.json"), r#"{"model_type": "wav2vec2"}"#).unwrap();
-  let err = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let err = Model::load(&dir.to_string_lossy());
   let _ = std::fs::remove_dir_all(&dir);
-  // `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so assert on the variant
+  // `Model` is not `Debug` (it holds `Array`s), so assert on the variant
   // without formatting the `Ok` payload.
   assert!(
     matches!(err, Err(Error::MissingKey(_))),
@@ -1589,7 +1582,7 @@ fn load_errors_when_safetensors_absent() {
 /// Build a complete **HF pre-sanitize** checkpoint map for `config`, with every
 /// backbone key carrying `prefix` (`"wav2vec2."` / `"hubert."`) and `lm_head.*`
 /// top-level — exactly the on-disk `*ForCTC` layout the PUBLIC
-/// [`Wav2Vec2Ctc::load`] path feeds through [`sanitize`]. This is the faithful
+/// [`Model::load`] path feeds through [`sanitize`]. This is the faithful
 /// inverse of what `from_weights` consumes: the conv weights are in HF
 /// `(out, in, k)` order (sanitize swaps them to MLX `(out, k, in)`), and the
 /// positional weight-norm pair is stored under the PyTorch parametrization names
@@ -1602,7 +1595,7 @@ fn load_errors_when_safetensors_absent() {
 /// Shapes are written longhand (not read from the code under test) so a
 /// regression in the production sanitize/shape derivation cannot also shift this
 /// oracle.
-fn hf_layout_prefixed_weights(c: &Wav2Vec2Config, prefix: &str) -> HashMap<String, Array> {
+fn hf_layout_prefixed_weights(c: &Config, prefix: &str) -> HashMap<String, Array> {
   let mut w: HashMap<String, Array> = HashMap::new();
   let bb = |k: &str| format!("{prefix}{k}"); // backbone-prefixed key
   let hs = c.hidden_size;
@@ -1716,12 +1709,12 @@ fn hf_layout_prefixed_weights(c: &Wav2Vec2Config, prefix: &str) -> HashMap<Strin
 
 /// Drive the PUBLIC `load()` path end to end for a backbone-prefixed checkpoint:
 /// write a `config.json` + a prefixed HF-layout `model.safetensors` to a temp
-/// dir, then `Wav2Vec2Ctc::load` it (exercising `sanitize` on real prefixed,
+/// dir, then `Model::load` it (exercising `sanitize` on real prefixed,
 /// HF-ordered keys, not `from_weights` with pre-sanitized ones) and forward to
 /// the right logits shape. `config_json` selects the `model_type`; `prefix` is
 /// its backbone prefix.
 fn assert_load_path_strips_prefix(config_json: &str, prefix: &str) {
-  let config = Wav2Vec2Config::from_json(config_json).unwrap();
+  let config = Config::from_json(config_json).unwrap();
   // The on-disk checkpoint carries the backbone prefix + HF tensor order that
   // load()'s sanitize must strip and swap.
   let prefixed = hf_layout_prefixed_weights(&config, prefix);
@@ -1738,7 +1731,7 @@ fn assert_load_path_strips_prefix(config_json: &str, prefix: &str) {
   // prefix — the path the synthetic from_weights tests bypass.
   crate::io::save_safetensors(&dir.join("model.safetensors"), &prefixed).unwrap();
 
-  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let loaded = Model::load(&dir.to_string_lossy());
   let _ = std::fs::remove_dir_all(&dir);
 
   let model = match loaded {
@@ -1836,14 +1829,14 @@ fn ramp(shape: &[i32], scale: f32) -> Array {
 }
 
 /// Build a complete **post-sanitize** weight map for an arbitrary
-/// [`Wav2Vec2Config`] — the exact layout `from_weights` consumes, every tensor
+/// [`Config`] — the exact layout `from_weights` consumes, every tensor
 /// at the shape the config implies. Norm affines are ones (weight) / zeros
 /// (bias); every other tensor is a small constant. Used to drive a real
 /// forward over newly-unlocked (large / conv_bias / non-gelu) configs at tiny
 /// synthetic dims. Shapes are written longhand (not read from the code under
 /// test) so a regression in the production shape derivation cannot also shift
 /// this oracle.
-fn synthetic_weights(c: &Wav2Vec2Config) -> HashMap<String, Array> {
+fn synthetic_weights(c: &Config) -> HashMap<String, Array> {
   let mut w: HashMap<String, Array> = HashMap::new();
   let hs = c.hidden_size;
   let inter = c.intermediate_size;
@@ -1945,7 +1938,7 @@ fn synthetic_weights(c: &Wav2Vec2Config) -> HashMap<String, Array> {
 
 /// The conv-output length recurrence (no padding, dilation 1) over the config's
 /// conv stack, computed independently of the model.
-fn feature_out_len(c: &Wav2Vec2Config, t_in: i64) -> i64 {
+fn feature_out_len(c: &Config, t_in: i64) -> i64 {
   let mut l = t_in;
   for i in 0..(c.num_feat_extract_layers as usize) {
     l = (l - i64::from(c.conv_kernel[i])) / i64::from(c.conv_stride[i]) + 1;
@@ -1956,7 +1949,7 @@ fn feature_out_len(c: &Wav2Vec2Config, t_in: i64) -> i64 {
 /// A tiny synthetic config (overriding the small dims onto the JSON the test
 /// supplies) so a full forward is cheap. Uses 3 feat-extract layers, 2
 /// transformer layers, hidden 32 / heads 4 / inter 64, kpos 16 / groups 4.
-fn tiny_config_json(extra: &str) -> Wav2Vec2Config {
+fn tiny_config_json(extra: &str) -> Config {
   let json = format!(
     r#"{{
       "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
@@ -1967,18 +1960,18 @@ fn tiny_config_json(extra: &str) -> Wav2Vec2Config {
       {extra}
     }}"#
   );
-  Wav2Vec2Config::from_json(&json).unwrap()
+  Config::from_json(&json).unwrap()
 }
 
 /// Forward a tiny model over a `(1, t_in)` waveform and assert the logits shape
 /// is `(1, T', vocab)` where `T'` is the analytic feature-encoder output length
 /// — exercising the full build + forward graph for a newly-unlocked config.
-fn assert_forward_shape(config: Wav2Vec2Config, t_in: i32) {
+fn assert_forward_shape(config: Config, t_in: i32) {
   let expected_t = feature_out_len(&config, i64::from(t_in));
   assert!(expected_t > 0, "choose a longer input: T' = {expected_t}");
   let vocab = config.vocab_size as usize;
   let weights = synthetic_weights(&config);
-  let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default())
+  let model = Model::from_weights(config, weights, Vocab::default())
     .expect("a valid family config must build");
   let waveform = filled(&[1, t_in], 0.1);
   let mut logits = model.forward(&waveform).expect("forward must succeed");
@@ -2019,7 +2012,7 @@ fn full_large_lv60_style_config_parses_and_validates() {
     "do_stable_layer_norm": true,
     "num_conv_pos_embeddings": 128, "num_conv_pos_embedding_groups": 16
   }"#;
-  let config = Wav2Vec2Config::from_json(json).unwrap();
+  let config = Config::from_json(json).unwrap();
   assert_eq!(config.hidden_size, 1024);
   assert_eq!(config.num_hidden_layers, 24);
   assert!(config.do_stable_layer_norm);
@@ -2043,7 +2036,7 @@ fn conv_bias_config_requires_bias_tensors() {
   let config = tiny_config_json(r#", "conv_bias": true"#);
   let mut weights = synthetic_weights(&config);
   weights.remove("feature_extractor.conv_layers.1.conv.bias");
-  match Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()) {
+  match Model::from_weights(config, weights, Vocab::default()) {
     Err(Error::MissingKey(p)) => {
       assert!(
         p.key().contains("conv_layers.1.conv.bias"),
@@ -2105,7 +2098,7 @@ fn wavlm_model_type_is_rejected() {
   let weights = synthetic_weights(&tiny_config_json(r#", "model_type": "wavlm""#));
   assert!(
     matches!(
-      Wav2Vec2Ctc::from_weights(
+      Model::from_weights(
         tiny_config_json(r#", "model_type": "wavlm""#),
         weights,
         Vocab::default()
@@ -2128,7 +2121,7 @@ fn post_norm_and_stable_layer_norm_differ() {
   assert!(stable.do_stable_layer_norm);
 
   let waveform = filled(&[1, 400], 0.1);
-  let mut post_logits = Wav2Vec2Ctc::from_weights(
+  let mut post_logits = Model::from_weights(
     post,
     synthetic_weights(&tiny_config_json("")),
     Vocab::default(),
@@ -2136,7 +2129,7 @@ fn post_norm_and_stable_layer_norm_differ() {
   .unwrap()
   .forward(&waveform)
   .unwrap();
-  let mut stable_logits = Wav2Vec2Ctc::from_weights(
+  let mut stable_logits = Model::from_weights(
     stable,
     synthetic_weights(&tiny_config_json(r#", "do_stable_layer_norm": true"#)),
     Vocab::default(),
@@ -2323,7 +2316,7 @@ fn forward_preserves_half_precision_dtype() {
   for dtype in [crate::dtype::Dtype::F16, crate::dtype::Dtype::BF16] {
     let config = tiny_config_json("");
     let weights = cast_weights(synthetic_weights(&tiny_config_json("")), dtype);
-    let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()).unwrap();
+    let model = Model::from_weights(config, weights, Vocab::default()).unwrap();
     let waveform = ramp(&[1, 400], 0.5).astype(dtype).unwrap();
     let logits = model.forward(&waveform).unwrap();
     assert_eq!(
@@ -2356,7 +2349,7 @@ fn forward_stable_ln_preserves_half_precision_dtype() {
     let extra = r#", "do_stable_layer_norm": true"#;
     let config = tiny_config_json(extra);
     let weights = cast_weights(synthetic_weights(&tiny_config_json(extra)), dtype);
-    let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()).unwrap();
+    let model = Model::from_weights(config, weights, Vocab::default()).unwrap();
     let waveform = ramp(&[1, 400], 0.5).astype(dtype).unwrap();
     let logits = model.forward(&waveform).unwrap();
     assert_eq!(
@@ -2399,7 +2392,7 @@ const QBITS: i32 = 8;
 /// A tiny quant-friendly config: every quantized Linear's input width
 /// (`hidden_size = 64`, `intermediate_size = 128`, `conv_dim[-1] = 64`) is a
 /// whole number of `QGROUP` groups. 3 feat-extract layers, 2 transformer layers.
-fn quant_config_json(extra: &str) -> Wav2Vec2Config {
+fn quant_config_json(extra: &str) -> Config {
   let json = format!(
     r#"{{
       "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
@@ -2410,7 +2403,7 @@ fn quant_config_json(extra: &str) -> Wav2Vec2Config {
       {extra}
     }}"#
   );
-  Wav2Vec2Config::from_json(&json).unwrap()
+  Config::from_json(&json).unwrap()
 }
 
 /// Replace the dense `<prefix>.weight` in `w` with the real
@@ -2441,7 +2434,7 @@ fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str, group_
 /// conv stay DENSE — only `nn.Linear` is quantized, matching mlx-audio / MLX.
 /// `group_size` must divide every quantized Linear's input width
 /// (`hidden_size` / `intermediate_size` / `conv_dim[-1]`).
-fn quant_weights_at(config: &Wav2Vec2Config, group_size: i32) -> HashMap<String, Array> {
+fn quant_weights_at(config: &Config, group_size: i32) -> HashMap<String, Array> {
   let mut w = synthetic_weights(config);
   // Feature projection Linear.
   quantize_weight_in_place(&mut w, "feature_projection.projection", group_size);
@@ -2469,7 +2462,7 @@ fn quant_weights_at(config: &Wav2Vec2Config, group_size: i32) -> HashMap<String,
 
 /// The synthetic quantized checkpoint at the module-default `QGROUP` — the
 /// shape an mlx-community 8-bit checkpoint ships for these dims.
-fn quant_weights(config: &Wav2Vec2Config) -> HashMap<String, Array> {
+fn quant_weights(config: &Config) -> HashMap<String, Array> {
   quant_weights_at(config, QGROUP)
 }
 
@@ -2486,7 +2479,7 @@ fn from_weights_quantized_builds_quantized_layers() {
   // (a packed `uint32` weight of a DIFFERENT shape than the dense `(out, in)`
   // would otherwise be rejected by the dense shape gate).
   let config = quant_config_json("");
-  let model = Wav2Vec2Ctc::from_weights_quantized(
+  let model = Model::from_weights_quantized(
     config,
     quant_weights(&quant_config_json("")),
     Vocab::default(),
@@ -2519,7 +2512,7 @@ fn from_weights_quantized_runs_forward_to_finite_ctc_logits() {
   let expected_t = feature_out_len(&config, 400);
   assert!(expected_t > 0, "choose a longer input: T' = {expected_t}");
   let vocab = config.vocab_size as usize;
-  let model = Wav2Vec2Ctc::from_weights_quantized(
+  let model = Model::from_weights_quantized(
     quant_config_json(""),
     quant_weights(&config),
     Vocab::default(),
@@ -2552,7 +2545,7 @@ fn from_weights_quantized_stable_ln_runs_forward() {
   assert!(config.do_stable_layer_norm);
   let expected_t = feature_out_len(&config, 400);
   let vocab = config.vocab_size as usize;
-  let model = Wav2Vec2Ctc::from_weights_quantized(
+  let model = Model::from_weights_quantized(
     quant_config_json(r#", "do_stable_layer_norm": true"#),
     quant_weights(&config),
     Vocab::default(),
@@ -2581,7 +2574,7 @@ fn from_weights_quantized_dense_checkpoint_unchanged() {
   let config = quant_config_json("");
   let expected_t = feature_out_len(&config, 400);
   let vocab = config.vocab_size as usize;
-  let model = Wav2Vec2Ctc::from_weights_quantized(
+  let model = Model::from_weights_quantized(
     quant_config_json(""),
     synthetic_weights(&config),
     Vocab::default(),
@@ -2606,9 +2599,9 @@ fn from_weights_quantized_scales_without_config_errors() {
   // `quantization_for` returns None for the quantized layer.
   let config = quant_config_json("");
   let empty_cfg = PerLayerQuantization::new(None, HashMap::new());
-  // `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so match rather than
+  // `Model` is not `Debug` (it holds `Array`s), so match rather than
   // `.unwrap_err()` (which would need the `Ok` value to be `Debug`).
-  match Wav2Vec2Ctc::from_weights_quantized(
+  match Model::from_weights_quantized(
     config,
     quant_weights(&quant_config_json("")),
     Vocab::default(),
@@ -2632,7 +2625,7 @@ fn from_weights_quantized_dense_path_identical_to_from_weights() {
   let config = quant_config_json("");
   let waveform = ramp(&[1, 400], 0.5);
 
-  let model_plain = Wav2Vec2Ctc::from_weights(
+  let model_plain = Model::from_weights(
     quant_config_json(""),
     synthetic_weights(&config),
     Vocab::default(),
@@ -2640,7 +2633,7 @@ fn from_weights_quantized_dense_path_identical_to_from_weights() {
   .unwrap();
   let mut logits_plain = model_plain.forward(&waveform).unwrap();
 
-  let model_none = Wav2Vec2Ctc::from_weights_quantized(
+  let model_none = Model::from_weights_quantized(
     quant_config_json(""),
     synthetic_weights(&config),
     Vocab::default(),
@@ -2677,11 +2670,7 @@ fn from_weights_quantized_dense_path_identical_to_from_weights() {
 /// exactly what an mlx-community quantized `*ForCTC` checkpoint ships. The conv
 /// feature extractor and positional conv stay DENSE (only `nn.Linear`
 /// quantizes). `group_size` must divide every quantized Linear's input width.
-fn hf_quant_layout_weights(
-  c: &Wav2Vec2Config,
-  prefix: &str,
-  group_size: i32,
-) -> HashMap<String, Array> {
+fn hf_quant_layout_weights(c: &Config, prefix: &str, group_size: i32) -> HashMap<String, Array> {
   let mut w = hf_layout_prefixed_weights(c, prefix);
   // Backbone Linears keep the backbone prefix on disk; `lm_head` is top-level.
   quantize_weight_in_place(
@@ -2715,7 +2704,7 @@ fn hf_quant_layout_weights(
 /// without `group_size`). The on-disk `model.safetensors` is the HF pre-sanitize
 /// layout with its Linears quantized at `weight_group_size` (the group size the
 /// resolved scheme must agree on). Writes the `config.json` + weights to a temp
-/// dir, calls `Wav2Vec2Ctc::load`, and asserts the quantized path was taken (the
+/// dir, calls `Model::load`, and asserts the quantized path was taken (the
 /// CTC head loaded quantized) and a real forward produces finite CTC logits of
 /// the right shape. The model dims are pinned here (mirroring
 /// `quant_config_json("")`) so the saved quantized weights line up with the
@@ -2732,7 +2721,7 @@ fn assert_quant_load_path(quant_block: &str, tag: &str, weight_group_size: i32) 
       {quant_block}
     }}"#
   );
-  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+  let config = Config::from_json(&config_json).unwrap();
   let weights = hf_quant_layout_weights(&config, "wav2vec2.", weight_group_size);
 
   let dir = std::env::temp_dir().join(format!(
@@ -2744,7 +2733,7 @@ fn assert_quant_load_path(quant_block: &str, tag: &str, weight_group_size: i32) 
   std::fs::write(dir.join("config.json"), &config_json).unwrap();
   crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
 
-  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let loaded = Model::load(&dir.to_string_lossy());
   let _ = std::fs::remove_dir_all(&dir);
 
   let model = match loaded {
@@ -2819,9 +2808,11 @@ fn loaded_group_size(layer: &super::Linear) -> Option<i32> {
 
 /// The transformer layer stack of a built [`Encoder`], regardless of its
 /// (post-norm / stable-LN) arm — both arms share the same `EncoderInner` layout.
-fn encoder_layers(encoder: &super::Encoder) -> &[super::EncoderLayer] {
+fn encoder_layers(encoder: &super::StandardEncoder) -> &[super::EncoderLayer] {
   match encoder {
-    super::Encoder::PostNorm(inner) | super::Encoder::StableLayerNorm(inner) => &inner.layers,
+    super::StandardEncoder::PostNorm(inner) | super::StandardEncoder::StableLayerNorm(inner) => {
+      &inner.layers
+    }
   }
 }
 
@@ -2858,7 +2849,7 @@ fn load_path_applies_hf_keyed_per_layer_quant_override() {
       }}
     }}"#
   );
-  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+  let config = Config::from_json(&config_json).unwrap();
 
   // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
   // each quantized-eligible Linear at its scheme's group size — the single
@@ -2907,7 +2898,7 @@ fn load_path_applies_hf_keyed_per_layer_quant_override() {
   std::fs::write(dir.join("config.json"), &config_json).unwrap();
   crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
 
-  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let loaded = Model::load(&dir.to_string_lossy());
   let _ = std::fs::remove_dir_all(&dir);
 
   let model = match loaded {
@@ -3118,7 +3109,7 @@ fn from_weights_quantized_applies_hf_keyed_per_layer_override_via_public_api() {
       }}
     }}"#
   );
-  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+  let config = Config::from_json(&config_json).unwrap();
 
   // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
   // each quantized-eligible Linear at its scheme's group size — the single
@@ -3174,7 +3165,7 @@ fn from_weights_quantized_applies_hf_keyed_per_layer_override_via_public_api() {
     "precondition: the parsed config carries the HF-prefixed override key the public constructor must normalize"
   );
 
-  let model = match Wav2Vec2Ctc::from_weights_quantized(
+  let model = match Model::from_weights_quantized(
     config.clone(),
     weights,
     Vocab::default(),
@@ -3239,5 +3230,274 @@ fn from_weights_quantized_applies_hf_keyed_per_layer_override_via_public_api() {
       .iter()
       .all(|v| v.is_finite()),
     "all mixed-quant CTC logits must be finite via the public constructor"
+  );
+}
+
+// ───────────────────── Family / Transcribe wiring ─────────────────────
+
+/// A `vocab.json` body covering every id `0..vocab_size` of [`tiny_config_json`]
+/// (12 tokens): id `0` is the CTC blank `<pad>` (collapsed out), the rest are
+/// single characters including the `|` word-delimiter at id `9`. With every
+/// class mapped, whatever the tiny model's per-frame argmax selects decodes to a
+/// known character — so the boxed and inherent transcription paths render real
+/// (non-empty) text, not the empty-default-`Vocab` placeholder.
+fn full_tiny_vocab() -> Vocab {
+  Vocab::from_json(
+    r#"{
+      "<pad>": 0, "A": 1, "B": 2, "C": 3, "D": 4,
+      "E": 5, "F": 6, "G": 7, "H": 8, "|": 9, "I": 10, "J": 11
+    }"#,
+  )
+  .expect("a well-formed 12-token vocab must parse")
+}
+
+#[test]
+fn model_standard_is_usable_as_dyn_transcribe() {
+  // The golden CTC trait wiring: `Model<Standard>` implements `CtcModel` (so the
+  // blanket-style `Transcribe` delegation to `greedy_ctc_transcribe` applies),
+  // making a loaded model usable through the object-safe `Box<dyn Transcribe>`
+  // seam every STT pipeline depends on. Build a tiny model with a real (non-empty)
+  // vocab, erase it behind the trait object, and drive a real transcription over a
+  // mono waveform — the dynamic dispatch must run the shared normalize → forward →
+  // greedy-collapse → decode path to a single-segment `Transcription`.
+  use crate::audio::stt::model::{Transcribe, TranscribeOptions};
+
+  let config = tiny_config_json("");
+  let model = Model::from_weights(
+    config,
+    synthetic_weights(&tiny_config_json("")),
+    full_tiny_vocab(),
+  )
+  .expect("a valid Standard config must build");
+
+  // Erase the concrete dialect at the trait-object boundary (the one dyn point).
+  let erased: Box<dyn Transcribe> = Box::new(model);
+  // A mono (T,) waveform — `greedy_ctc_transcribe` validates a non-empty mono
+  // input, then reads the model's `(T', vocab)` logits.
+  let waveform = filled(&[400], 0.1);
+  let transcription = erased
+    .transcribe(&waveform, &TranscribeOptions::new())
+    .expect("transcription through Box<dyn Transcribe> must succeed");
+  // CTC emits a single segment spanning the whole utterance; the language is
+  // unreported (CTC has no language conditioning).
+  assert_eq!(
+    transcription.segments_slice().len(),
+    1,
+    "a CTC transcription carries exactly one segment"
+  );
+  assert_eq!(transcription.language(), None);
+  // The single segment's text equals the top-level text (both run through the
+  // shared trimmed decode seam) — the reference sets `text=` and the segment to
+  // the same `text.strip()`.
+  assert_eq!(
+    transcription.segments_slice()[0].text(),
+    transcription.text(),
+    "the CTC segment text and the top-level text are the one trimmed decode"
+  );
+}
+
+#[test]
+fn boxed_transcribe_rejects_empty_vocabulary() {
+  // A model loaded without `vocab.json` carries the empty default `Vocab`. The
+  // forward is well-defined, but there is no id → token map, so transcription
+  // must be rejected — NOT silently succeed with empty text. The boxed
+  // `Box<dyn Transcribe>` path (which delegates to the infallible greedy driver)
+  // must return the SAME typed error the inherent `Model::transcribe` raises, via
+  // the one shared `ensure_decodable` guard.
+  use crate::audio::stt::model::{Transcribe, TranscribeOptions};
+
+  let config = tiny_config_json("");
+  let model = Model::from_weights(
+    config,
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .expect("a valid Standard config must build");
+  let erased: Box<dyn Transcribe> = Box::new(model);
+  let waveform = filled(&[400], 0.1);
+
+  match erased.transcribe(&waveform, &TranscribeOptions::new()) {
+    Err(Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "Model::transcribe");
+      assert_eq!(
+        p.requirement(),
+        "model was built without a vocabulary (use forward + ctc_greedy_collapse)"
+      );
+    }
+    other => {
+      panic!("empty-vocab boxed transcribe must reject with InvariantViolation, got {other:?}")
+    }
+  }
+
+  // The inherent path raises the identical error (the shared guard) — the two
+  // are byte-identical, not merely both-failing.
+  let inherent = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .expect("a valid Standard config must build");
+  match inherent.transcribe(&waveform) {
+    Err(Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "Model::transcribe");
+      assert_eq!(
+        p.requirement(),
+        "model was built without a vocabulary (use forward + ctc_greedy_collapse)"
+      );
+    }
+    other => {
+      panic!("empty-vocab inherent transcribe must reject with InvariantViolation, got {other:?}")
+    }
+  }
+}
+
+#[test]
+fn decode_ids_trims_pipe_mapped_edge_spaces() {
+  // The shared decode seam (`CtcModel::decode_ids`) every transcription path runs:
+  // it maps ids → text (the `|` word-delimiter → a space) and then trims the
+  // leading / trailing whitespace the delimiter mapping leaves at the utterance
+  // edges — the reference's `"".join(...).replace("|", " ").strip()`. A collapsed
+  // id stream that begins and ends with the `|` delimiter (id 9) must decode to
+  // the interior word with NO surrounding spaces.
+  use crate::audio::stt::model::CtcModel;
+
+  let model = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    full_tiny_vocab(),
+  )
+  .expect("a valid Standard config must build");
+
+  // ids: | H I | → raw "".join = " HI ", .replace already done, .strip() → "HI".
+  let decoded = model.decode_ids(&[9, 8, 10, 9]);
+  assert_eq!(
+    decoded, "HI",
+    "leading/trailing |-mapped spaces must be trimmed"
+  );
+
+  // An interior `|` is a real word break and is preserved; only the edges trim.
+  // ids: | A | B | → " A B " → strip → "A B".
+  let two_words = model.decode_ids(&[9, 1, 9, 2, 9]);
+  assert_eq!(
+    two_words, "A B",
+    "interior |-mapped spaces are word breaks and stay; only the edges trim"
+  );
+
+  // The empty collapse (the all-blank / empty-time CTC case) decodes to "" — the
+  // driver routes both through `decode_ids(&[])`, so the trim makes it empty.
+  assert_eq!(model.decode_ids(&[]), "");
+}
+
+#[test]
+fn boxed_and_inherent_transcribe_yield_identical_text() {
+  // The boxed `Box<dyn Transcribe>` path and the inherent `Model::transcribe`
+  // must produce BYTE-IDENTICAL text on the same model + waveform. Both reach the
+  // same `(T', vocab)` logits (one shared normalize → forward), collapse
+  // identically (the local `ctc_greedy_collapse` and the driver's inline collapse
+  // are the same algorithm), and render through the one shared `decode_ids` seam
+  // (the `|`→space mapping + edge trim), so the two decodes never diverge.
+  use crate::audio::stt::model::{Transcribe, TranscribeOptions};
+
+  let waveform = ramp(&[512], 0.5);
+
+  let inherent_model = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    full_tiny_vocab(),
+  )
+  .expect("a valid Standard config must build");
+  let inherent_text = inherent_model
+    .transcribe(&waveform)
+    .expect("inherent transcribe must succeed with a real vocab");
+
+  // A separately-built but identical model, erased behind the trait object.
+  let boxed_model = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    full_tiny_vocab(),
+  )
+  .expect("a valid Standard config must build");
+  let erased: Box<dyn Transcribe> = Box::new(boxed_model);
+  let boxed = erased
+    .transcribe(&waveform, &TranscribeOptions::new())
+    .expect("boxed transcribe must succeed with a real vocab");
+
+  assert_eq!(
+    boxed.text(),
+    inherent_text,
+    "the boxed Transcribe path and the inherent path must decode identically"
+  );
+  // And the segment text matches too (the segment carries the same trimmed text).
+  assert_eq!(boxed.segments_slice()[0].text(), inherent_text);
+}
+
+#[test]
+fn direct_greedy_ctc_transcribe_rejects_empty_vocabulary() {
+  // The third public text-producing route: a caller can invoke the shared CTC
+  // driver `greedy_ctc_transcribe(&model, …)` DIRECTLY (the `CtcModel` path),
+  // bypassing the boxed `Box<dyn Transcribe>` wrapper entirely. A model loaded
+  // without a `vocab.json` carries the empty default `Vocab`: the forward is
+  // well-defined, but there is no id → token map, so this route would otherwise
+  // silently succeed with empty text. The driver now calls
+  // `CtcModel::ensure_decodable` at its single chokepoint, so this DIRECT route
+  // must reject the empty vocabulary with the SAME typed `InvariantViolation`
+  // the boxed and inherent paths raise — closing the empty-vocab class at the
+  // one seam every route funnels through.
+  use crate::audio::stt::model::TranscribeOptions;
+
+  let model = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .expect("a valid Standard config must build");
+  let waveform = filled(&[400], 0.1);
+
+  // Reach the CtcModel driver directly — NOT via `Box<dyn Transcribe>`.
+  match greedy_ctc_transcribe(&model, &waveform, &TranscribeOptions::new()) {
+    Err(Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "Model::transcribe");
+      assert_eq!(
+        p.requirement(),
+        "model was built without a vocabulary (use forward + ctc_greedy_collapse)"
+      );
+    }
+    other => panic!(
+      "a direct greedy_ctc_transcribe on an empty-vocab model must reject with \
+         InvariantViolation (not empty-string success), got {other:?}"
+    ),
+  }
+}
+
+#[test]
+fn direct_greedy_ctc_transcribe_succeeds_with_real_vocabulary() {
+  // The companion to the empty-vocab rejection: the SAME direct `CtcModel`
+  // driver route, on a model carrying a real (non-empty) vocab, transcribes
+  // normally — the `ensure_decodable` chokepoint guard does not regress the
+  // happy path. CTC emits a single segment spanning the whole utterance, with
+  // no language reported, and the segment text equals the top-level text (both
+  // run through the one shared trimmed `decode_ids` seam).
+  use crate::audio::stt::model::TranscribeOptions;
+
+  let model = Model::from_weights(
+    tiny_config_json(""),
+    synthetic_weights(&tiny_config_json("")),
+    full_tiny_vocab(),
+  )
+  .expect("a valid Standard config must build");
+  let waveform = filled(&[400], 0.1);
+
+  let transcription = greedy_ctc_transcribe(&model, &waveform, &TranscribeOptions::new())
+    .expect("a direct greedy_ctc_transcribe with a real vocab must succeed");
+  assert_eq!(
+    transcription.segments_slice().len(),
+    1,
+    "a CTC transcription carries exactly one segment"
+  );
+  assert_eq!(transcription.language(), None);
+  assert_eq!(
+    transcription.segments_slice()[0].text(),
+    transcription.text(),
+    "the CTC segment text and the top-level text are the one trimmed decode"
   );
 }

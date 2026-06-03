@@ -394,6 +394,13 @@ pub fn default_log_mel(cfg: &MelConfig, audio: &Array) -> Result<Array> {
 /// CTC model instead calls this from inside its own [`Transcribe`](super::model::Transcribe) impl —
 /// symmetric with [`greedy_transcribe`] for [`AutoregressiveStt`].
 ///
+/// Calls [`CtcModel::ensure_decodable`] FIRST — the single empty-vocabulary
+/// chokepoint — so a model that cannot render ids to text (one loaded without
+/// its vocabulary) is rejected with a typed error before any work, whether it
+/// is reached through its own [`Transcribe`](super::model::Transcribe) impl or
+/// a direct `greedy_ctc_transcribe(&model, …)` (the [`CtcModel`] path). The
+/// default `ensure_decodable` is `Ok(())`; a vocab-backed model overrides it.
+///
 /// Validates the input waveform metadata (rank / length / cap) before the
 /// encoder forward, and the returned logits' shape `(T', vocab)`: a malformed
 /// rank is a typed [`Error::RankMismatch`]; an empty vocab axis (`vocab == 0`)
@@ -419,6 +426,16 @@ pub fn greedy_ctc_transcribe<M: CtcModel + ?Sized>(
   audio: &Array,
   _opts: &TranscribeOptions,
 ) -> Result<Transcription> {
+  // The single empty-vocabulary chokepoint: reject a model that cannot render
+  // ids to text BEFORE any waveform work or the encoder forward. Every route
+  // through this driver — a model's own `Transcribe` impl AND a direct
+  // `greedy_ctc_transcribe(&model, …)` (the `CtcModel` path) — passes through
+  // this one guard, so a model loaded without its vocabulary is rejected with a
+  // typed error here rather than silently producing empty text via the
+  // infallible `decode_ids`. The default impl is `Ok(())` (a self-contained
+  // detokenizer needs no guard); a vocab-backed model overrides it.
+  model.ensure_decodable()?;
+
   // Reject an empty / oversized / multi-rank waveform before the encoder
   // forward (the CTC frontend can reasonably assume a non-empty mono input).
   // Keep the validated sample count: a valid feature extractor emits no more
