@@ -17,7 +17,7 @@ use crate::{
   array::Array,
   audio::stt::model::{CtcModel, Transcribe, TranscribeOptions},
   error::Error,
-  lm::quant::{PerLayerQuantization, Quantization},
+  lm::quant::{PerLayerQuantization, Quantization, QuantizationOption},
 };
 
 // ───────────────────────────── synthetic dims + weights ─────────────────────────────
@@ -421,6 +421,177 @@ fn from_weights_quantized_dense_ignores_stale_quant_block() {
   assert_eq!(logits.shape()[1], QV as usize);
 }
 
+/// The full set of quantizable prefixes the tiny quant config loads — the head
+/// (`ctc_lo` / `embed`) plus the single `encoders0.0` block's four linears.
+const QUANT_PREFIXES: &[&str] = &[
+  "encoder.encoders0.0.self_attn.linear_q_k_v",
+  "encoder.encoders0.0.self_attn.linear_out",
+  "encoder.encoders0.0.feed_forward.w_1",
+  "encoder.encoders0.0.feed_forward.w_2",
+  "ctc_lo",
+  "embed",
+];
+
+#[test]
+fn from_weights_quantized_per_layer_only_no_global_default_loads() {
+  // A per-layer-only quantization config (NO global default) loads through
+  // `from_weights_quantized`: every quantized layer carries an explicit override
+  // and `quantization` (the global default) is `None`. The OLD code collapsed
+  // `quantization` to a single global tuple and wrongly REJECTED this (no global
+  // → `None` → present `.scales` → InvariantViolation). Per-prefix resolution via
+  // `quantization_for` loads it.
+  let config = quant_config();
+  let mut w = quant_weights();
+  let mut per_layer = HashMap::new();
+  for prefix in QUANT_PREFIXES {
+    quantize_in_place(&mut w, prefix, QGROUP);
+    per_layer.insert(
+      (*prefix).to_string(),
+      QuantizationOption::Quantize(Quantization::affine(QGROUP, 8)),
+    );
+  }
+  // `quantization = None` — only the explicitly-listed layers are quantized.
+  let quant = PerLayerQuantization::new(None, per_layer);
+
+  let model = SenseVoiceModel::from_weights_quantized(
+    config,
+    w,
+    SenseVoiceTokenizer::id_join(),
+    None,
+    Some(&quant),
+  )
+  .expect("a per-layer-only config (no global default) must load, not be rejected");
+  let wav = ramp_waveform(4000);
+  let logits = CtcModel::logits(&model, &wav).unwrap();
+  assert_eq!(logits.shape().len(), 2);
+  assert_eq!(logits.shape()[1], QV as usize);
+}
+
+#[test]
+fn from_weights_quantized_per_layer_skip_builds_dense_layer_dense() {
+  // A global default PLUS a per-layer `Skip` for `ctc_lo`, where `ctc_lo` is
+  // DENSE on disk (no `.scales`) and every OTHER quantizable layer is quantized.
+  // The pre-scan sees the other layers' `.scales` and threads `quant`; `ctc_lo`'s
+  // prefix then resolves to `None` (Skip) and, with no `.scales`, the dense arm
+  // builds it. A single collapsed global tuple could not carry the per-layer
+  // `Skip`. The model builds + forwards.
+  let config = quant_config();
+  let mut w = quant_weights();
+  for prefix in QUANT_PREFIXES {
+    if *prefix == "ctc_lo" {
+      continue; // leave `ctc_lo` DENSE on disk
+    }
+    quantize_in_place(&mut w, prefix, QGROUP);
+  }
+  let mut per_layer = HashMap::new();
+  per_layer.insert("ctc_lo".to_string(), QuantizationOption::Skip);
+  let quant = PerLayerQuantization::new(Some(Quantization::affine(QGROUP, 8)), per_layer);
+
+  let model = SenseVoiceModel::from_weights_quantized(
+    config,
+    w,
+    SenseVoiceTokenizer::id_join(),
+    None,
+    Some(&quant),
+  )
+  .expect("a per-layer Skip on a dense-on-disk ctc_lo builds it dense, the rest quantized");
+  let wav = ramp_waveform(4000);
+  let logits = CtcModel::logits(&model, &wav).unwrap();
+  assert_eq!(logits.shape().len(), 2);
+  assert_eq!(logits.shape()[1], QV as usize);
+}
+
+#[test]
+fn from_weights_quantized_per_layer_skip_on_scales_layer_errors() {
+  // The dual: a `Skip` override on a layer that DOES carry `.scales` on disk is a
+  // checkpoint/config inconsistency. The per-prefix resolution yields `None` for
+  // `ctc_lo` while its `.scales` is present, which the shared
+  // `MaybeQuantizedLinear` rejects with a typed `InvariantViolation` (the
+  // per-prefix `None` reached the leaf — the qwen3 contract).
+  let config = quant_config();
+  let mut w = quant_weights();
+  for prefix in QUANT_PREFIXES {
+    quantize_in_place(&mut w, prefix, QGROUP);
+  }
+  let mut per_layer = HashMap::new();
+  per_layer.insert("ctc_lo".to_string(), QuantizationOption::Skip);
+  let quant = PerLayerQuantization::new(Some(Quantization::affine(QGROUP, 8)), per_layer);
+  assert!(
+    matches!(
+      SenseVoiceModel::from_weights_quantized(
+        config,
+        w,
+        SenseVoiceTokenizer::id_join(),
+        None,
+        Some(&quant),
+      ),
+      Err(Error::InvariantViolation(_))
+    ),
+    "a Skip on a `.scales`-bearing ctc_lo is an InvariantViolation, not a silent quantized build"
+  );
+}
+
+#[test]
+fn from_weights_quantized_per_layer_parameter_override() {
+  // A global default group_size = 32 PLUS a per-layer override for `embed` to
+  // group_size = 64 (QD = 64 is divisible by 64): `embed` is quantized at 64 and
+  // every other layer at the global 32. Resolving the wrong (global = 32) tuple
+  // for the group_size = 64 packed `embed` would fail the triple validator, so
+  // the build succeeding proves `embed` resolved its OWN override per prefix.
+  const EMBED_GROUP: i32 = 64;
+  let config = quant_config();
+  let mut w = quant_weights();
+  for prefix in QUANT_PREFIXES {
+    let g = if *prefix == "embed" {
+      EMBED_GROUP
+    } else {
+      QGROUP
+    };
+    quantize_in_place(&mut w, prefix, g);
+  }
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "embed".to_string(),
+    QuantizationOption::Quantize(Quantization::affine(EMBED_GROUP, 8)),
+  );
+  let quant = PerLayerQuantization::new(Some(Quantization::affine(QGROUP, 8)), per_layer);
+
+  let model = SenseVoiceModel::from_weights_quantized(
+    config,
+    w,
+    SenseVoiceTokenizer::id_join(),
+    None,
+    Some(&quant),
+  )
+  .expect("the per-layer group_size override for embed must be used, not the global default");
+  let wav = ramp_waveform(4000);
+  let logits = CtcModel::logits(&model, &wav).unwrap();
+  assert_eq!(logits.shape()[1], QV as usize);
+
+  // Cross-check: the global tuple (group_size = 32) mis-decodes the group_size =
+  // 64 packed `embed` — the schemes are genuinely distinguishable.
+  let mut w_wrong = quant_weights();
+  for prefix in QUANT_PREFIXES {
+    let g = if *prefix == "embed" {
+      EMBED_GROUP
+    } else {
+      QGROUP
+    };
+    quantize_in_place(&mut w_wrong, prefix, g);
+  }
+  assert!(
+    SenseVoiceModel::from_weights_quantized(
+      quant_config(),
+      w_wrong,
+      SenseVoiceTokenizer::id_join(),
+      None,
+      Some(&quant_block()), // global group_size = 32 for ALL — wrong for embed
+    )
+    .is_err(),
+    "the global group_size must mis-decode the group_size=64 packed embed"
+  );
+}
+
 // ───────────────────────────── has_relevant_scales pre-scan ─────────────────────────────
 
 #[test]
@@ -615,6 +786,58 @@ fn load_cmvn_malformed_am_mvn_errors() {
   ));
 }
 
+#[test]
+fn load_cmvn_rejects_length_mismatched_am_mvn() {
+  // A length-1 CMVN against `input_size = D (8)` would broadcast silently with
+  // the wrong stats; require the parsed lengths to equal `input_size` -> a typed
+  // LengthMismatch.
+  let dir = temp_dir("cmvn_len_mismatch");
+  fs::write(dir.join("am.mvn"), am_mvn_text(&[0.0], &[1.0])).unwrap();
+  assert!(matches!(
+    load_cmvn(&dir, &tiny_config()),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn load_cmvn_rejects_length_mismatched_config_cmvn() {
+  // The in-config CMVN fallback is length-checked too (a length-1 pair against
+  // `input_size = D`). `Config::validate` would also catch this, but `load_cmvn`
+  // re-asserts so it never builds a mis-sized CMVN on its own.
+  let dir = temp_dir("cmvn_config_len");
+  let json = format!(
+    r#"{{ "model_type": "sensevoice", "vocab_size": {V}, "input_size": {D},
+         "cmvn_means": [0.0], "cmvn_istd": [1.0],
+         "encoder_conf": {{ "output_size": {H}, "attention_heads": 1, "num_blocks": 1, "tp_blocks": 0 }},
+         "frontend_conf": {{ "n_mels": {D}, "lfr_m": 1, "lfr_n": 1 }} }}"#
+  );
+  // Build the config WITHOUT `validate()` (it would reject the length-1 pair
+  // first); the test targets `load_cmvn`'s own re-assertion.
+  let config: Config = serde_json::from_str(&json).unwrap();
+  assert!(matches!(
+    load_cmvn(&dir, &config),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn load_cmvn_rejects_oversized_am_mvn() {
+  // The `am.mvn` body is read through the shared bounded reader (the 1 MiB
+  // config-read convention); a file over the cap is rejected rather than read
+  // into memory unbounded.
+  let dir = temp_dir("cmvn_oversized");
+  // A valid-looking header followed by > 1 MiB of padding inside the bracket ->
+  // over the cap. The bounded read fails before the parse runs.
+  let mut body = String::from("<AddShift> 1 1\n<LearnRateCoef> 0 [ 0.0 ");
+  body.push_str(&" ".repeat(1024 * 1024 + 1));
+  body.push_str("]\n<Rescale> 1 1\n<LearnRateCoef> 0 [ 1.0 ]\n");
+  fs::write(dir.join("am.mvn"), &body).unwrap();
+  assert!(
+    load_cmvn(&dir, &tiny_config()).is_err(),
+    "oversized am.mvn must be rejected by the bounded read"
+  );
+}
+
 // ───────────────────────────── tokenizer asset loading ─────────────────────────────
 
 #[test]
@@ -709,6 +932,36 @@ fn model_load_end_to_end_transcribes() {
   assert!(!rich.rich().language().is_empty());
   assert!(!rich.rich().emotion().is_empty());
   assert!(!rich.rich().event().is_empty());
+}
+
+#[test]
+fn dense_checkpoint_with_stale_quant_block_loads_dense() {
+  // A DENSE checkpoint (no `.scales`) whose config.json carries a malformed /
+  // stale `quantization` block must load as dense: `load()` runs the
+  // `has_relevant_scales` pre-scan BEFORE `apply_quantization`, so the stale
+  // block is never parsed (it would otherwise be a load-failing OutOfRange /
+  // Parse). The model builds and transcribes normally.
+  let dir = temp_dir("stale_quant_dense");
+  // A config.json with a non-object `quantization` block (which
+  // `apply_quantization` rejects with OutOfRange if it ever parses it).
+  let json = tiny_config_json().replace(
+    "\"model_type\": \"sensevoice\",",
+    "\"model_type\": \"sensevoice\",\n      \"quantization\": \"stale-garbage-block\",",
+  );
+  // Sanity: the injection actually landed (otherwise the test proves nothing).
+  assert!(json.contains("\"quantization\": \"stale-garbage-block\""));
+  fs::write(dir.join("config.json"), json).unwrap();
+  // A purely DENSE weights shard (no `.scales` anywhere), pre-sanitize layout.
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &tiny_weights_raw()).unwrap();
+
+  // Loads dense (the stale block is gated out), not a parse / OutOfRange error.
+  let model = SenseVoiceModel::load(dir.to_str().unwrap())
+    .expect("dense checkpoint must load despite the stale quantization block");
+  // The head is dense (the stale block never produced a quantization scheme).
+  let wav = ramp_waveform(3500);
+  let logits = CtcModel::logits(&model, &wav).unwrap();
+  assert_eq!(logits.shape().len(), 2);
+  assert_eq!(logits.shape()[1], V as usize);
 }
 
 #[test]

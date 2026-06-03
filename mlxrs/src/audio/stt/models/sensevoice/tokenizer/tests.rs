@@ -148,3 +148,165 @@ fn id_join_renders_space_separated_decimals() {
   assert_eq!(tok.decode(&[7]), "7");
   assert_eq!(tok.decode(&[]), "");
 }
+
+// ───────────────────────── fallible try_decode parity ─────────────────────────
+
+#[test]
+fn try_decode_token_list_matches_infallible_decode() {
+  // The fallible rich-path `try_decode` is byte-identical to the infallible
+  // `decode` on the `tokens.json` variant — same join + metaspace-strip + trim,
+  // only the output buffer is reserved fallibly (and the `▁`->" " substitution
+  // is written inline instead of via a separate `replace` allocation).
+  let tokens = vec![
+    "<unk>".to_string(),
+    "\u{2581}hello".to_string(),
+    "\u{2581}world".to_string(),
+    "!".to_string(),
+  ];
+  let tok = SenseVoiceTokenizer::from_token_list(tokens);
+  for ids in [
+    &[1u32, 2][..],
+    &[1, 2, 3][..],
+    &[0, 5, 1][..], // out-of-range id 5 skipped
+    &[][..],
+    &[3][..], // a piece with no metaspace + no surrounding space
+  ] {
+    assert_eq!(
+      tok.try_decode(ids).unwrap(),
+      tok.decode(ids),
+      "try_decode must equal decode for ids {ids:?}"
+    );
+  }
+  // Pin the headline values explicitly.
+  assert_eq!(tok.try_decode(&[1, 2]).unwrap(), "hello world");
+  assert_eq!(tok.try_decode(&[1, 2, 3]).unwrap(), "hello world!");
+  assert_eq!(tok.try_decode(&[]).unwrap(), "");
+}
+
+#[test]
+fn try_decode_token_list_trims_internal_metaspace_runs() {
+  // Multiple / leading / trailing metaspaces all normalize to single spaces and
+  // the result trims, identically to `decode` (= `replace(▁, " ").trim()`).
+  let tokens = vec![
+    "\u{2581}\u{2581}a".to_string(), // double leading metaspace
+    "\u{2581}b\u{2581}".to_string(), // leading + trailing metaspace
+  ];
+  let tok = SenseVoiceTokenizer::from_token_list(tokens);
+  // "▁▁a" + "▁b▁" -> "  a b " -> trim -> "a b" (leading run trimmed, the inner
+  // metaspace becomes the word separator, trailing metaspace trimmed).
+  assert_eq!(tok.try_decode(&[0, 1]).unwrap(), tok.decode(&[0, 1]));
+  assert_eq!(tok.try_decode(&[0, 1]).unwrap(), "a b");
+}
+
+#[test]
+fn try_decode_id_join_matches_infallible_decode() {
+  let tok = SenseVoiceTokenizer::id_join();
+  for ids in [
+    &[3u32, 14, 159][..],
+    &[7][..],
+    &[][..],
+    &[0, 0, 4294967295][..],
+  ] {
+    assert_eq!(tok.try_decode(ids).unwrap(), tok.decode(ids));
+  }
+  assert_eq!(tok.try_decode(&[3, 14, 159]).unwrap(), "3 14 159");
+  assert_eq!(tok.try_decode(&[u32::MAX]).unwrap(), "4294967295");
+}
+
+#[test]
+fn try_decode_token_list_checked_capacity_sum_succeeds_on_normal_input() {
+  // The capacity reservation sums the in-range piece byte-lengths with
+  // `checked_add` (so a pathological id/piece set cannot wrap the `usize` sum to
+  // an undersized capacity and let the subsequent `push` grow unbounded). A true
+  // `usize` overflow is not constructible here (the toy pieces cannot sum past
+  // `usize::MAX`), so this pins that the checked accumulation path — exercised
+  // across several multibyte pieces plus a skipped out-of-range id — returns the
+  // correct decode (no spurious `ArithmeticOverflow`).
+  let tokens = vec![
+    "\u{2581}alpha".to_string(), // 3-byte metaspace + 5 ASCII = 8 bytes
+    "\u{2581}beta".to_string(),  // 7 bytes
+    "\u{2581}gamma".to_string(), // 8 bytes
+  ];
+  let tok = SenseVoiceTokenizer::from_token_list(tokens);
+  // ids [0, 1, 9, 2]: id 9 is out of range and skipped by the checked sum.
+  let got = tok.try_decode(&[0, 1, 9, 2]).unwrap();
+  assert_eq!(got, tok.decode(&[0, 1, 9, 2]));
+  assert_eq!(got, "alpha beta gamma");
+}
+
+#[test]
+fn try_decode_sentencepiece_matches_infallible_decode() {
+  // The SentencePiece variant routes both paths through the shared decode; only
+  // the SenseVoice-owned `usize` id buffer differs (fallible vs `collect`).
+  let tok = SenseVoiceTokenizer::from_sentencepiece(toy_spm());
+  for ids in [&[1u32, 2][..], &[2, 1][..], &[][..]] {
+    assert_eq!(tok.try_decode(ids).unwrap(), tok.decode(ids));
+  }
+  assert_eq!(tok.try_decode(&[1, 2]).unwrap(), "hello world");
+}
+
+// ───────────────────────── bounded SPM .model read ─────────────────────────
+
+/// A per-process tmpdir for the on-disk `.model` fixtures.
+fn spm_temp_dir(name: &str) -> std::path::PathBuf {
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_sensevoice_spm_{}_{}",
+    std::process::id(),
+    name
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  dir
+}
+
+#[test]
+fn from_spm_file_reads_and_parses_a_small_model() {
+  // A valid `.model` on disk round-trips through the bounded reader +
+  // `from_spm_bytes`: the SentencePiece variant decodes the same as the
+  // in-memory fixture.
+  let dir = spm_temp_dir("spm_ok");
+  let normal = SentencePiecePieceType::Normal.as_raw() as u8;
+  let unknown = SentencePiecePieceType::Unknown.as_raw() as u8;
+  let data = build_model(&[
+    ("<unk>", 0.0, unknown),
+    ("\u{2581}hello", -1.0, normal),
+    ("\u{2581}world", -2.0, normal),
+  ]);
+  let path = dir.join(SPM_MODEL_FILE);
+  std::fs::write(&path, &data).unwrap();
+
+  let tok = SenseVoiceTokenizer::from_spm_file(&path)
+    .expect("bounded read + parse")
+    .expect("present file yields Some");
+  assert!(!tok.is_id_join());
+  assert_eq!(tok.decode(&[1u32, 2u32]), "hello world");
+}
+
+#[test]
+fn from_spm_file_absent_is_none() {
+  // An absent `.model` yields `Ok(None)` (the caller's "fall through to
+  // tokens.json" signal — and the TOCTOU-closed bounded read handles presence
+  // itself).
+  let dir = spm_temp_dir("spm_absent");
+  let path = dir.join(SPM_MODEL_FILE);
+  assert!(SenseVoiceTokenizer::from_spm_file(&path).unwrap().is_none());
+}
+
+#[test]
+fn from_spm_file_rejects_oversized_model() {
+  // A `.model` over the generous MAX_SPM_MODEL_BYTES cap is rejected by the
+  // bounded read (a soundness guard against a hostile huge `.model`) rather than
+  // read into memory unbounded — a typed CapExceeded, not an OOM. The body need
+  // not be valid SPM: the size check fires before any parse.
+  let dir = spm_temp_dir("spm_oversized");
+  let path = dir.join(SPM_MODEL_FILE);
+  let oversized = vec![0u8; MAX_SPM_MODEL_BYTES as usize + 1];
+  std::fs::write(&path, &oversized).unwrap();
+
+  let err = SenseVoiceTokenizer::from_spm_file(&path);
+  assert!(
+    matches!(err, Err(crate::error::Error::CapExceeded(_))),
+    "oversized .model must be a typed CapExceeded, got {err:?}"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}

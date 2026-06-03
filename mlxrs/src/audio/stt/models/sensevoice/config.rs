@@ -25,13 +25,28 @@
 
 use crate::{
   error::Result,
-  model_validation::{require_divisible, require_positive},
+  model_validation::{
+    checked_add, checked_mul, require_cardinality, require_divisible, require_positive,
+  },
 };
 
 /// The reference `model_type` tag (`config.py:54`, swift
 /// `SenseVoiceConfig.swift:163`, the `MODEL_REMAPPING["sensevoice"]` table key
 /// in `stt/utils.py:13`).
 pub const MODEL_TYPE: &str = "sensevoice";
+
+/// Inclusive upper bound for the encoder *block counts* (`num_blocks` /
+/// `tp_blocks`). Each sizes an eager `Vec` of heavyweight SANM blocks reserved
+/// up front in [`super::encoder::Encoder::from_weights`], so a corrupt
+/// `config.json` with a huge count would request a multi-gigabyte allocation
+/// before the first missing-key error. The released SenseVoice-Small has
+/// `num_blocks = 50` / `tp_blocks = 20` (`config.py:14-15`); `4096` is generous
+/// headroom for any variant yet keeps a malformed cardinality a recoverable
+/// [`crate::error::Error::CapExceeded`] (or, if it still slips through, a
+/// recoverable [`crate::error::Error::AllocFailure`] from the fallibly-reserved
+/// block `Vec`) rather than an allocator abort. Matches the cardinality cap the
+/// qwen3 / lfm2 / wav2vec2 configs use.
+const MAX_CONFIG_CARDINALITY: i32 = 4096;
 
 // ─────────────────────────────── defaults ───────────────────────────────
 // Each mirrors the corresponding reference dataclass field default verbatim,
@@ -202,34 +217,63 @@ impl EncoderConfig {
     }
   }
 
-  /// Pre-norm flag (`normalize_before`; `true`). Every released checkpoint is
-  /// pre-norm; the post-norm arm is intentionally not wired.
+  /// Pre-norm flag (`normalize_before`; `true`). SenseVoice-Small is pre-norm
+  /// (`config.py:17` defaults it `true`), and the encoder wires the pre-norm
+  /// order unconditionally (`norm1` → attention → `norm2` → feed-forward,
+  /// `sensevoice.py:220-237`); a `false` value is rejected by [`Self::validate`]
+  /// as an unsupported configuration rather than silently running a different
+  /// network.
   #[inline(always)]
   pub const fn normalize_before(&self) -> bool {
     self.normalize_before
   }
 
-  /// Validate the encoder dims: every width / count is positive, the kernel is
-  /// positive (so the FSMN pad split is non-negative), and the hidden width is
-  /// divisible by the head count (so the SANM head reshape is exact).
+  /// Validate the encoder dims: every width / count is positive, the block
+  /// counts are within `MAX_CONFIG_CARDINALITY` (they size eager per-block
+  /// `Vec`s), the kernel is positive, the FSMN pad split stays non-negative (the
+  /// `sanm_shift` cannot push `right_padding = kernel_size - 1 - left_padding`
+  /// below zero, `sensevoice.py:164-168`), the hidden width is divisible by the
+  /// head count (so the SANM head reshape is exact), and `normalize_before` is
+  /// `true` (the only order the encoder wires).
   ///
   /// # Errors
   /// - [`crate::error::Error::OutOfRange`] if any dim is `<= 0`;
+  /// - [`crate::error::Error::CapExceeded`] if `num_blocks` or `tp_blocks`
+  ///   exceeds `MAX_CONFIG_CARDINALITY`;
   /// - [`crate::error::Error::DivisibilityConstraint`] if `output_size %
-  ///   attention_heads != 0`.
+  ///   attention_heads != 0`;
+  /// - [`crate::error::Error::InvariantViolation`] if `normalize_before` is
+  ///   `false` (post-norm is not a supported SenseVoice-Small configuration).
   pub fn validate(&self) -> Result<()> {
     require_positive("encoder_conf.output_size", self.output_size)?;
     require_positive("encoder_conf.attention_heads", self.attention_heads)?;
     require_positive("encoder_conf.linear_units", self.linear_units)?;
-    require_positive("encoder_conf.num_blocks", self.num_blocks)?;
-    // `tp_blocks` may be `0` (a checkpoint with no second stage), so it is
-    // only required to be non-negative.
+    // `num_blocks` sizes the eager `encoders0` + `encoders` block `Vec`s, so it
+    // takes the cardinality cap: positive AND within `MAX_CONFIG_CARDINALITY`.
+    require_cardinality(
+      "encoder_conf.num_blocks",
+      i64::from(self.num_blocks),
+      MAX_CONFIG_CARDINALITY as u64,
+    )?;
+    // `tp_blocks` may be `0` (a checkpoint with no second stage), so it is only
+    // required to be non-negative — but it also sizes an eager `tp_encoders`
+    // block `Vec`, so an over-cap positive count is rejected like `num_blocks`.
     if self.tp_blocks < 0 {
       return Err(crate::error::Error::OutOfRange(
         crate::error::OutOfRangePayload::new(
           "encoder_conf.tp_blocks",
           "must be >= 0",
           smol_str::format_smolstr!("{}", self.tp_blocks),
+        ),
+      ));
+    }
+    if i64::from(self.tp_blocks) > i64::from(MAX_CONFIG_CARDINALITY) {
+      return Err(crate::error::Error::CapExceeded(
+        crate::error::CapExceededPayload::new(
+          "encoder_conf.tp_blocks",
+          "encoder_conf.tp_blocks",
+          MAX_CONFIG_CARDINALITY as u64,
+          self.tp_blocks as u64,
         ),
       ));
     }
@@ -244,12 +288,48 @@ impl EncoderConfig {
         ),
       ));
     }
+    // The FSMN pad split `left_padding = (kernel_size - 1) / 2 (+ sanm_shift)`,
+    // `right_padding = kernel_size - 1 - left_padding` (`sensevoice.py:164-168`).
+    // A `sanm_shift` larger than the available right slack drives `right_padding`
+    // negative, which `mx.pad` rejects only at the first forward; pin the
+    // invariant at load instead. `kernel_size > 0` here so `(kernel_size - 1) / 2`
+    // cannot wrap; the `+ sanm_shift` is checked so an adversarial pair cannot
+    // overflow `i32`.
+    let base_left = (self.kernel_size - 1) / 2;
+    let left_padding = checked_add(
+      "encoder_conf: FSMN left_padding = (kernel_size - 1) / 2 + sanm_shift",
+      "(kernel_size - 1) / 2",
+      base_left,
+      "encoder_conf.sanm_shift",
+      sanm_shift,
+    )?;
+    if self.kernel_size - 1 - left_padding < 0 {
+      return Err(crate::error::Error::OutOfRange(
+        crate::error::OutOfRangePayload::new(
+          "encoder_conf.sanm_shift",
+          "must keep the FSMN right pad (kernel_size - 1 - left_padding) >= 0",
+          smol_str::format_smolstr!("{sanm_shift} (kernel_size {})", self.kernel_size),
+        ),
+      ));
+    }
     require_divisible(
       "encoder_conf.output_size",
       self.output_size,
       "encoder_conf.attention_heads",
       self.attention_heads,
     )?;
+    // SenseVoice-Small is pre-norm (`config.py:17`), and the encoder wires the
+    // pre-norm order unconditionally (`sensevoice.py:220-237`). A `false` value
+    // would otherwise load and run a different (unsupported) network — reject it
+    // loudly here rather than mis-transcribe.
+    if !self.normalize_before {
+      return Err(crate::error::Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "encoder_conf.normalize_before",
+          "must be true (SenseVoice-Small is pre-norm; post-norm is unsupported)",
+        ),
+      ));
+    }
     Ok(())
   }
 }
@@ -337,13 +417,50 @@ impl FrontendConfig {
     self.lfr_n
   }
 
-  /// Validate the front-end params: the sample rate, mel count, frame sizes,
-  /// and LFR factors are positive (so the fbank framing and the LFR stacking
-  /// are well-formed).
+  /// Validate the front-end params, including the fbank-derived invariants
+  /// [`compute_fbank`](super::frontend::compute_fbank) /
+  /// [`compute_fbank_kaldi`](crate::audio::features::compute_fbank_kaldi) would
+  /// otherwise reject only at the first transcription — so a malformed
+  /// `frontend_conf` fails at LOAD, not at first transcribe:
+  ///
+  /// - the sample rate, mel count, and frame sizes are positive (so the fbank
+  ///   framing is well-formed);
+  /// - the `window` string is one of the four `compute_fbank_kaldi` accepts
+  ///   (`hamming` / `hanning` / `povey` / `rectangular`), via the shared
+  ///   `window_from_str` typed set (`dsp.py:918-929`);
+  /// - `n_mels > 3` — the reference `get_mel_banks_kaldi` asserts `num_bins > 3`
+  ///   (`dsp.py:822`), the smallest count its `(num_bins + 1)` mel-delta math is
+  ///   well-defined for;
+  /// - the fbank Nyquist invariant `fs / 2 > LOW_FREQ` —
+  ///   [`compute_fbank`](super::frontend::compute_fbank) always passes the fixed
+  ///   `low_freq = LOW_FREQ` (20 Hz), and `get_mel_banks_kaldi` rejects
+  ///   `low_freq >= nyquist` (`nyquist = fs / 2`, `dsp.py:826-831`), so a small
+  ///   `fs` whose Nyquist is `<= LOW_FREQ` (e.g. `fs = 40`) passes `fs > 0` but
+  ///   would fail only at the first transcribe;
+  /// - the derived analysis sizes `win_len = fs * frame_length / 1000` and
+  ///   `win_inc = fs * frame_shift / 1000` (samples, `sensevoice.py:27-28`)
+  ///   satisfy `win_len >= 2` (the window functions divide by `win_len - 1`,
+  ///   `dsp.py:920` etc., and the `next_power_of_2` padded size must be even,
+  ///   `dsp.py:823`) and `win_inc > 0` (the strided-framing hop, `dsp.py:890`).
+  ///   Both are computed with CHECKED arithmetic so a corrupt `fs` /
+  ///   `frame_length` / `frame_shift` cannot overflow;
+  /// - the LFR factors are positive AND within `MAX_CONFIG_CARDINALITY`.
+  ///   `lfr_m` sizes the per-frame stack `lfr_m * n_mels` (the LFR output width,
+  ///   `sensevoice.py:62`) and `lfr_n` is the stride; an oversized factor would
+  ///   drive an enormous tile / reshape, so both take the same cardinality cap
+  ///   the block counts do.
   ///
   /// # Errors
-  /// [`crate::error::Error::OutOfRange`] if any of `fs` / `n_mels` /
-  /// `frame_length` / `frame_shift` / `lfr_m` / `lfr_n` is `<= 0`.
+  /// - [`crate::error::Error::OutOfRange`] if any of `fs` / `n_mels` /
+  ///   `frame_length` / `frame_shift` / `lfr_m` / `lfr_n` is `<= 0`, if `n_mels
+  ///   <= 3`, if `fs / 2 <= LOW_FREQ` (the fbank Nyquist invariant), if the
+  ///   `window` string is unrecognized, or if the derived `win_len < 2`;
+  /// - [`crate::error::Error::InvariantViolation`] if the derived `win_inc == 0`;
+  /// - [`crate::error::Error::ArithmeticOverflow`] if `fs * frame_length` or
+  ///   `fs * frame_shift` overflows `i64`;
+  /// - [`crate::error::Error::CapExceeded`] if the derived `win_len` exceeds the
+  ///   fbank's `MAX_DECODED_SAMPLES` window budget, or if `lfr_m` / `lfr_n`
+  ///   exceeds `MAX_CONFIG_CARDINALITY`.
   pub fn validate(&self) -> Result<()> {
     if self.fs == 0 {
       return Err(crate::error::Error::OutOfRange(
@@ -353,10 +470,148 @@ impl FrontendConfig {
     require_positive("frontend_conf.n_mels", self.n_mels)?;
     require_positive("frontend_conf.frame_length", self.frame_length)?;
     require_positive("frontend_conf.frame_shift", self.frame_shift)?;
-    require_positive("frontend_conf.lfr_m", self.lfr_m)?;
-    require_positive("frontend_conf.lfr_n", self.lfr_n)?;
+
+    // The `window` string must be one of the four `compute_fbank_kaldi` accepts
+    // (`dsp.py:918-929`); reuse the *one* typed accepted set so load and the
+    // fbank step agree. The mapped `KaldiWindow` is discarded — only validity
+    // matters here.
+    super::frontend::window_from_str(&self.window)?;
+
+    // `get_mel_banks_kaldi` asserts `num_bins > 3` (`dsp.py:822`); a mel count
+    // `<= 3` fails only at the first fbank otherwise. Hoist it to load.
+    if self.n_mels <= 3 {
+      return Err(crate::error::Error::OutOfRange(
+        crate::error::OutOfRangePayload::new(
+          "frontend_conf.n_mels",
+          "must be > 3 (get_mel_banks_kaldi requires at least 4 mel bins)",
+          smol_str::format_smolstr!("{}", self.n_mels),
+        ),
+      ));
+    }
+
+    // The fbank Nyquist invariant. SenseVoice's `compute_fbank` always passes the
+    // FIXED `low_freq = LOW_FREQ` (20 Hz) into `compute_fbank_kaldi`
+    // (`frontend.rs` `compute_fbank`), and `get_mel_banks_kaldi` rejects
+    // `low_freq >= nyquist` with `nyquist = fs / 2`
+    // (`features.rs` `get_mel_banks_kaldi`, the `0.0 <= low_freq < nyquist`
+    // check; `dsp.py:826-831`). A small `fs` (e.g. `40`, whose Nyquist is exactly
+    // `LOW_FREQ`) passes the `fs > 0` / `win_len` checks but fails only at the
+    // first transcribe — hoist the same invariant here, tied to the SAME
+    // `LOW_FREQ` constant the fbank uses (referenced, not a divergent literal).
+    // `high_freq = HIGH_FREQ = 0.0` resolves to Nyquist, which is `> 0` and
+    // `<= nyquist` for any `fs > 0`, so it adds no constraint beyond this one.
+    // `fs` is a `u32`, so `nyquist` is always finite (never NaN); the direct
+    // `<=` is exact and avoids the partial-ord negation lint.
+    let nyquist = self.fs as f32 * 0.5;
+    if nyquist <= super::frontend::LOW_FREQ {
+      return Err(crate::error::Error::OutOfRange(
+        crate::error::OutOfRangePayload::new(
+          "frontend_conf.fs",
+          "must keep the fbank Nyquist (fs / 2) above the fixed low_freq mel floor (20 Hz)",
+          smol_str::format_smolstr!(
+            "fs={} (nyquist={nyquist}, low_freq={})",
+            self.fs,
+            super::frontend::LOW_FREQ
+          ),
+        ),
+      ));
+    }
+
+    // The derived analysis-window / hop sizes `win_len = fs * frame_length /
+    // 1000`, `win_inc = fs * frame_shift / 1000` (samples, `sensevoice.py:27-28`).
+    // `fs` / the frame sizes are validated positive above; compute the products
+    // through CHECKED i64 arithmetic so a corrupt huge `fs` / frame size cannot
+    // overflow, then narrow. `compute_fbank_kaldi` rejects `win_len < 2`
+    // (`features.rs`, the `window_size - 1` window denominator / even padded
+    // size) and `win_inc == 0` (the strided-framing hop) only at the first
+    // transcribe; pin both at load.
+    let win_len = derived_samples(
+      "frontend_conf: win_len = fs * frame_length / 1000",
+      self.fs,
+      self.frame_length,
+    )?;
+    let win_inc = derived_samples(
+      "frontend_conf: win_inc = fs * frame_shift / 1000",
+      self.fs,
+      self.frame_shift,
+    )?;
+    if win_len < 2 {
+      return Err(crate::error::Error::OutOfRange(
+        crate::error::OutOfRangePayload::new(
+          "frontend_conf: derived win_len = fs * frame_length / 1000",
+          "must be >= 2 (the fbank window denominator is win_len - 1)",
+          smol_str::format_smolstr!(
+            "{win_len} (fs={}, frame_length={})",
+            self.fs,
+            self.frame_length
+          ),
+        ),
+      ));
+    }
+    // `compute_fbank_kaldi` rejects `win_len > MAX_DECODED_SAMPLES`
+    // (`features.rs`, the analysis window cannot exceed the audio-IO sample
+    // budget); hoist that same upper bound to load so a pathological `fs` /
+    // `frame_length` whose derived window is enormous fails here, not at the
+    // first transcribe. This bounds the config-derived window size against the
+    // fbank's own contract — not a valid-input magnitude cap.
+    if win_len > crate::audio::io::MAX_DECODED_SAMPLES as i64 {
+      return Err(crate::error::Error::CapExceeded(
+        crate::error::CapExceededPayload::new(
+          "frontend_conf: derived win_len = fs * frame_length / 1000",
+          "MAX_DECODED_SAMPLES",
+          crate::audio::io::MAX_DECODED_SAMPLES as u64,
+          win_len.max(0) as u64,
+        ),
+      ));
+    }
+    if win_inc == 0 {
+      return Err(crate::error::Error::InvariantViolation(
+        crate::error::InvariantViolationPayload::new(
+          "frontend_conf: derived win_inc = fs * frame_shift / 1000",
+          "must be > 0 (the fbank framing hop)",
+        ),
+      ));
+    }
+
+    // `lfr_m` / `lfr_n` size the LFR stack width / stride; bound them like the
+    // encoder block counts so a corrupt value cannot request an enormous tile.
+    require_cardinality(
+      "frontend_conf.lfr_m",
+      i64::from(self.lfr_m),
+      MAX_CONFIG_CARDINALITY as u64,
+    )?;
+    require_cardinality(
+      "frontend_conf.lfr_n",
+      i64::from(self.lfr_n),
+      MAX_CONFIG_CARDINALITY as u64,
+    )?;
     Ok(())
   }
+}
+
+/// The reference's derived analysis-window / hop size in samples:
+/// `int(sample_rate * ms / 1000)` (`sensevoice.py:27-28`), computed through
+/// CHECKED i64 arithmetic so a corrupt huge `fs` / `ms` cannot overflow.
+///
+/// `fs` (a `u32`) and `ms` (validated positive by the caller) are widened to
+/// `i64`; their product is at most `~9.2e18`, comfortably within `i64::MAX`, but
+/// the multiply is checked so the bound holds for any input. The integer divide
+/// by `1000` mirrors the reference's `int(...)` truncation. The result is
+/// non-negative (both operands are) and is returned as `i64` so the caller can
+/// compare against the `win_len >= 2` / `win_inc > 0` thresholds without a
+/// narrowing cast.
+///
+/// # Errors
+/// [`crate::error::Error::ArithmeticOverflow`] if `fs * ms` overflows `i64`.
+fn derived_samples(context: &'static str, fs: u32, ms: i32) -> Result<i64> {
+  let product = i64::from(fs).checked_mul(i64::from(ms)).ok_or_else(|| {
+    crate::error::Error::ArithmeticOverflow(crate::error::ArithmeticOverflowPayload::with_operands(
+      context,
+      "i64",
+      [("fs", u64::from(fs)), ("ms", i64::from(ms) as u64)],
+    ))
+  })?;
+  Ok(product / 1000)
 }
 
 /// The top-level SenseVoice-Small configuration (`config.py:52-95`,
@@ -448,24 +703,59 @@ impl Config {
   }
 
   /// Validate the whole configuration: `vocab_size` / `input_size` are
-  /// positive, the nested configs validate, and (when both are present) the
-  /// in-config CMVN means / inverse-stddev have a consistent, `input_size`-wide
-  /// length — the CMVN stats are applied element-wise to the `(T', input_size)`
-  /// LFR features.
+  /// positive, the nested configs validate, the LFR output width matches the
+  /// encoder input width (`lfr_m * n_mels == input_size`), and (when both are
+  /// present) the in-config CMVN means / inverse-stddev have a consistent,
+  /// `input_size`-wide length — the CMVN stats are applied element-wise to the
+  /// `(T', input_size)` LFR features.
+  ///
+  /// The LFR relation pins the front-end's output width to the encoder's input
+  /// width: `_apply_lfr` stacks `lfr_m` consecutive `n_mels`-wide fbank frames
+  /// into one `lfr_m * n_mels`-wide LFR frame (`sensevoice.py:62`), and that is
+  /// exactly the `input_size` the encoder's first block consumes
+  /// (`sensevoice.py:244-254`, `input_size = config.input_size`). At the
+  /// SenseVoice-Small defaults this is `7 * 80 == 560`. A `config.json` whose
+  /// `input_size` disagrees with `lfr_m * n_mels` would build an encoder that
+  /// the front-end's features cannot feed; the product is computed with checked
+  /// arithmetic so a corrupt `lfr_m` / `n_mels` cannot overflow `i32`.
   ///
   /// # Errors
   /// - [`crate::error::Error::OutOfRange`] if `vocab_size` / `input_size` is
   ///   `<= 0`, or from the nested validators;
   /// - [`crate::error::Error::DivisibilityConstraint`] from
   ///   [`EncoderConfig::validate`];
-  /// - [`crate::error::Error::LengthMismatch`] if exactly one of `cmvn_means` /
-  ///   `cmvn_istd` is present, or if both are present but their lengths differ
-  ///   or do not equal `input_size`.
+  /// - [`crate::error::Error::ArithmeticOverflow`] if `lfr_m * n_mels`
+  ///   overflows `i32`;
+  /// - [`crate::error::Error::LengthMismatch`] if `lfr_m * n_mels != input_size`,
+  ///   if exactly one of `cmvn_means` / `cmvn_istd` is present, or if both are
+  ///   present but their lengths differ or do not equal `input_size`.
   pub fn validate(&self) -> Result<()> {
     require_positive("config.vocab_size", self.vocab_size)?;
     require_positive("config.input_size", self.input_size)?;
     self.encoder_conf.validate()?;
     self.frontend_conf.validate()?;
+
+    // The LFR output width must equal the encoder input width:
+    // `lfr_m * n_mels == input_size` (`sensevoice.py:62`, `:244-254`). Both
+    // factors are validated positive + cardinality-capped above, so the checked
+    // product cannot overflow in practice — but compute it through `checked_mul`
+    // so a corrupt config can never wrap into a spuriously-matching width.
+    let lfr_width = checked_mul(
+      "frontend_conf.lfr_m * frontend_conf.n_mels",
+      "frontend_conf.lfr_m",
+      self.frontend_conf.lfr_m(),
+      "frontend_conf.n_mels",
+      self.frontend_conf.n_mels(),
+    )?;
+    if lfr_width != self.input_size {
+      return Err(crate::error::Error::LengthMismatch(
+        crate::error::LengthMismatchPayload::new(
+          "config.input_size vs frontend_conf.lfr_m * frontend_conf.n_mels",
+          self.input_size.max(0) as usize,
+          lfr_width.max(0) as usize,
+        ),
+      ));
+    }
 
     // The in-config CMVN fallback (`config.py:59-61`) is consumed as a pair —
     // means AND inverse-stddev — by `post_load_hook` (`sensevoice.py:577-579`).

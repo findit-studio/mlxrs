@@ -11,7 +11,20 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::{array::Array, error::Error, nn::Linear};
+use crate::{
+  array::Array,
+  error::Error,
+  lm::quant::{PerLayerQuantization, Quantization, QuantizationOption},
+  nn::Linear,
+};
+
+/// The global affine quantization config the SANM quantized-path oracles thread
+/// in (the common SenseVoice scheme — a single global `{ group_size, bits }`).
+/// Each builder resolves its own `(group_size, bits, mode)` per prefix from it
+/// via `quantization_for`.
+fn global_quant() -> PerLayerQuantization {
+  PerLayerQuantization::from_global(Quantization::affine(QUANT_GROUP, QUANT_BITS))
+}
 
 // ───────────────────────── SinusoidalPositionEncoder ─────────────────────────
 
@@ -364,6 +377,38 @@ fn encoder_tower_consumes_tp_blocks_zero() {
 }
 
 #[test]
+fn encoder_fallible_reserve_builds_full_block_set() {
+  // The fallibly-reserved `encoders` / `tp_encoders` `Vec`s build the COMPLETE
+  // block set at a normal count: num_blocks = 4 -> encoders0 (1) + encoders (3);
+  // tp_blocks = 3 -> tp_encoders (3). The tower forwards and consumes every key.
+  let enc = synthetic_encoder_config(8, 2, 16, 4, 3, 3);
+  let mut w = HashMap::new();
+  build_full_tower_weights(&mut w, 4, &enc);
+  let encoder = Encoder::from_weights(&mut w, 4, &enc, None).unwrap();
+
+  // The reserved-then-filled block stacks have exactly the configured counts.
+  assert_eq!(
+    encoder.encoders0.len(),
+    1,
+    "encoders0 holds the first block"
+  );
+  assert_eq!(
+    encoder.encoders.len(),
+    3,
+    "num_blocks - 1 = 3 constant blocks"
+  );
+  assert_eq!(encoder.tp_encoders.len(), 3, "tp_blocks = 3");
+
+  let x = Array::from_slice::<f32>(
+    &(0..5 * 4).map(|i| (i as f32) * 0.01).collect::<Vec<_>>(),
+    &[1, 5, 4],
+  )
+  .unwrap();
+  assert_eq!(encoder.forward(&x).unwrap().shape(), vec![1, 5, 8]);
+  assert!(w.is_empty(), "all tower weights consumed: {:?}", w.keys());
+}
+
+#[test]
 fn encoder_missing_weight_is_typed_error() {
   // An incomplete weight map surfaces a typed MissingKey, not a panic.
   let enc = synthetic_encoder_config(8, 2, 16, 2, 0, 3);
@@ -399,7 +444,7 @@ fn sanm_loads_and_forwards_quantized_linear() {
     "blk.self_attn",
     &enc,
     n_feat,
-    Some((QUANT_GROUP, QUANT_BITS, "affine")),
+    Some(&global_quant()),
   )
   .expect("quantized SANM build");
   assert!(matches!(
@@ -438,6 +483,442 @@ fn quantized_scales_without_scheme_is_typed_error() {
     MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, n_feat, None),
     Err(Error::InvariantViolation(_))
   ));
+}
+
+// ───────────────────────── load-time weight shape-pins ─────────────────────────
+
+#[test]
+fn sanm_rejects_wrong_qkv_shape() {
+  // The fused `linear_q_k_v` must be `(3 * output_size, in_feat)`
+  // (`sensevoice.py:152`). A wrong out-feature count is a typed shape error at
+  // LOAD, not a deferred split / reshape failure at the first forward.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  // Overwrite the qkv with a wrong out width (3*8 = 24 expected; give 20).
+  insert_dense_linear(&mut w, "blk.self_attn.linear_q_k_v", 20, 8);
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_wrong_qkv_in_feat() {
+  // The qkv input width must equal the layer input width `in_feat`. A first
+  // (width-changing) block consumes `in_feat = input_size`; a shard whose qkv
+  // input width disagrees is a typed shape error at load.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  // Build qkv with in_feat = 6 but load with in_feat = 8.
+  insert_dense_linear(&mut w, "blk.self_attn.linear_q_k_v", 24, 6);
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_wrong_linear_out_shape() {
+  // `linear_out` must be `(output_size, output_size)` (`sensevoice.py:151`).
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  insert_dense_linear(&mut w, "blk.self_attn.linear_out", 8, 6); // (8, 6) != (8, 8)
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_wrong_fsmn_weight_shape() {
+  // The depthwise FSMN conv weight must be `(output_size, kernel_size, 1)` in the
+  // post-`sanitize` MLX layout. A wrong kernel extent is a typed shape error.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  // kernel_size = 3 expected; plant a (8, 5, 1) weight.
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (8 * 5) as usize], &[8, 5, 1]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_non_rank3_fsmn_weight() {
+  // A FSMN conv weight of the wrong RANK (e.g. the pre-sanitize torch `(C, 1, K)`
+  // left un-transposed would still be rank-3, but a rank-2 weight is a typed
+  // RankMismatch) — the conv would otherwise mis-group at the first forward.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (8 * 3) as usize], &[8, 3]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::RankMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_qkv_fused_width_overflow_is_typed_not_panic() {
+  // The fused QKV width `3 * output_size` is computed with checked arithmetic; an
+  // `output_size` near `i32::MAX / 3` is a typed ArithmeticOverflow at load (the
+  // check runs BEFORE any weight lookup, so an empty map suffices).
+  let enc = synthetic_encoder_config(i32::MAX, 1, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::ArithmeticOverflow(_))
+  ));
+}
+
+#[test]
+fn ffn_rejects_wrong_w1_shape() {
+  // `feed_forward.w_1` must be `(linear_units, output_size)` (`sensevoice.py:128`).
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  // A full encoder layer, then corrupt w_1's out width (linear_units = 16).
+  insert_encoder_layer(&mut w, "blk", 8, &enc);
+  insert_dense_linear(&mut w, "blk.feed_forward.w_1", 12, 8); // (12, 8) != (16, 8)
+  assert!(matches!(
+    EncoderLayerSANM::from_weights(&mut w, "blk", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn ffn_rejects_wrong_w2_shape() {
+  // `feed_forward.w_2` must be `(output_size, linear_units)` (`sensevoice.py:129`).
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_encoder_layer(&mut w, "blk", 8, &enc);
+  insert_dense_linear(&mut w, "blk.feed_forward.w_2", 8, 12); // (8, 12) != (8, 16)
+  assert!(matches!(
+    EncoderLayerSANM::from_weights(&mut w, "blk", &enc, 8, None),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn layer_norm_rejects_wrong_affine_length() {
+  // Each `nn.LayerNorm(dim)` affine vector must be length `dim`: `norm1` is sized
+  // to the input width, `norm2` to the output. A mis-sized affine would broadcast
+  // silently against the activations; pin it at load.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_encoder_layer(&mut w, "blk", 8, &enc);
+  // norm2 must be length 8 (output_size); plant a length-6 weight.
+  w.insert(
+    "blk.norm2.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0f32; 6], &[6]).unwrap(),
+  );
+  assert!(matches!(
+    EncoderLayerSANM::from_weights(&mut w, "blk", &enc, 8, None),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn after_norm_rejects_wrong_affine_length() {
+  // The tower's `after_norm` / `tp_norm` are `(output_size,)`; a mis-sized
+  // affine is a typed LengthMismatch at the full-tower build.
+  let enc = synthetic_encoder_config(8, 2, 16, 2, 0, 3);
+  let mut w = HashMap::new();
+  build_full_tower_weights(&mut w, 4, &enc);
+  w.insert(
+    "encoder.after_norm.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0f32; 7], &[7]).unwrap(),
+  );
+  assert!(matches!(
+    Encoder::from_weights(&mut w, 4, &enc, None),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn quantized_sanm_rejects_wrong_qkv_shape() {
+  // The shape-pin applies to the QUANTIZED arm too (via the dequantized logical
+  // shape): a packed qkv whose recovered `(3*n_feat, in_feat)` disagrees is a
+  // typed shape error at load, not a deferred mis-projection.
+  let n_feat = 64i32;
+  let enc = synthetic_encoder_config(n_feat, 4, 128, 1, 0, 3);
+  let mut w = HashMap::new();
+  // Quantize a qkv with the WRONG out width (3*n_feat = 192 expected; give 128).
+  insert_quantized_linear(&mut w, "blk.self_attn.linear_q_k_v", 128, n_feat);
+  insert_dense_linear(&mut w, "blk.self_attn.linear_out", n_feat, n_feat);
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (n_feat * 3) as usize], &[n_feat, 3, 1]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(
+      &mut w,
+      "blk.self_attn",
+      &enc,
+      n_feat,
+      Some(&global_quant())
+    ),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_resolves_quant_per_prefix_skip_builds_dense_layer_dense() {
+  // Per-prefix resolution: with a global default scheme PLUS a `Skip` override
+  // for `linear_out`, `linear_q_k_v` (a `.scales`-bearing layer) builds quantized
+  // via the global default while `linear_out` (DENSE on disk, no `.scales`) is
+  // left dense — its `Skip` prefix resolves to `None`, consistent with its dense
+  // weights. A single collapsed global tuple could not express the per-layer
+  // `Skip`; the per-prefix `None` is what threads through.
+  let n_feat = 64i32;
+  let enc = synthetic_encoder_config(n_feat, 4, 128, 1, 0, 3);
+  let mut w = HashMap::new();
+  // `linear_q_k_v` is quantized (carries `.scales`); `linear_out` is DENSE.
+  insert_quantized_linear(&mut w, "blk.self_attn.linear_q_k_v", n_feat * 3, n_feat);
+  insert_dense_linear(&mut w, "blk.self_attn.linear_out", n_feat, n_feat);
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (n_feat * 3) as usize], &[n_feat, 3, 1]).unwrap(),
+  );
+
+  // Global affine default, but `linear_out` is explicitly skipped (matching its
+  // on-disk dense weights).
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "blk.self_attn.linear_out".to_string(),
+    QuantizationOption::Skip,
+  );
+  let quant = PerLayerQuantization::new(
+    Some(Quantization::affine(QUANT_GROUP, QUANT_BITS)),
+    per_layer,
+  );
+
+  let sanm =
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, n_feat, Some(&quant))
+      .expect("per-prefix resolution: quantized qkv via global default, dense out via Skip");
+  // `linear_q_k_v` resolved the global default → quantized; `linear_out`
+  // resolved `Skip` → its prefix's tuple is `None`, and with no `.scales` the
+  // dense arm builds.
+  assert!(matches!(
+    sanm.linear_q_k_v,
+    MaybeQuantizedLinear::Quantized(_)
+  ));
+  assert!(
+    matches!(sanm.linear_out, MaybeQuantizedLinear::Dense(_)),
+    "a per-layer Skip on a dense-on-disk `linear_out` keeps it dense"
+  );
+}
+
+#[test]
+fn sanm_per_prefix_skip_on_scales_bearing_layer_is_typed_error() {
+  // The dual of the above: a `Skip` override on a layer that DOES carry `.scales`
+  // on disk is a checkpoint/config inconsistency — the per-prefix resolution
+  // yields `None` for `linear_out` while its `.scales` sibling is present, which
+  // the shared `MaybeQuantizedLinear` rejects with a typed `InvariantViolation`
+  // (the per-prefix `None` reached the leaf, exactly the qwen3 contract).
+  let n_feat = 64i32;
+  let enc = synthetic_encoder_config(n_feat, 4, 128, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_quantized_linear(&mut w, "blk.self_attn.linear_q_k_v", n_feat * 3, n_feat);
+  insert_quantized_linear(&mut w, "blk.self_attn.linear_out", n_feat, n_feat);
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (n_feat * 3) as usize], &[n_feat, 3, 1]).unwrap(),
+  );
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "blk.self_attn.linear_out".to_string(),
+    QuantizationOption::Skip,
+  );
+  let quant = PerLayerQuantization::new(
+    Some(Quantization::affine(QUANT_GROUP, QUANT_BITS)),
+    per_layer,
+  );
+  assert!(
+    matches!(
+      MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, n_feat, Some(&quant)),
+      Err(Error::InvariantViolation(_))
+    ),
+    "a Skip on a `.scales`-bearing layer is an InvariantViolation, not a silent quantized build"
+  );
+}
+
+#[test]
+fn sanm_resolves_quant_per_prefix_parameter_override() {
+  // Per-prefix resolution honors a per-layer PARAMETER override: `linear_q_k_v`
+  // is quantized at `group_size = 32` (its `.scales` width is `in/32 = 2`) while
+  // the global default is `group_size = 64` (`in/64 = 1`). Resolving the WRONG
+  // (global) tuple for `linear_q_k_v` would fail `check_quantized_shape` (the
+  // scales-width recovery would expect 1 group, not 2). The build succeeding is
+  // proof the OVERRIDE tuple — not the collapsed global tuple — was used.
+  const OVERRIDE_GROUP: i32 = 32;
+  let n_feat = 64i32; // multiple of both 32 and 64
+  let enc = synthetic_encoder_config(n_feat, 4, 128, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_quantized_linear_params(
+    &mut w,
+    "blk.self_attn.linear_q_k_v",
+    n_feat * 3,
+    n_feat,
+    OVERRIDE_GROUP,
+    QUANT_BITS,
+  );
+  insert_dense_linear(&mut w, "blk.self_attn.linear_out", n_feat, n_feat);
+  w.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (n_feat * 3) as usize], &[n_feat, 3, 1]).unwrap(),
+  );
+
+  // Global default group_size = 64; `linear_q_k_v` overridden to group_size = 32.
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "blk.self_attn.linear_q_k_v".to_string(),
+    QuantizationOption::Quantize(Quantization::affine(OVERRIDE_GROUP, QUANT_BITS)),
+  );
+  let quant = PerLayerQuantization::new(
+    Some(Quantization::affine(QUANT_GROUP, QUANT_BITS)),
+    per_layer,
+  );
+
+  let sanm =
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, n_feat, Some(&quant))
+      .expect("the per-layer group_size override must be used, not the global default");
+  assert!(matches!(
+    sanm.linear_q_k_v,
+    MaybeQuantizedLinear::Quantized(_)
+  ));
+
+  // Cross-check: resolving the GLOBAL tuple (group_size = 64) for this packed
+  // `group_size = 32` weight is a load-time shape error — confirming the two
+  // schemes are genuinely distinguishable (the override is load-bearing).
+  let mut w_wrong = HashMap::new();
+  insert_quantized_linear_params(
+    &mut w_wrong,
+    "blk.self_attn.linear_q_k_v",
+    n_feat * 3,
+    n_feat,
+    OVERRIDE_GROUP,
+    QUANT_BITS,
+  );
+  insert_dense_linear(&mut w_wrong, "blk.self_attn.linear_out", n_feat, n_feat);
+  w_wrong.insert(
+    "blk.self_attn.fsmn_block.weight".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; (n_feat * 3) as usize], &[n_feat, 3, 1]).unwrap(),
+  );
+  let wrong = MultiHeadedAttentionSANM::from_weights(
+    &mut w_wrong,
+    "blk.self_attn",
+    &enc,
+    n_feat,
+    Some(&global_quant()), // group_size = 64, the WRONG scheme for this layer
+  );
+  assert!(
+    wrong.is_err(),
+    "the global group_size must mis-decode the group_size=32 packed weight"
+  );
+}
+
+// ───────────────────────── dense Linear bias shape-pins ─────────────────────────
+
+#[test]
+fn sanm_rejects_wrong_linear_out_bias_length() {
+  // The dense arm of `MaybeQuantizedLinear` does NOT validate the optional
+  // `<prefix>.bias`; SenseVoice pins it locally. `linear_out` is
+  // `(output_size, output_size)`, so its bias must be rank-1 `(output_size,)`. A
+  // wrong-length bias (correct weight) would broadcast a single wrong offset
+  // across the channels — a typed LengthMismatch at LOAD.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  // Correct weight (8, 8); overwrite ONLY the bias to a wrong length (6 != 8).
+  w.insert(
+    "blk.self_attn.linear_out.bias".to_string(),
+    Array::from_slice::<f32>(&[0.0f32; 6], &[6]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_scalar_qkv_bias() {
+  // A stray `(1,)` fused-QKV bias (correct weight) would broadcast one offset
+  // across all `3 * output_size` channels — the SILENT-wrong-output case. Pinned
+  // to a typed LengthMismatch at load (expected length `3 * 8 = 24`).
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  w.insert(
+    "blk.self_attn.linear_q_k_v.bias".to_string(),
+    Array::from_slice::<f32>(&[0.0f32], &[1]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_rejects_rank2_linear_out_bias() {
+  // A `(1, out)` bias (rank-2, correct weight) is a typed RankMismatch — the
+  // mlx.nn.Linear bias must be the rank-1 `(out_features,)` vector.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  w.insert(
+    "blk.self_attn.linear_out.bias".to_string(),
+    Array::from_slice::<f32>(&[0.0f32; 8], &[1, 8]).unwrap(),
+  );
+  assert!(matches!(
+    MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None),
+    Err(Error::RankMismatch(_))
+  ));
+}
+
+#[test]
+fn ffn_rejects_wrong_w1_bias_length() {
+  // `feed_forward.w_1` is `(linear_units, output_size)`, so its dense bias must
+  // be `(linear_units,)`. A wrong-length bias (correct weight) is pinned at load.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_encoder_layer(&mut w, "blk", 8, &enc);
+  // linear_units = 16; plant a length-12 bias on the otherwise-correct w_1.
+  w.insert(
+    "blk.feed_forward.w_1.bias".to_string(),
+    Array::from_slice::<f32>(&[0.0f32; 12], &[12]).unwrap(),
+  );
+  assert!(matches!(
+    EncoderLayerSANM::from_weights(&mut w, "blk", &enc, 8, None),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn sanm_accepts_correct_dense_biases() {
+  // The bias-pin is a no-op for the well-formed checkpoint the other helpers
+  // build (every `insert_dense_linear` writes a correct `(out,)` bias): the SANM
+  // still loads + forwards. Guards against the pin rejecting valid biases.
+  let enc = synthetic_encoder_config(8, 2, 16, 1, 0, 3);
+  let mut w = HashMap::new();
+  insert_sanm(&mut w, "blk.self_attn", 8, &enc);
+  let sanm = MultiHeadedAttentionSANM::from_weights(&mut w, "blk.self_attn", &enc, 8, None)
+    .expect("correct dense biases load");
+  let x = Array::from_slice::<f32>(
+    &(0..5 * 8).map(|i| (i as f32) * 0.01).collect::<Vec<_>>(),
+    &[1, 5, 8],
+  )
+  .unwrap();
+  assert_eq!(sanm.forward(&x).unwrap().shape(), vec![1, 5, 8]);
 }
 
 // ───────────────────────── test helpers ─────────────────────────
@@ -520,6 +1001,34 @@ fn insert_quantized_linear(
   w.insert(format!("{prefix}.weight"), packed);
   w.insert(format!("{prefix}.scales"), scales);
   // Affine mode always yields per-group biases.
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine quantize yields biases"),
+  );
+  w.insert(
+    format!("{prefix}.bias"),
+    Array::from_slice::<f32>(&vec![0.0f32; out as usize], &[out]).unwrap(),
+  );
+}
+
+/// Insert a real affine-quantized `<prefix>.{weight,scales,biases,bias}` at an
+/// EXPLICIT `(group_size, bits)` (not the [`QUANT_GROUP`] / [`QUANT_BITS`]
+/// default) — used by the per-layer-override oracle to plant a layer whose
+/// scheme differs from the global default, so resolving the wrong (global) tuple
+/// for it would mis-shape / mis-decode the packed triple.
+fn insert_quantized_linear_params(
+  w: &mut HashMap<String, Array>,
+  prefix: &str,
+  out: i32,
+  in_features: i32,
+  group_size: i32,
+  bits: i32,
+) {
+  let dense = identity_linear_weight(out, in_features);
+  let (packed, scales, biases) =
+    crate::ops::quantized::quantize(&dense, group_size, bits, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), packed);
+  w.insert(format!("{prefix}.scales"), scales);
   w.insert(
     format!("{prefix}.biases"),
     biases.expect("affine quantize yields biases"),

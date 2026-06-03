@@ -19,14 +19,20 @@
 //! [`crate::nn::MaybeQuantizedEmbedding`]) selects quantized-vs-dense by the per-layer
 //! `<prefix>.scales` sibling.
 //! [`SenseVoiceModel::from_weights_quantized`](crate::audio::stt::models::sensevoice::SenseVoiceModel::from_weights_quantized)
-//! resolves the global `(group_size, bits, mode)` scheme ONLY when
+//! threads the parsed [`PerLayerQuantization`] to the builders ONLY when
 //! [`has_relevant_scales`] finds a
 //! `.scales` for some layer the model actually loads — a one-pass pre-scan over
 //! the weight keys, so a **dense** checkpoint loads through the unchanged dense
 //! path regardless of any stale / partial `quantization` block the config may
-//! still carry. A `.scales`-bearing layer with no resolvable scheme is a typed
+//! still carry. The `(group_size, bits, mode)` for each consumed prefix is then
+//! resolved PER PREFIX inside the per-layer builder via
+//! [`PerLayerQuantization::quantization_for`] (the qwen3 idiom), so a per-layer
+//! parameter override builds that layer with its own scheme, a per-layer `Skip`
+//! builds it dense, and a per-layer-only config (no global default) loads its
+//! listed layers. A `.scales`-bearing layer that resolves to no scheme for THAT
+//! layer (a `Skip` / no override + no global default) is a typed
 //! [`Error::InvariantViolation`] inside the per-layer builder (the weights say
-//! quantized, the config says dense).
+//! quantized, the config resolved dense for this layer).
 //!
 //! [sv]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/sensevoice/sensevoice.py
 
@@ -41,8 +47,8 @@ use crate::{
   array::Array,
   audio::stt::model::Transcribe,
   error::{
-    Error, FileIoPayload, FileOp, LayerKeyedPayload, MalformedDataPayload, MissingKeyPayload,
-    Result, UnknownEnumValuePayload,
+    Error, FileIoPayload, FileOp, LayerKeyedPayload, LengthMismatchPayload, MalformedDataPayload,
+    MissingKeyPayload, Result, UnknownEnumValuePayload,
   },
   lm::quant::PerLayerQuantization,
 };
@@ -93,32 +99,38 @@ impl SenseVoiceModel {
   /// tower ([`Encoder::from_weights`]) and the CTC head + query table
   /// ([`build_head`]) are then composed from the (drained) weight map.
   ///
-  /// **Quantization** (the qwen3 `.scales` discriminator): the global
-  /// `(group_size, bits, mode)` scheme is resolved from `quantization` ONLY
-  /// when [`has_relevant_scales`] finds a `<prefix>.scales` sibling for some
-  /// layer the model loads (a one-pass pre-scan). A dense checkpoint (no
-  /// `.scales`) loads through the unchanged dense path regardless of any stale
-  /// `quantization` block. Every quantize-aware layer then picks quantized vs
-  /// dense per-layer by its own `.scales` sibling
-  /// ([`crate::nn::MaybeQuantizedLinear::from_weights`]); a `.scales` with no
-  /// resolvable scheme is a typed [`Error::InvariantViolation`].
+  /// **Quantization** (the qwen3 `.scales` discriminator): `quantization` is
+  /// threaded to the builders ONLY when [`has_relevant_scales`] finds a
+  /// `<prefix>.scales` sibling for some layer the model loads (a one-pass
+  /// pre-scan). A dense checkpoint (no `.scales`) loads through the unchanged
+  /// dense path regardless of any stale `quantization` block. Every
+  /// quantize-aware layer then picks quantized vs dense per-layer by its own
+  /// `.scales` sibling ([`crate::nn::MaybeQuantizedLinear::from_weights`]) and
+  /// resolves its `(group_size, bits, mode)` PER PREFIX via
+  /// [`PerLayerQuantization::quantization_for`] (the qwen3 idiom); a `.scales`
+  /// that resolves to no scheme for THAT layer is a typed
+  /// [`Error::InvariantViolation`].
   ///
   /// `quantization` is the parsed
   /// [`crate::lm::quant::PerLayerQuantization`] (the `config.json`
   /// `quantization` block parsed by the shared audio resolver
-  /// [`crate::audio::load::apply_quantization`]). SenseVoice quantizes its
-  /// whole transformer with a single global scheme (no per-layer override is
-  /// emitted for it), so the global default is taken; a `quantization` carrying
-  /// only per-layer overrides and no global default resolves to no scheme,
-  /// which a present `.scales` then rejects.
+  /// [`crate::audio::load::apply_quantization`]). SenseVoice typically quantizes
+  /// its whole transformer with a single global scheme (mlx-community emits a
+  /// global `{ group_size, bits, [mode] }` block with no per-layer override),
+  /// but a per-layer parameter override is honored at its own prefix, a per-layer
+  /// `Skip` builds that one layer dense, and a per-layer-only config (no global
+  /// default) loads its explicitly-listed layers; a `<prefix>.scales` that
+  /// resolves to no scheme for its layer (a `Skip` / no override + no global
+  /// default) is rejected.
   ///
   /// # Errors
-  /// - the [`Config::validate`] errors (non-positive / non-divisible dims, a
-  ///   malformed in-config CMVN length);
+  /// - the [`Config::validate`] errors (non-positive / non-divisible dims, an
+  ///   over-cap block count, a malformed in-config CMVN length);
   /// - the [`Encoder::from_weights`] / [`build_head`] errors (a missing weight,
-  ///   a `.scales` with no resolvable scheme);
+  ///   a `.scales` that resolves to no scheme for its layer, an `embed` /
+  ///   `ctc_lo` whose shape does not match the SenseVoice invariants);
   /// - [`Error::InvariantViolation`] if a `.scales` is present but
-  ///   `quantization` resolved no global scheme.
+  ///   `quantization` resolved no scheme for that layer.
   pub fn from_weights_quantized(
     config: Config,
     mut weights: HashMap<String, Array>,
@@ -129,17 +141,23 @@ impl SenseVoiceModel {
     // Single config-validation gate BEFORE any tensor is built.
     config.validate()?;
 
-    // Resolve the global quantization scheme ONLY when the checkpoint actually
-    // carries a `.scales` sibling for some layer the model loads (the
-    // `.scales`-presence discriminator, hoisted to the whole map). A DENSE
-    // checkpoint loads through the unchanged dense path regardless of a stale
-    // `quantization` block. The non-quant `validate` above always runs.
-    let scheme = if has_relevant_scales(&config, &weights) {
-      resolve_global_scheme(quantization)
+    // Thread the parsed quantization config to the builders ONLY when the
+    // checkpoint actually carries a `.scales` sibling for some layer the model
+    // loads (the `.scales`-presence discriminator, hoisted to the whole map). A
+    // DENSE checkpoint loads through the unchanged dense path regardless of a
+    // stale `quantization` block. The non-quant `validate` above always runs.
+    //
+    // The `(group_size, bits, mode)` is then resolved PER CONSUMED PREFIX inside
+    // each builder via [`PerLayerQuantization::quantization_for`] (the qwen3
+    // idiom), so a per-layer parameter override builds that layer with its OWN
+    // scheme, a per-layer `Skip` builds it dense, and a per-layer-only config (no
+    // global default) loads its listed layers — none of which a single collapsed
+    // global tuple could express.
+    let quant = if has_relevant_scales(&config, &weights) {
+      quantization
     } else {
       None
     };
-    let quant = scheme.as_ref().map(QuantScheme::as_tuple);
 
     let encoder = Encoder::from_weights(
       &mut weights,
@@ -147,7 +165,13 @@ impl SenseVoiceModel {
       config.encoder_conf(),
       quant,
     )?;
-    let (ctc_lo, embed) = build_head(&mut weights, quant)?;
+    let (ctc_lo, embed) = build_head(
+      &mut weights,
+      config.input_size(),
+      encoder.output_size(),
+      config.vocab_size(),
+      quant,
+    )?;
 
     let (cmvn_means, cmvn_istd) = match cmvn {
       Some((means, istd)) => (Some(means), Some(istd)),
@@ -158,48 +182,6 @@ impl SenseVoiceModel {
       config, encoder, ctc_lo, embed, tokenizer, cmvn_means, cmvn_istd,
     ))
   }
-}
-
-/// The resolved global quantization scheme — the `(group_size, bits, mode)`
-/// the quantize-aware builders consume. The `mode` is owned (a `String` from
-/// the [`PerLayerQuantization`] block) so the borrowed `(i32, i32, &str)` tuple
-/// the builders take lives as long as this value.
-struct QuantScheme {
-  group_size: i32,
-  bits: i32,
-  mode: String,
-}
-
-impl QuantScheme {
-  /// Borrow the `(group_size, bits, mode)` tuple the quantize-aware builders
-  /// (`MaybeQuantizedLinear` / `MaybeQuantizedEmbedding`) take.
-  #[inline(always)]
-  fn as_tuple(&self) -> (i32, i32, &str) {
-    (self.group_size, self.bits, self.mode.as_str())
-  }
-}
-
-/// Resolve the single global `(group_size, bits, mode)` scheme from the parsed
-/// quantization config. SenseVoice quantizes its whole transformer with one
-/// scheme (mlx-community emits a global `{ group_size, bits, [mode] }` block,
-/// no per-layer override for it), so the global default
-/// ([`PerLayerQuantization::quantization`]) is taken.
-///
-/// Returns `None` when there is no scheme to resolve — `quantization` is `None`
-/// (no block at all) or carries only per-layer overrides with no global default.
-/// This is called only after [`has_relevant_scales`] has confirmed a `.scales`
-/// is present, so a `None` here means a quantized checkpoint whose config
-/// carries no usable global scheme; the per-layer builders then reject the
-/// present `.scales` with a typed [`Error::InvariantViolation`] (the weights say
-/// quantized, the config says dense).
-fn resolve_global_scheme(quantization: Option<&PerLayerQuantization>) -> Option<QuantScheme> {
-  quantization
-    .and_then(|q| q.quantization)
-    .map(|q| QuantScheme {
-      group_size: q.group_size,
-      bits: q.bits,
-      mode: q.mode.as_str().to_string(),
-    })
 }
 
 /// Probe whether the (sanitized) weight map carries a `<prefix>.scales` sibling
@@ -268,40 +250,73 @@ pub fn has_relevant_scales(config: &Config, weights: &HashMap<String, Array>) ->
 ///    ([`SenseVoiceModel::extract_features`] then skips it, the reference's
 ///    `if self._cmvn_means is not None` guard `sensevoice.py:392`).
 ///
+/// The `am.mvn` body is read through the shared bounded
+/// [`crate::lm::load::read_bounded_config_file`] (the 1 MiB config-read
+/// convention, same class as `config.json` / `tokens.json`) so a hostile model
+/// directory cannot OOM the loader by planting a huge stats file. Whichever
+/// source supplies the pair, both vectors must be exactly
+/// [`Config::input_size`]-wide — the CMVN stats are applied element-wise to the
+/// `(T', input_size)` LFR features (`(feats + means) * istd`,
+/// `sensevoice.py:80`), so a length-1 (or otherwise wrong-width) vector would
+/// broadcast silently with the wrong statistics rather than fail.
+///
 /// The vectors are widened into 1-D `(D,)` [`Array`]s broadcast across the LFR
 /// features by [`crate::audio::stt::models::sensevoice::frontend::apply_cmvn`].
 ///
 /// # Errors
-/// - [`Error::FileIo`] if an `am.mvn` file is present but unreadable;
+/// - [`Error::FileIo`] / a size-cap error from the bounded `am.mvn` read;
 /// - [`Error::MalformedData`] if a present `am.mvn` is missing its `<AddShift>`
 ///   / `<Rescale>` block or carries a non-float token (via [`parse_am_mvn`]);
+/// - [`Error::LengthMismatch`] if either CMVN vector's length is not
+///   `config.input_size()`;
 /// - propagates the [`Array::from_slice`] construction error.
 fn load_cmvn(dir: &Path, config: &Config) -> Result<Option<(Array, Array)>> {
   let mvn_path = dir.join(AM_MVN_FILE);
-  if mvn_path.is_file() {
-    let text = std::fs::read_to_string(&mvn_path).map_err(|e| {
-      Error::FileIo(FileIoPayload::new(
-        "sensevoice load: read am.mvn",
-        FileOp::Read,
-        mvn_path.clone(),
-        e,
-      ))
-    })?;
+  // Bounded, TOCTOU-closed read (the `tokens.json` / `config.json` convention):
+  // `Ok(Some(text))` present, `Ok(None)` absent (fall through to the in-config
+  // fallback), `Err` on oversized / non-regular / IO failure.
+  if let Some(text) = crate::lm::load::read_bounded_config_file(&mvn_path, "sensevoice am.mvn")? {
     let (means, istd) = parse_am_mvn(&text)?;
-    return Ok(Some(floats_to_arrays(&means, &istd)?));
+    return Ok(Some(floats_to_arrays(&means, &istd, config.input_size())?));
   }
 
   // In-config fallback (`sensevoice.py:577-579`). `Config::validate` (run by
-  // `from_weights_quantized` before this is consumed) pins the pair to be
-  // present together and `input_size`-wide.
+  // `from_weights_quantized` before this is consumed) already pins the pair to
+  // be present together and `input_size`-wide; the length check below is a
+  // self-contained re-assertion so this loader never builds a mis-sized CMVN.
   match (config.cmvn_means(), config.cmvn_istd()) {
-    (Some(means), Some(istd)) => Ok(Some(floats_to_arrays(means, istd)?)),
+    (Some(means), Some(istd)) => Ok(Some(floats_to_arrays(means, istd, config.input_size())?)),
     _ => Ok(None),
   }
 }
 
-/// Build the `(means, istd)` 1-D [`Array`] pair from the parsed float vectors.
-fn floats_to_arrays(means: &[f32], istd: &[f32]) -> Result<(Array, Array)> {
+/// Build the `(means, istd)` 1-D [`Array`] pair from the parsed float vectors,
+/// after pinning both lengths to `input_size`.
+///
+/// # Errors
+/// - [`Error::LengthMismatch`] if `means.len()` or `istd.len()` is not
+///   `input_size`;
+/// - [`Error::MalformedData`] if a length does not fit in `i32`;
+/// - propagates the [`Array::from_slice`] construction error.
+fn floats_to_arrays(means: &[f32], istd: &[f32], input_size: i32) -> Result<(Array, Array)> {
+  // The CMVN stats broadcast element-wise over the `(T', input_size)` LFR
+  // features, so each vector must be exactly `input_size` wide (`sensevoice.py:80`).
+  let expected = input_size.max(0) as usize;
+  if means.len() != expected {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "sensevoice load: CMVN means length vs input_size",
+      expected,
+      means.len(),
+    )));
+  }
+  if istd.len() != expected {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "sensevoice load: CMVN istd length vs input_size",
+      expected,
+      istd.len(),
+    )));
+  }
+
   let m_len = i32::try_from(means.len()).map_err(|_| {
     Error::MalformedData(MalformedDataPayload::new(
       "sensevoice load: CMVN means length",
@@ -330,19 +345,25 @@ fn floats_to_arrays(means: &[f32], istd: &[f32]) -> Result<(Array, Array)> {
 /// 3. otherwise the degenerate id-join detokenizer
 ///    ([`SenseVoiceTokenizer::id_join`], `sensevoice.py:448`).
 ///
-/// The `tokens.json` body is read through the shared bounded
+/// Both assets are read through the shared bounded readers so a hostile
+/// directory cannot OOM the loader: the SentencePiece `.model` through
+/// [`crate::lm::load::read_bounded_bytes_file`] with the generous
+/// [`crate::audio::stt::models::sensevoice::tokenizer::MAX_SPM_MODEL_BYTES`]
+/// cap (a binary protobuf), and the `tokens.json` body through
 /// [`crate::lm::load::read_bounded_config_file`] (the 1 MiB config-read
-/// convention) so a hostile directory cannot OOM the loader, then parsed as a
-/// `Vec<String>` of pieces.
+/// convention), then parsed as a `Vec<String>` of pieces.
 ///
 /// # Errors
-/// - [`Error::FileIo`] / size cap from the bounded `tokens.json` read;
+/// - [`Error::FileIo`] / size cap from the bounded `.model` / `tokens.json`
+///   read;
 /// - [`Error::Parse`] if a present `tokens.json` is not a JSON string list;
 /// - propagates [`SenseVoiceTokenizer::from_spm_file`]'s read / parse errors.
 fn load_tokenizer(dir: &Path) -> Result<SenseVoiceTokenizer> {
+  // The bounded `.model` read is open-once + TOCTOU-closed, so it handles the
+  // presence check itself (`Ok(None)` ⇒ absent ⇒ fall through to `tokens.json`).
   let spm_path = dir.join(SPM_MODEL_FILE);
-  if spm_path.is_file() {
-    return SenseVoiceTokenizer::from_spm_file(&spm_path);
+  if let Some(spm) = SenseVoiceTokenizer::from_spm_file(&spm_path)? {
+    return Ok(spm);
   }
 
   let tokens_path = dir.join(TOKENS_JSON_FILE);
@@ -447,10 +468,13 @@ impl SenseVoiceModel {
   ///    directory (a Hub id is rejected per the no-network policy);
   /// 2. [`crate::audio::load::load_config`] — read + bound `config.json`,
   ///    parse the [`Config`];
-  /// 3. [`crate::audio::load::apply_quantization`] — parse the optional
-  ///    `quantization` block;
-  /// 4. `load_all_safetensors` — walk + merge the `*.safetensors` shards;
-  /// 5. [`sanitize`] — the `ctc.ctc_lo.` strip + the FSMN conv transpose;
+  /// 3. `load_all_safetensors` — walk + merge the `*.safetensors` shards;
+  /// 4. [`sanitize`] — the `ctc.ctc_lo.` strip + the FSMN conv transpose;
+  /// 5. [`crate::audio::load::apply_quantization`] — parse the optional
+  ///    `quantization` block, but ONLY when [`has_relevant_scales`] proves the
+  ///    sanitized weights carry a `.scales` for some layer the model loads (the
+  ///    qwen3 pre-scan gate), so a dense checkpoint with a stale / malformed
+  ///    `quantization` block loads dense rather than failing at the parse;
   /// 6. `load_cmvn` — the `am.mvn` CMVN parse (or the in-config fallback);
   /// 7. `load_tokenizer` — the SentencePiece / `tokens.json` resolution;
   /// 8. [`SenseVoiceModel::from_weights_quantized`] — build the model.
@@ -458,7 +482,9 @@ impl SenseVoiceModel {
   /// # Errors
   /// The errors of every pipeline step above (a missing directory / config,
   /// a malformed config, a missing or duplicated weight, a malformed `am.mvn`
-  /// / `tokens.json`, a `.scales` with no resolvable scheme).
+  /// / `tokens.json`, a `.scales` with no resolvable scheme). A malformed
+  /// `quantization` block is surfaced ONLY for an actually-quantized checkpoint
+  /// (one carrying relevant `.scales`); a dense checkpoint ignores it.
   pub fn load(path: &str) -> Result<Self> {
     let dir = crate::audio::load::get_model_path(path)?;
     let config_json = crate::audio::load::load_config(&dir)?;
@@ -472,15 +498,24 @@ impl SenseVoiceModel {
     // Reject a malformed config before reading the (large) weight shards.
     config.validate()?;
 
-    // Parse the optional quantization block through the shared audio resolver
-    // (top-level `quantization` or the HF `quantization_config`), exactly as
-    // the rest of the STT subsystem resolves quantization.
-    let quantization = crate::audio::load::apply_quantization(&config_json)?;
-
     // Walk + merge the safetensors shards (the whisper / swift shard walk),
     // then sanitize (the `ctc.ctc_lo.` strip + the FSMN conv transpose).
     let raw = load_all_safetensors(&dir)?;
     let weights = sanitize(raw)?;
+
+    // Parse the optional quantization block through the shared audio resolver
+    // (top-level `quantization` or the HF `quantization_config`) ONLY when the
+    // sanitized checkpoint actually carries a `.scales` for some layer the model
+    // loads — the qwen3 `.scales`-presence pre-scan, applied at the parse so a
+    // DENSE checkpoint with a stale / partial / malformed `quantization` block
+    // loads dense instead of failing in `apply_quantization`. When no relevant
+    // scale is present the block is irrelevant (nothing to interpret), so it is
+    // never parsed.
+    let quantization = if has_relevant_scales(&config, &weights) {
+      crate::audio::load::apply_quantization(&config_json)?
+    } else {
+      None
+    };
 
     // The `post_load_hook` assets (`sensevoice.py:567-598`).
     let cmvn = load_cmvn(&dir, &config)?;

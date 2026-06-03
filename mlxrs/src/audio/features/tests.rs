@@ -168,6 +168,7 @@ fn compute_fbank_kaldi_output_shape() {
     20.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   assert_eq!(out.shape(), vec![98, 40]);
@@ -197,6 +198,7 @@ fn compute_fbank_kaldi_snip_edges_false_frame_count_and_finite() {
     20.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   let m_false: usize = (16_000 + 160 / 2) / 160; // 100
@@ -236,6 +238,7 @@ fn compute_fbank_kaldi_known_signal_peaks_near_1khz() {
     20.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   let shape = out.shape();
@@ -302,6 +305,7 @@ fn compute_fbank_kaldi_silence_is_finite() {
     20.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   let v = to_vec(&out);
@@ -334,6 +338,7 @@ fn compute_fbank_kaldi_short_input_returns_empty() {
     20.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   assert_eq!(out.shape(), vec![0, 40]);
@@ -354,7 +359,19 @@ fn compute_fbank_kaldi_window_variants_differ() {
     KaldiWindow::Rectangular,
   ] {
     let f = compute_fbank_kaldi(
-      &x, 16_000, 400, 160, 40, wt, 0.97, 0.0, true, 20.0, 0.0, None,
+      &x,
+      16_000,
+      400,
+      160,
+      40,
+      wt,
+      0.97,
+      0.0,
+      true,
+      20.0,
+      0.0,
+      None,
+      PreemphBoundary::Scale,
     )
     .unwrap();
     feats.push(to_vec(&f));
@@ -394,7 +411,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::RankMismatch(_))
   ));
@@ -413,7 +431,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::InvariantViolation(_))
   ));
@@ -432,7 +451,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::InvariantViolation(_))
   ));
@@ -451,7 +471,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::OutOfRange(_))
   ));
@@ -470,7 +491,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::InvariantViolation(_))
   ));
@@ -493,7 +515,8 @@ fn compute_fbank_kaldi_rejects_invalid_args() {
       true,
       20.0,
       0.0,
-      None
+      None,
+      PreemphBoundary::Scale,
     ),
     Err(Error::OutOfRange(_))
   ));
@@ -520,6 +543,7 @@ fn compute_fbank_kaldi_preemphasis_is_applied() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -537,6 +561,7 @@ fn compute_fbank_kaldi_preemphasis_is_applied() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -576,6 +601,7 @@ fn compute_fbank_kaldi_dither_keyed_is_deterministic() {
       20.0,
       0.0,
       Some(&key_a),
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -593,6 +619,7 @@ fn compute_fbank_kaldi_dither_keyed_is_deterministic() {
       20.0,
       0.0,
       Some(&key_a_again),
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -610,6 +637,7 @@ fn compute_fbank_kaldi_dither_keyed_is_deterministic() {
       20.0,
       0.0,
       Some(&key_b),
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -668,6 +696,7 @@ fn compute_fbank_kaldi_output_element_cap_rejects_large_matmul() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err("expected output-element cap to reject pathological num_mels");
   let msg = format!("{err:?}");
@@ -710,6 +739,7 @@ fn compute_fbank_kaldi_sliced_waveform_matches_contiguous() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -727,6 +757,7 @@ fn compute_fbank_kaldi_sliced_waveform_matches_contiguous() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -771,6 +802,7 @@ fn compute_fbank_kaldi_broadcasted_scalar_waveform_matches_contiguous() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -788,6 +820,7 @@ fn compute_fbank_kaldi_broadcasted_scalar_waveform_matches_contiguous() {
       20.0,
       0.0,
       None,
+      PreemphBoundary::Scale,
     )
     .unwrap(),
   );
@@ -903,6 +936,7 @@ fn compute_fbank_kaldi_preemphasis_first_sample_matches_kaldi() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   assert_eq!(out.shape(), vec![1, 4]);
@@ -913,6 +947,122 @@ fn compute_fbank_kaldi_preemphasis_first_sample_matches_kaldi() {
       "compute_fbank_kaldi[{i}] = {val}: must be finite under Kaldi preemphasis"
     );
   }
+}
+
+/// `PreemphBoundary::Preserve` keeps the first sample of each frame UNCHANGED
+/// under pre-emphasis (`y[0] = x[0]`), matching
+/// `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:911-915`, where
+/// `first_col = strided_input[:, 0:1]` is concatenated unchanged). This is the
+/// boundary SenseVoice's reference uses; the scaling deviation
+/// (`y[0] = x[0] * (1 - p)`) would FAIL the closed-form sentinel below.
+///
+/// We pin the boundary two ways:
+/// 1. **Closed-form sentinel.** For a 1-frame rectangular case the `Preserve`
+///    preemphasized-frame sum is mlx-audio's `-0.34375` (NOT the kaldi-asr
+///    `Scale` value `-0.875`) — the same sentinel the
+///    `compute_fbank_kaldi_preemphasis_first_sample_matches_kaldi` test uses to
+///    distinguish the two variants, here pinned to the `Preserve` side.
+/// 2. **End-to-end through the public function.** Driving the identical input
+///    through `compute_fbank_kaldi` with `Preserve` vs `Scale` must produce
+///    DIFFERENT features (the boundary feeds a different model input), and the
+///    `Preserve` output must be finite.
+#[test]
+fn compute_fbank_kaldi_preemphasis_preserve_keeps_first_sample() {
+  // Same minimal frame as the kaldi sibling test; here the boundary is the
+  // mlx-audio passthrough `y[0] = c[0]`.
+  let input = [2.0_f32, 1.0, 0.5, 0.25];
+  let mean = (input[0] + input[1] + input[2] + input[3]) / 4.0;
+  let centered: Vec<f32> = input.iter().map(|x| x - mean).collect();
+  let p = 0.5_f32;
+
+  // `PreemphBoundary::Preserve` boundary: y[0] = c[0] (unchanged).
+  let mut preserve = [0.0_f32; 4];
+  preserve[0] = centered[0];
+  for n in 1..4 {
+    preserve[n] = centered[n] - p * centered[n - 1];
+  }
+  let preserve_sum: f32 = preserve.iter().sum();
+  assert!(
+    (preserve_sum - (-0.34375)).abs() < 1e-5,
+    "Preserve closed-form check: y-sum = {preserve_sum}, want -0.34375 \
+       (mlx-audio passthrough; the Scale deviation would give -0.875)"
+  );
+
+  // Contrast sentinel: the Scale boundary gives the DISTINCT `-0.875`, proving
+  // the test setup observes the boundary difference.
+  let mut scale = [0.0_f32; 4];
+  scale[0] = centered[0] * (1.0 - p);
+  for n in 1..4 {
+    scale[n] = centered[n] - p * centered[n - 1];
+  }
+  let scale_sum: f32 = scale.iter().sum();
+  assert!(
+    (scale_sum - (-0.875)).abs() < 1e-5,
+    "Scale closed-form sentinel: y-sum = {scale_sum}, want -0.875"
+  );
+  assert!(
+    (preserve_sum - scale_sum).abs() > 1e-3,
+    "Preserve and Scale first-sample boundaries must be observably different"
+  );
+
+  // End-to-end: the boundary mode must change the public function's output.
+  // A DC-rich ramp over several frames makes the first-sample boundary feed a
+  // materially different rectangular-window spectrum.
+  let samples: Vec<f32> = (0..4_000).map(|i| (i as f32) / 4_000.0).collect();
+  let x = Array::from_slice::<f32>(&samples, &[4_000_i32]).unwrap();
+  let preserve_feats = to_vec(
+    &compute_fbank_kaldi(
+      &x,
+      16_000,
+      400,
+      160,
+      40,
+      KaldiWindow::Rectangular,
+      0.97,
+      0.0,
+      true,
+      20.0,
+      0.0,
+      None,
+      PreemphBoundary::Preserve,
+    )
+    .unwrap(),
+  );
+  let scale_feats = to_vec(
+    &compute_fbank_kaldi(
+      &x,
+      16_000,
+      400,
+      160,
+      40,
+      KaldiWindow::Rectangular,
+      0.97,
+      0.0,
+      true,
+      20.0,
+      0.0,
+      None,
+      PreemphBoundary::Scale,
+    )
+    .unwrap(),
+  );
+  assert_eq!(preserve_feats.len(), scale_feats.len());
+  for (i, &val) in preserve_feats.iter().enumerate() {
+    assert!(
+      val.is_finite(),
+      "Preserve fbank[{i}] = {val}: must be finite"
+    );
+  }
+  let max_diff = preserve_feats
+    .iter()
+    .zip(scale_feats.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_diff > 1e-4,
+    "Preserve vs Scale first-sample boundary must change the fbank features \
+       (max diff {max_diff})"
+  );
 }
 
 // ---- additional work-cap follow-ups -----------------------------------
@@ -956,6 +1106,7 @@ fn compute_fbank_kaldi_samples_len_cap_rejects_huge_broadcast() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err(
     "expected samples_len cap to reject a 100 Mi broadcasted waveform \
@@ -1009,6 +1160,7 @@ fn compute_fbank_kaldi_padded_mel_bank_cap_rejects_doubled_operand() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err(
     "expected padded-mel-bank cap to reject 64 Mi mels with n_fft_padded=2 \
@@ -1060,6 +1212,7 @@ fn compute_fbank_kaldi_snip_edges_false_reflect_buffer_cap_rejects_doubled_wavef
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err(
     "expected the reflect-buffer cap to reject a 64 Mi snip_edges=false \
@@ -1111,6 +1264,7 @@ fn compute_fbank_kaldi_snip_edges_false_reflect_buffer_cap_rejects_pad_one_under
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err(
     "expected the per-branch reflect-buffer cap to reject a pad==1 waveform \
@@ -1959,6 +2113,7 @@ fn compute_fbank_kaldi_rejects_win_len_below_two() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err("win_len < 2 must be rejected");
   let Error::OutOfRange(p) = &err else {
@@ -1988,6 +2143,7 @@ fn compute_fbank_kaldi_rejects_win_len_over_decoded_samples_cap() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err("win_len over MAX_DECODED_SAMPLES must be rejected");
   let Error::CapExceeded(p) = &err else {
@@ -2015,6 +2171,7 @@ fn compute_fbank_kaldi_snip_edges_false_zero_frames_returns_empty() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .unwrap();
   assert_eq!(out.shape(), vec![0, 7]);
@@ -2297,6 +2454,7 @@ fn compute_fbank_kaldi_rejects_num_mels_over_i32() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err("num_mels over i32::MAX must be rejected");
   let Error::OutOfRange(p) = &err else {
@@ -2344,6 +2502,7 @@ fn compute_fbank_kaldi_frame_work_cap_rejects_large_framed_matrix() {
     0.0,
     0.0,
     None,
+    PreemphBoundary::Scale,
   )
   .expect_err("frame_work over MAX_FBANK_WORK must be rejected");
   let Error::CapExceeded(p) = &err else {

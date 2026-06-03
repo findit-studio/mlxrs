@@ -576,11 +576,55 @@ pub(crate) fn read_bounded_config_file(path: &Path, label: &'static str) -> Resu
 /// unix + cap-via-`Read::take`) as [`read_bounded_config_file`]; factored out
 /// so the larger [`MAX_INDEX_BYTES`] cap for `model.safetensors.index.json`
 /// can reuse the *one* hardening path rather than restating it.
+///
+/// Adds a UTF-8 validation pass on top of the shared
+/// [`read_bounded_bytes_file`] byte read (a non-UTF-8 body is a typed parse
+/// error); the byte primitive owns the open/stat/cap hardening so both the
+/// text and the binary-asset readers share the *one* path.
 fn read_bounded_text_file(
   path: &Path,
   label: &'static str,
   max_bytes: u64,
 ) -> Result<Option<String>> {
+  let Some(bytes) = read_bounded_bytes_file(path, label, max_bytes)? else {
+    return Ok(None);
+  };
+  let text = String::from_utf8(bytes).map_err(|e| {
+    Error::LayerKeyed(LayerKeyedPayload::new(
+      path.display().to_string(),
+      Error::Parse(ParsePayload::new(label, "UTF-8", e)),
+    ))
+  })?;
+  Ok(Some(text))
+}
+
+/// Shared bounded-**bytes**-file primitive parametrized on the byte cap — the
+/// binary-asset twin of [`read_bounded_text_file`], returning the raw bytes
+/// (no UTF-8 validation) for files that are not text (e.g. a SentencePiece
+/// `.model` protobuf).
+///
+/// Identical TOCTOU-closed hardening as [`read_bounded_config_file`]: open
+/// **once** with `O_NONBLOCK | O_CLOEXEC` on unix (so a planted FIFO returns
+/// immediately and never hangs the loader), post-open `is_file()` fstat
+/// rejects non-regular targets even when reached via a symlink (HF Hub
+/// snapshot caches store assets as symlinks into `blobs/<hash>`, which is
+/// intentionally followed since the post-open stat enforces the guarantee on
+/// the *resolved* target), and the body is capped at `max_bytes` via
+/// `Read::take` so a hostile model directory cannot OOM the loader by planting
+/// a huge file.
+///
+/// `Ok(Some(bytes))` on a successful bounded read, `Ok(None)` if the file is
+/// absent (`ENOENT`), `Err` on every other failure (open failure other than
+/// `NotFound`, not a regular file, oversized, IO failure during read).
+///
+/// `pub(crate)` so a per-usecase asset reader (e.g. the SenseVoice SPM
+/// `.model` loader) can read a binary asset through the *one* bounded-read
+/// path with its own generous cap, rather than restating the hardening.
+pub(crate) fn read_bounded_bytes_file(
+  path: &Path,
+  label: &'static str,
+  max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
   use std::io::Read;
 
   #[cfg(unix)]
@@ -645,13 +689,7 @@ fn read_bounded_text_file(
     )));
   }
 
-  let text = String::from_utf8(bytes).map_err(|e| {
-    Error::LayerKeyed(LayerKeyedPayload::new(
-      path.display().to_string(),
-      Error::Parse(ParsePayload::new(label, "UTF-8", e)),
-    ))
-  })?;
-  Ok(Some(text))
+  Ok(Some(bytes))
 }
 
 /// The *truthy* `eos_token_id` override from optional

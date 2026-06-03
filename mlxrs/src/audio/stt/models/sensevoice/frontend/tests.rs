@@ -9,7 +9,11 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::{array::Array, error::Error};
+use crate::{
+  array::Array,
+  audio::features::{KaldiWindow, PreemphBoundary, compute_fbank_kaldi},
+  error::Error,
+};
 
 // ───────────────────────── independent LFR reference ─────────────────────────
 
@@ -142,6 +146,20 @@ fn lfr_rejects_non_positive_factors() {
   assert!(matches!(apply_lfr(&arr, 7, 0), Err(Error::OutOfRange(_))));
 }
 
+#[test]
+fn lfr_reshape_width_overflow_is_typed_not_panic() {
+  // The stacked-frame width `lfr_m * D` is computed through checked arithmetic
+  // (`sensevoice.py:62` reshape extent). A `lfr_m` so large that `lfr_m * D`
+  // overflows `i32` must surface a typed ArithmeticOverflow, never a debug
+  // overflow panic or a wrapped-small reshape. `D = 2`, `lfr_m = i32::MAX` makes
+  // the product overflow; the guard fires before any tile / window work.
+  let (arr, _) = ramp_feats(4, 2);
+  assert!(matches!(
+    apply_lfr(&arr, i32::MAX, 6),
+    Err(Error::ArithmeticOverflow(_))
+  ));
+}
+
 // ───────────────────────── CMVN ─────────────────────────
 
 #[test]
@@ -212,6 +230,75 @@ fn am_mvn_handles_multiline_bracket() {
   let (means, istd) = parse_am_mvn(text).unwrap();
   assert_eq!(means, vec![-1.0, -2.0]);
   assert_eq!(istd, vec![3.0, 4.0]);
+}
+
+// ───────────────────────── fbank pre-emphasis boundary ─────────────────────────
+
+#[test]
+fn compute_fbank_uses_preserve_preemph_boundary() {
+  // SenseVoice's `_compute_fbank` (`sensevoice.py:17-44`) forwards to
+  // `mlx_audio.dsp.compute_fbank_kaldi`, which KEEPS the first sample of each
+  // frame unchanged under pre-emphasis (`dsp.py:913`:
+  // `first_col = strided_input[:, 0:1]`). This test pins that the front-end
+  // opts into `PreemphBoundary::Preserve`: its features must equal a direct
+  // `compute_fbank_kaldi(..., Preserve)` call (same fixed params + the `2^15`
+  // pre-scale) and must DIFFER from the `Scale` boundary — i.e. the scaling
+  // deviation would change the model input for every frame.
+  let fc = FrontendConfig::default();
+  // A DC-rich ramp so the first-sample boundary feeds an observably different
+  // spectrum (matching the shared-helper boundary test's signal shape).
+  let samples: Vec<f32> = (0..4_000).map(|i| (i as f32) / 4_000.0).collect();
+  let x = Array::from_slice::<f32>(&samples, &[4_000_i32]).unwrap();
+
+  let mut got = compute_fbank(&x, &fc).unwrap();
+  let got_flat = got.to_vec::<f32>().unwrap();
+
+  // Reproduce the front-end's exact fbank call (`win_len = 16000*25/1000 =
+  // 400`, `win_inc = 160`, hamming, preemph 0.97, dither 0.0, snip_edges,
+  // low 20.0, high 0.0) with the `2^15` pre-scale, once per boundary mode.
+  let scale = Array::full::<f32>(&[0i32; 0], (1u32 << 15) as f32).unwrap();
+  let scaled = x.multiply(&scale).unwrap();
+  let make = |boundary| {
+    compute_fbank_kaldi(
+      &scaled,
+      16_000,
+      400,
+      160,
+      80,
+      KaldiWindow::Hamming,
+      0.97,
+      0.0,
+      true,
+      20.0,
+      0.0,
+      None,
+      boundary,
+    )
+    .unwrap()
+  };
+  let mut preserve = make(PreemphBoundary::Preserve);
+  let preserve_flat = preserve.to_vec::<f32>().unwrap();
+  let mut scale_feats = make(PreemphBoundary::Scale);
+  let scale_flat = scale_feats.to_vec::<f32>().unwrap();
+
+  // The front-end must use the Preserve boundary -> byte-identical to it.
+  assert_eq!(got_flat.len(), preserve_flat.len());
+  for (i, (g, p)) in got_flat.iter().zip(preserve_flat.iter()).enumerate() {
+    assert!(
+      (g - p).abs() < 1e-5,
+      "compute_fbank must match compute_fbank_kaldi(Preserve) at [{i}]: {g} vs {p}"
+    );
+  }
+  // ...and observably differ from the Scale boundary (the deviation we fixed).
+  let max_diff = got_flat
+    .iter()
+    .zip(scale_flat.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_diff > 1e-4,
+    "compute_fbank (Preserve) must differ from the Scale boundary (max diff {max_diff})"
+  );
 }
 
 // ───────────────────────── sanitize ─────────────────────────

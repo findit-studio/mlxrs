@@ -18,7 +18,15 @@ use crate::{
   array::Array,
   audio::stt::model::{Transcribe, TranscribeExt, TranscribeOptions},
   error::Error,
+  lm::quant::{PerLayerQuantization, Quantization},
 };
+
+/// The global affine quantization config the head quantized-path oracle threads
+/// in (the common SenseVoice scheme). `build_head` resolves `ctc_lo` / `embed`
+/// per prefix from it via `quantization_for`.
+fn global_quant(group_size: i32, bits: i32) -> PerLayerQuantization {
+  PerLayerQuantization::from_global(Quantization::affine(group_size, bits))
+}
 
 // ───────────────────────────── tiny synthetic model ─────────────────────────────
 
@@ -155,7 +163,14 @@ fn tiny_model(tokenizer: SenseVoiceTokenizer) -> SenseVoiceModel {
   let mut w = tiny_weights();
   let encoder =
     Encoder::from_weights(&mut w, config.input_size(), config.encoder_conf(), None).unwrap();
-  let (ctc_lo, embed) = build_head(&mut w, None).unwrap();
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    encoder.output_size(),
+    config.vocab_size(),
+    None,
+  )
+  .unwrap();
   SenseVoiceModel::new(config, encoder, ctc_lo, embed, tokenizer, None, None)
 }
 
@@ -258,6 +273,28 @@ fn greedy_collapse_adjacent_distinct_all_kept() {
   assert_eq!(got, vec![1, 2, 3, 4, 5]);
 }
 
+#[test]
+fn greedy_collapse_fallible_path_matches_oracle() {
+  // The collapsed-id buffer is reserved FALLIBLY (`reserve_or_error`, bounded by
+  // the `T'` frame count). A normal-size synthetic argmax sequence must collapse
+  // correctly THROUGH that fallible path and equal the independent run-length
+  // dedup + drop-blank oracle (`collapse_ref`) — the allocation became fallible
+  // without changing the collapse output.
+  let peaks = [
+    4u32, 4, 0, 9, 9, 9, 0, 0, 7, 7, 3, 3, 3, 0, 11, 11, 5, 0, 0, 8,
+  ];
+  let grid = grid_with_argmax(&peaks, V);
+  let got = SenseVoiceModel::greedy_collapse(&grid).expect("fallible collapse reserves Ok");
+  // Independent oracle: dedup consecutive ids, then drop the blank id.
+  let want = collapse_ref(&peaks, BLANK_ID);
+  assert_eq!(got, want);
+  // Pin the known expected sequence: dedup -> [4,0,9,0,7,3,0,11,5,0,8] -> drop 0
+  // -> [4,9,7,3,11,5,8].
+  assert_eq!(got, vec![4, 9, 7, 3, 11, 5, 8]);
+  // The reserved capacity is bounded by `T'` (the collapse never grows the Vec).
+  assert!(got.len() <= peaks.len());
+}
+
 // ───────────────────────────── rich-info argmax ─────────────────────────────
 
 /// Build a `(frames, vocab)` grid where frame `f` peaks at `peak_ids[f]`. Vocab
@@ -310,6 +347,78 @@ fn rich_info_reads_only_frames_0_1_2() {
 }
 
 #[test]
+fn build_query_layout_and_rich_info_agree_on_emotion_event() {
+  // Integrated swap-detector coupling `build_query` (which ABSOLUTE embed row
+  // lands at which prefix index) with `rich_info` (which prefix-frame index
+  // decodes as emotion vs event). Both sides are pinned to the reference's
+  // hardcoded layout — NOT to the port's named constants — so a divergence on
+  // EITHER side is caught:
+  //
+  //  * the reference gathers `event_emo_query = embed([[1, 2]])`
+  //    (`sensevoice.py:410`): embed row 1 lands at prefix index 1, row 2 at
+  //    index 2 (a constant-row `embed` makes the absolute row id the gathered
+  //    value). Swapping the gather order to `[2, 1]` is detected here.
+  //  * the reference decodes frame 1 -> emotion (`sensevoice.py:479`) and frame
+  //    2 -> event (`sensevoice.py:493`). Swapping `rich_info`'s frame->label is
+  //    detected by the grid asserts below.
+  //
+  // Together they pin: embed row 1 == the emotion head, embed row 2 == the event
+  // head — agreeing with the reference. A real forward on the (former) swapped
+  // mapping would decode the emotion query as event and vice-versa.
+  let model = tiny_model(SenseVoiceTokenizer::id_join());
+
+  // (1) build_query layout: the `embed` table has row i = constant value i, so a
+  // gathered query row's ABSOLUTE row id IS its column-0 value. The reference
+  // `embed([[1, 2]])` pins prefix index 1 -> embed row 1, index 2 -> embed row 2.
+  let (_textnorm, mut input_query) = model.build_query(1, "auto", false).unwrap();
+  assert_eq!(input_query.shape(), vec![1, 3, D as usize]);
+  let iq = input_query.to_vec::<f32>().unwrap();
+  let gathered_row = |frame: usize| iq[frame * D as usize] as i32;
+  assert_eq!(
+    gathered_row(1),
+    1,
+    "prefix index 1 must gather embed row 1 (reference embed([[1, 2]]))"
+  );
+  assert_eq!(
+    gathered_row(2),
+    2,
+    "prefix index 2 must gather embed row 2 (reference embed([[1, 2]]))"
+  );
+
+  // (2) rich_info extraction, pinned to the reference's ABSOLUTE frame indices:
+  // a known emotion id at frame 1, a known event id at frame 2, a known language
+  // id at frame 0 (frame 3, the textnorm slot, is unread). `rich_info` must read
+  // frame 1 -> emotion and frame 2 -> event.
+  const LANG_ID: u32 = 24885; // "en"
+  const EMO_ID: u32 = 25002; // "sad"   (the FRAME-1 emotion head)
+  const EVENT_ID: u32 = 24997; // "Laughter" (the FRAME-2 event head)
+  let grid = rich_grid(&[LANG_ID, EMO_ID, EVENT_ID, 0]);
+  let rich = model.rich_info(&grid).unwrap();
+  assert_eq!(rich.language(), "en");
+  assert_eq!(
+    rich.emotion(),
+    "sad",
+    "frame 1 (the emotion query head, embed row 1) must decode as emotion"
+  );
+  assert_eq!(
+    rich.event(),
+    "Laughter",
+    "frame 2 (the event query head, embed row 2) must decode as event"
+  );
+
+  // (3) the full real path runs build_query -> forward -> rich_info end-to-end
+  // without panicking, yielding well-formed tags off the prepended query frames.
+  let t = 4i32;
+  let feats = filled(t, D, |r, c| 0.05 * ((r + c) as f32));
+  let feats = crate::ops::shape::reshape(&feats, &[1, t, D]).unwrap();
+  let log_probs = model.forward(&feats, "auto", false).unwrap();
+  let utt = crate::ops::shape::squeeze_axes(&log_probs, &[0]).unwrap();
+  let rich_fwd = model.rich_info(&utt).unwrap();
+  assert!(!rich_fwd.emotion().is_empty());
+  assert!(!rich_fwd.event().is_empty());
+}
+
+#[test]
 fn rich_info_rejects_too_few_frames() {
   let tok = tiny_model(SenseVoiceTokenizer::id_join());
   let grid = rich_grid(&[24884, 25001, 24995]); // only 3 frames < QUERY_FRAMES
@@ -351,24 +460,26 @@ fn speech_frames_rejects_too_few() {
 // ───────────────────────────── query-prefix layout ─────────────────────────────
 
 #[test]
-fn build_query_injects_lid_event_emotion_textnorm_rows() {
+fn build_query_injects_lid_emotion_event_textnorm_rows() {
   // The `embed` table has row i = constant i; a gathered query row is therefore
   // identifiable by its constant value. Assert the prefix layout
-  // [language(lid), event(1), emotion(2)] for `input_query` and textnorm(14/15)
-  // for `textnorm_query` (`sensevoice.py:403-424`).
+  // [language(lid), emotion(1), event(2)] for `input_query` and textnorm(14/15)
+  // for `textnorm_query` (`sensevoice.py:403-424`): the `event_emo_query =
+  // embed([[1, 2]])` pair is decoded frame 1 -> emotion (`sensevoice.py:479`),
+  // frame 2 -> event (`sensevoice.py:493`), so embed row 1 is the emotion head.
   let model = tiny_model(SenseVoiceTokenizer::id_join());
 
   // language = "en" -> lid row 4; use_itn = true -> textnorm row 14.
   let (mut textnorm_query, mut input_query) = model.build_query(1, "en", true).unwrap();
 
-  // input_query is (1, 3, D): rows [lid=4, event=1, emotion=2].
+  // input_query is (1, 3, D): rows [lid=4, emotion=row 1, event=row 2].
   assert_eq!(input_query.shape(), vec![1, 3, D as usize]);
   let iq = input_query.to_vec::<f32>().unwrap();
   // Row r is constant value `row_id`; read column 0 of each of the 3 rows.
   let row_val = |r: usize| iq[r * D as usize];
   assert_eq!(row_val(0), 4.0, "frame 0 = language (lid=en=4)");
-  assert_eq!(row_val(1), 1.0, "frame 1 = event (row 1)");
-  assert_eq!(row_val(2), 2.0, "frame 2 = emotion (row 2)");
+  assert_eq!(row_val(1), 1.0, "frame 1 = emotion (embed row 1)");
+  assert_eq!(row_val(2), 2.0, "frame 2 = event (embed row 2)");
 
   // textnorm_query is (1, 1, D): row 14 (withitn).
   assert_eq!(textnorm_query.shape(), vec![1, 1, D as usize]);
@@ -666,7 +777,14 @@ fn quantized_ctc_lo_loads_and_forwards() {
   quantize_in_place(&mut w, "ctc_lo", QGROUP);
   quantize_in_place(&mut w, "embed", QGROUP);
 
-  let (ctc_lo, embed) = build_head(&mut w, Some((QGROUP, 8, "affine"))).unwrap();
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    encoder.output_size(),
+    config.vocab_size(),
+    Some(&global_quant(QGROUP, 8)),
+  )
+  .unwrap();
   assert!(ctc_lo.is_quantized(), "ctc_lo built quantized");
   assert!(embed.is_quantized(), "embed built quantized");
 
@@ -688,6 +806,116 @@ fn quantized_ctc_lo_loads_and_forwards() {
 }
 
 #[test]
+fn build_head_resolves_quant_per_prefix_parameter_override() {
+  // Per-prefix resolution at the head: `ctc_lo` quantizes via the global default
+  // (group_size = 32) while `embed` is OVERRIDDEN to group_size = 64. A single
+  // collapsed global tuple (group_size = 32) would mis-decode the group_size = 64
+  // packed `embed` (its scales width is `QD/64 = 1`, not `QD/32 = 2`) and fail
+  // the triple validator — so the build succeeding proves each head resolved its
+  // OWN scheme via `quantization_for`.
+  const EMBED_GROUP: i32 = 64; // QD (64) is divisible by 64
+  let config = quant_config();
+  let mut w = quant_weights();
+  let encoder =
+    Encoder::from_weights(&mut w, config.input_size(), config.encoder_conf(), None).unwrap();
+  quantize_in_place(&mut w, "ctc_lo", QGROUP); // group_size = 32 (global default)
+  quantize_in_place(&mut w, "embed", EMBED_GROUP); // group_size = 64 (override)
+
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "embed".to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(Quantization::affine(EMBED_GROUP, 8)),
+  );
+  let quant = PerLayerQuantization::new(Some(Quantization::affine(QGROUP, 8)), per_layer);
+
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    encoder.output_size(),
+    config.vocab_size(),
+    Some(&quant),
+  )
+  .expect("each head must resolve its own per-prefix scheme (ctc_lo=32, embed=64)");
+  assert!(
+    ctc_lo.is_quantized(),
+    "ctc_lo built quantized (global default)"
+  );
+  assert!(
+    embed.is_quantized(),
+    "embed built quantized (per-layer override)"
+  );
+
+  // Cross-check: resolving the GLOBAL tuple (group_size = 32) for the
+  // group_size = 64 packed `embed` is a load-time error — the two schemes are
+  // genuinely distinguishable, so the override is load-bearing.
+  let mut w_wrong = quant_weights();
+  let _enc = Encoder::from_weights(
+    &mut w_wrong,
+    config.input_size(),
+    config.encoder_conf(),
+    None,
+  )
+  .unwrap();
+  quantize_in_place(&mut w_wrong, "ctc_lo", QGROUP);
+  quantize_in_place(&mut w_wrong, "embed", EMBED_GROUP);
+  assert!(
+    build_head(
+      &mut w_wrong,
+      config.input_size(),
+      encoder.output_size(),
+      config.vocab_size(),
+      Some(&global_quant(QGROUP, 8)), // group_size = 32 for BOTH — wrong for embed
+    )
+    .is_err(),
+    "the global group_size must mis-decode the group_size=64 packed embed"
+  );
+}
+
+#[test]
+fn build_head_resolves_quant_per_layer_only_no_global_default() {
+  // A per-layer-only config (no GLOBAL default) loads its explicitly-listed
+  // layers: `ctc_lo` + `embed` each have an explicit override, `quantization`
+  // (the global default) is `None`. The OLD code collapsed `quantization` to a
+  // single global tuple and would have rejected this (no global → `None` →
+  // `.scales` present → InvariantViolation). Per-prefix resolution loads it.
+  let config = quant_config();
+  let mut w = quant_weights();
+  let encoder =
+    Encoder::from_weights(&mut w, config.input_size(), config.encoder_conf(), None).unwrap();
+  quantize_in_place(&mut w, "ctc_lo", QGROUP);
+  quantize_in_place(&mut w, "embed", QGROUP);
+
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "ctc_lo".to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(Quantization::affine(QGROUP, 8)),
+  );
+  per_layer.insert(
+    "embed".to_string(),
+    crate::lm::quant::QuantizationOption::Quantize(Quantization::affine(QGROUP, 8)),
+  );
+  // No global default — only the explicitly-listed layers are quantized.
+  let quant = PerLayerQuantization::new(None, per_layer);
+
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    encoder.output_size(),
+    config.vocab_size(),
+    Some(&quant),
+  )
+  .expect("a per-layer-only config (no global default) must load its listed layers");
+  assert!(
+    ctc_lo.is_quantized(),
+    "ctc_lo built quantized (explicit override)"
+  );
+  assert!(
+    embed.is_quantized(),
+    "embed built quantized (explicit override)"
+  );
+}
+
+#[test]
 fn quantized_head_scales_present_but_no_quant_errors() {
   // A `.scales` sibling with `quant == None` is a checkpoint/config
   // inconsistency -> typed InvariantViolation (the MaybeQuantized* contract).
@@ -696,11 +924,188 @@ fn quantized_head_scales_present_but_no_quant_errors() {
   let _encoder =
     Encoder::from_weights(&mut w, config.input_size(), config.encoder_conf(), None).unwrap();
   quantize_in_place(&mut w, "ctc_lo", QGROUP);
-  // Pass quant = None despite the present `.scales` sibling.
+  // Pass quant = None despite the present `.scales` sibling (the
+  // InvariantViolation fires inside the per-layer builder, before the shape-pin).
   assert!(matches!(
-    build_head(&mut w, None),
+    build_head(&mut w, config.input_size(), QH, config.vocab_size(), None),
     Err(Error::InvariantViolation(_))
   ));
+}
+
+// ───────────────────────────── head shape-pin at load ─────────────────────────────
+
+#[test]
+fn build_head_rejects_wrong_embed_row_count() {
+  // The `embed` table must be the fixed 16-row query+token table
+  // (`sensevoice.py:348`). A 15-row table (wrong shard) is a typed
+  // ShapePairMismatch at load, not a deferred out-of-bounds query gather.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  // Replace the 16-row embed with a 15-row one (ctc_lo stays correct so the
+  // embed check is the one that fires).
+  w.insert("embed.weight".to_string(), filled(15, D, |r, _| r as f32));
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_wrong_embed_width() {
+  // A 16-row embed but with the wrong feature width (input_size + 1) is also a
+  // ShapePairMismatch — the gathered query rows would be the wrong width.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  w.insert(
+    "embed.weight".to_string(),
+    filled(16, D + 1, |r, _| r as f32),
+  );
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_wrong_ctc_lo_projection() {
+  // `ctc_lo` must project `output_size -> vocab_size` (mlx weight
+  // `(vocab_size, output_size)`, `sensevoice.py:347`). A weight whose input
+  // width is not `output_size` is a typed ShapePairMismatch at load.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  // ctc_lo with input width H + 1 (wrong) instead of H.
+  w.insert(
+    "ctc_lo.weight".to_string(),
+    filled(V, H + 1, |r, c| 0.03 * ((r + c) as f32)),
+  );
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_wrong_ctc_lo_vocab() {
+  // A `ctc_lo` whose output (row) count is not `vocab_size` is likewise a typed
+  // ShapePairMismatch (it would emit logits over an unusable vocab).
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  w.insert(
+    "ctc_lo.weight".to_string(),
+    filled(V + 1, H, |r, c| 0.03 * ((r + c) as f32)),
+  );
+  w.insert("ctc_lo.bias".to_string(), filled1(V + 1, |_| 0.0));
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_wrong_ctc_lo_bias_length() {
+  // The dense arm of `MaybeQuantizedLinear` does not validate the optional
+  // `ctc_lo.bias`; `build_head` pins it to `(vocab_size,)`. A wrong-length bias
+  // (correct weight) would broadcast a single wrong offset across every logit —
+  // a typed LengthMismatch at load.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  // ctc_lo weight stays the correct (V, H); shrink ONLY the bias to (V - 1,).
+  w.insert("ctc_lo.bias".to_string(), filled1(V - 1, |_| 0.0));
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_scalar_ctc_lo_bias() {
+  // A stray `(1,)` `ctc_lo` bias (correct weight) — the SILENT-wrong-output case
+  // a single broadcast offset across all `vocab_size` logits — is pinned to a
+  // typed LengthMismatch at load (expected `(vocab_size,)`).
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  w.insert("ctc_lo.bias".to_string(), filled1(1, |_| 0.0));
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::LengthMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_rejects_rank2_ctc_lo_bias() {
+  // A `(1, vocab)` `ctc_lo` bias (rank-2, correct weight) is a typed
+  // RankMismatch — the mlx.nn.Linear bias must be the rank-1 `(vocab_size,)`.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  w.insert(
+    "ctc_lo.bias".to_string(),
+    Array::from_slice::<f32>(&vec![0.0f32; V as usize], &[1, V]).unwrap(),
+  );
+  assert!(matches!(
+    build_head(
+      &mut w,
+      config.input_size(),
+      config.encoder_conf().output_size(),
+      config.vocab_size(),
+      None,
+    ),
+    Err(Error::RankMismatch(_))
+  ));
+}
+
+#[test]
+fn build_head_accepts_correct_shapes() {
+  // The control: the correct `(16, input_size)` embed + `(vocab, output_size)`
+  // ctc_lo build cleanly (the pins do not reject the real shapes), including the
+  // correct `(vocab,)` ctc_lo dense bias that `tiny_weights` writes.
+  let config = tiny_config();
+  let mut w = tiny_weights();
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    config.encoder_conf().output_size(),
+    config.vocab_size(),
+    None,
+  )
+  .expect("correct head shapes build");
+  assert_eq!(embed.logical_shape().unwrap(), (16, D));
+  assert_eq!(ctc_lo.logical_shape().unwrap(), (V, H));
 }
 
 // ───────────────────────────── CMVN integration ─────────────────────────────
@@ -713,7 +1118,14 @@ fn extract_features_applies_cmvn_when_present() {
   let mut w = tiny_weights();
   let encoder =
     Encoder::from_weights(&mut w, config.input_size(), config.encoder_conf(), None).unwrap();
-  let (ctc_lo, embed) = build_head(&mut w, None).unwrap();
+  let (ctc_lo, embed) = build_head(
+    &mut w,
+    config.input_size(),
+    encoder.output_size(),
+    config.vocab_size(),
+    None,
+  )
+  .unwrap();
 
   // CMVN means = 1.0, istd = 2.0 across the D LFR dims.
   let means = filled1(D, |_| 1.0);

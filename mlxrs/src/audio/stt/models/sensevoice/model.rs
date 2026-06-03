@@ -46,7 +46,9 @@ use smol_str::format_smolstr;
 use crate::{
   array::Array,
   audio::stt::model::{CtcModel, Segment, Transcribe, TranscribeOptions, Transcription},
-  error::{Error, OutOfRangePayload, RankMismatchPayload, Result},
+  error::{Error, OutOfRangePayload, RankMismatchPayload, Result, ShapePairMismatchPayload},
+  lm::quant::PerLayerQuantization,
+  model_validation::reserve_or_error,
   nn::{MaybeQuantizedEmbedding, MaybeQuantizedLinear},
   ops,
 };
@@ -62,17 +64,26 @@ use super::{
 /// (`sensevoice.py:368`: `self.blank_id = 0`).
 pub const BLANK_ID: u32 = 0;
 
-/// The number of prepended query rows: `[language, event, emotion, textnorm]`
+/// The number of prepended query rows: `[language, emotion, event, textnorm]`
 /// (`sensevoice.py:432-433`). The encoder output's first [`QUERY_FRAMES`] frames
 /// are the rich-info heads; frame index `>= QUERY_FRAMES` is the speech.
+///
+/// The middle two rows are the `event_emo_query = embed([[1, 2]])` pair
+/// (`sensevoice.py:410`); the reference decodes frame 1 through `emo_map`
+/// (`sensevoice.py:479`) and frame 2 through `event_map` (`sensevoice.py:493`),
+/// so embed row 1 is the **emotion** head and embed row 2 is the **event** head.
 pub const QUERY_FRAMES: i32 = 4;
 
-/// The fixed `event` query embedding row id (`sensevoice.py:410`:
-/// `event_emo_query = self.embed([[1, 2]])`, the first of the pair).
-const EVENT_QUERY_ROW: i32 = 1;
-/// The fixed `emotion` query embedding row id (`sensevoice.py:410`, the second
-/// of the pair).
-const EMOTION_QUERY_ROW: i32 = 2;
+/// The fixed `emotion` query embedding row id — the first of the
+/// `event_emo_query = embed([[1, 2]])` pair (`sensevoice.py:410`). It is the
+/// emotion head because the reference reads frame 1's argmax through `emo_map`
+/// (`sensevoice.py:479`: `emo_pred = mx.argmax(log_probs[1])`).
+const EMOTION_QUERY_ROW: i32 = 1;
+/// The fixed `event` query embedding row id — the second of the
+/// `event_emo_query = embed([[1, 2]])` pair (`sensevoice.py:410`). It is the
+/// event head because the reference reads frame 2's argmax through `event_map`
+/// (`sensevoice.py:493`: `event_pred = mx.argmax(log_probs[2])`).
+const EVENT_QUERY_ROW: i32 = 2;
 
 /// Resolve the language-id query embedding row from a language code, mirroring
 /// the reference `lid_dict` (`sensevoice.py:350-358`).
@@ -332,14 +343,15 @@ impl SenseVoiceModel {
   ///
   /// Returns `(textnorm_query, input_query)` where `input_query =
   /// concat([language_query, event_emo_query], axis=1)` is the
-  /// `[language, event, emotion]` 3-row prefix and `textnorm_query` is the
+  /// `[language, emotion, event]` 3-row prefix and `textnorm_query` is the
   /// single text-norm row (`sensevoice.py:423-424`). Each is `(B, n, input_size)`
   /// (gathered rows broadcast over the batch, `sensevoice.py:412-421`).
   ///
   /// The embedding rows: `language_query = embed[[lid]]` (the `lid_dict` row,
-  /// `sensevoice.py:404`), `event_emo_query = embed[[1, 2]]` (the fixed event +
-  /// emotion rows, `sensevoice.py:410`), `textnorm_query = embed[[14 or 15]]`
-  /// (the `textnorm_dict` row, `sensevoice.py:407-408`).
+  /// `sensevoice.py:404`), `event_emo_query = embed[[1, 2]]` (the fixed
+  /// emotion + event rows — row 1 is the emotion head, row 2 the event head,
+  /// `sensevoice.py:410/479/493`), `textnorm_query = embed[[14 or 15]]` (the
+  /// `textnorm_dict` row, `sensevoice.py:407-408`).
   ///
   /// # Errors
   /// - [`Error::OutOfRange`] if `batch_size` does not fit in `i32`;
@@ -364,9 +376,11 @@ impl SenseVoiceModel {
     let lid_ids = Array::from_slice::<i32>(&[lid], &[1, 1])?;
     let language_query = self.embed.gather(&lid_ids)?;
 
-    // `event_emo_query = embed([[1, 2]])` — the fixed event + emotion rows, a
-    // (1, 2) id grid -> (1, 2, input_size) (`sensevoice.py:410`).
-    let event_emo_ids = Array::from_slice::<i32>(&[EVENT_QUERY_ROW, EMOTION_QUERY_ROW], &[1, 2])?;
+    // `event_emo_query = embed([[1, 2]])` — the fixed emotion + event rows, a
+    // (1, 2) id grid -> (1, 2, input_size) (`sensevoice.py:410`). Row 1 is the
+    // emotion head, row 2 the event head (decoded by frame in `rich_info`,
+    // `sensevoice.py:479/493`); the gather order stays `[1, 2]`.
+    let event_emo_ids = Array::from_slice::<i32>(&[EMOTION_QUERY_ROW, EVENT_QUERY_ROW], &[1, 2])?;
     let event_emo_query = self.embed.gather(&event_emo_ids)?;
 
     // `textnorm_query = embed([[14 or 15]])` (`sensevoice.py:406-408`).
@@ -387,7 +401,7 @@ impl SenseVoiceModel {
     };
 
     // `input_query = concat([language_query, event_emo_query], axis=1)`
-    // (`sensevoice.py:423`) -> (B, 3, input_size): [language, event, emotion].
+    // (`sensevoice.py:423`) -> (B, 3, input_size): [language, emotion, event].
     let input_query = ops::shape::concatenate(&[&language_query, &event_emo_query], 1)?;
     Ok((textnorm_query, input_query))
   }
@@ -420,7 +434,7 @@ impl SenseVoiceModel {
   /// The query assembly (`sensevoice.py:432-433`): `speech =
   /// concat([textnorm_query, feats], axis=1)`, then `speech =
   /// concat([input_query, speech], axis=1)`, so the final time order is
-  /// `[language, event, emotion, textnorm, <feats…>]`.
+  /// `[language, emotion, event, textnorm, <feats…>]`.
   ///
   /// `feats` is `(B, T, input_size)`.
   ///
@@ -589,16 +603,32 @@ impl SenseVoiceModel {
   /// [`CtcModel`] route still uses the shared driver verbatim.
   ///
   /// # Errors
-  /// Propagates the argmax / `to_vec` op errors.
+  /// - [`Error::AllocFailure`] if reserving the collapsed-id buffer (bounded by
+  ///   the frame count `T'`) exhausts the allocator;
+  /// - propagates the argmax / `as_slice` op errors.
   fn greedy_collapse(speech_frames: &Array) -> Result<Vec<u32>> {
-    // `pred = argmax(log_probs, axis=-1)` -> (T',) (`sensevoice.py:451`).
+    // `pred = argmax(log_probs, axis=-1)` -> (T',) (`sensevoice.py:451`). Borrow
+    // the evaluated argmax buffer in place (`as_slice`, no frame-sized copy);
+    // `argmax` over a single axis yields a fresh row-contiguous `(T',)` array, so
+    // the borrow is sound (the `to_vec` copy would have been the only other
+    // frame-sized allocation here).
     let mut pred = ops::misc::argmax(speech_frames, Some(1), false)?;
-    let ids = pred.to_vec::<u32>()?;
+    let ids = pred.as_slice::<u32>()?;
 
-    // Run-length dedup then drop the blank (`sensevoice.py:454-461`).
+    // Run-length dedup then drop the blank (`sensevoice.py:454-461`). The
+    // collapse only drops frames (run-length dedup + blank removal), so the
+    // output is at most `T'` (`ids.len()`) tokens. Reserve that bound FALLIBLY
+    // (typed `AllocFailure`) rather than growing an infallible `Vec`, so a
+    // within-cap but heavyweight reservation recovers gracefully instead of the
+    // abort an infallible `push`-growth would raise.
     let mut collapsed: Vec<u32> = Vec::new();
+    reserve_or_error(
+      &mut collapsed,
+      "sensevoice greedy_collapse: collapsed ids",
+      ids.len(),
+    )?;
     let mut prev: Option<u32> = None;
-    for &id in &ids {
+    for &id in ids {
       if prev != Some(id) {
         if id != BLANK_ID {
           collapsed.push(id);
@@ -624,7 +654,8 @@ impl SenseVoiceModel {
   ///
   /// # Errors
   /// Propagates the feature-extraction / forward / rich-info / collapse op
-  /// errors.
+  /// errors, plus [`Error::AllocFailure`] if the fallible collapse-id or decode
+  /// buffers exhaust the allocator.
   pub fn transcribe_rich(
     &self,
     audio: &Array,
@@ -637,7 +668,10 @@ impl SenseVoiceModel {
     // Greedy collapse over the speech frames `log_probs[4:]` (`sensevoice.py:533`).
     let speech = Self::speech_frames(&log_probs)?;
     let ids = Self::greedy_collapse(&speech)?;
-    let text = self.tokenizer.decode(&ids);
+    // The rich path decodes through the FALLIBLE `try_decode` (typed
+    // `AllocFailure`); the `CtcModel::decode_ids` seam keeps the infallible
+    // `decode` the shared driver requires.
+    let text = self.tokenizer.try_decode(&ids)?;
     Ok(SenseVoiceResult::new(text, rich))
   }
 }
@@ -760,21 +794,96 @@ impl Transcribe for SenseVoiceModel {
 /// sibling `.scales` (the `class_predicate` analogue), exactly as the encoder's
 /// linears do.
 ///
-/// `quant` carries the resolved `(group_size, bits, mode)` scheme (a dense
-/// checkpoint passes `None`); quant resolution is the loader's concern.
+/// Both shapes are pinned at load against the SenseVoice invariants (the
+/// shape-pin-at-load discipline whisper / wav2vec2 use), so a wrong / stale
+/// shard reports a typed shape error here instead of mis-gathering the query
+/// rows or emitting unusable logits at the first forward:
+/// - `embed` is the 16-row query+token table `(16, input_size)`
+///   (`sensevoice.py:348`: `nn.Embedding(16, config.input_size)`) — the four
+///   prepended query rows are gathered from rows 0-15;
+/// - `ctc_lo` projects `output_size -> vocab_size`
+///   (`sensevoice.py:347`: `nn.Linear(output_size, vocab_size)`), so its
+///   `mlx.nn.Linear` weight is `(vocab_size, output_size)` and its optional
+///   dense bias is `(vocab_size,)` — pinned via the encoder's
+///   `pin_dense_linear_bias` (the dense arm of the shared
+///   [`MaybeQuantizedLinear`] does not validate it).
+///
+/// `input_size` / `output_size` / `vocab_size` are the [`Config`] /
+/// [`Encoder`] dims the loader pins ([`Config::input_size`],
+/// [`Encoder::output_size`], [`Config::vocab_size`]). `quant` is the parsed
+/// [`PerLayerQuantization`] (a dense checkpoint passes `None`); `ctc_lo` and
+/// `embed` each resolve their own `(group_size, bits, mode)` PER PREFIX via
+/// the encoder's `resolve_layer_quant` /
+/// [`PerLayerQuantization::quantization_for`] (the qwen3 idiom), so a per-layer
+/// override / `Skip` for either head is honored at the right granularity.
 ///
 /// # Errors
 /// - [`Error::MissingKey`] for an absent `ctc_lo.weight` / `embed.weight`;
+/// - [`Error::ShapePairMismatch`] if `embed` is not `(16, input_size)` or
+///   `ctc_lo` is not `(vocab_size, output_size)`;
+/// - [`Error::RankMismatch`] / [`Error::LengthMismatch`] if the `ctc_lo` dense
+///   bias is present but is not rank-1 `(vocab_size,)`;
+/// - [`Error::InvariantViolation`] if `ctc_lo` / `embed` carries a
+///   `<prefix>.scales` but the config resolved no scheme for that layer;
 /// - propagates the [`MaybeQuantizedLinear`] / [`MaybeQuantizedEmbedding`] build
-///   errors.
+///   and `logical_shape` errors.
 pub fn build_head(
   weights: &mut HashMap<String, Array>,
-  quant: Option<(i32, i32, &str)>,
+  input_size: i32,
+  output_size: i32,
+  vocab_size: i32,
+  quant: Option<&PerLayerQuantization>,
 ) -> Result<(MaybeQuantizedLinear, MaybeQuantizedEmbedding)> {
-  let ctc_lo = MaybeQuantizedLinear::from_weights(weights, "ctc_lo", quant)?;
-  let embed = MaybeQuantizedEmbedding::from_weights(weights, "embed", quant)?;
+  let ctc_lo = MaybeQuantizedLinear::from_weights(
+    weights,
+    "ctc_lo",
+    super::encoder::resolve_layer_quant(quant, "ctc_lo"),
+  )?;
+  let embed = MaybeQuantizedEmbedding::from_weights(
+    weights,
+    "embed",
+    super::encoder::resolve_layer_quant(quant, "embed"),
+  )?;
+
+  // `ctc_lo` weight is the `mlx.nn.Linear` `(out_features, in_features) =
+  // (vocab_size, output_size)` (`sensevoice.py:347`). A wrong projection would
+  // emit logits over an unusable vocab / hidden width, deferring the failure
+  // into the matmul; pin it here.
+  let ctc_shape = ctc_lo.logical_shape()?;
+  if ctc_shape != (vocab_size, output_size) {
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      "sensevoice build_head: ctc_lo weight must be (vocab_size, output_size)",
+      vec![vocab_size.max(0) as usize, output_size.max(0) as usize],
+      vec![ctc_shape.0.max(0) as usize, ctc_shape.1.max(0) as usize],
+    )));
+  }
+  // Pin the optional `ctc_lo` dense bias to `(vocab_size,)` alongside the weight
+  // — the head analogue of the encoder linears' bias-pin (the dense arm of the
+  // shared `MaybeQuantizedLinear` does not validate it). A `(1,)` / `(1, vocab)`
+  // / wrong-length bias would broadcast a single wrong offset across the logits.
+  super::encoder::pin_dense_linear_bias(&ctc_lo, vocab_size)?;
+
+  // `embed` is the fixed 16-row query+token table `(16, input_size)`
+  // (`sensevoice.py:348`). The query gathers read rows 0-15; a wrong row count
+  // would mis-gather (or fail out of bounds) at the first forward.
+  let embed_shape = embed.logical_shape()?;
+  if embed_shape != (QUERY_TABLE_ROWS, input_size) {
+    return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+      "sensevoice build_head: embed table must be (16, input_size)",
+      vec![QUERY_TABLE_ROWS as usize, input_size.max(0) as usize],
+      vec![embed_shape.0.max(0) as usize, embed_shape.1.max(0) as usize],
+    )));
+  }
+
   Ok((ctc_lo, embed))
 }
+
+/// The fixed row count of the `embed` prompt-embedding table
+/// (`sensevoice.py:348`: `nn.Embedding(16, config.input_size)`). The four
+/// prepended query rows ([`QUERY_FRAMES`]) plus the rich-info token rows are all
+/// gathered from these 16 rows, so the table's row count is an invariant, not a
+/// config field.
+const QUERY_TABLE_ROWS: i32 = 16;
 
 #[cfg(test)]
 mod tests;

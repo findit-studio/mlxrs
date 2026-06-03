@@ -566,6 +566,24 @@ fn maybe_quantized_embedding_logical_shape_both_arms() {
 }
 
 #[test]
+fn maybe_quantized_linear_logical_shape_both_arms() {
+  // `logical_shape` returns the dense `(out_features, in_features)` for BOTH
+  // arms: the dense weight's own shape, and the quantized weight's logical shape
+  // recovered from the validated triple (NOT the packed `uint32` width). The two
+  // are built from the same `(out, QUANT_IN)` source, so they agree.
+  let dense = MaybeQuantizedLinear::Dense(Linear::new(dense_weight(5), None)); // (5, QUANT_IN)
+  assert_eq!(dense.logical_shape().unwrap(), (5, QUANT_IN as i32));
+
+  let dense_w = dense_weight(8); // logical (8, QUANT_IN)
+  let (w_q, scales, q_biases) = quantized::quantize(&dense_w, 64, 4, "affine", None).unwrap();
+  let q = QuantizedLinear::from_parts(w_q, scales, q_biases, None, 64, 4, "affine").unwrap();
+  let quant = MaybeQuantizedLinear::Quantized(q);
+  // 4-bit packs 8 values per `uint32`, so the packed trailing axis is narrower
+  // than QUANT_IN; the logical input width MUST come from the recovery.
+  assert_eq!(quant.logical_shape().unwrap(), (8, QUANT_IN as i32));
+}
+
+#[test]
 fn maybe_quantized_embedding_scales_present_but_no_config_errors() {
   // `.scales` present but no resolved scheme params is a checkpoint/config
   // inconsistency — a typed error, not a guess.

@@ -9,7 +9,10 @@
 //! `_compute_fbank` is exactly a `compute_fbank_kaldi` call with a fixed
 //! parameter set (`win_type="hamming"`, `preemphasis=0.97`, `dither=0.0`,
 //! `snip_edges=True`, `low_freq=20.0`, `high_freq=0.0`) preceded by a `2^15`
-//! waveform pre-scale (`sensevoice.py:30`).
+//! waveform pre-scale (`sensevoice.py:30`). The pre-emphasis first-sample
+//! boundary is [`crate::audio::features::PreemphBoundary::Preserve`], matching
+//! `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:913`, which keeps `x[0]`
+//! unchanged).
 //!
 //! The LFR stacking and the `am.mvn` parse are the only genuinely new pieces;
 //! both are model-private (FunASR/Paraformer-family idioms, not general DSP).
@@ -23,11 +26,12 @@ use smol_str::format_smolstr;
 
 use crate::{
   array::Array,
-  audio::features::{KaldiWindow, compute_fbank_kaldi},
+  audio::features::{KaldiWindow, PreemphBoundary, compute_fbank_kaldi},
   error::{
     Error, InvariantViolationPayload, MalformedDataPayload, OutOfRangePayload, RankMismatchPayload,
     Result,
   },
+  model_validation::{checked_mul, reserve_or_error},
   ops,
 };
 
@@ -42,7 +46,13 @@ const WAVEFORM_SCALE: f32 = (1u32 << 15) as f32;
 /// Kaldi fbank `preemphasis` coefficient (`sensevoice.py:39`).
 const PREEMPHASIS: f32 = 0.97;
 /// Kaldi fbank `low_freq` mel floor in Hz (`sensevoice.py:42`).
-const LOW_FREQ: f32 = 20.0;
+///
+/// `pub(super)` so [`FrontendConfig::validate`](super::config::FrontendConfig::validate)
+/// can hoist the fbank Nyquist invariant to load against the SAME constant
+/// [`compute_fbank`] passes — `get_mel_banks_kaldi` rejects `low_freq >= nyquist`
+/// (`nyquist = fs / 2`, `dsp.py:826-831`), so a small `fs` whose Nyquist is
+/// `<= LOW_FREQ` must fail at load rather than at the first transcribe.
+pub(super) const LOW_FREQ: f32 = 20.0;
 /// Kaldi fbank `high_freq` (`0.0` = Nyquist; `sensevoice.py:43`).
 const HIGH_FREQ: f32 = 0.0;
 
@@ -51,10 +61,14 @@ const HIGH_FREQ: f32 = 0.0;
 /// accepts these four; an unrecognized window is rejected with a typed error
 /// rather than silently falling back.
 ///
+/// `pub(crate)` so [`FrontendConfig::validate`](super::config::FrontendConfig::validate)
+/// can hoist the same window-enum check to load (the fbank-derived-invariant
+/// load gate), sharing the *one* accepted set rather than restating it.
+///
 /// # Errors
 /// [`Error::OutOfRange`] for a `window` value outside
 /// `hamming` / `hanning` / `povey` / `rectangular`.
-fn window_from_str(window: &str) -> Result<KaldiWindow> {
+pub(crate) fn window_from_str(window: &str) -> Result<KaldiWindow> {
   match window {
     "hamming" => Ok(KaldiWindow::Hamming),
     "hanning" => Ok(KaldiWindow::Hanning),
@@ -112,6 +126,10 @@ pub fn compute_fbank(waveform: &Array, fc: &FrontendConfig) -> Result<Array> {
     LOW_FREQ,
     HIGH_FREQ,
     None,
+    // `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:913`) keeps the first sample
+    // of each frame unchanged under pre-emphasis (`first_col =
+    // strided_input[:, 0:1]`), so SenseVoice's features match the reference.
+    PreemphBoundary::Preserve,
   )
 }
 
@@ -162,6 +180,13 @@ pub fn apply_lfr(feats: &Array, lfr_m: i32, lfr_n: i32) -> Result<Array> {
     ))
   })?;
 
+  // The stacked LFR-frame width `lfr_m * D` (`sensevoice.py:62`). Computed once
+  // through checked arithmetic so a huge `lfr_m` (or `D`) cannot wrap the `i32`
+  // reshape extent into a small / negative value; the loader path additionally
+  // pins `lfr_m * n_mels == input_size` in `Config::validate`, but this public
+  // helper defends itself.
+  let lfr_width = checked_mul("apply_lfr: lfr_m * D", "lfr_m", lfr_m, "D", d)?;
+
   // `T_lfr = ceil(T / lfr_n)` (`sensevoice.py:49`).
   let lfr_n_usize = lfr_n as usize;
   let t_lfr = t.div_ceil(lfr_n_usize);
@@ -189,8 +214,12 @@ pub fn apply_lfr(feats: &Array, lfr_m: i32, lfr_n: i32) -> Result<Array> {
   // window (`feats[-1:]` in `sensevoice.py:68`).
   let last = ops::indexing::slice(&padded, &[t_padded_i32 - 1, 0], &[t_padded_i32, d], &[1, 1])?;
 
+  // The LFR window count `t_lfr` is bounded by the fbank frame count `T`; reserve
+  // it FALLIBLY (typed `AllocFailure`) rather than the abort `Vec::with_capacity`
+  // would raise under allocator pressure on a long utterance.
   let lfr_m_usize = lfr_m as usize;
-  let mut frames: Vec<Array> = Vec::with_capacity(t_lfr);
+  let mut frames: Vec<Array> = Vec::new();
+  reserve_or_error(&mut frames, "sensevoice apply_lfr: LFR frames", t_lfr)?;
   for i in 0..t_lfr {
     let start = i * lfr_n_usize;
     let end = start + lfr_m_usize;
@@ -205,7 +234,7 @@ pub fn apply_lfr(feats: &Array, lfr_m: i32, lfr_n: i32) -> Result<Array> {
       // Full window: `feats[start:end].reshape(-1)` (`sensevoice.py:62`).
       let end_i32 = start_i32 + lfr_m;
       let window = ops::indexing::slice(&padded, &[start_i32, 0], &[end_i32, d], &[1, 1])?;
-      ops::shape::reshape(&window, &[lfr_m * d])?
+      ops::shape::reshape(&window, &[lfr_width])?
     } else {
       // Partial final window: take what is available and right-pad with copies
       // of the last frame (`sensevoice.py:64-70`).
@@ -220,12 +249,18 @@ pub fn apply_lfr(feats: &Array, lfr_m: i32, lfr_n: i32) -> Result<Array> {
       })?;
       let tail = ops::shape::tile(&last, &[pad_count, 1])?;
       let window = ops::shape::concatenate(&[&available, &tail], 0)?;
-      ops::shape::reshape(&window, &[lfr_m * d])?
+      ops::shape::reshape(&window, &[lfr_width])?
     };
     frames.push(stacked);
   }
 
-  let refs: Vec<&Array> = frames.iter().collect();
+  // Borrow each stacked frame for `stack`. The reference vector is `frames.len()`
+  // long; reserve it FALLIBLY then fill (no infallible `collect` growth).
+  let mut refs: Vec<&Array> = Vec::new();
+  reserve_or_error(&mut refs, "sensevoice apply_lfr: frame refs", frames.len())?;
+  for frame in &frames {
+    refs.push(frame);
+  }
   ops::shape::stack(&refs)
 }
 

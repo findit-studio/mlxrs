@@ -26,11 +26,24 @@
 
 use std::{fmt::Write as _, path::Path};
 
-use crate::{error::Result, tokenizer::sentencepiece::SentencePieceTokenizer};
+use crate::{
+  error::{AllocFailurePayload, ArithmeticOverflowPayload, Error, Result},
+  model_validation::reserve_or_error,
+  tokenizer::sentencepiece::SentencePieceTokenizer,
+};
 
 /// The SentencePiece model file the reference loads
 /// (`sensevoice.py:581`, swift `SenseVoiceTokenizer.swift` prefers any `*.model`).
 pub const SPM_MODEL_FILE: &str = "chn_jpn_yue_eng_ko_spectok.bpe.model";
+
+/// Generous upper bound on the SentencePiece `.model` we read into memory — a
+/// bounded-read **soundness** guard against a hostile model directory planting a
+/// huge `.model`, NOT a valid-input cap. Real SentencePiece models are typically
+/// a few MiB, but a very large multilingual vocabulary can be larger; `64 MiB`
+/// is generous headroom so no real `.model` is rejected, while still bounding
+/// the read so a planted multi-GB file cannot OOM the loader. Deliberately far
+/// above the 1 MiB `config.json` cap (a binary protobuf, not a small JSON).
+pub(crate) const MAX_SPM_MODEL_BYTES: u64 = 64 << 20;
 
 /// The `tokens.json` piece-list file the reference falls back to
 /// (`sensevoice.py:582`, swift `:18`).
@@ -86,16 +99,48 @@ impl SenseVoiceTokenizer {
     Self::IdJoin
   }
 
+  /// Build the SentencePiece variant from already-read `.model` protobuf bytes
+  /// (`sensevoice.py:588-590`: `sp.Load(...)`), via
+  /// [`SentencePieceTokenizer::from_model_bytes`]. The caller is responsible for
+  /// reading the bytes through a bounded reader (see [`Self::from_spm_file`]).
+  ///
+  /// # Errors
+  /// Propagates [`SentencePieceTokenizer::from_model_bytes`]'s protobuf-parse
+  /// errors (malformed / truncated / empty-vocabulary input).
+  pub fn from_spm_bytes(data: &[u8]) -> Result<Self> {
+    Ok(Self::SentencePiece(Box::new(
+      SentencePieceTokenizer::from_model_bytes(data)?,
+    )))
+  }
+
   /// Load the SentencePiece variant from a `.bpe.model` file on disk
   /// (`sensevoice.py:588-590`: `sp.Load(str(bpe_path))`).
   ///
+  /// The `.model` is read through the shared bounded `read_bounded_bytes_file`
+  /// reader with the generous `MAX_SPM_MODEL_BYTES` cap — an open-once,
+  /// TOCTOU-closed, non-regular-file-rejecting, size-capped read — so a hostile
+  /// model directory cannot OOM the loader by planting a huge `.model` (the
+  /// bounded-read soundness convention the `config.json` / `tokens.json` /
+  /// `am.mvn` reads use, with a cap sized for a binary tokenizer model rather
+  /// than a small JSON), then parsed via [`Self::from_spm_bytes`].
+  ///
+  /// Returns `Ok(None)` if the file is absent (the caller's "fall through to
+  /// `tokens.json`" signal — this also closes the stat-then-read TOCTOU window
+  /// where the file vanishes after a presence check).
+  ///
   /// # Errors
-  /// Propagates [`SentencePieceTokenizer::from_model_file`]'s
-  /// [`crate::error::Error::FileIo`] (read failure) / parse errors.
-  pub fn from_spm_file(path: &Path) -> Result<Self> {
-    Ok(Self::SentencePiece(Box::new(
-      SentencePieceTokenizer::from_model_file(path)?,
-    )))
+  /// - [`crate::error::Error::FileIo`] (open / read failure, non-regular file) or
+  ///   [`crate::error::Error::CapExceeded`] from the bounded read;
+  /// - propagates [`Self::from_spm_bytes`]'s protobuf-parse errors.
+  pub fn from_spm_file(path: &Path) -> Result<Option<Self>> {
+    match crate::lm::load::read_bounded_bytes_file(
+      path,
+      "sensevoice spm model",
+      MAX_SPM_MODEL_BYTES,
+    )? {
+      Some(bytes) => Ok(Some(Self::from_spm_bytes(&bytes)?)),
+      None => Ok(None),
+    }
   }
 
   /// `true` if this is the degenerate id-join variant (neither asset present).
@@ -120,7 +165,10 @@ impl SenseVoiceTokenizer {
   ///
   /// Total over every id slice (no panic / no error path) — the
   /// [`super::model::SenseVoiceModel`] CTC `decode_ids` is infallible by
-  /// contract.
+  /// contract (the [`crate::audio::stt::model::CtcModel`] trait and the shared
+  /// `greedy_ctc_transcribe` driver require an infallible signature). The rich
+  /// [`Transcribe`](crate::audio::stt::model::Transcribe) path uses the fallible
+  /// [`Self::try_decode`] companion instead.
   pub fn decode(&self, ids: &[u32]) -> String {
     match self {
       Self::SentencePiece(tokenizer) => {
@@ -131,6 +179,63 @@ impl SenseVoiceTokenizer {
       Self::IdJoin => join_ids(ids),
     }
   }
+
+  /// The fallible analogue of [`Self::decode`] — the same two-tier
+  /// SentencePiece / `tokens.json` / id-join decode (`sensevoice.py:439-448`),
+  /// but every id / output buffer this detokenizer owns is reserved FALLIBLY
+  /// (typed [`Error::AllocFailure`]) instead of the abort the infallible
+  /// `decode`'s `collect` / `String::with_capacity` growth would raise.
+  ///
+  /// Used by the rich [`SenseVoiceModel::transcribe_rich`](super::model::SenseVoiceModel::transcribe_rich)
+  /// /
+  /// [`Transcribe`](crate::audio::stt::model::Transcribe) path. The infallible
+  /// [`Self::decode`] is retained for the
+  /// [`CtcModel::decode_ids`](crate::audio::stt::model::CtcModel::decode_ids)
+  /// seam the shared `greedy_ctc_transcribe` driver requires.
+  ///
+  /// The decode result is byte-identical to [`Self::decode`]; only the
+  /// allocation behavior differs.
+  ///
+  /// # Errors
+  /// [`Error::AllocFailure`] if reserving the id buffer (bounded by the id
+  /// count) or the joined-output buffer (bounded by the summed piece lengths)
+  /// exhausts the allocator. For the SentencePiece variant, only the
+  /// SenseVoice-owned `usize` id buffer is reserved fallibly; the shared
+  /// [`SentencePieceTokenizer::decode`] owns its internal output buffer.
+  pub fn try_decode(&self, ids: &[u32]) -> Result<String> {
+    match self {
+      Self::SentencePiece(tokenizer) => {
+        // Reserve the `usize` id buffer fallibly (bounded by the id count),
+        // then route through the shared byte-fallback decode.
+        let mut usize_ids: Vec<usize> = Vec::new();
+        reserve_or_error(
+          &mut usize_ids,
+          "sensevoice tokenizer try_decode: spm id buffer",
+          ids.len(),
+        )?;
+        for &id in ids {
+          usize_ids.push(id as usize);
+        }
+        Ok(tokenizer.decode(&usize_ids))
+      }
+      Self::TokenList(tokens) => try_decode_token_list(tokens, ids),
+      Self::IdJoin => try_join_ids(ids),
+    }
+  }
+}
+
+/// Wrap a `String::try_reserve_exact` failure into a typed
+/// [`Error::AllocFailure`] (the [`crate::model_validation::reserve_or_error`]
+/// analogue for `String`, which the `TryReserve` trait does not cover).
+fn reserve_string_or_error(s: &mut String, item: &'static str, additional: usize) -> Result<()> {
+  s.try_reserve_exact(additional).map_err(|e| {
+    Error::AllocFailure(AllocFailurePayload::new(
+      "sensevoice tokenizer try_decode",
+      item,
+      additional as u64,
+      e,
+    ))
+  })
 }
 
 /// Index `ids` into the `tokens.json` piece list, join, strip the metaspace
@@ -167,6 +272,92 @@ fn join_ids(ids: &[u32]) -> String {
     let _ = write!(out, "{id}");
   }
   out
+}
+
+/// The fallible analogue of [`decode_token_list`]: index `ids` into the piece
+/// list, join + strip the metaspace marker + trim, but reserve the output buffer
+/// FALLIBLY and write the metaspace-normalized text directly (so the extra
+/// `replace` allocation the infallible path incurs is avoided).
+///
+/// Byte-identical to [`decode_token_list`]: each `▁` is substituted with a
+/// single space inline (== `replace(METASPACE, " ")`), then the result is
+/// trimmed in place (no reallocation). The reserved capacity is the summed
+/// in-range piece byte-length — an upper bound, since substituting a 3-byte `▁`
+/// for a 1-byte space only shrinks the output. The sum is accumulated with
+/// `checked_add` so it cannot wrap to an undersized capacity.
+///
+/// # Errors
+/// - [`Error::ArithmeticOverflow`] if the summed piece byte-length overflows
+///   `usize` (before any reservation);
+/// - [`Error::AllocFailure`] if reserving the output buffer exhausts the
+///   allocator.
+fn try_decode_token_list(tokens: &[String], ids: &[u32]) -> Result<String> {
+  // The summed in-range piece lengths bound the (pre-trim) output; substituting
+  // the 3-byte metaspace for a 1-byte space never grows past it. Accumulate with
+  // `checked_add` so a pathological id/piece set cannot WRAP the `usize` sum to a
+  // smaller capacity (in release) — a wrapped reservation would then let the
+  // subsequent infallible `out.push` grow unbounded, defeating the reserve guard.
+  let mut capacity: usize = 0;
+  for &id in ids {
+    if let Some(piece) = tokens.get(id as usize) {
+      capacity = capacity.checked_add(piece.len()).ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::new(
+          "sensevoice try_decode_token_list: summed piece byte-length",
+          "usize",
+        ))
+      })?;
+    }
+  }
+  let mut out = String::new();
+  reserve_string_or_error(&mut out, "token-list joined output", capacity)?;
+
+  for &id in ids {
+    // The reference indexes `self._token_list[t] for t in token_ids if
+    // 0 <= t < len(...)` (`sensevoice.py:444`): an out-of-range id is skipped.
+    if let Some(piece) = tokens.get(id as usize) {
+      // Substitute the metaspace marker inline (== `replace(METASPACE, " ")`,
+      // `sensevoice.py:446`) so no separate `replace` pass allocates.
+      for ch in piece.chars() {
+        out.push(if ch == METASPACE { ' ' } else { ch });
+      }
+    }
+  }
+
+  // `.trim()` in place (`sensevoice.py:446`): drop the trailing then the leading
+  // whitespace, both shrinking `out` without a fresh allocation. The byte offsets
+  // come from `trim_end` / `trim_start` lengths (char boundaries), so no raw
+  // pointer arithmetic is needed.
+  let end = out.trim_end().len();
+  out.truncate(end);
+  let start = out.len() - out.trim_start().len();
+  out.drain(..start);
+  Ok(out)
+}
+
+/// The fallible analogue of [`join_ids`]: render `ids` as their space-joined
+/// decimals (`sensevoice.py:448`), reserving the output buffer FALLIBLY.
+///
+/// Byte-identical to [`join_ids`]. The reserved capacity bounds the decimal
+/// digits (≤ 10 per `u32`) plus the `n - 1` separators.
+///
+/// # Errors
+/// [`Error::AllocFailure`] if reserving the output buffer exhausts the
+/// allocator.
+fn try_join_ids(ids: &[u32]) -> Result<String> {
+  // Each `u32` is at most 10 decimal digits; with `n - 1` single-space
+  // separators the join is at most `11 * n` bytes.
+  let capacity = ids.len().saturating_mul(11);
+  let mut out = String::new();
+  reserve_string_or_error(&mut out, "id-join output", capacity)?;
+  for (i, id) in ids.iter().enumerate() {
+    if i != 0 {
+      out.push(' ');
+    }
+    // Writing a decimal integer into a `String` is infallible (the buffer is
+    // pre-reserved to the digit + separator bound above).
+    let _ = write!(out, "{id}");
+  }
+  Ok(out)
 }
 
 #[cfg(test)]

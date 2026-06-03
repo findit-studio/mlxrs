@@ -612,6 +612,68 @@ impl MaybeQuantizedLinear {
     matches!(self, MaybeQuantizedLinear::Quantized(_))
   }
 
+  /// The **logical** `(out_features, in_features)` of the projection — the
+  /// dense weight layout (`mlx.nn.Linear` stores `weight` as
+  /// `(out_features, in_features)`), recovered identically for both arms.
+  ///
+  /// A model that pins its projection to a config-derived `(out, in)` uses this
+  /// for both arms so the quantized arm is shape-checked at load (a packed
+  /// weight whose dequantized width / row count disagrees with the config would
+  /// otherwise only mis-project at the first forward) — the linear analogue of
+  /// [`MaybeQuantizedEmbedding::logical_shape`].
+  ///
+  /// - **Dense**: the weight's own `(out_features, in_features)` (the dense
+  ///   weight is the logical weight verbatim).
+  /// - **Quantized**: `out_features` is the packed weight's row count (the
+  ///   leading axis, validated equal to the `scales` row count at construction)
+  ///   and `in_features` is `scales.shape(-1) * group_size` — the same logical
+  ///   input width `validate_quantized_triple` recovers and pins against the
+  ///   packed weight, so no dequantization is needed.
+  ///
+  /// Reads only `shape()` metadata (no materialization / eval).
+  ///
+  /// # Errors
+  /// - [`Error::RankMismatch`] if the dense weight is not rank-2 (the quantized
+  ///   arm's rank-2 layout is guaranteed by its construction-time validation);
+  /// - [`Error::OutOfRange`] if a dimension exceeds `i32::MAX` (a corrupt huge
+  ///   weight; the recovery is computed in `i64` so it cannot overflow first).
+  pub fn logical_shape(&self) -> Result<(i32, i32)> {
+    let context = "MaybeQuantizedLinear::logical_shape";
+    let (out, in_features): (i64, i64) = match self {
+      MaybeQuantizedLinear::Dense(l) => {
+        let shape = l.weight_ref().shape();
+        if shape.len() != 2 {
+          return Err(Error::RankMismatch(RankMismatchPayload::new(
+            "MaybeQuantizedLinear::logical_shape: dense weight must be rank-2 (out_features, in_features)",
+            shape.len() as u32,
+            shape.to_vec(),
+          )));
+        }
+        (shape[0] as i64, shape[1] as i64)
+      }
+      MaybeQuantizedLinear::Quantized(q) => {
+        // The triple was validated rank-2 at construction; `out_features` is the
+        // packed weight's leading axis and the logical input width is
+        // `scales.shape(-1) * group_size` (mlx's per-group recovery, pinned
+        // against the packed weight by `validate_quantized_triple`).
+        let w_rows = q.weight.shape()[0] as i64;
+        let s_shape = q.scales.shape();
+        let logical_in = (s_shape[1] as i64) * i64::from(q.group_size);
+        (w_rows, logical_in)
+      }
+    };
+    let to_i32 = |v: i64| -> Result<i32> {
+      i32::try_from(v).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          context,
+          "logical linear dimension exceeds i32::MAX",
+          format_smolstr!("{v}"),
+        ))
+      })
+    };
+    Ok((to_i32(out)?, to_i32(in_features)?))
+  }
+
   /// Run the layer: `mlx.nn.Linear.__call__` or
   /// `mlx.nn.QuantizedLinear.__call__` depending on the variant.
   ///
