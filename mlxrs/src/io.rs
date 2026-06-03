@@ -1,6 +1,9 @@
-//! Model IO — safetensors and GGUF load/save.
+//! Model IO — safetensors, GGUF, and NumPy `.npy` / `.npz` load/save.
 //!
-//! Thin wrappers over mlx-c `io.h`. Local-file IO only; no HF-hub download.
+//! safetensors + GGUF are thin wrappers over mlx-c `io.h`; the NumPy formats
+//! are parsed in Rust (the `npy` submodule, behind the `npz` feature)
+//! mirroring MLX core's own byte format. Local-file IO only; no HF-hub
+//! download.
 //!
 //! - safetensors: a map of named arrays plus an optional `String -> String`
 //!   metadata side-table. Mirrors `mlx.core.load/save_safetensors` and
@@ -8,10 +11,26 @@
 //! - GGUF: a map of named tensors plus typed metadata entries (array /
 //!   string / list-of-strings), mirroring mlx-c's `mlx_io_gguf` API and
 //!   `mlx.core.load_gguf` (returns weights + metadata).
+//! - NumPy (`npz` feature): `.npy` a single array, `.npz` a ZIP archive of
+//!   `<name>.npy` members (the mlx-community-native multi-array weight
+//!   format). Mirrors `mlx.core.load` / `mlx.core.save` / `savez` /
+//!   `savez_compressed`. See the `npy` submodule (`load_npy` / `load_npz` /
+//!   `save_npy` / `save_npz` / `save_npz_compressed`).
 //!
-//! Validation (bad file, missing key, dtype quirks) is left to mlx-c and
-//! surfaced through [`Result`]. See
+//! Validation (bad file, missing key, dtype quirks) is left to mlx-c for
+//! safetensors/GGUF and done with bounds-checked Rust parsing for NumPy; both
+//! surface through [`Result`]. See
 //! [mlx io docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.load.html).
+
+/// NumPy `.npy` / `.npz` array IO — load/save what `mx.save` / `mx.savez`
+/// write, with a bounds-checked Rust parser mirroring MLX's byte format.
+#[cfg(feature = "npz")]
+#[cfg_attr(docsrs, doc(cfg(feature = "npz")))]
+pub mod npy;
+
+#[cfg(feature = "npz")]
+#[cfg_attr(docsrs, doc(cfg(feature = "npz")))]
+pub use npy::{load_npy, load_npz, save_npy, save_npz, save_npz_compressed};
 
 use std::{
   cell::Cell,
