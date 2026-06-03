@@ -148,7 +148,7 @@ use crate::{
 
 use super::{
   audio::{N_FRAMES, N_SAMPLES, log_mel_spectrogram_whisper},
-  config::ModelDimensions,
+  config::{AlignmentHeads, ModelDimensions},
   decoder::{DecoderKvCache, TextDecoder},
   decoding::{self, DecodingOptions, SuppressSpec, TranscribeOptions as WhisperTranscribeOptions},
   encoder::AudioEncoder,
@@ -239,6 +239,13 @@ pub struct WhisperModel {
   /// falls back to the canonical [`EOT_TOKEN_ID`]. Set by
   /// [`WhisperModel::with_tokenizer`] / [`WhisperModel::with_eot_token`].
   eot_token: Option<u32>,
+  /// The word-timing alignment heads — the `(layer, head)` cross-attention
+  /// heads the word-timestamp DTW averages (`whisper.py:_alignment_heads`).
+  /// Defaults to the last half of the decoder layers
+  /// ([`AlignmentHeads::default_for`]); overridable from a checkpoint's
+  /// `generation_config.json` ([`WhisperModel::with_alignment_heads`], loaded by
+  /// [`WhisperModel::load`]).
+  alignment_heads: AlignmentHeads,
 }
 
 impl fmt::Debug for WhisperModel {
@@ -253,6 +260,7 @@ impl fmt::Debug for WhisperModel {
       .field("decoder", &self.decoder)
       .field("has_tokenizer", &self.tokenizer.is_some())
       .field("eot_token", &self.eot_token)
+      .field("alignment_heads", &self.alignment_heads.heads().len())
       .finish()
   }
 }
@@ -372,6 +380,12 @@ impl WhisperModel {
     let encoder = builder.build_encoder(&dims)?;
     let decoder = builder.build_decoder(&dims, dtype)?;
 
+    // Default the alignment heads to the last half of the decoder layers
+    // (`whisper.py:510-516`); a checkpoint's `generation_config.json` can
+    // override this via `WhisperModel::with_alignment_heads`. Computed before
+    // `dims` is moved into the struct.
+    let alignment_heads = AlignmentHeads::default_for(&dims);
+
     Ok(Self {
       dims,
       dtype,
@@ -379,6 +393,7 @@ impl WhisperModel {
       decoder,
       tokenizer: None,
       eot_token: None,
+      alignment_heads,
     })
   }
 
@@ -432,6 +447,56 @@ impl WhisperModel {
     self
   }
 
+  /// Override the word-timing [`AlignmentHeads`] — the `set_alignment_heads`
+  /// analogue (`whisper.py:522-537`). A checkpoint that ships an explicit head
+  /// set in its `generation_config.json` uses it (instead of the last-half
+  /// default) for the word-timestamp DTW. Returns `self` for chaining.
+  ///
+  /// Takes an already-validated [`AlignmentHeads`]: the only public ways to
+  /// build a custom one are [`AlignmentHeads::try_new`] and
+  /// [`AlignmentHeads::from_generation_config`], both of which run the
+  /// `validate_alignment_heads` in-grid + no-duplicate check against the dims
+  /// passed to them (the unchecked `AlignmentHeads::new` is crate-private). An
+  /// [`AlignmentHeads`] carries the `(n_layer, n_head)` grid it was validated
+  /// against; this rechecks it equals this model's `(n_text_layer, n_text_head)`
+  /// and rejects a mismatch, so a set validated against a *different* (e.g.
+  /// larger) model cannot be installed here and reach the DTW gather out of this
+  /// model's grid. Build the override with
+  /// `AlignmentHeads::try_new(heads, model.dims())?`.
+  ///
+  /// [`WhisperModel::load`] applies this automatically when a
+  /// `generation_config.json` with an `alignment_heads` key is present
+  /// alongside the weights.
+  ///
+  /// # Errors
+  /// - [`Error::OutOfRange`] if `heads`'s validated `(n_layer, n_head)` grid does
+  ///   not equal this model's `(n_text_layer, n_text_head)` — the heads were
+  ///   validated for a different model.
+  pub fn with_alignment_heads(mut self, heads: AlignmentHeads) -> Result<Self> {
+    let (n_layer, n_head) = (self.dims.n_text_layer(), self.dims.n_text_head());
+    if heads.n_layer() != n_layer || heads.n_head() != n_head {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "Whisper alignment_heads",
+        "heads were validated for a different model's (n_text_layer, n_text_head) grid",
+        smol_str::format_smolstr!(
+          "validated ({}, {}), model ({n_layer}, {n_head})",
+          heads.n_layer(),
+          heads.n_head()
+        ),
+      )));
+    }
+    self.alignment_heads = heads;
+    Ok(self)
+  }
+
+  /// The word-timing [`AlignmentHeads`] (the last-half default unless
+  /// overridden). Consumed by the word-timestamp DTW
+  /// ([`super::timing::find_alignment`]).
+  #[inline(always)]
+  pub fn alignment_heads(&self) -> &AlignmentHeads {
+    &self.alignment_heads
+  }
+
   /// Load a Whisper model from a local model directory: read the
   /// `*.safetensors`, then forward to [`WhisperModel::from_weights`]. `dims`
   /// is parsed by the caller via [`ModelDimensions::from_dict`] (the
@@ -444,7 +509,8 @@ impl WhisperModel {
   ///   errors.
   pub fn load(dir: &std::path::Path, dims: ModelDimensions, dtype: Dtype) -> Result<Self> {
     let weights = load_all_safetensors(dir)?;
-    Self::from_weights(dims, weights, dtype)
+    let model = Self::from_weights(dims, weights, dtype)?;
+    apply_dir_alignment_heads(model, dir)
   }
 
   /// Load a Whisper model from a local model directory **with** an optional
@@ -473,7 +539,8 @@ impl WhisperModel {
     quantization: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
     let weights = load_all_safetensors(dir)?;
-    Self::from_weights_quantized(dims, weights, dtype, quantization)
+    let model = Self::from_weights_quantized(dims, weights, dtype, quantization)?;
+    apply_dir_alignment_heads(model, dir)
   }
 
   /// The model dimensions.
@@ -550,19 +617,37 @@ impl WhisperModel {
   /// `f32`, matching `Inference.logits`'s `.astype(mx.float32)`) and the
   /// per-block cache to thread into the next call.
   ///
+  /// `tokens` is the new-segment token slice, passed straight to the decoder,
+  /// which is the single crate-visible chokepoint every gather path funnels
+  /// through: it builds the `(1, T)` `u32` decoder-input array **internally**
+  /// (so the rank/batch and dtype classes are true by construction) and
+  /// value-checks every id `< n_vocab` BEFORE the token-embedding gather, so an
+  /// id `>= n_vocab` — which would index out of bounds in the `(n_vocab,
+  /// n_text_state)` embedding — is rejected at the gather root regardless of
+  /// caller ([`AutoregressiveStt::decode_step`] and the decoding task's prefill /
+  /// step / language-detection forwards all reach the decoder through here or
+  /// [`Self::forward_with_cross_qk`]).
+  ///
   /// # Errors
   /// - [`Error::ShapePairMismatch`] if `encoder_states` is not `(1, n_audio_ctx,
   ///   n_audio_state)`;
+  /// - [`Error::OutOfRange`] if `tokens` is empty, longer than `max_context`
+  ///   (`n_text_ctx`), overflows `i32`, or contains an id `>= n_vocab`;
   /// - propagates the decoder forward op errors (embedding / block / LayerNorm /
   ///   positional-slice).
   pub(crate) fn decode_tokens(
     &self,
-    tokens: &Array,
+    tokens: &[u32],
     encoder_states: &Array,
     cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
     // Bound the encoder extent BEFORE the decoder cross-attention projects it.
     self.validate_encoder_states(encoder_states)?;
+    // Pass the validated `&[u32]` straight to the decoder: it builds the
+    // `(1, T)` `u32` array itself and enforces the empty / `id < n_vocab` /
+    // `i32` / `offset + T <= n_text_ctx` guards at the single gather chokepoint —
+    // so the value-range / rank / dtype classes are structurally closed there for
+    // every caller, with no double Array-build at this layer.
     let (logits, new_cache) = self.decoder.forward(tokens, encoder_states, cache)?;
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
@@ -573,11 +658,11 @@ impl WhisperModel {
   /// `Model.forward_with_cross_qk` / `Inference.logits_with_cross_qk` analogue
   /// (`whisper.py:614-616`, `decoding.py:177-189`).
   ///
-  /// This is the extraction point for the cross-attention pattern the
-  /// word-timestamp DTW alignment (and the streaming AlignAtt monitor) consume.
-  /// It only extracts and exposes the weights — nothing downstream in mlxrs yet
-  /// uses them (the DTW alignment is a later phase); a caller can retrieve the
-  /// per-decoder-layer cross-attention for a decode here.
+  /// This is the incremental (cache-threaded) extraction point for the
+  /// cross-attention pattern. The word-timestamp DTW alignment uses the
+  /// cacheless full-sequence variant [`Self::forward_with_cross_qk`] instead;
+  /// this per-step form lets a caller (e.g. a streaming AlignAtt monitor)
+  /// retrieve the per-decoder-layer cross-attention as the decode advances.
   ///
   /// `enc` is the encoder states `(1, n_audio_ctx, n_audio_state)` (extent-
   /// guarded exactly as [`AutoregressiveStt::decode_step`]); `cache` is the
@@ -606,18 +691,21 @@ impl WhisperModel {
     enc: &Array,
     tokens: &[u32],
   ) -> Result<(Array, Vec<Option<Array>>)> {
-    // Bound the encoder-states extent and the token prefix BEFORE allocating —
-    // the same guards as `decode_step`, factored into `prepare_decode_input`.
-    let tok = self.prepare_decode_input(cache, enc, tokens)?;
+    // Bound the encoder-states extent and the token prefix BEFORE the decoder
+    // allocates — the same guards as `decode_step`, factored into
+    // `prepare_decode_tail`, which returns the new (uncached) `&[u32]` tail. The
+    // decoder builds the `(1, T_new)` array itself and re-checks the value range
+    // at the gather chokepoint, so there is no double Array-build at this layer.
+    let new_tokens = self.prepare_decode_tail(cache, enc, tokens)?;
     let (logits, new_cache, cross_qk) =
       self
         .decoder
-        .forward_with_cross_qk(&tok, enc, cache.inner.as_ref())?;
+        .forward_with_cross_qk(new_tokens, enc, cache.inner.as_ref())?;
     // Run EVERY fallible step (the `f32` cast — `Inference.logits`'s
     // `.astype(mx.float32)`) BEFORE committing the cache, then make the cache
     // mutation the LAST step. If the cast (an allocation / backend op) failed
     // after `cache.inner` had already advanced, a retry with the same prefix
-    // would see no new tokens to decode (`prepare_decode_input` would treat the
+    // would see no new tokens to decode (`prepare_decode_tail` would treat the
     // mutated cache as caught up) and the decode trajectory would be corrupted.
     // Mirrors the `decode_tokens` path, which casts before returning the cache.
     let logits = logits.astype(Dtype::F32)?;
@@ -625,23 +713,142 @@ impl WhisperModel {
     Ok((logits, cross_qk))
   }
 
-  /// Validate the encoder-states extent + the token-prefix length and build the
-  /// `(1, T_new)` token array for the **new** (uncached) tail — the shared
-  /// front of [`AutoregressiveStt::decode_step`] and
-  /// [`Self::decode_step_with_cross_qk`].
+  /// Encode `mel` and run the decoder over the **full** `tokens` sequence in one
+  /// (cacheless) forward, returning the logits and per-layer cross-attention
+  /// weights — `Model.forward_with_cross_qk` (`whisper.py:614-616`).
+  ///
+  /// This is the entry the word-timestamp DTW ([`super::timing::find_alignment`])
+  /// drives: unlike [`Self::decode_step_with_cross_qk`] (the incremental,
+  /// cache-threaded decode path), it forwards the whole token prefix at once
+  /// (`kv_cache = None`), so the returned `cross_qk[layer]` is the full
+  /// `(1, n_text_head, T, n_audio_ctx)` attention over every token position —
+  /// exactly what the alignment needs.
+  ///
+  /// `tokens` is the token-id sequence (the sot sequence + `no_timestamps` +
+  /// text + eot the DTW assembles), taken as a `&[u32]` to mirror the
+  /// incremental [`Self::decode_step_with_cross_qk`] contract: the `(1, T)`
+  /// decoder-input array is built **internally** from the slice, so the
+  /// rank/batch (always `(1, T)`) and dtype (always `u32`) classes are guaranteed
+  /// by construction. The cheap host-side `tokens` checks (non-empty, `<=
+  /// max_context`, `i32` fit, every id `< n_vocab`) run **before** `mel` is
+  /// encoded, so an invalid-token call fails fast with its typed token error
+  /// rather than after a wasted full encoder pass (the decoder re-checks the same
+  /// invariants at its gather chokepoint as defense-in-depth). `mel` is a
+  /// `(N_FRAMES, n_mels)` (or already-encoded
+  /// `(1, n_audio_ctx, n_audio_state)`) log-mel segment. Returns
+  /// `(logits, cross_qk)`:
+  /// - `logits` — the full `(1, T, n_vocab)` decoder output, cast to `f32`
+  ///   (`Inference.logits`'s `.astype(mx.float32)`);
+  /// - `cross_qk` — one `(1, n_text_head, T, n_audio_ctx)` weight tensor per
+  ///   decoder layer (`Some` for every block).
+  ///
+  /// # Errors
+  /// - [`Error::OutOfRange`] if `tokens` is empty, longer than `max_context`
+  ///   (`n_text_ctx`), overflows `i32`, or contains an id `>= n_vocab` (which
+  ///   would gather out of bounds in the decoder token embedding);
+  /// - [`Error::RankMismatch`] / [`Error::ShapePairMismatch`] if `mel` is not a
+  ///   valid mel / encoder-states tensor (via [`Self::encode`]);
+  /// - propagates the encoder / decoder forward op errors.
+  pub fn forward_with_cross_qk(
+    &self,
+    mel: &Array,
+    tokens: &[u32],
+  ) -> Result<(Array, Vec<Option<Array>>)> {
+    // Fail-fast on the cheap host-side `tokens` input BEFORE the expensive
+    // `self.encode(mel)` (which drives the FULL encoder + its device
+    // allocations). A caller can supply an empty slice, an over-context prefix,
+    // or an id `>= n_vocab`; each is a typed token error the decoder already
+    // raises, but with `encode` first that error only surfaces AFTER a wasted
+    // encoder pass — so this re-uses the same host-side fail-fast boundary the
+    // incremental path establishes in `prepare_decode_tail`, ordered the same
+    // way (non-empty → `<= max_context` → `i32` fit → `id < n_vocab`). The
+    // decoder re-checks every one of these at its single gather chokepoint
+    // (`TextDecoder::run`), so this is a (cheap, whole-prefix) defense-in-depth
+    // fail-fast that makes the token error precede encoder work, NOT the gather's
+    // only guard. This cacheless full-sequence path forwards the whole prefix at
+    // `offset == 0`, so `offset + T <= n_text_ctx` reduces to `T <= max_context`.
+    if tokens.is_empty() {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::forward_with_cross_qk: token sequence length",
+        "must be non-empty",
+        smol_str::format_smolstr!("len={}", tokens.len()),
+      )));
+    }
+    let max_context = self.max_context();
+    if tokens.len() > max_context {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::forward_with_cross_qk: token sequence length",
+        "must not exceed max_context (n_text_ctx)",
+        smol_str::format_smolstr!("len={}, max_context={max_context}", tokens.len()),
+      )));
+    }
+    if i32::try_from(tokens.len()).is_err() {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::forward_with_cross_qk: token sequence length",
+        "must fit in i32",
+        smol_str::format_smolstr!("{}", tokens.len()),
+      )));
+    }
+    self.validate_token_ids("WhisperModel::forward_with_cross_qk", tokens)?;
+
+    let enc = self.encode(mel)?;
+    // Cacheless full-sequence decode (`kv_cache = None`): the whole prefix is
+    // forwarded, so every position's cross-attention is surfaced. The caller's
+    // `&[u32]` is passed straight to the decoder, which builds the `(1, T)` `u32`
+    // array itself and re-enforces the empty / `id < n_vocab` / `i32` /
+    // `T <= n_text_ctx` guards at the single gather chokepoint — so the value-
+    // range / rank / dtype classes are structurally closed there, with no
+    // double Array-build at this layer.
+    let (logits, _cache, cross_qk) = self.decoder.forward_with_cross_qk(tokens, &enc, None)?;
+    let logits = logits.astype(Dtype::F32)?;
+    Ok((logits, cross_qk))
+  }
+
+  /// Reject any token id `>= n_vocab` BEFORE it reaches the decoder token-
+  /// embedding gather — a `(n_vocab, n_text_state)` table, so an out-of-range id
+  /// would index out of bounds. This is the model-layer early fail-fast: the
+  /// decoding task ([`DecodingTask::new`]) uses it to reject a caller-supplied
+  /// `prompt` / `prefix` id at construction (before any forward / encode work),
+  /// and the incremental decode path ([`Self::prepare_decode_tail`]) uses it to
+  /// validate the WHOLE running prefix (including already-cached positions) up
+  /// front. The decoder's [`super::decoder::TextDecoder::run`] independently
+  /// re-checks the same `id < n_vocab` invariant on the new window at the gather
+  /// root — the single structural chokepoint — so this model-layer check is a
+  /// (cheap, whole-prefix) defense-in-depth fail-fast, not the gather's only
+  /// guard. `context` names the calling entry for the typed error.
+  ///
+  /// # Errors
+  /// [`Error::OutOfRange`] on the first id `>= n_vocab`.
+  pub(crate) fn validate_token_ids(&self, context: &'static str, tokens: &[u32]) -> Result<()> {
+    let n_vocab = self.dims.n_vocab();
+    if let Some(&id) = tokens.iter().find(|&&id| id as usize >= n_vocab) {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        context,
+        "token id must be < n_vocab (the decoder token-embedding rows)",
+        smol_str::format_smolstr!("id={id}, n_vocab={n_vocab}"),
+      )));
+    }
+    Ok(())
+  }
+
+  /// Validate the encoder-states extent + the token-prefix length / ids and
+  /// return the **new** (uncached) token tail — the shared front of
+  /// [`AutoregressiveStt::decode_step`] and [`Self::decode_step_with_cross_qk`].
+  /// Returns the `[cached ..]` subslice of `tokens` (the positions not yet in the
+  /// cache), validated so every id is `< n_vocab` before any embedding gather.
   ///
   /// # Errors
   /// - [`Error::ShapePairMismatch`] if `enc` is not `(1, n_audio_ctx,
   ///   n_audio_state)`;
   /// - [`Error::EmptyInput`] if `tokens` is shorter than the cache;
-  /// - [`Error::OutOfRange`] if the token prefix exceeds `max_context` or the
-  ///   new-token window overflows `i32`.
-  fn prepare_decode_input(
+  /// - [`Error::OutOfRange`] if the token prefix exceeds `max_context`, contains
+  ///   an id `>= n_vocab`, or the new-token window overflows `i32`.
+  fn prepare_decode_tail<'t>(
     &self,
     cache: &WhisperDecodeCache,
     enc: &Array,
-    tokens: &[u32],
-  ) -> Result<Array> {
+    tokens: &'t [u32],
+  ) -> Result<&'t [u32]> {
     // Bound the encoder-states extent FIRST — before the token array or the
     // decoder allocates. A caller can supply any `enc`; the cross-attention
     // forms its scores from `enc.shape()[1]`, so a longer / batched segment must
@@ -664,6 +871,12 @@ impl WhisperModel {
         smol_str::format_smolstr!("len={}, max_context={max_context}", tokens.len()),
       )));
     }
+    // Reject any token id `>= n_vocab` before the decoder token-embedding gather —
+    // the same value-range guard the full-sequence `forward_with_cross_qk` path
+    // applies, shared so an out-of-range caller-owned id cannot index out of
+    // bounds on either path. Checks the whole prefix: on a warm cache the new
+    // tail is gathered, on a fresh cache the entire prefix is.
+    self.validate_token_ids("WhisperModel::decode_step", tokens)?;
     // Forward only the tokens not yet in the cache: the whole prefix on a fresh
     // cache, else just the new tail.
     let new_tokens = tokens
@@ -675,14 +888,7 @@ impl WhisperModel {
            tokens to decode)",
         ))
       })?;
-    let t = i32::try_from(new_tokens.len()).map_err(|_| {
-      Error::OutOfRange(crate::error::OutOfRangePayload::new(
-        "WhisperModel::decode_step: new-token window length",
-        "must fit in i32",
-        smol_str::format_smolstr!("{}", new_tokens.len()),
-      ))
-    })?;
-    Array::from_slice::<u32>(new_tokens, &[1, t])
+    Ok(new_tokens)
   }
 }
 
@@ -765,6 +971,44 @@ fn load_all_safetensors(dir: &std::path::Path) -> Result<HashMap<String, Array>>
     }
   }
   Ok(all)
+}
+
+/// Apply the word-timing alignment heads from `<dir>/generation_config.json`,
+/// if present — the model-load half of `set_alignment_heads`
+/// (`whisper.py:704-715`). An absent `generation_config.json` (or one with no
+/// `alignment_heads` key) leaves `model`'s last-half default in place; a present
+/// override replaces it.
+///
+/// The `generation_config.json` is read with the shared bounded config reader
+/// (capped at the `lm::load` `MAX_CONFIG_BYTES` ceiling), so a hostile model
+/// directory cannot OOM the loader by planting a huge file.
+///
+/// # Errors
+/// - propagates the bounded reader's typed errors (`FileIo`, `CapExceeded`,
+///   non-UTF-8 `Parse`);
+/// - [`Error::Parse`] for a malformed `generation_config.json` body or a
+///   malformed `alignment_heads` value;
+/// - [`Error::OutOfRange`] for an alignment head outside the decoder grid.
+fn apply_dir_alignment_heads(model: WhisperModel, dir: &std::path::Path) -> Result<WhisperModel> {
+  let path = dir.join("generation_config.json");
+  let Some(text) = crate::lm::load::read_bounded_config_file(&path, "Whisper generation config")?
+  else {
+    return Ok(model);
+  };
+  let config: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+    Error::Parse(crate::error::ParsePayload::new(
+      "Whisper generation_config.json",
+      "generation_config.json",
+      e.to_string(),
+    ))
+  })?;
+  match AlignmentHeads::from_generation_config(&config, model.dims())? {
+    // `from_generation_config` validated against `model.dims()`, so the carried
+    // grid matches and the install-time dims recheck always passes here; `?`
+    // surfaces it as a typed error rather than panicking if that ever changes.
+    Some(heads) => model.with_alignment_heads(heads),
+    None => Ok(model),
+  }
 }
 
 // ───────────────────────── sanitize (whisper.py:539-606) ──────────────────
@@ -1687,6 +1931,7 @@ impl Builder<'_> {
       blocks,
       ln,
       dims.n_text_ctx(),
+      dims.n_vocab(),
       dtype,
     )
   }
@@ -1749,11 +1994,13 @@ impl AutoregressiveStt for WhisperModel {
   /// - [`Error::OutOfRange`] if the vocab dimension exceeds `i32::MAX`;
   /// - propagates the embedding / block / LayerNorm / logit op errors.
   fn decode_step(&self, cache: &mut Self::Cache, enc: &Array, tokens: &[u32]) -> Result<Array> {
-    // Validate the encoder extent + token-prefix length and build the new-tail
-    // `(1, T)` token array (the guards fire before any allocation they size).
-    let tok = self.prepare_decode_input(cache, enc, tokens)?;
+    // Validate the encoder extent + token-prefix length / ids and take the
+    // new-tail slice (the guards fire before any allocation they size).
+    // `decode_tokens` builds the `(1, T)` array from this slice and re-checks the
+    // value range at the gather chokepoint.
+    let new_tokens = self.prepare_decode_tail(cache, enc, tokens)?;
 
-    let (logits, new_cache) = self.decode_tokens(&tok, enc, cache.inner.as_ref())?;
+    let (logits, new_cache) = self.decode_tokens(new_tokens, enc, cache.inner.as_ref())?;
 
     // The decoder returns `[B=1, T, V]`; slice the LAST position and reshape to
     // the rank-1 `[V]` row the greedy driver reads `argmax` over. Run every
@@ -1913,12 +2160,18 @@ impl Transcribe for WhisperModel {
     } else {
       decoding::DEFAULT_TEMPERATURES.to_vec()
     };
+    // The universal `Transcribe` contract surfaces no word-timestamp knob (it is
+    // a Whisper-specific feature, driven through the lower-level
+    // `decoding::transcribe`), so this path keeps word timestamps off — the
+    // default decode path. The remaining word-timestamp fields take their
+    // defaults.
     let whisper_opts = WhisperTranscribeOptions {
       decode,
       temperatures,
       compression_ratio_threshold: Some(decoding::DEFAULT_COMPRESSION_RATIO_THRESHOLD),
       logprob_threshold: Some(decoding::DEFAULT_LOGPROB_THRESHOLD),
       no_speech_threshold: Some(decoding::DEFAULT_NO_SPEECH_THRESHOLD),
+      ..WhisperTranscribeOptions::default()
     };
 
     let result = decoding::transcribe(self, &wrapper, &mel, content_frames, &whisper_opts)?;

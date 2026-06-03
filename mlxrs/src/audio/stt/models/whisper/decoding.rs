@@ -38,8 +38,9 @@ use crate::{
 };
 
 use super::{
-  audio::{CHUNK_LENGTH, HOP_LENGTH, N_FRAMES, SAMPLE_RATE, pad_or_trim},
+  audio::{CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, SAMPLE_RATE, pad_or_trim},
   model::WhisperModel,
+  timing,
   tokenizer::HFTokenizerWrapper,
 };
 
@@ -743,6 +744,14 @@ impl<'a> DecodingTask<'a> {
 
     let initial_tokens =
       build_initial_tokens(tokenizer, &sot_sequence, &options, n_ctx, sample_len);
+    // Fail-fast on a caller-supplied `prompt` / `prefix` id `>= n_vocab` BEFORE
+    // any forward: those ids flow through `initial_tokens` into the prefill
+    // `decode_tokens` and then the decoder token-embedding gather, where an
+    // out-of-range id would index out of bounds. `decode_tokens` re-checks the
+    // same value range at the gather chokepoint; validating here surfaces the
+    // typed error at task construction (before the encoder runs) and names the
+    // initial-token boundary. Shares the model's `validate_token_ids` helper.
+    model.validate_token_ids("DecodingTask: initial token", &initial_tokens)?;
     let sample_begin = initial_tokens.len();
     let sot_index = initial_tokens
       .iter()
@@ -876,10 +885,7 @@ impl<'a> DecodingTask<'a> {
     // the prefill, not of any sampled token. `audio_features` is constant across
     // this whole trajectory, so the cross-attention K/V the first forward caches
     // is the K/V of these features for every subsequent step.
-    let first_tokens = arr_row(&tokens)?;
-    let (logits3d, new_cache) = self
-      .model
-      .decode_tokens(&first_tokens, audio_features, None)?;
+    let (logits3d, new_cache) = self.model.decode_tokens(&tokens, audio_features, None)?;
     let mut cache = Some(new_cache);
 
     let no_speech_prob = self.no_speech_prob(&logits3d)?;
@@ -907,11 +913,10 @@ impl<'a> DecodingTask<'a> {
       if completed || tokens.len() > self.n_ctx {
         break;
       }
-      let input = arr_row(&[next])?;
       let cache_ref = cache.as_ref();
       let (logits3d, new_cache) = self
         .model
-        .decode_tokens(&input, audio_features, cache_ref)?;
+        .decode_tokens(&[next], audio_features, cache_ref)?;
       cache = Some(new_cache);
 
       let row = last_position_row(&logits3d)?;
@@ -1003,12 +1008,6 @@ fn build_initial_tokens(
   tokens
 }
 
-/// Make a `(1, T)` int token array from a token slice.
-fn arr_row(tokens: &[u32]) -> Result<Array> {
-  let t = i32::try_from(tokens.len()).map_err(|_| dim_overflow("token sequence length"))?;
-  Array::from_slice::<u32>(tokens, &[1, t])
-}
-
 /// Extract the last-position logits row `(n_vocab,)` from a `(1, T, n_vocab)`
 /// decoder output as a device [`Array`] (the reference's `logits[:, -1]`).
 ///
@@ -1082,8 +1081,7 @@ pub fn detect_language<'a>(
   }
 
   // Single `sot` forward, fresh cache.
-  let sot = arr_row(&[tokenizer.sot()])?;
-  let (logits3d, _cache) = model.decode_tokens(&sot, audio_features, None)?;
+  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], audio_features, None)?;
   // logits[:, 0] → the only (first) position's row. Language detection runs
   // once (not per decode step), so reading this row to the host here is fine —
   // it is the masking + softmax over a small language-token set, not the hot
@@ -1363,8 +1361,24 @@ pub fn decode_with_fallback(
 }
 
 /// One transcribed segment of a longer mel — the per-window result of the
+/// A per-word timing attached to a [`Segment`] when word timestamps are enabled
+/// — the reference's `segment["words"]` entry (`whisper.py:272-279`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Word {
+  /// The word text (including any leading space / merged punctuation).
+  pub word: String,
+  /// The word start time in seconds (absolute, including the segment offset).
+  pub start: f64,
+  /// The word end time in seconds (absolute).
+  pub end: f64,
+  /// The mean per-token probability of the word's tokens.
+  pub probability: f64,
+}
+
 /// seek loop (`whisper.py:996-1011` `new_segment`), trimmed to the fields
-/// mlxrs surfaces (no word timestamps — that is the deferred DTW feature).
+/// mlxrs surfaces. [`Self::words`] is populated only when word timestamps are
+/// requested ([`TranscribeOptions::word_timestamps`]); it is empty on the
+/// default (no-word-timestamp) path.
 #[derive(Debug, Clone)]
 pub struct Segment {
   /// Segment start time in seconds.
@@ -1383,6 +1397,9 @@ pub struct Segment {
   pub no_speech_prob: f64,
   /// The compression ratio of this segment's text.
   pub compression_ratio: f64,
+  /// The per-word timings — empty unless word timestamps were requested
+  /// ([`TranscribeOptions::word_timestamps`]).
+  pub words: Vec<Word>,
 }
 
 /// The whole-utterance transcription — the `generate` return shape
@@ -1414,6 +1431,21 @@ pub struct TranscribeOptions {
   pub logprob_threshold: Option<f64>,
   /// No-speech threshold (`None` disables the silence skip).
   pub no_speech_threshold: Option<f64>,
+  /// Attach per-word timestamps to each segment via the cross-attention DTW
+  /// (`whisper.py:804`). `false` (the default) leaves the decode path
+  /// byte-identical and adds **zero** cost; `true` runs the extra
+  /// [`super::timing::add_word_timestamps`] alignment pass per window.
+  pub word_timestamps: bool,
+  /// Punctuation merged onto the **next** word when word timestamps are on
+  /// ([`super::timing::PREPEND_PUNCTUATIONS`], `whisper.py:805`).
+  pub prepend_punctuations: String,
+  /// Punctuation merged onto the **previous** word
+  /// ([`super::timing::APPEND_PUNCTUATIONS`], `whisper.py:806`).
+  pub append_punctuations: String,
+  /// When `Some` (and `word_timestamps` is on), skip silent periods longer than
+  /// this threshold (seconds) around a detected hallucination
+  /// (`whisper.py:808`, `:1171-1237`). `None` disables the heuristic.
+  pub hallucination_silence_threshold: Option<f64>,
 }
 
 impl Default for TranscribeOptions {
@@ -1424,13 +1456,23 @@ impl Default for TranscribeOptions {
       compression_ratio_threshold: Some(DEFAULT_COMPRESSION_RATIO_THRESHOLD),
       logprob_threshold: Some(DEFAULT_LOGPROB_THRESHOLD),
       no_speech_threshold: Some(DEFAULT_NO_SPEECH_THRESHOLD),
+      word_timestamps: false,
+      prepend_punctuations: super::timing::PREPEND_PUNCTUATIONS.to_string(),
+      append_punctuations: super::timing::APPEND_PUNCTUATIONS.to_string(),
+      hallucination_silence_threshold: None,
     }
   }
 }
 
 /// Transcribe a (possibly long) mel by sliding a 30-second window over it —
-/// the core seek loop of `generate` (`whisper.py:978-1300`), without the
-/// word-timestamp DTW / hallucination heuristics (deferred features).
+/// the core seek loop of `generate` (`whisper.py:978-1300`).
+///
+/// When [`TranscribeOptions::word_timestamps`] is set, each window additionally
+/// runs the cross-attention DTW alignment ([`super::timing::add_word_timestamps`])
+/// to attach per-word timings and (with
+/// [`TranscribeOptions::hallucination_silence_threshold`]) the
+/// hallucination-silence skip; when it is unset the loop is the plain
+/// segment-level seek with no added cost.
 ///
 /// `mel` is the full `(num_frames, n_mels)` log-mel spectrogram (frames on
 /// axis 0), which the caller typically padded by a trailing 30-second chunk so
@@ -1504,6 +1546,10 @@ pub fn transcribe(
   let mut segments: Vec<Segment> = Vec::new();
   let mut all_text = String::new();
   let mut seek = 0usize;
+  // `last_speech_timestamp` (`whisper.py:1017`) — the running end of the last
+  // emitted word, used by the word-timestamp duration hacks and the
+  // hallucination heuristic. Unused on the no-word-timestamp path.
+  let mut last_speech_timestamp = 0.0f64;
 
   while seek < content_frames {
     let time_offset = seek as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
@@ -1540,11 +1586,15 @@ pub fn transcribe(
       }
     }
 
-    // Timestamp-aware seek advance (`whisper.py:1081-1149`), simplified to the
-    // segment-level path (no word timestamps): find consecutive timestamp
-    // pairs to cut sub-segments, else advance by the last single timestamp.
+    let previous_seek = seek;
+    // Timestamp-aware segment cut (`whisper.py:1081-1149`): find consecutive
+    // timestamp pairs to cut sub-segments, else one segment for the whole
+    // window. Collect into a per-window `current_segments` (the reference's
+    // local list) — the global `segments` / `all_text` are extended below, so
+    // the word-timestamp / hallucination pass can adjust this window first.
     let tokens = &result.tokens;
-    let advance = advance_and_collect_segments(
+    let mut current_segments: Vec<Segment> = Vec::new();
+    let (advance, single_timestamp_ending) = advance_and_collect_segments(
       tokens,
       timestamp_begin,
       time_offset,
@@ -1553,10 +1603,49 @@ pub fn transcribe(
       input_stride,
       &result,
       tokenizer,
-      &mut segments,
-      &mut all_text,
+      &mut current_segments,
     )?;
     seek += advance;
+
+    if options.word_timestamps {
+      // Attach per-word timings + apply the duration hacks (`whisper.py:1151-
+      // 1161`), then re-derive `seek` from the last word end and run the
+      // hallucination-silence skip. `skip_window` signals the reference's
+      // leading-silence `continue` (the window's segments are dropped).
+      let outcome = apply_word_timestamps(
+        model,
+        tokenizer,
+        &mel_segment,
+        segment_size,
+        time_offset,
+        previous_seek,
+        seek,
+        single_timestamp_ending,
+        &mut current_segments,
+        &mut last_speech_timestamp,
+        content_frames,
+        options,
+      )?;
+      seek = outcome.seek;
+      if outcome.skip_window {
+        continue;
+      }
+
+      // Clear degenerate segments before accumulating (`whisper.py:1253-1261`):
+      // a segment that is instantaneous (`start == end`) or whose text is
+      // whitespace-only has its text, tokens, and words emptied. This is part of
+      // the word-timestamp finalization, so it is gated to the word-timestamp
+      // path: the default `word_timestamps == false` path stays byte-identical
+      // to the pre-feature behavior (every segment emitted with its sampled
+      // tokens / text intact), which callers reading `Segment.tokens` rely on.
+      clear_degenerate_segments(&mut current_segments);
+    }
+
+    // Append this window's segments + their text to the running totals.
+    for segment in &current_segments {
+      all_text.push_str(&segment.text);
+    }
+    segments.append(&mut current_segments);
   }
 
   Ok(TranscribeResult {
@@ -1564,6 +1653,283 @@ pub fn transcribe(
     language,
     segments,
   })
+}
+
+/// Clear instantaneous / whitespace-only segments in place — `whisper.py:1253-
+/// 1261` (`if a segment is instantaneous or does not contain text, clear it`).
+///
+/// For each segment whose `start == end` (zero duration) **or** whose text is
+/// whitespace-only (`text.strip() == ""`), the reference empties its `text`,
+/// `tokens`, **and** `words`, so the emitted segment carries no public words /
+/// tokens and adds no whitespace to the accumulated transcript. Non-degenerate
+/// segments are left untouched.
+fn clear_degenerate_segments(segments: &mut [Segment]) {
+  for segment in segments.iter_mut() {
+    if segment.start == segment.end || segment.text.trim().is_empty() {
+      segment.text.clear();
+      segment.tokens.clear();
+      segment.words.clear();
+    }
+  }
+}
+
+/// The outcome of the word-timestamp + hallucination pass for one window: the
+/// (possibly re-derived) `seek` and whether the window's segments are dropped
+/// (the reference's leading-silence `continue`, `whisper.py:1196`).
+struct WordTimestampOutcome {
+  seek: usize,
+  skip_window: bool,
+}
+
+/// Attach per-word timestamps to a window's `current_segments`, re-derive `seek`
+/// from the last word end, and run the hallucination-silence skip — the
+/// `word_timestamps` branch of the seek loop (`whisper.py:1151-1242`).
+///
+/// `time_offset` / `previous_seek` are the pre-advance window position; `seek`
+/// the post-segment-cut advance. `content_frames` bounds the final seek.
+/// Returns the updated seek + whether to drop this window (leading-silence
+/// hallucination skip).
+///
+/// # Errors
+/// Propagates [`timing::add_word_timestamps`].
+#[allow(clippy::too_many_arguments)]
+fn apply_word_timestamps(
+  model: &WhisperModel,
+  tokenizer: &HFTokenizerWrapper<'_>,
+  mel_segment: &Array,
+  segment_size: usize,
+  time_offset: f64,
+  previous_seek: usize,
+  seek: usize,
+  single_timestamp_ending: bool,
+  current_segments: &mut Vec<Segment>,
+  last_speech_timestamp: &mut f64,
+  content_frames: usize,
+  options: &TranscribeOptions,
+) -> Result<WordTimestampOutcome> {
+  let mut seek = seek;
+  let segment_duration = segment_size as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+  // `window_end_time` is the end of the full PADDED 30-second window
+  // (`seek + N_FRAMES`), NOT `time_offset + segment_duration` — both the OpenAI
+  // and mlx-audio references derive it from `N_FRAMES` even on a final partial
+  // window (`whisper.py:1021-1023`). The hallucination `remaining` /
+  // `silence_after` checks below are defined against this padded end, so it is
+  // kept verbatim for parity. (`segment_duration` / `content_duration` carry the
+  // real audio extent where the reference uses those instead.)
+  let window_end_time = (previous_seek + N_FRAMES) as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+  let content_duration = content_frames as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+
+  // `add_word_timestamps(...)` (`whisper.py:1152-1161`): attach the words +
+  // duration hacks. The reference passes the PRIOR `last_speech_timestamp` in
+  // (for the per-segment pause hack) but does not feed the function's local
+  // mutation back to the caller — the cross-window value is only advanced after
+  // the skip decision below (`whisper.py:1239-1241`). `prev_last_speech` keeps
+  // that prior accepted-speech end so the hallucination `silence_before` check
+  // measures the gap against it, not against this window's last word.
+  let prev_last_speech = *last_speech_timestamp;
+  timing::add_word_timestamps(
+    model,
+    tokenizer,
+    current_segments,
+    mel_segment,
+    segment_size,
+    previous_seek,
+    &options.prepend_punctuations,
+    &options.append_punctuations,
+    prev_last_speech,
+  )?;
+
+  // Re-derive `seek` from the last word end (`whisper.py:1163-1169`), unless the
+  // window ended on a lone trailing timestamp.
+  if !single_timestamp_ending
+    && let Some(last_word_end) = timing::get_end(current_segments)
+    && last_word_end > time_offset
+  {
+    seek = round_to_frames(last_word_end);
+  }
+
+  // Hallucination-silence skip (`whisper.py:1171-1237`), measured against the
+  // PRIOR `last_speech_timestamp` (`prev_last_speech`).
+  if let Some(threshold) = options.hallucination_silence_threshold {
+    let skip = hallucination_silence_skip(HallucinationSkipParams {
+      current_segments,
+      threshold,
+      prev_last_speech,
+      time_offset,
+      previous_seek,
+      segment_size,
+      segment_duration,
+      window_end_time,
+      content_duration,
+      content_frames,
+      single_timestamp_ending,
+      seek,
+    });
+    // The leading-silence drop (`whisper.py:1196` `continue`) returns WITHOUT
+    // advancing the cross-window `last_speech_timestamp` — the next window's
+    // pause heuristic must still see the prior accepted-speech end.
+    if skip.skip_window {
+      return Ok(WordTimestampOutcome {
+        seek: skip.seek,
+        skip_window: true,
+      });
+    }
+    seek = skip.seek;
+  }
+
+  // Final `last_word_end` → `last_speech_timestamp` (`whisper.py:1239-1241`):
+  // advance the cross-window value only now, for a window that is NOT dropped.
+  if let Some(last_word_end) = timing::get_end(current_segments) {
+    *last_speech_timestamp = last_word_end;
+  }
+
+  Ok(WordTimestampOutcome {
+    seek,
+    skip_window: false,
+  })
+}
+
+/// Inputs to [`hallucination_silence_skip`] — the per-window timing context for
+/// the hallucination-silence skip (`whisper.py:1171-1237`). Bundled to keep the
+/// signature within the argument lint.
+struct HallucinationSkipParams<'a> {
+  /// This window's segments (already carrying [`Word`]s). Truncated in place at
+  /// a hallucination surrounded by silence (`whisper.py:1235`).
+  current_segments: &'a mut Vec<Segment>,
+  /// The configured `hallucination_silence_threshold`.
+  threshold: f64,
+  /// The PRIOR accepted-speech end (the cross-window `last_speech_timestamp`
+  /// from before this window) — `hal_last_end`'s seed (`whisper.py:1200`).
+  prev_last_speech: f64,
+  /// This window's start time in seconds.
+  time_offset: f64,
+  /// This window's pre-advance frame offset.
+  previous_seek: usize,
+  /// This window's real (non-pad) frame count.
+  segment_size: usize,
+  /// `segment_size`'s duration in seconds (`hal_next_start` fallback).
+  segment_duration: f64,
+  /// The padded 30-second window end in seconds.
+  window_end_time: f64,
+  /// The full content (non-pad) duration in seconds.
+  content_duration: f64,
+  /// The total content frame count (the seek upper bound).
+  content_frames: usize,
+  /// Whether the window ended on a lone trailing timestamp.
+  single_timestamp_ending: bool,
+  /// The seek already re-derived from the last word end.
+  seek: usize,
+}
+
+/// The result of [`hallucination_silence_skip`]: the (possibly fast-forwarded)
+/// seek and whether the window is dropped (the leading-silence `continue`).
+struct SilenceSkip {
+  seek: usize,
+  skip_window: bool,
+}
+
+/// The hallucination-silence skip block (`whisper.py:1172-1237`), factored out
+/// of [`apply_word_timestamps`] so it operates purely on populated segments —
+/// it never touches the cross-window `last_speech_timestamp`, only reading the
+/// PRIOR value (`params.prev_last_speech`) for the `silence_before` /
+/// `hal_last_end` gap. The caller advances the cross-window value afterwards,
+/// and only for a window that is not dropped.
+fn hallucination_silence_skip(params: HallucinationSkipParams<'_>) -> SilenceSkip {
+  let HallucinationSkipParams {
+    current_segments,
+    threshold,
+    prev_last_speech,
+    time_offset,
+    previous_seek,
+    segment_size,
+    segment_duration,
+    window_end_time,
+    content_duration,
+    content_frames,
+    single_timestamp_ending,
+    mut seek,
+  } = params;
+
+  if !single_timestamp_ending
+    && let Some(last_word_end) = timing::get_end(current_segments)
+    && last_word_end > time_offset
+  {
+    let remaining = window_end_time - last_word_end;
+    seek = if remaining > threshold {
+      round_to_frames(last_word_end)
+    } else {
+      previous_seek + segment_size
+    };
+  }
+
+  // If the first segment with words is anomalous, skip the leading silence
+  // (`whisper.py:1186-1196`) — dropping this window's segments.
+  if let Some(first) = timing::next_words_segment(current_segments)
+    && timing::is_segment_anomaly(Some(first))
+  {
+    let gap = first.start - time_offset;
+    if gap > threshold {
+      seek = previous_seek + round_to_frames(gap);
+      return SilenceSkip {
+        seek,
+        skip_window: true,
+      };
+    }
+  }
+
+  // Skip silence before any hallucination surrounded by silence
+  // (`whisper.py:1198-1237`). `hal_last_end` seeds from the PRIOR accepted
+  // speech (`prev_last_speech`), then walks each segment's own end.
+  let mut hal_last_end = prev_last_speech;
+  for si in 0..current_segments.len() {
+    if current_segments[si].words.is_empty() {
+      continue;
+    }
+    if is_segment_anomaly_at(current_segments, si) {
+      // `next_segment = next_words_segment(current_segments[si + 1:])`
+      // (`whisper.py:1206-1208`): the NEXT segment WITH WORDS, used for both
+      // `hal_next_start` and the `silence_after` anomaly check below — never the
+      // immediate `si + 1` segment, which may be empty / timestamp-only.
+      let next_segment = timing::next_words_segment(&current_segments[si + 1..]);
+      let hal_next_start =
+        next_segment.map_or(time_offset + segment_duration, |s| s.words[0].start);
+      let seg_start = current_segments[si].start;
+      let seg_end = current_segments[si].end;
+      let silence_before = seg_start - hal_last_end > threshold
+        || seg_start < threshold
+        || seg_start - time_offset < 2.0;
+      let silence_after = hal_next_start - seg_end > threshold
+        || timing::is_segment_anomaly(next_segment)
+        || window_end_time - seg_end < 2.0;
+      if silence_before && silence_after {
+        seek = round_to_frames((time_offset + 1.0).max(seg_start));
+        if content_duration - seg_end < threshold {
+          seek = content_frames;
+        }
+        current_segments.truncate(si);
+        break;
+      }
+    }
+    hal_last_end = current_segments[si].end;
+  }
+
+  SilenceSkip {
+    seek,
+    skip_window: false,
+  }
+}
+
+/// `is_segment_anomaly(current_segments[idx])` with bounds — `None` for an
+/// out-of-range index (the reference's `next_segment` may be `None`).
+fn is_segment_anomaly_at(segments: &[Segment], idx: usize) -> bool {
+  timing::is_segment_anomaly(segments.get(idx))
+}
+
+/// `round(seconds * FRAMES_PER_SECOND)` clamped non-negative — the seek
+/// frame conversion (`whisper.py`'s `round(... * FRAMES_PER_SECOND)`).
+fn round_to_frames(seconds: f64) -> usize {
+  let frames = (seconds * FRAMES_PER_SECOND as f64).round();
+  if frames <= 0.0 { 0 } else { frames as usize }
 }
 
 /// Slice `mel[start : start + len]` along the frame axis (axis 0).
@@ -1576,12 +1942,14 @@ fn slice_frames(mel: &Array, start: usize, len: usize) -> Result<Array> {
 }
 
 /// Cut a window's tokens into segments at consecutive-timestamp boundaries,
-/// append them to `segments` / `all_text`, and return the frame advance for
-/// `seek` — the segment-level core of `whisper.py:1081-1149`.
+/// append them to `segments`, and return `(advance, single_timestamp_ending)` —
+/// the segment-level core of `whisper.py:1081-1149`. `advance` is the frame
+/// step for `seek`; `single_timestamp_ending` (`whisper.py:1082-1085`) is true
+/// when the window ended on a lone trailing timestamp (consumed in full),
+/// consumed by the word-timestamp seek re-derivation.
 ///
-/// Without word timestamps, the advance is: if the window ended on a
-/// consecutive-timestamp pair, advance by the last timestamp's position;
-/// otherwise advance the full `segment_size`.
+/// The advance is: if the window ended on a consecutive-timestamp pair, advance
+/// by the last timestamp's position; otherwise advance the full `segment_size`.
 #[allow(clippy::too_many_arguments)]
 fn advance_and_collect_segments(
   tokens: &[u32],
@@ -1593,8 +1961,7 @@ fn advance_and_collect_segments(
   result: &DecodingResult,
   tokenizer: &HFTokenizerWrapper<'_>,
   segments: &mut Vec<Segment>,
-  all_text: &mut String,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
   // `timestamp_tokens = tokens >= timestamp_begin`.
   let is_ts: Vec<bool> = tokens.iter().map(|&t| t >= timestamp_begin).collect();
   // `single_timestamp_ending = is_ts[-2:] == [False, True]`.
@@ -1622,7 +1989,6 @@ fn advance_and_collect_segments(
         let end_pos = (last.saturating_sub(timestamp_begin)) as f64;
         push_segment(
           segments,
-          all_text,
           tokenizer,
           time_offset + start_pos * time_precision,
           time_offset + end_pos * time_precision,
@@ -1635,7 +2001,7 @@ fn advance_and_collect_segments(
 
     if single_timestamp_ending {
       // The whole window was consumed up to the final timestamp.
-      Ok(segment_size)
+      Ok((segment_size, true))
     } else {
       // Advance to the last consumed timestamp (`whisper.py:1127`:
       // `seek += last_timestamp_pos * input_stride`). The `.max(1)` guarantees
@@ -1647,7 +2013,7 @@ fn advance_and_collect_segments(
       let last_ts_pos = tokens
         .get(last_slice.saturating_sub(1))
         .map_or(0, |&t| t.saturating_sub(timestamp_begin) as usize);
-      Ok((last_ts_pos * input_stride).max(1).min(segment_size))
+      Ok(((last_ts_pos * input_stride).max(1).min(segment_size), false))
     }
   } else {
     // No consecutive timestamps: one segment for the whole window
@@ -1666,23 +2032,22 @@ fn advance_and_collect_segments(
     }
     push_segment(
       segments,
-      all_text,
       tokenizer,
       time_offset,
       time_offset + duration,
       tokens,
       result,
     )?;
-    Ok(segment_size)
+    Ok((segment_size, false))
   }
 }
 
-/// Build a [`Segment`] from a token slice + timing and append it (with its
-/// text) to the running collections. Text is the non-special (`< eot`) tokens
-/// decoded (`whisper.py:1000-1005`).
+/// Build a [`Segment`] from a token slice + timing and append it to
+/// `segments`. Text is the non-special (`< eot`) tokens decoded
+/// (`whisper.py:1000-1005`). The caller accumulates `all_text` from the
+/// window's segments after any word-timestamp adjustment.
 fn push_segment(
   segments: &mut Vec<Segment>,
-  all_text: &mut String,
   tokenizer: &HFTokenizerWrapper<'_>,
   start: f64,
   end: f64,
@@ -1692,7 +2057,6 @@ fn push_segment(
   let eot = tokenizer.eot();
   let text_tokens: Vec<u32> = tokens.iter().copied().filter(|&t| t < eot).collect();
   let text = tokenizer.decode(&text_tokens, false)?;
-  all_text.push_str(&text);
   segments.push(Segment {
     start,
     end,
@@ -1702,6 +2066,7 @@ fn push_segment(
     avg_logprob: result.avg_logprob,
     no_speech_prob: result.no_speech_prob,
     compression_ratio: result.compression_ratio,
+    words: Vec::new(),
   });
   Ok(())
 }

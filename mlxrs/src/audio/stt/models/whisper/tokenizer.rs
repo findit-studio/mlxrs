@@ -141,6 +141,23 @@ static LANGUAGE_ALIASES: &[(&str, &str)] = &[
   ("mandarin", "zh"),
 ];
 
+/// Whether `s` is in Python's `string.punctuation` — the reference's
+/// `subword.strip() in string.punctuation` test (`tokenizer.py:227`).
+///
+/// Python's `string.punctuation` is the 32 ASCII punctuation characters
+/// (`!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~`). The `in` membership of a string is a
+/// substring test, so a single such character matches; the empty string also
+/// matches (`"" in s` is `True` in Python) — which is reachable only for an
+/// all-whitespace subword. Any longer / non-punctuation string does not.
+fn is_ascii_punctuation(s: &str) -> bool {
+  match s.chars().next() {
+    // Empty: Python `"" in string.punctuation` is True.
+    None => true,
+    // A single ASCII-punctuation char (and nothing after it).
+    Some(c) => s.len() == c.len_utf8() && c.is_ascii_punctuation(),
+  }
+}
+
 /// Normalize a language name or code to its two/three-letter code — the
 /// reference's `TO_LANGUAGE_CODE` dict lookup (`tokenizer.py:107-121`).
 ///
@@ -379,6 +396,106 @@ impl<'a> HFTokenizerWrapper<'a> {
   /// Propagates the underlying tokenizer decode error.
   pub fn decode_with_timestamps(&self, tokens: &[u32]) -> Result<String> {
     self.tokenizer.decode(tokens, false)
+  }
+
+  /// Split a token list into words, returning `(words, word_tokens)` where
+  /// `word_tokens[i]` is the token slice decoding to `words[i]` — the
+  /// reference's `split_to_word_tokens` (`tokenizer.py:184-188`).
+  ///
+  /// The word-boundary rule depends on the language: CJK-like languages (no
+  /// space-delimited words — `zh`, `ja`, `th`, `lo`, `my`, `yue`) split at
+  /// unicode-codepoint boundaries (`_split_tokens_on_unicode`); every other
+  /// language splits at leading-space / punctuation boundaries
+  /// (`_split_tokens_on_spaces`). Used by the word-timestamp DTW to merge
+  /// per-token frame alignments into per-word timings.
+  ///
+  /// # Errors
+  /// Propagates the underlying [`Self::decode_with_timestamps`] errors.
+  pub fn split_to_word_tokens(&self, tokens: &[u32]) -> Result<(Vec<String>, Vec<Vec<u32>>)> {
+    // `whisper.py:184-188`: the space-delimited split is the default; the
+    // listed CJK-like languages have no word spacing, so they split on unicode.
+    if matches!(
+      self.language.as_str(),
+      "zh" | "ja" | "th" | "lo" | "my" | "yue"
+    ) {
+      self.split_tokens_on_unicode(tokens)
+    } else {
+      self.split_tokens_on_spaces(tokens)
+    }
+  }
+
+  /// Split `tokens` at unicode boundaries — `_split_tokens_on_unicode`
+  /// (`tokenizer.py:190-214`). A subword closes whenever its decoded text has
+  /// no replacement char (`U+FFFD`) — or the replacement char it carries is a
+  /// real `U+FFFD` in the full decode (a genuine codepoint, not a partial
+  /// multi-byte sequence still being assembled).
+  ///
+  /// # Errors
+  /// Propagates [`Self::decode_with_timestamps`].
+  fn split_tokens_on_unicode(&self, tokens: &[u32]) -> Result<(Vec<String>, Vec<Vec<u32>>)> {
+    const REPLACEMENT_CHAR: char = '\u{fffd}';
+    let decoded_full = self.decode_with_timestamps(tokens)?;
+    // Index the full decode by codepoint so `unicode_offset` (a codepoint count)
+    // can resolve the char at the running offset, matching numpy/Python string
+    // indexing (which is codepoint-based) rather than Rust's byte indexing.
+    let full_chars: Vec<char> = decoded_full.chars().collect();
+
+    let mut words: Vec<String> = Vec::new();
+    let mut word_tokens: Vec<Vec<u32>> = Vec::new();
+    let mut current_tokens: Vec<u32> = Vec::new();
+    let mut unicode_offset = 0usize;
+
+    for &token in tokens {
+      current_tokens.push(token);
+      let decoded = self.decode_with_timestamps(&current_tokens)?;
+
+      // Close the subword when it has no replacement char, OR when the replaced
+      // position in the full decode is itself a real replacement char (so the
+      // `U+FFFD` is a genuine codepoint, not a still-incomplete byte sequence).
+      let close = match decoded.chars().position(|c| c == REPLACEMENT_CHAR) {
+        None => true,
+        Some(rel) => full_chars.get(unicode_offset + rel) == Some(&REPLACEMENT_CHAR),
+      };
+      if close {
+        unicode_offset += decoded.chars().count();
+        words.push(decoded);
+        word_tokens.push(std::mem::take(&mut current_tokens));
+      }
+    }
+
+    Ok((words, word_tokens))
+  }
+
+  /// Split `tokens` at space boundaries — `_split_tokens_on_spaces`
+  /// (`tokenizer.py:216-235`). First splits on unicode, then merges a subword
+  /// into the previous word unless it is special (`>= eot`), starts with a
+  /// space, is pure punctuation, or is the first word.
+  ///
+  /// # Errors
+  /// Propagates [`Self::split_tokens_on_unicode`].
+  fn split_tokens_on_spaces(&self, tokens: &[u32]) -> Result<(Vec<String>, Vec<Vec<u32>>)> {
+    let (subwords, subword_tokens_list) = self.split_tokens_on_unicode(tokens)?;
+    let mut words: Vec<String> = Vec::new();
+    let mut word_tokens: Vec<Vec<u32>> = Vec::new();
+
+    for (subword, subword_toks) in subwords.into_iter().zip(subword_tokens_list) {
+      // `special = subword_tokens[0] >= self.eot`.
+      let special = subword_toks.first().is_some_and(|&t| t >= self.eot);
+      let with_space = subword.starts_with(' ');
+      // `punctuation = subword.strip() in string.punctuation`: the trimmed
+      // subword is a single ASCII punctuation character.
+      let punctuation = is_ascii_punctuation(subword.trim());
+      if special || with_space || punctuation || words.is_empty() {
+        words.push(subword);
+        word_tokens.push(subword_toks);
+      } else if let (Some(last_word), Some(last_toks)) = (words.last_mut(), word_tokens.last_mut())
+      {
+        last_word.push_str(&subword);
+        last_toks.extend(subword_toks);
+      }
+    }
+
+    Ok((words, word_tokens))
   }
 
   /// The start-of-transcript sequence (`whisper.py:131-135`):

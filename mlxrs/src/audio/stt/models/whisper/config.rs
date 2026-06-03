@@ -10,13 +10,14 @@
 //! would otherwise surface as a downstream reshape panic.
 
 use serde_json::Value;
+use smol_str::format_smolstr;
 
 use crate::{
   Error, Result,
-  error::{MissingFieldPayload, ParsePayload},
+  error::{EmptyInputPayload, MissingFieldPayload, OutOfRangePayload, ParsePayload},
   model_validation::{
     Extent, elem_count, pin_usize, require_cardinality, require_divisible, require_even,
-    require_in_range, require_positive,
+    require_in_range, require_positive, reserve_or_error,
   },
 };
 
@@ -648,6 +649,298 @@ impl ModelDimensions {
   pub fn n_text_layer(&self) -> usize {
     self.n_text_layer.get()
   }
+
+  /// The default word-timing alignment heads — every `(layer, head)` in the
+  /// **last half** of the decoder layers (`whisper.py:510-516`):
+  /// `all_heads[n_text_layer // 2 :] = True`, enumerated in
+  /// `(layer, head)` row-major order (numpy `nonzero().T` over a
+  /// `(n_text_layer, n_text_head)` boolean mask).
+  ///
+  /// These are used by the word-timestamp DTW when a checkpoint ships no
+  /// explicit `alignment_heads` in its `generation_config.json` (the override
+  /// is parsed by [`AlignmentHeads::from_generation_config`]).
+  pub fn default_alignment_heads(&self) -> Vec<(usize, usize)> {
+    let layers = self.n_text_layer();
+    let heads = self.n_text_head();
+    // `n_text_layer // 2` — the first layer index in the last half.
+    let first = layers / 2;
+    let mut out = Vec::with_capacity((layers - first) * heads);
+    for l in first..layers {
+      for h in 0..heads {
+        out.push((l, h));
+      }
+    }
+    out
+  }
+}
+
+/// The word-timing alignment heads — the `(layer, head)` cross-attention heads
+/// the word-timestamp DTW averages to align text tokens to audio frames
+/// (`whisper.py:_alignment_heads`).
+///
+/// The reference stores these as an `mx.array` of shape `(num_heads, 2)` (each
+/// row `[layer, head]`); this carries the equivalent `Vec<(layer, head)>`. The
+/// default is the **last half** of the decoder layers
+/// ([`ModelDimensions::default_alignment_heads`]); a checkpoint can override it
+/// through its `generation_config.json` (`set_alignment_heads`,
+/// `whisper.py:522-537`), parsed by [`Self::from_generation_config`].
+///
+/// Alongside the pairs this carries the `(n_layer, n_head)` decoder grid the
+/// list was validated against, so the value has a dimension identity. The pairs
+/// alone cannot say *which* model they are in-grid for; a set validated against
+/// a larger model's grid would carry indices out of a smaller model's grid.
+/// [`WhisperModel::with_alignment_heads`](super::model::WhisperModel::with_alignment_heads)
+/// checks the carried `(n_layer, n_head)` equals the target model's
+/// `(n_text_layer, n_text_head)`, so a set validated for one model cannot be
+/// installed on another and reach the word-timestamp DTW gather out of grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignmentHeads {
+  heads: Vec<(usize, usize)>,
+  n_layer: usize,
+  n_head: usize,
+}
+
+impl AlignmentHeads {
+  /// Wrap an explicit `(layer, head)` list **without validation**, tagged with
+  /// the `(n_layer, n_head)` grid it belongs to — for the crate's internal
+  /// default construction only ([`Self::default_for`], which derives the list
+  /// from validated `dims` so it is in-grid + distinct by construction). The
+  /// public, validating constructor is [`Self::try_new`].
+  #[inline(always)]
+  pub(crate) fn new(heads: Vec<(usize, usize)>, n_layer: usize, n_head: usize) -> Self {
+    Self {
+      heads,
+      n_layer,
+      n_head,
+    }
+  }
+
+  /// Wrap an explicit `(layer, head)` list, validated against `dims` — the only
+  /// public way to build a custom [`AlignmentHeads`]. Each pair must lie in the
+  /// decoder grid (`layer < n_text_layer`, `head < n_text_head`) and the list
+  /// must contain no duplicate pair; on any violation the shared in-grid +
+  /// no-duplicate check's typed error is returned. The validated `dims`'
+  /// `(n_text_layer, n_text_head)` is recorded on the value, so the returned
+  /// [`AlignmentHeads`] carries the grid it is in-grid for. The list can only be
+  /// installed on a [`WhisperModel`](super::model::WhisperModel) whose dims match
+  /// that grid (the install rechecks), so no out-of-grid or duplicate head set —
+  /// nor a set validated for a *different* model — can ever reach the
+  /// word-timestamp DTW.
+  ///
+  /// # Errors
+  /// - [`Error::EmptyInput`] if `heads` is empty;
+  /// - [`Error::OutOfRange`] if a pair is outside the model's
+  ///   `(n_text_layer, n_text_head)` grid, or if the same pair appears twice;
+  /// - [`Error::AllocFailure`] if reserving the dedup bitset fails.
+  pub fn try_new(heads: Vec<(usize, usize)>, dims: &ModelDimensions) -> Result<Self> {
+    let n_layer = dims.n_text_layer();
+    let n_head = dims.n_text_head();
+    Ok(Self::new(
+      validate_alignment_heads(heads, n_layer, n_head)?,
+      n_layer,
+      n_head,
+    ))
+  }
+
+  /// The default alignment heads for `dims` — the last half of the decoder
+  /// layers ([`ModelDimensions::default_alignment_heads`]). The list is in-grid
+  /// and distinct by construction (derived from the validated `dims`), so it is
+  /// wrapped through the unchecked `Self::new`, tagged with the same `dims` grid.
+  #[inline(always)]
+  pub fn default_for(dims: &ModelDimensions) -> Self {
+    Self::new(
+      dims.default_alignment_heads(),
+      dims.n_text_layer(),
+      dims.n_text_head(),
+    )
+  }
+
+  /// The `(layer, head)` pairs.
+  #[inline(always)]
+  pub fn heads(&self) -> &[(usize, usize)] {
+    &self.heads
+  }
+
+  /// The decoder layer count (`n_text_layer`) the heads were validated against.
+  #[inline(always)]
+  pub fn n_layer(&self) -> usize {
+    self.n_layer
+  }
+
+  /// The decoder head count (`n_text_head`) the heads were validated against.
+  #[inline(always)]
+  pub fn n_head(&self) -> usize {
+    self.n_head
+  }
+
+  /// Parse the alignment heads from a parsed `generation_config.json` body —
+  /// the reference's `set_alignment_heads(gen_config["alignment_heads"])`
+  /// (`whisper.py:704-715`, `:522-537`). Returns `None` when the config carries
+  /// no `alignment_heads` key (the caller then keeps the
+  /// [`Self::default_for`] last-half default).
+  ///
+  /// The JSON-reachable form is a **list of `[layer, head]` pairs** (the
+  /// `isinstance(dump, list)` branch — a `generation_config.json` cannot embed
+  /// the raw-bytes bitmask). Each pair is parsed **as `usize`** (no intermediate
+  /// `i32` cast, so a pathological index `> i32::MAX` cannot wrap into an
+  /// in-range `i32`), then the whole list is run through the shared in-grid +
+  /// no-duplicate validation (`validate_alignment_heads`), so neither an
+  /// out-of-grid value nor a repeated pair can survive as an out-of-bounds index
+  /// at DTW time.
+  ///
+  /// # Errors
+  /// - [`Error::Parse`] if `alignment_heads` is present but not a list of
+  ///   two-element non-negative-integer pairs;
+  /// - [`Error::EmptyInput`] if `alignment_heads` is present but an empty list;
+  /// - [`Error::OutOfRange`] if a pair's layer / head is outside the model's
+  ///   `(n_text_layer, n_text_head)` grid, if the same pair appears twice, or if
+  ///   the list has more entries than the grid (a valid in-grid, distinct list
+  ///   cannot exceed `n_text_layer * n_text_head`);
+  /// - [`Error::AllocFailure`] if reserving the head `Vec` fails.
+  pub fn from_generation_config(config: &Value, dims: &ModelDimensions) -> Result<Option<Self>> {
+    let Some(value) = config.get("alignment_heads") else {
+      return Ok(None);
+    };
+    let list = value.as_array().ok_or_else(|| {
+      Error::Parse(ParsePayload::new(
+        "Whisper alignment_heads",
+        "generation_config.json",
+        "alignment_heads must be a list of [layer, head] pairs",
+      ))
+    })?;
+
+    let n_layer = dims.n_text_layer();
+    let n_head = dims.n_text_head();
+    // In-grid + no-duplicate makes the valid list bounded by the decoder grid
+    // (`n_layer * n_head`); both are validated dims (>= 1), so the product is the
+    // logical maximum number of distinct heads. Reserve to that bound through the
+    // fallible path — no arbitrary magnitude cap beyond the grid.
+    let grid = n_layer * n_head;
+    // A valid list is in-grid AND has no duplicate, so it cannot be longer than
+    // the grid; reject an over-long list up front so the parse loop's pushes stay
+    // bounded by the reserved grid capacity (no growth past it via `Vec`'s
+    // infallible path). This is the logical grid bound, not a magnitude cap.
+    if list.len() > grid {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Whisper alignment_heads",
+        "list cannot have more entries than the decoder grid (n_text_layer * n_text_head)",
+        format_smolstr!("{} (grid {grid})", list.len()),
+      )));
+    }
+    let mut parsed: Vec<(usize, usize)> = Vec::new();
+    reserve_or_error(&mut parsed, "Whisper alignment_heads", grid)?;
+    for pair in list {
+      let pair = pair.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+        Error::Parse(ParsePayload::new(
+          "Whisper alignment_heads",
+          "generation_config.json",
+          "each alignment_heads entry must be a [layer, head] pair",
+        ))
+      })?;
+      // Parse each index as `usize` (no `i32` cast). The in-grid + no-duplicate
+      // validation is deferred to the shared helper below, the single source of
+      // truth for a valid alignment-head list.
+      parsed.push((alignment_index(&pair[0])?, alignment_index(&pair[1])?));
+    }
+    Ok(Some(Self::new(
+      validate_alignment_heads(parsed, n_layer, n_head)?,
+      n_layer,
+      n_head,
+    )))
+  }
+}
+
+/// Validate an alignment-head `(layer, head)` list against the decoder grid —
+/// the single source of truth for "a valid alignment-head list", shared by
+/// [`AlignmentHeads::try_new`] and [`AlignmentHeads::from_generation_config`].
+///
+/// The list must be non-empty (the DTW averages over the heads; an empty set
+/// has no analogue in `whisper.py`, whose default is the last-half of the
+/// layers). Each pair must lie in the half-open grid (`layer < n_layer`,
+/// `head < n_head`), compared in `usize` so a pathological value `> i32::MAX`
+/// cannot wrap into an in-range `i32` (the bug an `as i32` cast would
+/// introduce). Duplicates are rejected through an `O(1)` per-pair lookup into a
+/// grid-sized seen bitset (no `O(n^2)` linear scan): with both dims validated
+/// (`>= 1`), `grid = n_layer * n_head` is the logical maximum number of distinct
+/// heads, and a duplicate maps to an already-set slot. The bitset is reserved
+/// through the fallible [`reserve_or_error`] path — no magnitude cap beyond the
+/// logical grid. Returns the validated list unchanged.
+///
+/// # Errors
+/// - [`Error::EmptyInput`] if `heads` is empty;
+/// - [`Error::OutOfRange`] if a pair is outside the `(n_layer, n_head)` grid, or
+///   if the same pair appears twice;
+/// - [`Error::AllocFailure`] if reserving the dedup bitset fails.
+fn validate_alignment_heads(
+  heads: Vec<(usize, usize)>,
+  n_layer: usize,
+  n_head: usize,
+) -> Result<Vec<(usize, usize)>> {
+  if heads.is_empty() {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "Whisper alignment_heads",
+    )));
+  }
+  let grid = n_layer * n_head;
+  // Grid-sized seen bitset for O(1) duplicate detection (replaces an O(n^2)
+  // `contains` scan). Reserved through the fallible path against the logical
+  // grid bound — no arbitrary magnitude cap.
+  let mut seen: Vec<bool> = Vec::new();
+  reserve_or_error(&mut seen, "Whisper alignment_heads dedup", grid)?;
+  seen.resize(grid, false);
+  for &(layer, head) in &heads {
+    // Validate against the decoder grid BEFORE indexing the bitset, so the DTW's
+    // `cross_qk[layer][0, head]` gather can never index out of bounds. The grid
+    // is `[0, n)` exclusive.
+    require_index_below("Whisper alignment_heads layer", layer, n_layer)?;
+    require_index_below("Whisper alignment_heads head", head, n_head)?;
+    // `layer < n_layer` and `head < n_head` ⇒ `idx < n_layer * n_head == grid`,
+    // so the bitset index is always in bounds.
+    let idx = layer * n_head + head;
+    if seen[idx] {
+      // Reject a repeated pair (the reference's heads are a distinct set); a
+      // duplicate would inflate the alignment-head stack with no analogue in
+      // `whisper.py`.
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "Whisper alignment_heads",
+        "each [layer, head] pair must be unique",
+        format_smolstr!("({layer}, {head})"),
+      )));
+    }
+    seen[idx] = true;
+  }
+  Ok(heads)
+}
+
+/// Parse one non-negative-integer alignment-head index from a JSON value.
+fn alignment_index(v: &Value) -> Result<usize> {
+  v.as_u64()
+    .and_then(|n| usize::try_from(n).ok())
+    .ok_or_else(|| {
+      Error::Parse(ParsePayload::new(
+        "Whisper alignment_heads",
+        "generation_config.json",
+        "layer / head must be a non-negative integer",
+      ))
+    })
+}
+
+/// Require a `usize` index to lie in the half-open grid `[0, bound)` — the
+/// alignment-head bound check.
+///
+/// Compared in `usize` so a pathological value `> i32::MAX` cannot wrap into an
+/// in-range `i32` (the bug an `as i32` cast would introduce). `bound` is a
+/// validated dimension (`>= 1`). On violation returns [`Error::OutOfRange`]
+/// naming `field`, the bound, and the offending index.
+fn require_index_below(field: &'static str, index: usize, bound: usize) -> Result<()> {
+  if index >= bound {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      field,
+      "must be in the half-open range [0, bound)",
+      format_smolstr!("{index} (allowed [0, {bound}))"),
+    )));
+  }
+  Ok(())
 }
 
 /// The ten raw `usize` Whisper dimensions, before each is lifted into a capped

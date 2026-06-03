@@ -1055,8 +1055,7 @@ fn decode_tokens_returns_seq_logits() {
   let model = tiny_model(13);
   let mel = tiny_mel();
   let enc = model.encode(&mel).unwrap();
-  let toks = Array::from_slice::<u32>(&[3, 4, 7], &(1, 3)).unwrap();
-  let (logits, _cache) = model.decode_tokens(&toks, &enc, None).unwrap();
+  let (logits, _cache) = model.decode_tokens(&[3, 4, 7], &enc, None).unwrap();
   assert_eq!(logits.shape(), vec![1usize, 3, N_VOCAB]);
 }
 
@@ -1265,6 +1264,73 @@ fn initial_tokens_include_sot_sequence_and_prompt() {
   // sot_index points at the sot token within the initial sequence.
   assert_eq!(it[task.sot_index], wrapper.sot());
   assert_eq!(task.sample_begin, it.len());
+}
+
+/// A caller-supplied `prompt` / `prefix` id `>= n_vocab` flows through
+/// `initial_tokens` into the prefill `decode_tokens` and the decoder
+/// token-embedding gather — where an out-of-range id would index out of bounds.
+/// `DecodingTask::new` fails fast with a typed `OutOfRange` at construction
+/// (before any forward), naming the initial-token boundary, for both the
+/// boundary id (`== n_vocab`) and a strictly-out-of-range id; an in-range
+/// prompt is accepted.
+#[test]
+fn decoding_task_rejects_out_of_vocab_prompt_or_prefix() {
+  let dir = fresh_dir("oob_prompt");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+
+  // `DecodingTask` does not derive `Debug`, so extract the error from the `Err`
+  // arm directly rather than via `unwrap_err` (which would require the `Ok` type
+  // to be `Debug`).
+  let expect_oob = |res: Result<DecodingTask<'_>>, what: &str| match res {
+    Err(Error::OutOfRange(p)) => assert_eq!(
+      p.context(),
+      "DecodingTask: initial token",
+      "expected the initial-token OutOfRange for {what}, got context {:?}",
+      p.context()
+    ),
+    Err(other) => panic!("expected OutOfRange for {what}, got {other:?}"),
+    Ok(_) => panic!("expected OutOfRange for {what}, got Ok"),
+  };
+
+  // `sample_len = 1` keeps a non-zero prompt/prefix truncation budget for this
+  // tiny `n_ctx = 8` fixture (`prefix` keeps `n_ctx/2 - sample_len = 3` tokens,
+  // `prompt` keeps `n_ctx/2 - 1 = 3`), so a single out-of-vocab id survives into
+  // `initial_tokens` and reaches the guard rather than being truncated away.
+
+  // prompt id == n_vocab (the first out-of-bounds embedding row).
+  let options = DecodingOptions {
+    without_timestamps: true,
+    sample_len: Some(1),
+    prompt: vec![N_VOCAB as u32],
+    ..Default::default()
+  };
+  expect_oob(
+    DecodingTask::new(&model, &wrapper, options),
+    "an out-of-vocab prompt id",
+  );
+
+  // prefix id > n_vocab.
+  let options = DecodingOptions {
+    without_timestamps: true,
+    sample_len: Some(1),
+    prefix: vec![N_VOCAB as u32 + 7],
+    ..Default::default()
+  };
+  expect_oob(
+    DecodingTask::new(&model, &wrapper, options),
+    "an out-of-vocab prefix id",
+  );
+
+  // An in-range prompt is accepted (the guard does not reject valid ids).
+  let options = DecodingOptions {
+    without_timestamps: true,
+    sample_len: Some(1),
+    prompt: vec![12, 13],
+    ..Default::default()
+  };
+  assert!(DecodingTask::new(&model, &wrapper, options).is_ok());
 }
 
 #[test]
@@ -1637,6 +1703,192 @@ fn transcribe_seek_loop_excludes_trailing_padding() {
 }
 
 #[test]
+fn transcribe_no_word_timestamps_leaves_words_empty() {
+  // The default (no-word-timestamp) path must produce segments with NO words
+  // attached — the zero-cost contract. A real content window is decoded.
+  let dir = fresh_dir("transcribe_no_words");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  // Bias toward "b" (id 1 < eot 2) so the decoded tokens are real text tokens.
+  let model = tiny_model(1);
+
+  let mel = tiny_mel();
+  let mut options = TranscribeOptions::default();
+  options.decode.language = Some("en".into());
+  options.decode.without_timestamps = true;
+  options.decode.suppress_blank = false;
+  options.decode.suppress_tokens = SuppressSpec::None;
+  options.decode.sample_len = Some(3);
+  // Single greedy temperature, no fallback thresholds → deterministic.
+  options.temperatures = vec![0.0];
+  options.compression_ratio_threshold = None;
+  options.logprob_threshold = None;
+  options.no_speech_threshold = None;
+  assert!(!options.word_timestamps);
+
+  let result = transcribe(
+    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+  )
+  .unwrap();
+  assert!(!result.segments.is_empty());
+  for seg in &result.segments {
+    assert!(seg.words.is_empty(), "no-word path must not attach words");
+  }
+}
+
+#[test]
+fn transcribe_word_timestamps_attaches_monotonic_words() {
+  // With word_timestamps on, each non-empty segment carries per-word timings
+  // whose (start, end) are ordered and non-decreasing across the segment — the
+  // shape + monotonicity contract (exact times depend on the synthetic
+  // attention, so only the structural invariants are asserted).
+  let dir = fresh_dir("transcribe_words");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  // Bias toward "b" (id 1 < eot 2): the decode emits real text tokens, so the
+  // window's text_tokens are non-empty and the alignment produces words.
+  let model = tiny_model(1);
+
+  let mel = tiny_mel();
+  let mut options = TranscribeOptions::default();
+  options.decode.language = Some("en".into());
+  options.decode.without_timestamps = true;
+  options.decode.suppress_blank = false;
+  options.decode.suppress_tokens = SuppressSpec::None;
+  options.decode.sample_len = Some(3);
+  options.temperatures = vec![0.0];
+  options.compression_ratio_threshold = None;
+  options.logprob_threshold = None;
+  options.no_speech_threshold = None;
+  options.word_timestamps = true;
+
+  let result = transcribe(
+    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+  )
+  .unwrap();
+  assert!(!result.segments.is_empty());
+  // At least one segment should carry words (the decode emits the biased text
+  // token), and every word's end >= start, with non-decreasing starts.
+  let mut saw_words = false;
+  for seg in &result.segments {
+    let mut prev_start = f64::NEG_INFINITY;
+    for word in &seg.words {
+      saw_words = true;
+      assert!(
+        word.end >= word.start,
+        "word end {} < start {}",
+        word.end,
+        word.start
+      );
+      assert!(
+        word.start >= prev_start,
+        "word starts must be non-decreasing"
+      );
+      assert!(
+        (0.0..=1.0).contains(&word.probability),
+        "prob {} out of [0,1]",
+        word.probability
+      );
+      prev_start = word.start;
+    }
+  }
+  assert!(saw_words, "word_timestamps should attach at least one word");
+}
+
+/// A sub-token alignment window (`num_frames / 2 == 0`, i.e. `num_frames < 2`)
+/// has no audio-token columns to align: `find_alignment` must return no word
+/// timings (the faithful degenerate-window result) with no panic and never a
+/// negative / clamped-bogus time index. Drives the real `find_alignment`
+/// against the tiny model + tokenizer with `num_frames` 0 and 1.
+#[test]
+fn find_alignment_subtoken_window_yields_no_words() {
+  use crate::audio::stt::models::whisper::timing::find_alignment;
+
+  let dir = fresh_dir("subtoken_align");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+  let mel = tiny_mel();
+  // A non-empty text-token slice (so the empty-text early return is NOT the one
+  // under test) — one real text token id `1` ("b", below the eot id 2).
+  let text_tokens = [1u32];
+
+  // `num_frames < 2` ⇒ `num_frames / 2 == 0`: a sub-token window.
+  for num_frames in [0usize, 1] {
+    let words = find_alignment(&model, &w, &text_tokens, &mel, num_frames, 1.0)
+      .expect("sub-token window must not error");
+    assert!(
+      words.is_empty(),
+      "sub-token window (num_frames={num_frames}) must yield no word timings, got {words:?}"
+    );
+  }
+
+  // A non-degenerate window (`num_frames / 2 >= 1`) still aligns and never
+  // emits a negative timestamp.
+  let words = find_alignment(&model, &w, &text_tokens, &mel, 4, 1.0).expect("alignment");
+  for word in &words {
+    assert!(
+      word.start >= 0.0,
+      "timestamp must be non-negative, got {word:?}"
+    );
+    assert!(word.end >= word.start, "end must be >= start, got {word:?}");
+  }
+}
+
+/// `find_alignment` is public, so it enforces the `text_token < eot` precondition
+/// itself: `text_token_probabilities` slices the probability matrix to the
+/// `[0, eot)` text-vocab columns and gathers it by `text_tokens`, so a timestamp
+/// / special id in `[eot, n_vocab)` — which clears the embedding gather's
+/// `< n_vocab` bound — would index PAST that `eot`-wide matrix (out of bounds).
+/// Such an id is rejected with a typed `OutOfRange` BEFORE the forward; a valid
+/// (`< eot`) text stream still aligns.
+#[test]
+fn find_alignment_rejects_text_token_at_or_above_eot() {
+  use crate::audio::stt::models::whisper::timing::find_alignment;
+
+  let dir = fresh_dir("align_eot");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+  let mel = tiny_mel();
+  let eot = w.eot(); // 2
+
+  // A text token == eot: the first id that indexes past the `[0, eot)` columns.
+  let at_eot = [1u32, eot];
+  let err = find_alignment(&model, &w, &at_eot, &mel, 4, 1.0).unwrap_err();
+  assert!(
+    matches!(&err, Error::OutOfRange(p)
+      if p.context() == "Whisper word timestamps: alignment text token"),
+    "expected OutOfRange for a text token == eot, got {err:?}"
+  );
+
+  // A timestamp id in `[eot, n_vocab)` (timestamp_begin = 14, n_vocab = 18) —
+  // passes the `< n_vocab` embedding bound but is `>= eot`.
+  let timestamp = [1u32, w.timestamp_begin()];
+  assert!(
+    w.timestamp_begin() >= eot && (w.timestamp_begin() as usize) < N_VOCAB,
+    "fixture: timestamp id must sit in [eot, n_vocab)"
+  );
+  let err = find_alignment(&model, &w, &timestamp, &mel, 4, 1.0).unwrap_err();
+  assert!(
+    matches!(&err, Error::OutOfRange(p)
+      if p.context() == "Whisper word timestamps: alignment text token"),
+    "expected OutOfRange for a timestamp text token, got {err:?}"
+  );
+
+  // A valid (`< eot`) text stream still produces alignments (the guard does not
+  // reject real text tokens).
+  let words = find_alignment(&model, &w, &[1u32], &mel, 4, 1.0).expect("valid alignment");
+  for word in &words {
+    assert!(
+      word.start >= 0.0,
+      "timestamp must be non-negative, got {word:?}"
+    );
+    assert!(word.end >= word.start, "end must be >= start, got {word:?}");
+  }
+}
+
+#[test]
 fn segment_collection_no_timestamps_one_segment() {
   // No consecutive timestamps → one segment spanning the whole window; advance
   // by the full segment_size.
@@ -1645,9 +1897,8 @@ fn segment_collection_no_timestamps_one_segment() {
   let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
   let ts_begin = w.timestamp_begin(); // 14
   let mut segments = Vec::new();
-  let mut all_text = String::new();
   let tokens = vec![0u32, 1, 12]; // all text tokens "a b c", no timestamps
-  let advance = advance_and_collect_segments(
+  let (advance, single_end) = advance_and_collect_segments(
     &tokens,
     ts_begin,
     /* time_offset */ 0.0,
@@ -1657,14 +1908,14 @@ fn segment_collection_no_timestamps_one_segment() {
     &dummy_result(),
     &w,
     &mut segments,
-    &mut all_text,
   )
   .unwrap();
   assert_eq!(advance, 100);
+  assert!(!single_end);
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].start, 0.0);
   // text decodes the non-special tokens.
-  assert!(!all_text.is_empty());
+  assert!(!segments[0].text.is_empty());
 }
 
 #[test]
@@ -1676,9 +1927,8 @@ fn segment_collection_consecutive_timestamps_cut_segments() {
   let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
   let ts_begin = w.timestamp_begin(); // 14
   let mut segments = Vec::new();
-  let mut all_text = String::new();
   let tokens = vec![14u32, 0, 1, 16, 16, 12, 17];
-  let advance = advance_and_collect_segments(
+  let (advance, _single_end) = advance_and_collect_segments(
     &tokens,
     ts_begin,
     0.0,
@@ -1688,7 +1938,6 @@ fn segment_collection_consecutive_timestamps_cut_segments() {
     &dummy_result(),
     &w,
     &mut segments,
-    &mut all_text,
   )
   .unwrap();
   // A consecutive pair at index 4 → at least one segment cut, and the advance
@@ -1706,10 +1955,9 @@ fn segment_collection_single_timestamp_ending_advances_full_window() {
   let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
   let ts_begin = w.timestamp_begin();
   let mut segments = Vec::new();
-  let mut all_text = String::new();
   // 14 14 (consecutive pair) ... 12 (text) 15 (single trailing ts).
   let tokens = vec![14u32, 14, 0, 12, 15];
-  let advance = advance_and_collect_segments(
+  let (advance, single_end) = advance_and_collect_segments(
     &tokens,
     ts_begin,
     0.0,
@@ -1719,10 +1967,10 @@ fn segment_collection_single_timestamp_ending_advances_full_window() {
     &dummy_result(),
     &w,
     &mut segments,
-    &mut all_text,
   )
   .unwrap();
   assert_eq!(advance, 150);
+  assert!(single_end);
 }
 
 // ───────────────────────── high-level Transcribe trait ────────────────────
@@ -1773,5 +2021,239 @@ fn transcribe_trait_with_tokenizer_drives_decoding_task() {
     result.language().map(str::to_owned),
     Some("en".to_string()),
     "the supplied language must echo through the universal Transcription"
+  );
+}
+
+// ───────────────────── hallucination-silence skip ─────────────────────────
+
+/// A single-word, anomalous-looking segment: one low-probability, very short
+/// word makes [`timing::is_segment_anomaly`] fire (`word_anomaly_score`
+/// contributes `1.0` for `prob < 0.15` plus the short-duration term, and a
+/// one-word segment trips the `score + 0.01 >= len` branch).
+fn anomalous_segment(start: f64, end: f64) -> Segment {
+  Segment {
+    start,
+    end,
+    text: String::from("x"),
+    tokens: vec![0],
+    temperature: 0.0,
+    avg_logprob: 0.0,
+    no_speech_prob: 0.0,
+    compression_ratio: 1.0,
+    words: vec![Word {
+      word: String::from(" x"),
+      start,
+      end: start + 0.05,
+      probability: 0.05,
+    }],
+  }
+}
+
+/// A word-free, timestamp-only segment (`words` empty): the loop skips it, and
+/// [`timing::is_segment_anomaly`] returns `false` for it.
+fn empty_segment(start: f64, end: f64) -> Segment {
+  Segment {
+    start,
+    end,
+    text: String::new(),
+    tokens: vec![],
+    temperature: 0.0,
+    avg_logprob: 0.0,
+    no_speech_prob: 0.0,
+    compression_ratio: 0.0,
+    words: vec![],
+  }
+}
+
+#[test]
+fn hallucination_skip_uses_next_word_bearing_segment_for_silence_after() {
+  // Regression: the `silence_after` anomaly check must consult the next
+  // WORD-BEARING segment (`next_words_segment(current_segments[si + 1:])`), not
+  // the immediate `si + 1` segment. With an empty/timestamp-only segment wedged
+  // between two anomalous word-bearing segments, the hallucination at index 0 is
+  // only surrounded-by-hallucination via the index-2 segment; checking the empty
+  // index-1 segment (which is never anomalous) would wrongly keep it.
+  //
+  // The gap clause (`hal_next_start - seg.end > threshold`) and the window-end
+  // clause (`window_end_time - seg.end < 2.0`) are both arranged to be FALSE, so
+  // `silence_after` can only become true through the next-segment anomaly term —
+  // making this sensitive to exactly the fixed bug.
+  let threshold = 2.0;
+  let mut segments = vec![
+    anomalous_segment(0.5, 1.0),
+    empty_segment(1.0, 1.2),
+    anomalous_segment(1.5, 2.0),
+  ];
+
+  // window_end_time = (0 + N_FRAMES) * HOP / SR = 30.0 s; content spans the full
+  // window too. So `window_end_time - 1.0 = 29.0` (not < 2.0) and the next
+  // word's start (1.5) minus seg0.end (1.0) = 0.5 (not > 2.0): both fall to
+  // false, isolating the next-segment-anomaly term.
+  let window_end_time = N_FRAMES as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+  let content_frames = N_FRAMES;
+  let content_duration = content_frames as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+
+  let skip = hallucination_silence_skip(HallucinationSkipParams {
+    current_segments: &mut segments,
+    threshold,
+    prev_last_speech: 0.0,
+    time_offset: 0.0,
+    previous_seek: 0,
+    segment_size: N_FRAMES,
+    segment_duration: window_end_time,
+    window_end_time,
+    content_duration,
+    content_frames,
+    single_timestamp_ending: false,
+    seek: 0,
+  });
+
+  // The index-2 anomaly makes `silence_after` true, so the window is truncated
+  // at index 0 (the reference's `current_segments[si:] = []`) and NOT dropped as
+  // a leading-silence `continue`. The buggy si+1 check would leave all three
+  // segments in place.
+  assert!(
+    segments.is_empty(),
+    "the surrounded hallucination must be truncated via the si+2 word-bearing \
+     segment, got {segments:?}"
+  );
+  assert!(
+    !skip.skip_window,
+    "this is a truncation, not a leading-silence drop"
+  );
+  // seek = round(max(time_offset + 1, seg.start) * FRAMES_PER_SECOND) = 100; the
+  // `content_duration - seg.end (29.0) < threshold (2.0)` branch does not fire.
+  assert_eq!(skip.seek, FRAMES_PER_SECOND);
+}
+
+// ─────────────────── degenerate-segment cleanup ───────────────────────────
+
+/// A populated [`Segment`] with the given timing + text (a single word + token
+/// so the cleanup's word/token clearing is observable).
+fn seg_with(start: f64, end: f64, text: &str) -> Segment {
+  Segment {
+    start,
+    end,
+    text: text.to_string(),
+    tokens: vec![7],
+    temperature: 0.0,
+    avg_logprob: 0.0,
+    no_speech_prob: 0.0,
+    compression_ratio: 1.0,
+    words: vec![Word {
+      word: text.to_string(),
+      start,
+      end,
+      probability: 0.9,
+    }],
+  }
+}
+
+#[test]
+fn clear_degenerate_segments_empties_whitespace_and_instantaneous() {
+  // A whitespace-only segment and a zero-duration (start == end) segment are
+  // both cleared — text, tokens, AND words emptied (`whisper.py:1253-1261`) —
+  // while a normal segment between them is left fully intact.
+  let mut segments = vec![
+    seg_with(0.0, 1.0, "   "),     // whitespace-only text → cleared
+    seg_with(1.0, 2.0, " hello"),  // normal → unchanged
+    seg_with(2.0, 2.0, "instant"), // zero duration (start == end) → cleared
+  ];
+  clear_degenerate_segments(&mut segments);
+
+  // Whitespace-only: emptied.
+  assert_eq!(segments[0].text, "");
+  assert!(segments[0].tokens.is_empty());
+  assert!(segments[0].words.is_empty());
+  // Zero-duration: emptied even though its text was non-blank.
+  assert_eq!(segments[2].text, "");
+  assert!(segments[2].tokens.is_empty());
+  assert!(segments[2].words.is_empty());
+
+  // Non-degenerate segment is untouched (text, tokens, and words all intact).
+  assert_eq!(segments[1].text, " hello");
+  assert_eq!(segments[1].tokens, vec![7]);
+  assert_eq!(segments[1].words.len(), 1);
+  assert_eq!(segments[1].words[0].word, " hello");
+
+  // The cleared segments contribute nothing to the joined transcript: the only
+  // surviving text is the non-degenerate segment's.
+  let joined: String = segments.iter().map(|s| s.text.as_str()).collect();
+  assert_eq!(joined, " hello");
+}
+
+#[test]
+fn clear_degenerate_segments_leaves_nondegenerate_unchanged() {
+  // Every segment has a non-empty text and a non-zero duration → no clearing.
+  let mut segments = vec![seg_with(0.0, 1.0, " the"), seg_with(1.0, 2.5, " cat")];
+  let before = segments.clone();
+  clear_degenerate_segments(&mut segments);
+  for (after, orig) in segments.iter().zip(&before) {
+    assert_eq!(after.text, orig.text);
+    assert_eq!(after.tokens, orig.tokens);
+    assert_eq!(after.words, orig.words);
+  }
+}
+
+/// Build one window's segments through the exact `transcribe` collection path
+/// (`advance_and_collect_segments`) for a tokens stream — so a segment it
+/// produces is byte-identical to one `transcribe` would accumulate.
+fn collect_window_segments(w: &HFTokenizerWrapper<'_>, tokens: &[u32]) -> Vec<Segment> {
+  let mut segments = Vec::new();
+  advance_and_collect_segments(
+    tokens,
+    w.timestamp_begin(),
+    /* time_offset */ 0.0,
+    /* time_precision */ 0.02,
+    /* segment_size */ 100,
+    /* input_stride */ 2,
+    &dummy_result(),
+    w,
+    &mut segments,
+  )
+  .unwrap();
+  segments
+}
+
+#[test]
+fn no_word_path_preserves_degenerate_segment_tokens() {
+  // REGRESSION GUARD: the degenerate-segment cleanup is part of the
+  // word-timestamp finalization and is gated to `word_timestamps == true`. On
+  // the DEFAULT no-word path a degenerate (here zero-duration, timestamp-only)
+  // segment must be emitted with its sampled tokens / text intact — the
+  // byte-identical pre-feature behavior callers reading `Segment.tokens` rely on.
+  let dir = fresh_dir("degenerate_no_word");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  // Two consecutive `<|0.00|>` (id 14 == timestamp_begin): the slice [14] has
+  // equal start/end timestamp positions → a zero-duration (start == end)
+  // segment whose only token is the timestamp (text strips to empty). This is
+  // exactly the degenerate shape `clear_degenerate_segments` targets.
+  let segments = collect_window_segments(&w, &[14u32, 14]);
+  assert_eq!(segments.len(), 1);
+  assert_eq!(
+    segments[0].start, segments[0].end,
+    "the collected segment must be zero-duration (degenerate)"
+  );
+  assert!(
+    !segments[0].tokens.is_empty(),
+    "the degenerate segment still carries its sampled token(s)"
+  );
+
+  // No-word path: the gating means `clear_degenerate_segments` is NOT applied,
+  // so tokens are preserved verbatim.
+  let no_word = segments.clone();
+  assert_eq!(
+    no_word[0].tokens, segments[0].tokens,
+    "no-word path must keep the degenerate segment's tokens intact"
+  );
+
+  // Word path: the same segment IS cleared (the prior contract still holds).
+  let mut word_path = segments;
+  clear_degenerate_segments(&mut word_path);
+  assert!(
+    word_path[0].tokens.is_empty() && word_path[0].text.is_empty(),
+    "word-timestamp path still clears the degenerate segment"
   );
 }
