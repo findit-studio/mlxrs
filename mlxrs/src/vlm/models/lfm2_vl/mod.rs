@@ -10,21 +10,29 @@
 //! [`MaybeQuantizedLinear`](crate::nn::MaybeQuantizedLinear), so the 8-bit
 //! checkpoint loads through the same code path as a dense one.
 //!
-//! ## Phase status
+//! ## Module map
 //!
-//! This phase adds the
-//! [pixel-unshuffle + multimodal projector + image-feature merge](crate::vlm::models::lfm2_vl::projector)
-//! and the [language adapter](crate::vlm::models::lfm2_vl::language) (the thin
-//! guarded wrapper that forwards merged embeddings through the LFM2 LM), on top
-//! of the previously-ported
-//! [config structs](crate::vlm::models::lfm2_vl::config), the
-//! [vision tower](crate::vlm::models::lfm2_vl::vision), and the pure-MLX bicubic
-//! interpolation primitive
-//! ([`crate::ops::interpolation::bicubic_interpolate`]) the position-embed
-//! resize uses. The native-resolution processor and the top-level
-//! [`crate::vlm::model::Model`] implementation (wiring the LM + vision +
-//! projector together and registering in the VLM factory) come in a later
-//! phase.
+//! - [config structs](crate::vlm::models::lfm2_vl::config) — `TextConfig` (the
+//!   re-exported LFM2 LM config) / `VisionConfig` / `ModelConfig`.
+//! - [vision tower](crate::vlm::models::lfm2_vl::vision) — the native-resolution
+//!   SigLIP2 ViT (Linear patch embed, per-image bicubic-resized position
+//!   embedding), using the pure-MLX
+//!   [`bicubic_interpolate`](crate::ops::interpolation::bicubic_interpolate).
+//! - [pixel-unshuffle + multimodal projector + image-feature
+//!   merge](crate::vlm::models::lfm2_vl::projector).
+//! - [language adapter](crate::vlm::models::lfm2_vl::language) — the thin guarded
+//!   wrapper that forwards merged embeddings through the LFM2 LM.
+//! - [native-resolution processor](crate::vlm::models::lfm2_vl::processor) — the
+//!   SigLIP2 NaFlex smart-resize + normalize + patchify + `<image>`-token
+//!   expansion the checkpoint's image processor (`Siglip2ImageProcessor`)
+//!   performs.
+//! - [top-level VL model + factory](crate::vlm::models::lfm2_vl::model) — the
+//!   [`Lfm2Vl`](crate::vlm::models::lfm2_vl::model::Lfm2Vl)
+//!   [`crate::vlm::model::Model`] implementation (vision tower → projector →
+//!   mask-driven splice into the LM embeddings → LFM2 LM → logits) plus the
+//!   [`constructor`](crate::vlm::models::lfm2_vl::model::constructor) /
+//!   [`register`](crate::vlm::models::lfm2_vl::model::register) hooks that plug
+//!   it into the VLM [`crate::vlm::load`] factory on `model_type = "lfm2-vl"`.
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
@@ -32,6 +40,12 @@ pub mod config;
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub mod language;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub mod model;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub mod processor;
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub mod projector;
@@ -45,6 +59,15 @@ pub use config::{ModelConfig, TextConfig, VisionConfig};
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use language::LanguageModel;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub use model::{Lfm2Vl, constructor, register};
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub use processor::{
+  Lfm2VlImageInputs, Lfm2VlProcessorConfig, expand_image_tokens, num_image_tokens_from_patch_grid,
+  preprocess_image,
+};
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use projector::{

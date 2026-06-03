@@ -73,12 +73,13 @@ pub mod rotate_buf;
 pub(crate) use bgr_widen::bgr_widen;
 pub(crate) use pad_canvas_fill::pad_canvas_fill;
 pub(crate) use rgb_widen::rgb_widen;
-// `rgba_to_rgb_affine`'s only consumer is the SigLIP2 NaFlex
-// patchify-normalize, so gate the `pub(crate) use` on that feature —
-// under `vlm` alone the re-export would be unused and trip the
-// workspace `-D warnings` gate (the kernel module itself stays
-// available via its public submodule path).
-#[cfg(feature = "siglip2-naflex")]
+// `rgba_to_rgb_affine`'s consumers are the SigLIP2 NaFlex
+// patchify-normalize and the LFM2.5-VL native-resolution processor (which
+// defers to the same SigLIP2 slow image processor), so gate the
+// `pub(crate) use` on either feature — under `vlm` alone the re-export
+// would be unused and trip the workspace `-D warnings` gate (the kernel
+// module itself stays available via its public submodule path).
+#[cfg(any(feature = "siglip2-naflex", feature = "lfm2-vl"))]
 pub(crate) use rgba_to_rgb_affine::rgba_to_rgb_affine;
 // `rotate_buf::rotate_buf_u8` is re-exported via the public submodule
 // (no `pub(crate) use` here yet — the caller wiring lands separately,

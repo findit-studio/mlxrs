@@ -2523,6 +2523,74 @@ pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
   }
 }
 
+// ═══════════════════════════ SigLIP2 NaFlex sizing ══════════════════════════
+
+/// Tolerance for the [`patch_grid`] binary-search termination. Mirrors the
+/// `siglip2-naflex` crate's `SCALE_EPS` (= the upstream `transformers` value).
+/// **Do not loosen**: it is what keeps `s` clearly below the boundary where
+/// `ceil()` flips, the difference between emitting upstream-equivalent grids vs
+/// silently drifting by one patch in the longer axis on edge inputs.
+const NAFLEX_SCALE_EPS: f64 = 1e-5;
+
+/// Upper search bound on the uniform scale. Mirrors the oracle's
+/// `scale_max = 100.0`.
+const NAFLEX_SCALE_MAX: f64 = 100.0;
+
+/// Find the largest uniform scale `s` such that, after rounding each axis up to
+/// a multiple of `patch_size`, the patch grid `H_p x W_p` fits within
+/// `max_num_patches`. Returns `(H_p, W_p)` with both `>= 1`.
+///
+/// The SigLIP2 NaFlex *smart-resize* target-grid formula — a port of upstream
+/// `transformers`'
+/// `image_processing_siglip2_fast.get_image_size_for_max_num_patches` (validated
+/// against PyTorch by the user's published `siglip2-naflex` crate): binary-search
+/// `s ∈ [SCALE_EPS/10, SCALE_MAX]`, terminating at `hi - lo < SCALE_EPS`. Shared
+/// (it lives in the model-agnostic `vlm::image` layer) by every model whose
+/// processor defers to the SigLIP2 slow image processor — the
+/// [`siglip2-naflex`](crate::embeddings::siglip2_naflex) dual-tower embeddings
+/// and the [`lfm2-vl`](crate::vlm::models::lfm2_vl) native-resolution processor.
+///
+/// `patch_size` and `max_num_patches` must be `> 0` (the caller validates this
+/// from the config); `width` / `height` must be `> 0`. The returned product is
+/// **not** guaranteed `<= max_num_patches` for adversarial `u32` inputs whose
+/// entire feasible scale range falls below the `SCALE_EPS/10` search floor (e.g.
+/// `width` near `u32::MAX` at `height = 1`) — every caller re-checks the budget
+/// post-hoc and rejects such inputs with [`crate::Error::CapExceeded`].
+pub fn patch_grid(height: u32, width: u32, patch_size: u32, max_num_patches: u32) -> (u32, u32) {
+  let h = f64::from(height);
+  let w = f64::from(width);
+  let p = f64::from(patch_size);
+  let m = f64::from(max_num_patches);
+
+  // Round `scale * original` up to a multiple of `P`, then floor at `P` so the
+  // smallest target is one full patch (matches upstream).
+  fn scaled_pixel_size(scale: f64, original: f64, patch: f64) -> f64 {
+    let scaled = scale * original;
+    let scaled = (scaled / patch).ceil() * patch;
+    scaled.max(patch)
+  }
+
+  let mut scale_min: f64 = NAFLEX_SCALE_EPS / 10.0;
+  let mut scale_max: f64 = NAFLEX_SCALE_MAX;
+  while (scale_max - scale_min) >= NAFLEX_SCALE_EPS {
+    let scale = 0.5 * (scale_min + scale_max);
+    let target_h = scaled_pixel_size(scale, h, p);
+    let target_w = scaled_pixel_size(scale, w, p);
+    let num_patches = (target_h * target_w) / (p * p);
+    if num_patches <= m {
+      scale_min = scale;
+    } else {
+      scale_max = scale;
+    }
+  }
+
+  let target_h = scaled_pixel_size(scale_min, h, p);
+  let target_w = scaled_pixel_size(scale_min, w, p);
+  let h_p = ((target_h / p) as u32).max(1);
+  let w_p = ((target_w / p) as u32).max(1);
+  (h_p, w_p)
+}
+
 /// Private regression tests for [`apply_orientation_fallible`] and
 /// the truly-fallible [`rotate_buf`] helper.
 ///
