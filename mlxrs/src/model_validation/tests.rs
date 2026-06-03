@@ -2,7 +2,7 @@
 //! every typed-error path for each helper, asserting the exact [`Error`]
 //! variant (not merely `is_err`) and, where load-bearing, the payload fields.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{error::Error, model_validation::*};
 
@@ -429,6 +429,22 @@ fn reserve_or_error_reserves_hashmap_capacity() {
   let mut m: HashMap<String, u32> = HashMap::new();
   assert!(reserve_or_error(&mut m, "weights", 32).is_ok());
   assert!(m.capacity() >= 32);
+}
+
+#[test]
+fn reserve_or_error_reserves_hashset_capacity() {
+  // `HashSet` is supported alongside `Vec` / `HashMap` so the MMS adapter
+  // overlay's allowed-key set reserves fallibly. A normal reservation succeeds
+  // and grows capacity; an oversize request maps to a typed `AllocFailure`.
+  let mut s: HashSet<String> = HashSet::new();
+  assert!(reserve_or_error(&mut s, "allowed keys", 32).is_ok());
+  assert!(s.capacity() >= 32);
+  assert!(s.is_empty()); // reservation only — no elements added
+  let mut big: HashSet<u64> = HashSet::new();
+  match reserve_or_error(&mut big, "allowed keys", usize::MAX) {
+    Err(Error::AllocFailure(p)) => assert_eq!(p.item(), "allowed keys"),
+    other => panic!("expected AllocFailure, got {other:?}"),
+  }
 }
 
 #[test]

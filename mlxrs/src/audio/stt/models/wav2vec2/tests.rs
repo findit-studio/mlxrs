@@ -428,21 +428,38 @@ fn config_validate_accepts_base_960h() {
 }
 
 #[test]
-fn config_validate_rejects_out_of_scope_arms() {
-  // (a) The "layer" feature-encoder arm is out of scope -> UnknownEnumValue,
-  // and the payload carries the rejected value + the supported set.
-  let layer = Config::from_json(r#"{"feat_extract_norm": "layer"}"#).unwrap();
-  match layer.validate() {
-    Err(Error::UnknownEnumValue(p)) => {
-      assert_eq!(p.value(), "layer");
-      assert_eq!(p.supported(), &["group"]);
-    }
-    other => panic!("expected UnknownEnumValue for feat_extract_norm, got {other:?}"),
+fn config_validate_accepts_both_feat_extract_norm_arms_rejects_other() {
+  // (a) BOTH feature-encoder norm arms are now wired: "group" (the default) and
+  // "layer" (used by large-960h-lv60-self) must each validate.
+  for norm in ["group", "layer"] {
+    let cfg = Config::from_json(&format!(r#"{{"feat_extract_norm": "{norm}"}}"#)).unwrap();
+    assert!(
+      cfg.validate().is_ok(),
+      "feat_extract_norm == {norm:?} must validate (both arms are wired)"
+    );
+    assert_eq!(
+      cfg.feat_extract_norm_scheme().unwrap(),
+      if norm == "group" {
+        FeatExtractNorm::Group
+      } else {
+        FeatExtractNorm::Layer
+      }
+    );
   }
 
-  // (b) The stable-layer-norm arm is now SUPPORTED: a `do_stable_layer_norm`
-  // config (otherwise default) must validate (the both-directions check that
-  // the relaxation actually took effect, not just that the rejection moved).
+  // (b) Any OTHER feat_extract_norm value is rejected -> UnknownEnumValue, and
+  // the payload carries the rejected value + the (group/layer) supported set.
+  let bad = Config::from_json(r#"{"feat_extract_norm": "instance"}"#).unwrap();
+  match bad.validate() {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.value(), "instance");
+      assert_eq!(p.supported(), &["group", "layer"]);
+    }
+    other => panic!("expected UnknownEnumValue for an unknown feat_extract_norm, got {other:?}"),
+  }
+
+  // (c) The stable-layer-norm arm is likewise SUPPORTED: a `do_stable_layer_norm`
+  // config (otherwise default) must validate.
   let stable = Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
   assert!(stable.do_stable_layer_norm);
   assert!(
@@ -464,20 +481,38 @@ fn config_validate_accepts_conv_bias() {
 }
 
 #[test]
-fn config_validate_accepts_large_positive_layer_count() {
-  // A large positive layer count is a valid (if deep) variant, not something
-  // `validate` rejects: `validate` only checks positivity (it allocates no
-  // per-layer `Vec`), and the builder reserves the layer `Vec`s fallibly, so a
-  // pathological count surfaces later as a typed allocation error, never a
-  // magnitude cap here. (`validate` itself does no allocation, so this check is
-  // cheap regardless of the count.)
-  let deep = Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
+fn config_validate_accepts_within_cap_layer_count_rejects_over_cap() {
+  // A layer count up to the config-cardinality cap is a valid (if deep) variant:
+  // `num_hidden_layers` sizes eager per-layer `Vec`s (and, on the MMS path, an
+  // `O(layers)` adapter-key `Vec` + set), so it is bounded by
+  // `MAX_CONFIG_CARDINALITY` (matching qwen3 / lfm2), not merely checked
+  // positive. A count AT the cap validates; the within-cap reservations are made
+  // fallibly by the builders / overlay, so a within-cap-but-heavyweight count
+  // surfaces later as a typed `AllocFailure`, never an abort.
+  let at_cap = Config::from_json(&format!(
+    r#"{{"num_hidden_layers": {MAX_CONFIG_CARDINALITY}}}"#
+  ))
+  .unwrap();
   assert!(
-    deep.validate().is_ok(),
-    "a large positive num_hidden_layers must validate (no magnitude cap)"
+    at_cap.validate().is_ok(),
+    "num_hidden_layers == MAX_CONFIG_CARDINALITY must validate (the cap is inclusive)"
+  );
+  // An OVER-cap count is rejected as a recoverable `CapExceeded` (the
+  // config-cardinality bound — NOT a DoS cap on valid input: a billion-layer
+  // transformer is not a real checkpoint), so an `O(layers)` allocation is never
+  // even attempted.
+  let over = Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
+  assert!(
+    matches!(over.validate(), Err(Error::CapExceeded(_))),
+    "an over-cap num_hidden_layers must be a CapExceeded"
+  );
+  let over_feat = Config::from_json(r#"{"num_feat_extract_layers": 1000000}"#).unwrap();
+  assert!(
+    matches!(over_feat.validate(), Err(Error::CapExceeded(_))),
+    "an over-cap num_feat_extract_layers must be a CapExceeded"
   );
   // A zero / negative count is still rejected as malformed (OutOfRange) — that
-  // is a positivity/soundness check, not a magnitude cap.
+  // is a positivity/soundness check, distinct from the cardinality cap.
   let zero = Config::from_json(r#"{"num_hidden_layers": 0}"#).unwrap();
   assert!(matches!(zero.validate(), Err(Error::OutOfRange(_))));
   let negative = Config::from_json(r#"{"num_feat_extract_layers": -1}"#).unwrap();
@@ -809,25 +844,39 @@ fn config_validate_rejects_add_adapter() {
 }
 
 #[test]
-fn config_validate_rejects_adapter_attn_dim() {
-  // A set `adapter_attn_dim` adds a per-layer attention adapter (its output
-  // added to the hidden states) that this port omits, so a non-null value
-  // would silently drop a graph term. Only the absent (`None`) form is
-  // supported; a set value is a typed InvariantViolation naming the field.
-  let cfg = Config::from_json(r#"{"adapter_attn_dim": 16}"#).unwrap();
+fn config_validate_accepts_positive_adapter_attn_dim_rejects_non_positive() {
+  // A POSITIVE `adapter_attn_dim` is now wired (the MMS per-attention-block
+  // language adapter): a config with `adapter_attn_dim` set (and the stable-LN
+  // arm MMS uses) must validate.
+  let cfg = Config::from_json(r#"{"adapter_attn_dim": 16, "do_stable_layer_norm": true}"#).unwrap();
   assert_eq!(cfg.adapter_attn_dim, Some(16));
-  match cfg.validate() {
-    Err(Error::InvariantViolation(p)) => {
-      assert!(
-        p.context().contains("adapter_attn_dim"),
-        "context should name adapter_attn_dim, got {:?}",
-        p.context()
-      );
+  assert!(
+    cfg.validate().is_ok(),
+    "a positive adapter_attn_dim must validate (the MMS adapter is now wired)"
+  );
+  // It also validates with the (default) post-norm arm — the reference attaches
+  // the adapter only to the stable-LN layer, so a post-norm checkpoint carrying
+  // adapter_attn_dim simply runs no adapter; the value is still accepted.
+  let post = Config::from_json(r#"{"adapter_attn_dim": 16}"#).unwrap();
+  assert!(post.validate().is_ok());
+
+  // A NON-POSITIVE `adapter_attn_dim` (it sizes the adapter Linears) is
+  // malformed -> typed OutOfRange naming the field.
+  for bad in ["0", "-4"] {
+    let cfg = Config::from_json(&format!(r#"{{"adapter_attn_dim": {bad}}}"#)).unwrap();
+    match cfg.validate() {
+      Err(Error::OutOfRange(p)) => {
+        assert!(
+          p.context().contains("adapter_attn_dim"),
+          "context should name adapter_attn_dim, got {:?}",
+          p.context()
+        );
+      }
+      other => panic!("expected OutOfRange for adapter_attn_dim = {bad}, got {other:?}"),
     }
-    other => panic!("expected InvariantViolation for a set adapter_attn_dim, got {other:?}"),
   }
   // An explicit `null` is equivalent to absent and validates (the base-960h
-  // form), so a checkpoint that spells out the default is still accepted.
+  // form): no adapter at all.
   let explicit_null = Config::from_json(r#"{"adapter_attn_dim": null}"#).unwrap();
   assert_eq!(explicit_null.adapter_attn_dim, None);
   assert!(explicit_null.validate().is_ok());
@@ -859,42 +908,62 @@ fn config_validate_rejects_deviating_pad_token_id() {
 }
 
 #[test]
-fn config_validate_rejects_non_default_feat_proj_layer_norm() {
-  // `feat_proj_layer_norm` is a HuBERT-only flag (HF default `true`); the wired
-  // FeatureProjection unconditionally applies the LayerNorm, so the `false`
-  // (no-LayerNorm) arm is not implemented this phase. A `false` value must be
-  // rejected with a typed InvariantViolation naming the field, BEFORE any
-  // tensor is built — never silently run the normalizing graph on a config that
-  // asked for the un-normalized one.
-  let cfg = Config::from_json(r#"{"feat_proj_layer_norm": false}"#).unwrap();
-  assert!(!cfg.feat_proj_layer_norm);
-  match cfg.validate() {
-    Err(Error::InvariantViolation(p)) => {
-      assert!(
-        p.context().contains("feat_proj_layer_norm"),
-        "context should name feat_proj_layer_norm, got {:?}",
-        p.context()
-      );
-    }
-    other => panic!("expected InvariantViolation for feat_proj_layer_norm = false, got {other:?}"),
+fn config_validate_feat_proj_layer_norm_false_is_hubert_only() {
+  // `feat_proj_layer_norm` is a HuBERT-ONLY flag (HF default `true`): HF's
+  // `Wav2Vec2FeatureProjection` has no such field and ALWAYS applies the
+  // projection LayerNorm, while only `HubertFeatureProjection` gates it. So the
+  // no-LayerNorm arm (`false`) is valid ONLY for `model_type == "hubert"`.
+
+  // (a) wav2vec2 (the default model_type) + `false` is REJECTED — honoring it
+  // would build a wav2vec2 graph with its projection LayerNorm silently dropped.
+  let w2v2_no_ln = Config::from_json(r#"{"feat_proj_layer_norm": false}"#).unwrap();
+  assert!(!w2v2_no_ln.feat_proj_layer_norm);
+  assert!(!w2v2_no_ln.is_hubert());
+  match w2v2_no_ln.validate() {
+    Err(Error::InvariantViolation(_)) => {}
+    Ok(()) => panic!(
+      "feat_proj_layer_norm = false on a wav2vec2 model_type must be REJECTED (the no-LayerNorm \
+       projection is a HuBERT-only arm)"
+    ),
+    Err(e) => panic!(
+      "expected a typed InvariantViolation for wav2vec2 + feat_proj_layer_norm=false, got {e:?}"
+    ),
   }
-  // The default (`true`, the wired arm) validates — the HF default for HuBERT
-  // and the implicit value for every wav2vec2 config — proving the gate rejects
-  // only the non-default arm, not the supported one.
-  let default_true = Config::from_json(r#"{"feat_proj_layer_norm": true}"#).unwrap();
-  assert!(default_true.feat_proj_layer_norm);
+  // An explicit `"model_type": "wav2vec2"` + `false` is likewise rejected.
+  let w2v2_explicit =
+    Config::from_json(r#"{"model_type": "wav2vec2", "feat_proj_layer_norm": false}"#).unwrap();
+  assert!(w2v2_explicit.validate().is_err());
+
+  // (b) hubert + `false` is HONORED (HuBERT's no-LayerNorm arm) — validates.
+  let hubert_no_ln =
+    Config::from_json(r#"{"model_type": "hubert", "feat_proj_layer_norm": false}"#).unwrap();
+  assert!(!hubert_no_ln.feat_proj_layer_norm);
+  assert!(hubert_no_ln.is_hubert());
   assert!(
-    default_true.validate().is_ok(),
-    "the default feat_proj_layer_norm = true (the wired arm) must validate"
+    hubert_no_ln.validate().is_ok(),
+    "feat_proj_layer_norm = false on a hubert model_type is the no-LayerNorm arm and must validate"
   );
-  // Absent (the common case: wav2vec2 configs never carry the field, HuBERT
-  // defaults it true) falls back to the wired arm and validates.
+
+  // (c) `true` (the LayerNorm arm) validates for BOTH model_types — the HF
+  // default for HuBERT and the implicit value for every wav2vec2 config.
+  let w2v2_true = Config::from_json(r#"{"feat_proj_layer_norm": true}"#).unwrap();
+  assert!(w2v2_true.feat_proj_layer_norm);
+  assert!(w2v2_true.validate().is_ok());
+  let hubert_true =
+    Config::from_json(r#"{"model_type": "hubert", "feat_proj_layer_norm": true}"#).unwrap();
+  assert!(hubert_true.validate().is_ok());
+
+  // (d) Absent (the common case: wav2vec2 configs never carry the field, HuBERT
+  // defaults it true) falls back to the LayerNorm arm and validates for both.
   let absent = Config::from_json("{}").unwrap();
   assert!(
     absent.feat_proj_layer_norm,
     "feat_proj_layer_norm must default to true when absent"
   );
   assert!(absent.validate().is_ok());
+  let hubert_absent = Config::from_json(r#"{"model_type": "hubert"}"#).unwrap();
+  assert!(hubert_absent.feat_proj_layer_norm);
+  assert!(hubert_absent.validate().is_ok());
 }
 
 #[test]
@@ -975,6 +1044,14 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
     // The HuBERT-only flags spelled out at their HF defaults (the wired arm).
     r#"{"model_type": "hubert", "feat_proj_layer_norm": true}"#,
     r#"{"model_type": "hubert", "conv_pos_batch_norm": false}"#,
+    // The newly-unlocked variant arms: the "layer" feature-encoder norm
+    // (large-960h-lv60-self), the HuBERT no-LayerNorm feature projection (only
+    // valid on `model_type == "hubert"`), and the MMS per-attention-block adapter
+    // (positive bottleneck width).
+    r#"{"feat_extract_norm": "layer"}"#,
+    r#"{"model_type": "hubert", "feat_proj_layer_norm": false}"#,
+    r#"{"adapter_attn_dim": 16}"#,
+    r#"{"adapter_attn_dim": 16, "do_stable_layer_norm": true}"#,
     // A consistent larger transformer (hidden divisible by heads + groups).
     r#"{"hidden_size": 1024, "num_attention_heads": 16,
         "num_conv_pos_embedding_groups": 16}"#,
@@ -1001,16 +1078,23 @@ fn config_validate_accepts_family_variants_rejects_out_of_scope() {
     // phase); admitting it would run its rel-pos tensors through the plain
     // attention path unconsumed (silent corruption), so it is rejected.
     r#"{"model_type": "wavlm"}"#,
-    r#"{"feat_extract_norm": "layer"}"#,
+    // An UNKNOWN feat_extract_norm (neither "group" nor "layer") is rejected.
+    r#"{"feat_extract_norm": "instance"}"#,
     r#"{"hidden_act": "relu"}"#,
     r#"{"feat_extract_activation": "relu"}"#,
     r#"{"add_adapter": true}"#,
-    r#"{"adapter_attn_dim": 16}"#,
+    // A non-positive adapter bottleneck width is malformed (it sizes the
+    // adapter Linears) even though the adapter itself is now wired.
+    r#"{"adapter_attn_dim": 0}"#,
+    r#"{"adapter_attn_dim": -8}"#,
     r#"{"pad_token_id": 1}"#,
-    // The HuBERT-only graph arms not wired this phase: the no-LayerNorm feature
-    // projection and the batch-norm positional conv.
-    r#"{"feat_proj_layer_norm": false}"#,
+    // The HuBERT-only batch-norm positional conv arm is not wired this phase.
     r#"{"conv_pos_batch_norm": true}"#,
+    // The no-LayerNorm feature projection is HuBERT-only: a wav2vec2 model_type
+    // (default + explicit) with feat_proj_layer_norm=false is rejected (HF's
+    // Wav2Vec2FeatureProjection always applies the projection LayerNorm).
+    r#"{"feat_proj_layer_norm": false}"#,
+    r#"{"model_type": "wav2vec2", "feat_proj_layer_norm": false}"#,
     // Structurally invalid.
     r#"{"hidden_size": 0}"#,
     r#"{"hidden_size": 1000, "num_attention_heads": 12}"#,
@@ -2003,12 +2087,14 @@ fn large_stable_layer_norm_config_builds_and_forwards() {
 #[test]
 fn full_large_lv60_style_config_parses_and_validates() {
   // The real large-960h-lv60-self transformer dims (1024 hidden / 16 heads / 24
-  // layers / 4096 intermediate, stable-LN) must parse and validate (the
-  // feat_extract_norm stays "group" here — the "layer" arm is out of scope).
+  // layers / 4096 intermediate, stable-LN) with its defining `feat_extract_norm
+  // = "layer"` extractor must parse, validate, and resolve to the LayerNorm
+  // feature-extractor scheme (the arm this checkpoint actually uses).
   let json = r#"{
     "model_type": "wav2vec2",
     "hidden_size": 1024, "num_attention_heads": 16, "num_hidden_layers": 24,
     "intermediate_size": 4096, "vocab_size": 32,
+    "feat_extract_norm": "layer",
     "do_stable_layer_norm": true,
     "num_conv_pos_embeddings": 128, "num_conv_pos_embedding_groups": 16
   }"#;
@@ -2016,6 +2102,10 @@ fn full_large_lv60_style_config_parses_and_validates() {
   assert_eq!(config.hidden_size, 1024);
   assert_eq!(config.num_hidden_layers, 24);
   assert!(config.do_stable_layer_norm);
+  assert_eq!(
+    config.feat_extract_norm_scheme().unwrap(),
+    FeatExtractNorm::Layer
+  );
   assert!(config.validate().is_ok());
 }
 
@@ -3500,4 +3590,2281 @@ fn direct_greedy_ctc_transcribe_succeeds_with_real_vocabulary() {
     transcription.text(),
     "the CTC segment text and the top-level text are the one trimmed decode"
   );
+}
+
+// ═════════════ feat_extract_norm == "layer" feature extractor ═════════════
+
+/// A complete post-sanitize weight map for a `feat_extract_norm == "layer"`
+/// config — like [`synthetic_weights`] but EVERY conv layer carries a
+/// `layer_norm.{weight,bias}` affine over its conv output width (the
+/// `Wav2Vec2LayerNormConvLayer` extractor), instead of only L0 carrying one (the
+/// GroupNorm extractor). Shapes written longhand.
+fn layer_norm_extractor_weights(c: &Config) -> HashMap<String, Array> {
+  let mut w = synthetic_weights(c);
+  // synthetic_weights only inserts conv_layers.0.layer_norm.*; the "layer" arm
+  // needs one per conv layer (each over conv_dim[i]). Insert the missing
+  // per-layer LayerNorm affines (L0's is already present from synthetic_weights,
+  // sized conv_dim[0], which is correct here too).
+  for i in 0..(c.num_feat_extract_layers as usize) {
+    let out = c.conv_dim[i];
+    w.insert(
+      format!("feature_extractor.conv_layers.{i}.layer_norm.weight"),
+      filled(&[out], 1.0),
+    );
+    w.insert(
+      format!("feature_extractor.conv_layers.{i}.layer_norm.bias"),
+      filled(&[out], 0.0),
+    );
+  }
+  w
+}
+
+#[test]
+fn layer_feat_extract_norm_builds_and_forwards() {
+  // A `feat_extract_norm = "layer"` config (the large-960h-lv60-self extractor)
+  // must build the all-LayerNorm feature encoder and forward to the right logits
+  // shape — the large-960h-lv60-self extractor.
+  let config = tiny_config_json(r#", "feat_extract_norm": "layer""#);
+  assert_eq!(
+    config.feat_extract_norm_scheme().unwrap(),
+    FeatExtractNorm::Layer
+  );
+  let expected_t = feature_out_len(&config, 400);
+  let vocab = config.vocab_size as usize;
+  let weights = layer_norm_extractor_weights(&config);
+  let model = Model::from_weights(config, weights, Vocab::default())
+    .expect("a feat_extract_norm=layer config must build");
+  // Every conv layer must carry a LayerNorm (and none a GroupNorm) — the
+  // structural proof the "layer" arm was built, not the group arm.
+  for (i, layer) in model.feature_encoder.conv_layers.iter().enumerate() {
+    assert!(
+      layer.layer_norm.is_some(),
+      "conv layer {i} must carry a LayerNorm in the \"layer\" extractor"
+    );
+    assert!(
+      layer.group_norm.is_none(),
+      "conv layer {i} must NOT carry a GroupNorm in the \"layer\" extractor"
+    );
+  }
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model.forward(&waveform).expect("forward must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, vocab],
+    "layer-norm-extractor logits must be (1, T'={expected_t}, vocab={vocab})"
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all logits must be finite"
+  );
+}
+
+#[test]
+fn group_arm_has_only_l0_groupnorm() {
+  // The both-directions counterpart: the default "group" extractor must have a
+  // GroupNorm at L0 ONLY, and no LayerNorm anywhere — distinguishing it from the
+  // "layer" arm built above.
+  let config = tiny_config_json("");
+  assert_eq!(
+    config.feat_extract_norm_scheme().unwrap(),
+    FeatExtractNorm::Group
+  );
+  let model = Model::from_weights(
+    config,
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .expect("the default group config must build");
+  for (i, layer) in model.feature_encoder.conv_layers.iter().enumerate() {
+    assert_eq!(
+      layer.group_norm.is_some(),
+      i == 0,
+      "conv layer {i}: GroupNorm present iff it is L0 (the \"group\" extractor)"
+    );
+    assert!(
+      layer.layer_norm.is_none(),
+      "conv layer {i}: no LayerNorm in the \"group\" extractor"
+    );
+  }
+}
+
+#[test]
+fn layer_and_group_feature_extractors_differ() {
+  // The "layer" and "group" extractors must produce DIFFERENT features (hence
+  // logits) from the same conv weights + input — proving the LayerNorm arm is a
+  // distinct graph (per-layer LayerNorm at every layer vs a single L0 GroupNorm),
+  // not an accidental alias.
+  let group_cfg = tiny_config_json("");
+  let layer_cfg = tiny_config_json(r#", "feat_extract_norm": "layer""#);
+  // Share the SAME conv weights (synthetic_weights is deterministic for a given
+  // config and the two configs share every conv dim), so the only difference is
+  // the normalization scheme.
+  let group_w = synthetic_weights(&tiny_config_json(""));
+  let layer_w =
+    layer_norm_extractor_weights(&tiny_config_json(r#", "feat_extract_norm": "layer""#));
+  let waveform = filled(&[1, 400], 0.3);
+  let mut g = Model::from_weights(group_cfg, group_w, Vocab::default())
+    .unwrap()
+    .forward(&waveform)
+    .unwrap();
+  let mut l = Model::from_weights(layer_cfg, layer_w, Vocab::default())
+    .unwrap()
+    .forward(&waveform)
+    .unwrap();
+  assert_eq!(g.shape(), l.shape(), "same dims, same logits shape");
+  let ga = g.to_vec::<f32>().unwrap();
+  let la = l.to_vec::<f32>().unwrap();
+  assert!(
+    ga.iter().zip(la.iter()).any(|(x, y)| (x - y).abs() > 1e-5),
+    "the group and layer feature-extractor norm arms must produce different outputs"
+  );
+}
+
+#[test]
+fn layer_feat_extract_norm_requires_per_layer_layernorm() {
+  // The "layer" extractor consumes a `layer_norm.{weight,bias}` for EVERY conv
+  // layer (not just L0). A checkpoint missing a non-L0 layer's LayerNorm is a
+  // clear MissingKey — the both-directions proof the per-layer norms are
+  // actually consumed.
+  let config = tiny_config_json(r#", "feat_extract_norm": "layer""#);
+  let mut weights = layer_norm_extractor_weights(&config);
+  // Drop layer 1's LayerNorm weight (present in the "layer" arm, absent in
+  // "group").
+  weights.remove("feature_extractor.conv_layers.1.layer_norm.weight");
+  match Model::from_weights(config, weights, Vocab::default()) {
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("conv_layers.1.layer_norm.weight"),
+      "the missing key should name the absent per-layer LayerNorm, got {:?}",
+      p.key()
+    ),
+    // `Model` is not `Debug`, so the Ok arm is reported without formatting it.
+    Err(other) => panic!("expected MissingKey for an absent per-layer LayerNorm, got {other:?}"),
+    Ok(_) => panic!("expected MissingKey for an absent per-layer LayerNorm, but the model built"),
+  }
+}
+
+// ═════════════ feat_proj_layer_norm == false (HuBERT no-LN projection) ═════════════
+
+#[test]
+fn feat_proj_no_layernorm_builds_and_skips_projection_ln() {
+  // A `feat_proj_layer_norm = false` config (HuBERT's no-LayerNorm projection
+  // arm) must build with NO projection LayerNorm and forward correctly — the
+  // HuBERT no-LayerNorm feature-projection arm.
+  let config = tiny_config_json(r#", "model_type": "hubert", "feat_proj_layer_norm": false"#);
+  assert!(!config.feat_proj_layer_norm);
+  // The synthetic weight map carries the projection LayerNorm affine; the
+  // builder must NOT consume it when the flag is false (so the model still
+  // builds — the unused tensor is simply left in the map).
+  let weights = synthetic_weights(&config);
+  let model = Model::from_weights(config, weights, Vocab::default())
+    .expect("a feat_proj_layer_norm=false config must build");
+  assert!(
+    model.feature_projection.layer_norm.is_none(),
+    "the projection LayerNorm must be absent when feat_proj_layer_norm = false"
+  );
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model.forward(&waveform).expect("forward must succeed");
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all logits must be finite for the no-LayerNorm projection arm"
+  );
+}
+
+#[test]
+fn feat_proj_layernorm_present_when_flag_true() {
+  // The both-directions counterpart: the default (feat_proj_layer_norm = true)
+  // builds WITH the projection LayerNorm — so the flag genuinely gates it.
+  let config = tiny_config_json("");
+  assert!(config.feat_proj_layer_norm);
+  let model = Model::from_weights(
+    config,
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .expect("the default config must build");
+  assert!(
+    model.feature_projection.layer_norm.is_some(),
+    "the projection LayerNorm must be present when feat_proj_layer_norm = true"
+  );
+}
+
+#[test]
+fn feat_proj_with_and_without_layernorm_differ() {
+  // The LayerNorm and no-LayerNorm projection arms must produce DIFFERENT logits
+  // from the same weights + input — proving the `false` arm actually skips the
+  // normalization (an un-normalized projection input vs a normalized one).
+  let with_ln = tiny_config_json(r#", "model_type": "hubert""#); // default true
+  let no_ln = tiny_config_json(r#", "model_type": "hubert", "feat_proj_layer_norm": false"#);
+  assert!(with_ln.feat_proj_layer_norm);
+  assert!(!no_ln.feat_proj_layer_norm);
+  // Use a NON-trivial projection LayerNorm affine so dropping it actually
+  // changes the result (the default synthetic affine is ones/zeros, which on a
+  // feature-uniform input could be near-identity; ramp the input so the
+  // pre-projection features vary across the channel axis).
+  let waveform = ramp(&[1, 400], 0.5);
+  let mut a = Model::from_weights(
+    with_ln,
+    synthetic_weights(&tiny_config_json(r#", "model_type": "hubert""#)),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  let mut b = Model::from_weights(
+    no_ln,
+    synthetic_weights(&tiny_config_json(
+      r#", "model_type": "hubert", "feat_proj_layer_norm": false"#,
+    )),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  assert_eq!(a.shape(), b.shape());
+  let av = a.to_vec::<f32>().unwrap();
+  let bv = b.to_vec::<f32>().unwrap();
+  assert!(
+    av.iter().zip(bv.iter()).any(|(x, y)| (x - y).abs() > 1e-5),
+    "the LayerNorm and no-LayerNorm projection arms must produce different outputs"
+  );
+}
+
+#[test]
+fn feat_proj_no_layernorm_is_hubert_only_on_build_path() {
+  // The no-LayerNorm feature projection is HuBERT-only — HF's
+  // `Wav2Vec2FeatureProjection` ALWAYS applies the projection LayerNorm. So a
+  // wav2vec2 `model_type` with `feat_proj_layer_norm = false` must be REJECTED on
+  // the build path (Model::from_weights runs Config::validate), never load a
+  // silently-wrong graph (a wav2vec2 model with its projection LayerNorm dropped).
+
+  // (a) wav2vec2 (default model_type) + false → rejected by the build path.
+  let w2v2_no_ln = tiny_config_json(r#", "feat_proj_layer_norm": false"#);
+  assert!(!w2v2_no_ln.feat_proj_layer_norm);
+  assert!(!w2v2_no_ln.is_hubert());
+  let weights = synthetic_weights(&w2v2_no_ln);
+  match Model::from_weights(w2v2_no_ln, weights, Vocab::default()) {
+    Err(Error::InvariantViolation(_)) => {}
+    Ok(_) => panic!(
+      "a wav2vec2 model_type with feat_proj_layer_norm=false must be REJECTED on the build path \
+       (the no-LayerNorm projection is HuBERT-only)"
+    ),
+    Err(e) => panic!("expected a typed InvariantViolation, got {e:?}"),
+  }
+
+  // (b) An explicit wav2vec2 model_type + false → likewise rejected.
+  let w2v2_explicit =
+    tiny_config_json(r#", "model_type": "wav2vec2", "feat_proj_layer_norm": false"#);
+  let weights = synthetic_weights(&w2v2_explicit);
+  assert!(Model::from_weights(w2v2_explicit, weights, Vocab::default()).is_err());
+
+  // (c) wav2vec2 with the flag absent (the common case) builds WITH the
+  // projection LayerNorm — the wav2vec2 graph always applies it.
+  let w2v2_default = tiny_config_json("");
+  assert!(w2v2_default.feat_proj_layer_norm);
+  let weights = synthetic_weights(&w2v2_default);
+  let model = Model::from_weights(w2v2_default, weights, Vocab::default())
+    .expect("a default wav2vec2 config must build");
+  assert!(
+    model.feature_projection.layer_norm.is_some(),
+    "the wav2vec2 projection LayerNorm must always be present"
+  );
+
+  // (d) hubert + false is the no-LayerNorm arm and is honored (builds, no LN) —
+  // proving the gate is on model_type, not a blanket rejection of false.
+  let hubert_no_ln = tiny_config_json(r#", "model_type": "hubert", "feat_proj_layer_norm": false"#);
+  assert!(hubert_no_ln.is_hubert());
+  let weights = synthetic_weights(&hubert_no_ln);
+  let hubert_model = Model::from_weights(hubert_no_ln, weights, Vocab::default()).expect(
+    "a hubert model_type with feat_proj_layer_norm=false must build (its no-LayerNorm arm)",
+  );
+  assert!(
+    hubert_model.feature_projection.layer_norm.is_none(),
+    "the hubert no-LayerNorm arm must drop the projection LayerNorm"
+  );
+}
+
+// ═══════════════════ MMS attention adapter ═══════════════════
+
+/// A tiny MMS config: the tiny dims + the stable-LN arm (which MMS uses) + a
+/// small `adapter_attn_dim` bottleneck. The `extra` is appended to the JSON.
+fn mms_config_json(extra: &str) -> Config {
+  tiny_config_json(&format!(
+    r#", "do_stable_layer_norm": true, "adapter_attn_dim": 8{extra}"#
+  ))
+}
+
+/// Add the per-layer MMS adapter weights (`encoder.layers.{i}.adapter_layer.*`)
+/// to a base synthetic weight map for `c`: a `norm` LayerNorm affine over
+/// hidden, a `linear_1` (hidden → adapter_attn_dim) + a `linear_2`
+/// (adapter_attn_dim → hidden), each with a bias. Used for the build/forward
+/// tests; `value` scales the adapter Linear ramps (0.0 ⇒ a zero adapter, so the
+/// adapter add is a no-op — handy for the "adapter present but inert" check).
+fn add_adapter_weights(w: &mut HashMap<String, Array>, c: &Config, value: f32) {
+  let hs = c.hidden_size;
+  let d = c
+    .adapter_attn_dim
+    .expect("an MMS config sets adapter_attn_dim");
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}.adapter_layer");
+    w.insert(format!("{p}.norm.weight"), filled(&[hs], 1.0));
+    w.insert(format!("{p}.norm.bias"), filled(&[hs], 0.0));
+    w.insert(format!("{p}.linear_1.weight"), ramp(&[d, hs], value));
+    w.insert(format!("{p}.linear_1.bias"), filled(&[d], 0.0));
+    w.insert(format!("{p}.linear_2.weight"), ramp(&[hs, d], value));
+    w.insert(format!("{p}.linear_2.bias"), filled(&[hs], 0.0));
+  }
+}
+
+/// A complete MMS synthetic weight map (the base synthetic weights + the
+/// per-layer adapter weights).
+fn mms_weights(c: &Config, adapter_value: f32) -> HashMap<String, Array> {
+  let mut w = synthetic_weights(c);
+  add_adapter_weights(&mut w, c, adapter_value);
+  w
+}
+
+#[test]
+fn attn_adapter_layer_forward_oracle() {
+  // VALUE-LEVEL oracle for the adapter branch: norm → linear_1 → relu →
+  // linear_2 (Wav2Vec2AttnAdapterLayer.__call__). The oracle recomputes each
+  // step through the PUBLIC primitives (LayerNorm, the Linear forward, the relu
+  // = max(x,0)), independently of AttnAdapterLayer::forward, then compares.
+  use crate::lm::nn::norm::LayerNorm as Ln;
+
+  let hidden = 4i32;
+  let adapter_dim = 3i32;
+  // Deterministic, element-varying weights/input so relu actually clips some
+  // values (a constant fill would not exercise the nonlinearity).
+  let norm_w = filled(&[hidden], 1.0);
+  let norm_b = filled(&[hidden], 0.0);
+  let l1_w = ramp(&[adapter_dim, hidden], 0.7);
+  let l1_b = ramp(&[adapter_dim], 0.5);
+  let l2_w = ramp(&[hidden, adapter_dim], 0.7);
+  let l2_b = ramp(&[hidden], 0.3);
+  let x = ramp(&[1, 5, hidden], 0.9);
+
+  let adapter = AttnAdapterLayer {
+    norm: Ln::new(
+      Some(norm_w.try_clone().unwrap()),
+      Some(norm_b.try_clone().unwrap()),
+      1e-5,
+    ),
+    linear_1: Linear::new(l1_w.try_clone().unwrap(), Some(l1_b.try_clone().unwrap())),
+    linear_2: Linear::new(l2_w.try_clone().unwrap(), Some(l2_b.try_clone().unwrap())),
+  };
+  let mut got = adapter.forward(&x).unwrap();
+
+  // Oracle: norm(x) → linear_1 → relu → linear_2, all via public ops.
+  let oracle_norm = Ln::new(Some(norm_w), Some(norm_b), 1e-5);
+  let n = oracle_norm.forward(&x).unwrap();
+  let h1 = Linear::new(l1_w, Some(l1_b)).forward(&n).unwrap();
+  // relu = max(h1, 0).
+  let zero = Array::full::<f32>(&[0i32; 0], 0.0).unwrap();
+  let r = ops::arithmetic::maximum(&h1, &zero).unwrap();
+  let mut want = Linear::new(l2_w, Some(l2_b)).forward(&r).unwrap();
+
+  assert_eq!(
+    got.shape(),
+    want.shape(),
+    "adapter output shape (B, T, hidden)"
+  );
+  assert_eq!(got.shape(), vec![1, 5, hidden as usize]);
+  let g = got.to_vec::<f32>().unwrap();
+  let wv = want.to_vec::<f32>().unwrap();
+  for (i, (a, b)) in g.iter().zip(wv.iter()).enumerate() {
+    assert!(
+      (a - b).abs() < 1e-5,
+      "adapter[{i}]: got {a}, want {b} (norm→linear_1→relu→linear_2)"
+    );
+  }
+}
+
+#[test]
+fn mms_config_builds_adapter_in_every_stable_ln_layer() {
+  // An MMS config (stable-LN + adapter_attn_dim) must build an adapter in EVERY
+  // encoder layer and forward to the right shape — the structural proof the
+  // per-layer adapter is wired.
+  let config = mms_config_json("");
+  assert_eq!(config.adapter_attn_dim, Some(8));
+  assert!(config.do_stable_layer_norm);
+  let weights = mms_weights(&config, 0.3);
+  let model = Model::from_weights(config, weights, Vocab::default())
+    .expect("an MMS (stable-LN + adapter_attn_dim) config must build");
+  let layers = encoder_layers(&model.encoder);
+  assert!(!layers.is_empty());
+  for (i, layer) in layers.iter().enumerate() {
+    assert!(
+      layer.adapter_layer.is_some(),
+      "stable-LN layer {i} must carry the MMS adapter when adapter_attn_dim is set"
+    );
+  }
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model.forward(&waveform).expect("MMS forward must succeed");
+  let expected_t = feature_out_len(&mms_config_json(""), 400);
+  assert_eq!(
+    logits.shape(),
+    vec![
+      1,
+      expected_t as usize,
+      mms_config_json("").vocab_size as usize
+    ]
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+#[test]
+fn post_norm_config_with_adapter_attn_dim_builds_no_adapter() {
+  // The reference attaches the adapter ONLY to the stable-LN layer
+  // (Wav2Vec2EncoderLayerStableLayerNorm). A POST-norm config that nonetheless
+  // carries adapter_attn_dim must build NO adapter (and consume no
+  // adapter_layer.* weights) — faithful to the reference's post-norm
+  // Wav2Vec2EncoderLayer, which has no adapter.
+  let config = tiny_config_json(r#", "adapter_attn_dim": 8"#); // post-norm (default)
+  assert_eq!(config.adapter_attn_dim, Some(8));
+  assert!(!config.do_stable_layer_norm);
+  // The base synthetic weights carry NO adapter_layer.* keys; if the post-norm
+  // builder tried to consume them it would MissingKey. It must build cleanly.
+  let model = Model::from_weights(
+    config,
+    synthetic_weights(&tiny_config_json(r#", "adapter_attn_dim": 8"#)),
+    Vocab::default(),
+  )
+  .expect("a post-norm config with adapter_attn_dim must build with no adapter");
+  for (i, layer) in encoder_layers(&model.encoder).iter().enumerate() {
+    assert!(
+      layer.adapter_layer.is_none(),
+      "post-norm layer {i} must have NO adapter (the reference attaches it only to stable-LN)"
+    );
+  }
+}
+
+#[test]
+fn mms_adapter_changes_output_vs_no_adapter() {
+  // A non-zero MMS adapter must CHANGE the logits vs the same stable-LN model
+  // with a zero adapter (whose `h + adapter(h)` add is a no-op) — proving the
+  // adapter branch is actually summed into the hidden states, not dropped.
+  let cfg_active = mms_config_json("");
+  let cfg_zero = mms_config_json("");
+  let waveform = ramp(&[1, 400], 0.4);
+  // Active adapter (non-zero Linear ramps) vs an all-zero adapter (linear_1 /
+  // linear_2 weights = 0, biases = 0 ⇒ adapter(h) = 0 ⇒ h + 0 = h).
+  let mut active = Model::from_weights(
+    cfg_active,
+    mms_weights(&mms_config_json(""), 0.5),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  let mut zero = Model::from_weights(
+    cfg_zero,
+    mms_weights(&mms_config_json(""), 0.0),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  assert_eq!(active.shape(), zero.shape());
+  let a = active.to_vec::<f32>().unwrap();
+  let z = zero.to_vec::<f32>().unwrap();
+  assert!(
+    a.iter().zip(z.iter()).any(|(x, y)| (x - y).abs() > 1e-5),
+    "a non-zero MMS adapter must change the output (its branch is added to the hidden states)"
+  );
+}
+
+#[test]
+fn mms_config_requires_adapter_weights() {
+  // With adapter_attn_dim set on a stable-LN config, the builder consumes the
+  // `adapter_layer.*` weights per layer; a checkpoint missing one is a clear
+  // MissingKey (not a silent drop of the adapter graph term).
+  let config = mms_config_json("");
+  let mut weights = mms_weights(&config, 0.3);
+  weights.remove("encoder.layers.0.adapter_layer.linear_1.weight");
+  match Model::from_weights(config, weights, Vocab::default()) {
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("layers.0.adapter_layer.linear_1.weight"),
+      "the missing key should name the absent adapter weight, got {:?}",
+      p.key()
+    ),
+    // `Model` is not `Debug`, so the Ok arm is reported without formatting it.
+    Err(other) => panic!("expected MissingKey for an absent adapter weight, got {other:?}"),
+    Ok(_) => panic!("expected MissingKey for an absent adapter weight, but the model built"),
+  }
+}
+
+// ─────────────── MMS per-language adapter loading ───────────────
+
+/// The dense lm_head weight of a loaded model (for asserting the adapter file's
+/// lm_head replaced the base one). Panics if the lm_head is quantized (these
+/// fixtures are dense).
+fn lm_head_weight(model: &Model<Standard>) -> Vec<f32> {
+  match &model.lm_head.inner {
+    crate::nn::MaybeQuantizedLinear::Dense(l) => {
+      l.weight_ref().try_clone().unwrap().to_vec::<f32>().unwrap()
+    }
+    crate::nn::MaybeQuantizedLinear::Quantized(_) => panic!("dense lm_head expected"),
+  }
+}
+
+/// A per-language MMS adapter safetensors map (the on-disk
+/// `adapter.{lang}.safetensors` content): the per-layer `adapter_layer.*`
+/// weights + the per-language `lm_head.*`, all at scale `value` so different
+/// languages produce distinguishable weights. Keys are backbone-relative (no
+/// `wav2vec2.` prefix — real MMS adapter files store them this way); `lm_head`
+/// is top-level. No conv tensors (sanitize leaves these unchanged).
+fn adapter_file_weights(c: &Config, value: f32) -> HashMap<String, Array> {
+  let mut w: HashMap<String, Array> = HashMap::new();
+  let hs = c.hidden_size;
+  let d = c
+    .adapter_attn_dim
+    .expect("MMS config sets adapter_attn_dim");
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}.adapter_layer");
+    w.insert(format!("{p}.norm.weight"), filled(&[hs], 1.0));
+    w.insert(format!("{p}.norm.bias"), filled(&[hs], 0.0));
+    w.insert(format!("{p}.linear_1.weight"), ramp(&[d, hs], value));
+    w.insert(format!("{p}.linear_1.bias"), filled(&[d], 0.0));
+    w.insert(format!("{p}.linear_2.weight"), ramp(&[hs, d], value));
+    w.insert(format!("{p}.linear_2.bias"), filled(&[hs], 0.0));
+  }
+  // The per-language CTC head (a DISTINCT ramp so it is distinguishable from the
+  // base init's lm_head).
+  w.insert(
+    "lm_head.weight".to_string(),
+    ramp(&[c.vocab_size, hs], value),
+  );
+  w.insert("lm_head.bias".to_string(), filled(&[c.vocab_size], value));
+  w
+}
+
+/// Write an MMS checkpoint to a fresh temp dir: the base `model.safetensors`
+/// (HF `wav2vec2.`-prefixed, with a language-agnostic adapter init scaled by
+/// `base_value`) plus an `adapter.{lang}.safetensors` per `(lang, value)` pair.
+/// Returns the dir; the caller removes it.
+fn write_mms_checkpoint(
+  config_json: &str,
+  config: &Config,
+  base_value: f32,
+  adapters: &[(&str, f32)],
+  tag: &str,
+) -> std::path::PathBuf {
+  // Base HF-prefixed weights + the language-agnostic adapter init (also
+  // prefixed). hf_layout_prefixed_weights covers the backbone; add the adapter
+  // init under the same prefix.
+  let mut base = hf_layout_prefixed_weights(config, "wav2vec2.");
+  let hs = config.hidden_size;
+  let d = config.adapter_attn_dim.unwrap();
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}.adapter_layer");
+    base.insert(format!("{p}.norm.weight"), filled(&[hs], 1.0));
+    base.insert(format!("{p}.norm.bias"), filled(&[hs], 0.0));
+    base.insert(format!("{p}.linear_1.weight"), ramp(&[d, hs], base_value));
+    base.insert(format!("{p}.linear_1.bias"), filled(&[d], 0.0));
+    base.insert(format!("{p}.linear_2.weight"), ramp(&[hs, d], base_value));
+    base.insert(format!("{p}.linear_2.bias"), filled(&[hs], 0.0));
+  }
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_mms_{tag}_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &base).unwrap();
+  for (lang, value) in adapters {
+    let adapter = adapter_file_weights(config, *value);
+    crate::io::save_safetensors(&dir.join(format!("adapter.{lang}.safetensors")), &adapter)
+      .unwrap();
+  }
+  dir
+}
+
+#[test]
+fn mms_load_overlays_per_language_adapter_and_lm_head() {
+  // The MMS per-language overlay (mms.py post_load_hook): loading a checkpoint
+  // with an adapter.{lang}.safetensors must REPLACE the base's adapter-layer
+  // weights AND lm_head with the per-language ones. Proven two ways:
+  //   (1) the loaded lm_head weight equals the ADAPTER file's lm_head (not the
+  //       base init's) — a direct, byte-level proof of the overlay;
+  //   (2) loading the same base with TWO DIFFERENT per-language adapters
+  //       (eng vs fra) produces DIFFERENT logits (both go through the identical
+  //       on-disk → sanitize → build path, differing only in which adapter was
+  //       overlaid) — proving the adapter weights flow into the forward, not
+  //       just the lm_head. (An MMS config now REQUIRES an adapter, so a
+  //       no-overlay baseline is no longer a valid load — see
+  //       `mms_load_requires_adapter_file_for_mms_config`.)
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  const BASE_V: f32 = 0.2;
+  const ENG_V: f32 = 0.6;
+  const FRA_V: f32 = 0.35;
+  // Two dirs sharing the SAME base init; one ships adapter.eng, the other ships a
+  // DIFFERENT adapter.fra (a distinct per-language ramp).
+  let eng_dir = write_mms_checkpoint(
+    config_json,
+    &config,
+    BASE_V,
+    &[("eng", ENG_V)],
+    "overlay_eng",
+  );
+  let fra_dir = write_mms_checkpoint(
+    config_json,
+    &config,
+    BASE_V,
+    &[("fra", FRA_V)],
+    "overlay_fra",
+  );
+
+  // `Model` is not `Debug`, so unwrap via `match` (not `.expect`).
+  let eng_model =
+    match Model::<Standard>::load_with_target_lang(&eng_dir.to_string_lossy(), Some("eng")) {
+      Ok(m) => m,
+      Err(e) => panic!("loading an MMS checkpoint with adapter.eng must succeed, got {e:?}"),
+    };
+  let fra_model =
+    match Model::<Standard>::load_with_target_lang(&fra_dir.to_string_lossy(), Some("fra")) {
+      Ok(m) => m,
+      Err(e) => panic!("loading an MMS checkpoint with adapter.fra must succeed, got {e:?}"),
+    };
+
+  // (1) The eng-adapter model's lm_head must be the ADAPTER's (ENG_V ramp), not
+  // the base init's (BASE_V ramp). Compare against the adapter file's lm_head
+  // weight computed independently.
+  let got_head = lm_head_weight(&eng_model);
+  let want_head = ramp(&[config.vocab_size, config.hidden_size], ENG_V)
+    .to_vec::<f32>()
+    .unwrap();
+  assert_eq!(got_head.len(), want_head.len());
+  assert!(
+    got_head
+      .iter()
+      .zip(want_head.iter())
+      .all(|(a, b)| (a - b).abs() < 1e-5),
+    "the loaded lm_head must be the per-language adapter's, not the base init's"
+  );
+  // The base init lm_head (BASE_V ramp) must differ from the adapter's (ENG_V) —
+  // proof the overlay is what changed lm_head, and that BASE_V and ENG_V actually
+  // differ (so (1) discriminates).
+  let base_head = ramp(&[config.vocab_size, config.hidden_size], BASE_V)
+    .to_vec::<f32>()
+    .unwrap();
+  assert!(
+    base_head
+      .iter()
+      .zip(want_head.iter())
+      .any(|(a, b)| (a - b).abs() > 1e-5),
+    "the base-init and adapter lm_heads must differ (else the test cannot discriminate)"
+  );
+
+  // (2) The eng vs fra models' logits must DIFFER — both built from the identical
+  // on-disk base via the same sanitize/build path, differing ONLY in which
+  // per-language adapter was overlaid. So the adapter-layer weights (not just
+  // lm_head) reach the forward.
+  let waveform = ramp(&[1, 400], 0.3);
+  let mut eng_logits = eng_model.forward(&waveform).unwrap();
+  let mut fra_logits = fra_model.forward(&waveform).unwrap();
+  let _ = std::fs::remove_dir_all(&eng_dir);
+  let _ = std::fs::remove_dir_all(&fra_dir);
+  assert_eq!(eng_logits.shape(), fra_logits.shape());
+  let a = eng_logits.to_vec::<f32>().unwrap();
+  let b = fra_logits.to_vec::<f32>().unwrap();
+  assert!(
+    a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-4),
+    "two different per-language adapters must produce different logits (the overlay reaches the forward)"
+  );
+}
+
+/// The config JSON string for the MMS fixture (must match `mms_config_json`'s
+/// dims so the saved weights line up with the parsed config).
+fn mms_config_json_str() -> &'static str {
+  r#"{
+    "model_type": "wav2vec2",
+    "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+    "num_hidden_layers": 2, "vocab_size": 12,
+    "num_feat_extract_layers": 3,
+    "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+    "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+    "do_stable_layer_norm": true, "adapter_attn_dim": 8
+  }"#
+}
+
+#[test]
+fn mms_adapter_file_discovery_exact_then_fallback() {
+  // adapter_file_for: the EXACT `adapter.{target_lang}.safetensors` is preferred;
+  // when it is absent, it falls back to the lexicographically-smallest
+  // `adapter.*.safetensors`. Drive both branches against a real temp dir.
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  // Two adapter files (fra, deu) but NOT the requested eng.
+  let dir = write_mms_checkpoint(
+    mms_config_json_str(),
+    &config,
+    0.2,
+    &[("fra", 0.5), ("deu", 0.6)],
+    "discovery",
+  );
+
+  // (a) Requesting "fra" finds the exact adapter.fra.safetensors AND reports the
+  // selected language as the requested "fra".
+  let exact = adapter_file_for(&dir, "fra")
+    .unwrap()
+    .expect("fra adapter present");
+  assert!(
+    exact.path.file_name().unwrap().to_str().unwrap() == "adapter.fra.safetensors",
+    "the exact requested-language file must be chosen, got {:?}",
+    exact.path
+  );
+  assert_eq!(
+    exact.lang, "fra",
+    "an exact hit reports the requested language as selected"
+  );
+  // (b) Requesting "eng" (absent) falls back to the smallest adapter.* —
+  // "adapter.deu.safetensors" < "adapter.fra.safetensors" lexicographically —
+  // and reports the FALLBACK's language ("deu"), not the requested "eng", so the
+  // caller can align the vocab to it.
+  let fallback = adapter_file_for(&dir, "eng")
+    .unwrap()
+    .expect("a fallback adapter.* must be found");
+  assert_eq!(
+    fallback.path.file_name().unwrap().to_str().unwrap(),
+    "adapter.deu.safetensors",
+    "the fallback must be the lexicographically-smallest adapter.* file"
+  );
+  assert_eq!(
+    fallback.lang, "deu",
+    "the fallback reports the selected file's language (deu), not the requested eng"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mms_adapter_discovery_none_when_no_adapter_files() {
+  // A checkpoint dir with NO adapter.*.safetensors (a plain wav2vec2 / HuBERT
+  // model) yields None — not an error, just the absence of an overlay.
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_noadapter_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  // Write an unrelated file so the dir is non-empty but has no adapter.
+  std::fs::write(dir.join("config.json"), "{}").unwrap();
+  let found = adapter_file_for(&dir, "eng").unwrap();
+  let _ = std::fs::remove_dir_all(&dir);
+  assert!(found.is_none(), "no adapter.* files ⇒ None (no overlay)");
+}
+
+#[test]
+fn mms_adapter_file_for_returns_canonical_in_dir_path() {
+  // No-escape / TOCTOU closure: `adapter_file_for` returns the CANONICALIZED path
+  // that passed the under-`dir` no-escape check — NOT the raw `entry.path()` —
+  // so the loader opens exactly the validated path (no swap-between-check-and-
+  // open re-resolution of the unchecked original). The returned `SelectedAdapter`
+  // path must equal the canonicalized in-`dir` adapter file.
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  let dir = write_mms_checkpoint(
+    mms_config_json_str(),
+    &config,
+    0.2,
+    &[("fra", 0.5)],
+    "canon_path",
+  );
+  let selected = adapter_file_for(&dir, "fra")
+    .unwrap()
+    .expect("fra adapter present");
+  let expected_canon = dir.join("adapter.fra.safetensors").canonicalize().unwrap();
+  assert_eq!(
+    selected.path, expected_canon,
+    "the returned adapter path must be the canonicalized in-dir file (the validated path), \
+     so the loader opens exactly what was checked"
+  );
+  // It must be absolute (a canonicalized path always is) — a further proof it is
+  // the resolved path, not a relative `entry.path()` artifact.
+  assert!(
+    selected.path.is_absolute(),
+    "a canonicalized adapter path is absolute"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mms_adapter_file_for_resolves_in_dir_symlink_to_canonical_target() {
+  // Canonical-path resolution (defense in depth): an `adapter.{lang}.safetensors`
+  // that is a SYMLINK to a real adapter file located ELSEWHERE UNDER the model
+  // dir is accepted, and the returned path is the canonical (resolved) target —
+  // demonstrating the loader opens the resolved path that passed the under-`dir`
+  // check, not the symlink's own `entry.path()`.
+  use std::os::unix::fs::symlink;
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  // Build a checkpoint whose real adapter lives under a `real/` subdir; expose it
+  // at the top level via a symlink named `adapter.fra.safetensors`.
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_canon_symlink_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(dir.join("real")).unwrap();
+  let target = dir.join("real").join("adapter.fra.safetensors");
+  let adapter = adapter_file_weights(&config, 0.5);
+  crate::io::save_safetensors(&target, &adapter).unwrap();
+  let link = dir.join("adapter.fra.safetensors");
+  symlink(&target, &link).unwrap();
+
+  let selected = adapter_file_for(&dir, "fra")
+    .unwrap()
+    .expect("the symlinked in-dir adapter must be discovered");
+  // The returned path is the canonical TARGET (resolved through the symlink),
+  // which stays under the (canonicalized) model dir.
+  let canon_target = target.canonicalize().unwrap();
+  assert_eq!(
+    selected.path, canon_target,
+    "the returned path must be the symlink's canonical target (the validated path the loader opens)"
+  );
+  assert!(
+    selected.path.starts_with(dir.canonicalize().unwrap()),
+    "the resolved adapter path stays under the model dir"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mms_adapter_file_for_rejects_symlink_escaping_dir() {
+  // No-escape invariant: an `adapter.{lang}.safetensors` symlink that resolves
+  // OUTSIDE the model dir is rejected with a typed error — never overlaid. (And
+  // because discovery now returns the canonical path, a symlink that passes the
+  // check could not later be swapped for an escaping target: the checked path IS
+  // the opened path.)
+  use std::os::unix::fs::symlink;
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  // The real adapter target lives in a SIBLING dir (outside the model dir).
+  let base = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_escape_symlink_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&base);
+  let model_dir = base.join("model");
+  let outside_dir = base.join("outside");
+  std::fs::create_dir_all(&model_dir).unwrap();
+  std::fs::create_dir_all(&outside_dir).unwrap();
+  let outside_target = outside_dir.join("secret.safetensors");
+  let adapter = adapter_file_weights(&config, 0.5);
+  crate::io::save_safetensors(&outside_target, &adapter).unwrap();
+  // Inside the model dir, an adapter.fra.safetensors symlink pointing OUT.
+  let link = model_dir.join("adapter.fra.safetensors");
+  symlink(&outside_target, &link).unwrap();
+
+  let result = adapter_file_for(&model_dir, "fra");
+  let _ = std::fs::remove_dir_all(&base);
+  // `SelectedAdapter` is not `Debug`, so discriminate without formatting it.
+  match result {
+    Err(Error::InvariantViolation(_)) => {}
+    Err(other) => {
+      panic!("an escaping adapter symlink must be an InvariantViolation, got {other:?}")
+    }
+    Ok(_) => panic!("an adapter symlink escaping the model dir must be rejected, not accepted"),
+  }
+}
+
+#[test]
+fn mms_adapter_file_for_rejects_in_dir_symlink_to_other_language() {
+  // Adapter/vocab language consistency: an in-`dir` `adapter.eng.safetensors`
+  // that is a SYMLINK to a real `adapter.fra.safetensors` (also under the dir)
+  // passes the under-`dir` escape check, but opening it would load the FRENCH
+  // weights while the entry name "eng" selects the ENGLISH vocab — a silent
+  // wrong-language transcription. `adapter_file_for` must reject it: the
+  // canonical basename's language (`fra`) differs from the discovered entry's
+  // (`eng`), so it is a typed InvariantViolation, never a SelectedAdapter whose
+  // weights and `lang` describe different languages.
+  use std::os::unix::fs::symlink;
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_lang_desync_symlink_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  // A real French adapter, and an `adapter.eng.safetensors` symlink retargeting
+  // to it (both top-level under the model dir, so the no-escape check passes).
+  let fra_target = dir.join("adapter.fra.safetensors");
+  let adapter = adapter_file_weights(&config, 0.5);
+  crate::io::save_safetensors(&fra_target, &adapter).unwrap();
+  let eng_link = dir.join("adapter.eng.safetensors");
+  symlink(&fra_target, &eng_link).unwrap();
+
+  // Requesting "eng" discovers the `adapter.eng.safetensors` entry, but it
+  // canonicalizes to `adapter.fra.safetensors` — a language mismatch.
+  let result = adapter_file_for(&dir, "eng");
+  let _ = std::fs::remove_dir_all(&dir);
+  // `SelectedAdapter` is not `Debug`, so discriminate without formatting an `Ok`.
+  match result {
+    Err(Error::InvariantViolation(_)) => {}
+    Err(other) => panic!(
+      "an adapter symlink retargeting to another language must be an InvariantViolation, got \
+       {other:?}"
+    ),
+    Ok(_) => panic!(
+      "an `adapter.eng.safetensors` symlinked to `adapter.fra.safetensors` must be rejected (its \
+       weights and selected vocab would describe different languages), not accepted"
+    ),
+  }
+}
+
+#[test]
+fn expected_adapter_keys_fallible_path_builds_full_key_set() {
+  // Fallible allocation: `expected_adapter_keys` reserves its
+  // `O(num_hidden_layers)` key `Vec` FALLIBLY (via `reserve_or_error`) and
+  // returns `Result`. A within-cap config must build the full key set with no
+  // panic: 6 adapter-layer tensors per layer + the 2 lm_head keys, every key
+  // present and the count exact.
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  let n = config.num_hidden_layers as usize;
+  let keys = expected_adapter_keys(&config).expect("within-cap key set reserves successfully");
+  assert_eq!(
+    keys.len(),
+    n.saturating_mul(6).saturating_add(2),
+    "6 adapter-layer tensors per layer + 2 lm_head keys"
+  );
+  for i in 0..n {
+    let p = format!("encoder.layers.{i}.adapter_layer");
+    for suffix in [
+      "norm.weight",
+      "norm.bias",
+      "linear_1.weight",
+      "linear_1.bias",
+      "linear_2.weight",
+      "linear_2.bias",
+    ] {
+      assert!(
+        keys.contains(&format!("{p}.{suffix}")),
+        "expected key {p}.{suffix} present"
+      );
+    }
+  }
+  assert!(keys.contains(&"lm_head.weight".to_string()));
+  assert!(keys.contains(&"lm_head.bias".to_string()));
+}
+
+#[test]
+fn expected_adapter_keys_at_cardinality_cap_does_not_panic() {
+  // A config AT the cardinality cap (the largest count `validate` accepts) must
+  // build its key set through the fallible path WITHOUT panicking or aborting.
+  // The cap bounds the request and the `try_reserve_exact` path would surface any
+  // genuine OOM as a typed `AllocFailure` — here the in-cap allocation succeeds,
+  // returning `Ok` with the full key count.
+  let json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+      "num_hidden_layers": {MAX_CONFIG_CARDINALITY}, "vocab_size": 12,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "do_stable_layer_norm": true, "adapter_attn_dim": 8
+    }}"#
+  );
+  let config = Config::from_json(&json).unwrap();
+  // `validate` accepts the at-cap count (the cap is inclusive).
+  assert!(config.validate().is_ok(), "at-cap config validates");
+  let keys = expected_adapter_keys(&config).expect("at-cap key set reserves successfully");
+  assert_eq!(
+    keys.len(),
+    (MAX_CONFIG_CARDINALITY as usize)
+      .saturating_mul(6)
+      .saturating_add(2)
+  );
+}
+
+#[test]
+fn overlay_uses_fallible_allowed_set_and_rejects_foreign_key() {
+  // Fallible allocation + structural-contract regression: `overlay_adapter_weights`
+  // builds its allowed-key `HashSet` FALLIBLY (via `reserve_or_error`) from the
+  // (`Result`-returning) `expected_adapter_keys`, and reserves the overlay into
+  // `base` fallibly from the adapter file's key count. The structural contract is
+  // unchanged: a complete, allowed overlay succeeds; a foreign key is still a
+  // typed `KeyCollision`. (A within-cap count never panics on the reservation —
+  // it succeeds here.)
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  // `Array` is not `Clone`, so rebuild a fresh base map (backbone + the
+  // language-agnostic adapter init + lm_head the overlay replaces) per call.
+  let fresh_base = || -> HashMap<String, Array> {
+    let mut base = sanitize(hf_layout_prefixed_weights(&config, "wav2vec2.")).unwrap();
+    for (k, v) in adapter_file_weights(&config, 0.2) {
+      base.insert(k, v);
+    }
+    base
+  };
+  // Write a valid adapter file and overlay it through the real function.
+  let dir = std::env::temp_dir().join(format!("mlxrs_w2v_overlay_fallible_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let good = adapter_file_weights(&config, 0.7);
+  let good_path = dir.join("adapter.fra.safetensors");
+  crate::io::save_safetensors(&good_path, &good).unwrap();
+  let mut base_ok = fresh_base();
+  overlay_adapter_weights(&mut base_ok, &good_path, &config, true)
+    .expect("a complete allowed overlay must succeed (fallible reservations OK in-cap)");
+
+  // A foreign key (a stray attention sidecar the adapter must not carry) is still
+  // rejected as a typed KeyCollision — the allocation-discipline change did not
+  // weaken the structural contract.
+  let mut bad = adapter_file_weights(&config, 0.7);
+  bad.insert(
+    "encoder.layers.0.attention.q_proj.scales".to_string(),
+    filled(&[4], 1.0),
+  );
+  let bad_path = dir.join("adapter.deu.safetensors");
+  crate::io::save_safetensors(&bad_path, &bad).unwrap();
+  let mut base_bad = fresh_base();
+  let err = overlay_adapter_weights(&mut base_bad, &bad_path, &config, true);
+  let _ = std::fs::remove_dir_all(&dir);
+  assert!(
+    matches!(err, Err(Error::KeyCollision(_))),
+    "a foreign adapter key must still be a typed KeyCollision, got {err:?}"
+  );
+}
+
+#[test]
+fn overlay_rejects_layernorm_sidecar_and_orphan_biases() {
+  // Exact sidecar contract: quant sidecars (`.scales`/`.biases`) are admitted
+  // ONLY for the `build_linear`-loaded prefixes (the adapter `linear_1` /
+  // `linear_2` projections and `lm_head`) — never for the `take_shaped` adapter
+  // `LayerNorm` (`adapter_layer.norm`), and a `.biases` is valid only ALONGSIDE
+  // its `.scales`. Two malformed adapters are rejected:
+  //   (1) `encoder.layers.0.adapter_layer.norm.scales` — a sidecar on a
+  //       non-quantizable LayerNorm prefix. `norm` is never quantized, so this is
+  //       a key `build_linear` would never read; it must be a foreign key
+  //       (KeyCollision), NOT admitted merely because `norm.weight` is present;
+  //   (2) `encoder.layers.0.adapter_layer.linear_1.biases` with no matching
+  //       `.scales` — a `.biases` is the affine half of a quantized triple, read
+  //       only with its `.scales`; a lone `.biases` (even next to its `.weight`)
+  //       is a MissingKey naming the absent `.scales`.
+  let config = Config::from_json(mms_config_json_str()).unwrap();
+  // `Array` is not `Clone`, so rebuild a fresh base map (backbone + the
+  // language-agnostic adapter init + lm_head the overlay replaces) per call.
+  let fresh_base = || -> HashMap<String, Array> {
+    let mut base = sanitize(hf_layout_prefixed_weights(&config, "wav2vec2.")).unwrap();
+    for (k, v) in adapter_file_weights(&config, 0.2) {
+      base.insert(k, v);
+    }
+    base
+  };
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_w2v_overlay_sidecar_contract_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+
+  // (1) A LayerNorm `.scales` sidecar — a foreign key on a non-quantizable
+  // prefix. The `norm.weight` it shadows IS present (the full adapter is
+  // complete), so this proves the sidecar is rejected on the PREFIX being
+  // non-quantizable, not on a missing companion weight.
+  let mut ln_sidecar = adapter_file_weights(&config, 0.7);
+  ln_sidecar.insert(
+    "encoder.layers.0.adapter_layer.norm.scales".to_string(),
+    filled(&[config.hidden_size], 1.0),
+  );
+  let ln_path = dir.join("adapter.fra.safetensors");
+  crate::io::save_safetensors(&ln_path, &ln_sidecar).unwrap();
+  let mut base_ln = fresh_base();
+  let err_ln = overlay_adapter_weights(&mut base_ln, &ln_path, &config, true);
+  assert!(
+    matches!(err_ln, Err(Error::KeyCollision(_))),
+    "a `.scales` on the non-quantizable adapter LayerNorm prefix must be a foreign-key \
+     KeyCollision, got {err_ln:?}"
+  );
+
+  // (2) A linear-projection `.biases` with no `.scales` sibling (its `.weight` is
+  // present in the complete adapter) — an incomplete affine triple, rejected as a
+  // MissingKey naming the absent `.scales`.
+  let mut orphan_biases = adapter_file_weights(&config, 0.7);
+  let d = config.adapter_attn_dim.unwrap();
+  orphan_biases.insert(
+    "encoder.layers.0.adapter_layer.linear_1.biases".to_string(),
+    filled(&[d], 0.0),
+  );
+  let ob_path = dir.join("adapter.deu.safetensors");
+  crate::io::save_safetensors(&ob_path, &orphan_biases).unwrap();
+  let mut base_ob = fresh_base();
+  let err_ob = overlay_adapter_weights(&mut base_ob, &ob_path, &config, true);
+  let _ = std::fs::remove_dir_all(&dir);
+  assert!(
+    matches!(err_ob, Err(Error::MissingKey(_))),
+    "a `.biases` with no `.scales` sibling on a linear prefix must be a MissingKey, got {err_ob:?}"
+  );
+}
+
+#[test]
+fn mms_load_falls_back_to_first_adapter_when_requested_lang_absent() {
+  // When the requested target_lang has no adapter file, load() falls back to the
+  // first adapter.* (mms.py's `adapters[0]`). Here only adapter.fra exists; a
+  // request for the (absent) default "eng" must still load — applying the fra
+  // adapter (the only one) — so the loaded lm_head is fra's, not the base init's.
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  const BASE_V: f32 = 0.2;
+  const FRA_V: f32 = 0.7;
+  let dir = write_mms_checkpoint(config_json, &config, BASE_V, &[("fra", FRA_V)], "fallback");
+
+  // Request the default language (eng) — absent; the loader must fall back to
+  // adapter.fra.
+  let loaded = Model::<Standard>::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("loading must fall back to the only adapter.* file, got {e:?}"),
+  };
+  let got_head = lm_head_weight(&model);
+  let want_fra = ramp(&[config.vocab_size, config.hidden_size], FRA_V)
+    .to_vec::<f32>()
+    .unwrap();
+  assert!(
+    got_head
+      .iter()
+      .zip(want_fra.iter())
+      .all(|(a, b)| (a - b).abs() < 1e-5),
+    "the fallback must apply the only adapter.* (fra), so the lm_head is fra's"
+  );
+}
+
+#[test]
+fn mms_multilingual_vocab_selects_target_language() {
+  // Vocab::from_json_for_lang on a nested {lang: {token: id}} MMS vocab must
+  // select the requested language's map (then eng/en, then the smallest key).
+  let nested = r#"{
+    "eng": {"<pad>": 0, "A": 1, "B": 2},
+    "fra": {"<pad>": 0, "E": 1, "T": 2},
+    "deu": {"<pad>": 0, "X": 1, "Y": 2}
+  }"#;
+  // Requested language wins.
+  let fra = Vocab::from_json_for_lang(nested, "fra").unwrap();
+  assert_eq!(fra.token(1), Some("E"));
+  assert_eq!(fra.token(2), Some("T"));
+  // An absent requested language falls back to eng.
+  let missing = Vocab::from_json_for_lang(nested, "spa").unwrap();
+  assert_eq!(
+    missing.token(1),
+    Some("A"),
+    "fallback to eng when target absent"
+  );
+  // A flat monolingual vocab still parses unchanged (the base-960h shape).
+  let flat = Vocab::from_json_for_lang(r#"{"<pad>": 0, "Z": 1}"#, "eng").unwrap();
+  assert_eq!(flat.token(1), Some("Z"));
+}
+
+#[test]
+fn mms_multilingual_vocab_fallback_without_eng() {
+  // With no eng/en key, the nested-vocab selection falls back to the
+  // lexicographically-smallest language key (a deterministic substitute for the
+  // reference's insertion-order first). Keys "deu" < "fra", so "deu" wins.
+  let nested = r#"{
+    "fra": {"<pad>": 0, "E": 1},
+    "deu": {"<pad>": 0, "X": 1}
+  }"#;
+  let v = Vocab::from_json_for_lang(nested, "spa").unwrap();
+  assert_eq!(
+    v.token(1),
+    Some("X"),
+    "with no eng/en, the smallest language key (deu) is selected"
+  );
+}
+
+// ─────────── MMS adapter loading: completeness + vocab-alignment + quant ───────────
+// Three correctness properties of the MMS per-language adapter loader:
+//   1. an MMS config (adapter_attn_dim on the stable-LN arm) REQUIRES a complete
+//      adapter — a missing file or a missing tensor/lm_head half is a typed load
+//      failure, not a silent base build;
+//   2. the vocab follows the SELECTED adapter language (a fallback adapter is
+//      decoded with its own token table, not the requested language's);
+//   3. a DENSE per-language overlay over a QUANTIZED base removes the base's
+//      stale `.scales`/`.biases` so the overlaid layer loads dense (not as a
+//      mis-read packed-quantized layer).
+
+#[test]
+fn mms_load_requires_adapter_file_for_mms_config() {
+  // Property 1 (adapter required): an MMS config (adapter_attn_dim + stable-LN)
+  // with NO adapter.*.safetensors must be a typed load failure — never a silent
+  // build from the language-agnostic base init (which would transcribe WRONG).
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  // A base checkpoint with the language-agnostic adapter init but NO adapter file.
+  let dir = write_mms_checkpoint(config_json, &config, 0.2, &[], "require_none");
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match loaded {
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("adapter.eng.safetensors"),
+      "the error must name the missing adapter file, got {:?}",
+      p.key()
+    ),
+    Err(other) => panic!("an MMS config with no adapter file must MissingKey, got {other:?}"),
+    Ok(_) => {
+      panic!("an MMS config with no adapter file must NOT silently build from the base init")
+    }
+  }
+}
+
+#[test]
+fn mms_load_rejects_adapter_missing_required_key() {
+  // Property 1 (adapter complete): an adapter file present but MISSING a
+  // required key (an adapter tensor, or an lm_head half) must be a typed load
+  // failure naming the absent key — the overlay is validated COMPLETE before any
+  // merge.
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+
+  // Case (a): missing a per-layer adapter tensor.
+  let dir_a = write_mms_checkpoint(config_json, &config, 0.2, &[("eng", 0.6)], "miss_layer");
+  {
+    // Rewrite adapter.eng.safetensors WITHOUT one adapter-layer tensor.
+    let mut adapter = adapter_file_weights(&config, 0.6);
+    adapter.remove("encoder.layers.0.adapter_layer.linear_2.weight");
+    crate::io::save_safetensors(&dir_a.join("adapter.eng.safetensors"), &adapter).unwrap();
+  }
+  let loaded_a = Model::<Standard>::load_with_target_lang(&dir_a.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir_a);
+  match loaded_a {
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("layers.0.adapter_layer.linear_2.weight"),
+      "the error must name the missing adapter tensor, got {:?}",
+      p.key()
+    ),
+    Err(other) => panic!("a truncated adapter (missing tensor) must MissingKey, got {other:?}"),
+    Ok(_) => panic!("a truncated adapter must NOT build a hybrid model"),
+  }
+
+  // Case (b): missing lm_head.bias (an lm_head half).
+  let dir_b = write_mms_checkpoint(config_json, &config, 0.2, &[("eng", 0.6)], "miss_head");
+  {
+    let mut adapter = adapter_file_weights(&config, 0.6);
+    adapter.remove("lm_head.bias");
+    crate::io::save_safetensors(&dir_b.join("adapter.eng.safetensors"), &adapter).unwrap();
+  }
+  let loaded_b = Model::<Standard>::load_with_target_lang(&dir_b.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir_b);
+  match loaded_b {
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("lm_head.bias"),
+      "the error must name the missing lm_head half, got {:?}",
+      p.key()
+    ),
+    Err(other) => panic!("an adapter missing lm_head.bias must MissingKey, got {other:?}"),
+    Ok(_) => panic!("an adapter missing lm_head.bias must NOT build"),
+  }
+}
+
+#[test]
+fn mms_load_complete_adapter_builds_and_non_mms_no_adapter_is_noop() {
+  // Property 1 (positive cases): a COMPLETE adapter overlays + builds; and a
+  // NON-MMS config (no adapter_attn_dim) with no adapter files still loads (the
+  // absence-of-adapter no-op is unchanged for plain wav2vec2 / HuBERT).
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  // (a) Complete adapter → builds.
+  let dir = write_mms_checkpoint(config_json, &config, 0.2, &[("eng", 0.6)], "complete");
+  let built = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match built {
+    Ok(_) => {}
+    Err(e) => panic!("a complete MMS adapter must overlay + build, got {e:?}"),
+  }
+
+  // (b) A plain (non-MMS) checkpoint with no adapter files: write a dense
+  // backbone with NO adapter_attn_dim and NO adapter.*.safetensors. It must load
+  // (no adapter requirement, no overlay).
+  let plain_json = r#"{
+    "model_type": "wav2vec2",
+    "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+    "num_hidden_layers": 2, "vocab_size": 12,
+    "num_feat_extract_layers": 3,
+    "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+    "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+    "do_stable_layer_norm": true
+  }"#;
+  let plain_config = Config::from_json(plain_json).unwrap();
+  assert_eq!(plain_config.adapter_attn_dim, None);
+  let base = hf_layout_prefixed_weights(&plain_config, "wav2vec2.");
+  let plain_dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_plain_noadapter_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&plain_dir);
+  std::fs::create_dir_all(&plain_dir).unwrap();
+  std::fs::write(plain_dir.join("config.json"), plain_json).unwrap();
+  crate::io::save_safetensors(&plain_dir.join("model.safetensors"), &base).unwrap();
+  let plain_loaded = Model::<Standard>::load_with_target_lang(&plain_dir.to_string_lossy(), None);
+  let _ = std::fs::remove_dir_all(&plain_dir);
+  match plain_loaded {
+    Ok(_) => {}
+    Err(e) => panic!("a plain (non-MMS) checkpoint with no adapter files must load, got {e:?}"),
+  }
+}
+
+#[test]
+fn mms_load_vocab_follows_selected_adapter_language() {
+  // Property 2 (vocab follows adapter): requesting "eng" when only adapter.fra is
+  // present must OVERLAY the fra adapter AND select the FRA vocab map (aligned
+  // with the overlaid adapter + lm_head), NOT the eng vocab — so the French
+  // logits are decoded with the French token table.
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  const FRA_V: f32 = 0.4;
+  let dir = write_mms_checkpoint(config_json, &config, 0.2, &[("fra", FRA_V)], "vocab_align");
+  // A nested multilingual vocab whose eng/fra maps assign DIFFERENT tokens to the
+  // same ids (so the selected language is observable).
+  let nested_vocab = r#"{
+    "eng": {"<pad>": 0, "A": 1, "B": 2},
+    "fra": {"<pad>": 0, "E": 1, "T": 2}
+  }"#;
+  std::fs::write(dir.join("vocab.json"), nested_vocab).unwrap();
+
+  // Request eng (absent) → falls back to the only adapter (fra).
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("a fallback-to-fra load must succeed, got {e:?}"),
+  };
+  // (1) The lm_head is fra's (the overlaid adapter) — adapter aligned to fra.
+  let got_head = lm_head_weight(&model);
+  let want_fra = ramp(&[config.vocab_size, config.hidden_size], FRA_V)
+    .to_vec::<f32>()
+    .unwrap();
+  assert!(
+    got_head
+      .iter()
+      .zip(want_fra.iter())
+      .all(|(a, b)| (a - b).abs() < 1e-5),
+    "the overlaid lm_head must be the fallback (fra) adapter's"
+  );
+  // (2) The vocab follows fra (token 1 = "E", 2 = "T"), NOT eng ("A"/"B") — the
+  // load-bearing assertion: adapter language and vocab language MATCH.
+  assert_eq!(
+    model.vocab.token(1),
+    Some("E"),
+    "the vocab must follow the SELECTED adapter language (fra: id 1 = E), not the requested eng (A)"
+  );
+  assert_eq!(model.vocab.token(2), Some("T"), "fra vocab id 2 = T");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mms_load_exact_language_uses_that_adapter_and_vocab() {
+  // Property 2 (exact case): an exact-language request uses THAT language's
+  // adapter AND vocab — adapter and vocab languages match on the exact path too.
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  const ENG_V: f32 = 0.55;
+  const FRA_V: f32 = 0.35;
+  // Both adapters present; request fra exactly.
+  let dir = write_mms_checkpoint(
+    config_json,
+    &config,
+    0.2,
+    &[("eng", ENG_V), ("fra", FRA_V)],
+    "exact_align",
+  );
+  let nested_vocab = r#"{
+    "eng": {"<pad>": 0, "A": 1},
+    "fra": {"<pad>": 0, "E": 1}
+  }"#;
+  std::fs::write(dir.join("vocab.json"), nested_vocab).unwrap();
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("fra"));
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("an exact fra request must load, got {e:?}"),
+  };
+  // lm_head is fra's, and the vocab is fra's (id 1 = E, not eng's A).
+  let got_head = lm_head_weight(&model);
+  let want_fra = ramp(&[config.vocab_size, config.hidden_size], FRA_V)
+    .to_vec::<f32>()
+    .unwrap();
+  assert!(
+    got_head
+      .iter()
+      .zip(want_fra.iter())
+      .all(|(a, b)| (a - b).abs() < 1e-5),
+    "an exact fra request must overlay the fra adapter"
+  );
+  assert_eq!(
+    model.vocab.token(1),
+    Some("E"),
+    "an exact fra request must select the fra vocab (id 1 = E)"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Group size for the quantized-MMS fixtures — a valid mlx affine group size
+/// (`{32, 64, 128}`). 32 divides every quantized Linear's input width at the
+/// [`mms_quant_config_json`] dims (hidden 64, intermediate 128, conv_dim[-1] 64,
+/// adapter_attn_dim 32, vocab 64) — base + adapter + lm_head.
+const MMS_QGROUP: i32 = 32;
+
+/// A quantized MMS checkpoint's `config.json`: an MMS stable-LN config sized so
+/// every quantized Linear's input width is a whole number of [`MMS_QGROUP`]
+/// groups (the adapter `linear_2`'s input is `adapter_attn_dim = 32`, so a
+/// smaller bottleneck would not be group-aligned), with an 8-bit affine
+/// `quantization` block at [`MMS_QGROUP`].
+fn mms_quant_config_json() -> String {
+  format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 64,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "do_stable_layer_norm": true, "adapter_attn_dim": 32,
+      "quantization": {{ "group_size": {MMS_QGROUP}, "bits": {QBITS} }}
+    }}"#
+  )
+}
+
+/// Write a QUANTIZED MMS checkpoint to a temp dir: the base `model.safetensors`
+/// has every quantized-eligible Linear packed (incl. the per-layer adapter
+/// `linear_{1,2}` + `lm_head`), plus an `adapter.{lang}.safetensors`. The
+/// adapter's adapter-layer linears + lm_head are DENSE when `dense_adapter`,
+/// else quantized (its own `.scales`/`.biases`). Returns the dir.
+fn write_quant_mms_checkpoint(
+  config: &Config,
+  config_json: &str,
+  base_value: f32,
+  lang: &str,
+  adapter_value: f32,
+  dense_adapter: bool,
+  tag: &str,
+) -> std::path::PathBuf {
+  let hs = config.hidden_size;
+  let d = config.adapter_attn_dim.unwrap();
+  // Base: HF-prefixed backbone, then add the (prefixed) adapter init, then pack
+  // every quantized-eligible Linear (backbone + adapter linears + lm_head).
+  let mut base = hf_layout_prefixed_weights(config, "wav2vec2.");
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}.adapter_layer");
+    base.insert(format!("{p}.norm.weight"), filled(&[hs], 1.0));
+    base.insert(format!("{p}.norm.bias"), filled(&[hs], 0.0));
+    base.insert(format!("{p}.linear_1.weight"), ramp(&[d, hs], base_value));
+    base.insert(format!("{p}.linear_1.bias"), filled(&[d], 0.0));
+    base.insert(format!("{p}.linear_2.weight"), ramp(&[hs, d], base_value));
+    base.insert(format!("{p}.linear_2.bias"), filled(&[hs], 0.0));
+  }
+  // Pack the backbone Linears.
+  quantize_weight_in_place(
+    &mut base,
+    "wav2vec2.feature_projection.projection",
+    MMS_QGROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut base, &format!("{p}.attention.{proj}"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      MMS_QGROUP,
+    );
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.output_dense"),
+      MMS_QGROUP,
+    );
+    // Pack the per-layer adapter linears in the base too.
+    let ap = format!("{p}.adapter_layer");
+    quantize_weight_in_place(&mut base, &format!("{ap}.linear_1"), MMS_QGROUP);
+    quantize_weight_in_place(&mut base, &format!("{ap}.linear_2"), MMS_QGROUP);
+  }
+  quantize_weight_in_place(&mut base, "lm_head", MMS_QGROUP);
+
+  // Adapter file: the adapter-layer linears + lm_head, dense or quantized.
+  let mut adapter = adapter_file_weights(config, adapter_value);
+  if !dense_adapter {
+    for i in 0..(config.num_hidden_layers as usize) {
+      let ap = format!("encoder.layers.{i}.adapter_layer");
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_1"), MMS_QGROUP);
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_2"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(&mut adapter, "lm_head", MMS_QGROUP);
+  }
+
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_qmms_{tag}_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &base).unwrap();
+  crate::io::save_safetensors(&dir.join(format!("adapter.{lang}.safetensors")), &adapter).unwrap();
+  dir
+}
+
+/// The adapter-layer linear of a built encoder layer (panics if absent).
+fn adapter_linear(layer: &super::EncoderLayer, which: u8) -> &super::Linear {
+  let ad = layer
+    .adapter_layer
+    .as_ref()
+    .expect("MMS layer has an adapter");
+  match which {
+    1 => &ad.linear_1,
+    _ => &ad.linear_2,
+  }
+}
+
+#[test]
+fn mms_quant_base_dense_adapter_overlay_loads_dense() {
+  // Property 3 (dense overlay clears stale sidecars): a QUANTIZED MMS base + a
+  // DENSE adapter overlay (adapter-layer linears + lm_head) must load those
+  // overlaid prefixes DENSE — the base's stale `.scales`/`.biases` are removed so
+  // build_linear does NOT mis-read the dense F32 weight as a packed-quantized
+  // triple (which would dtype/shape-fail).
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  let dir = write_quant_mms_checkpoint(
+    &config,
+    &config_json,
+    0.2,
+    "eng",
+    0.5,
+    true,
+    "dense_overlay",
+  );
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => {
+      panic!(
+        "a quantized base with a dense adapter overlay must load (stale sidecars removed), got {e:?}"
+      )
+    }
+  };
+  // The overlaid lm_head must be DENSE (the adapter supplied a plain .weight).
+  assert!(
+    !model.lm_head.is_quantized(),
+    "a dense lm_head overlay must load DENSE (the stale base .scales must be removed)"
+  );
+  // Every overlaid adapter-layer linear must be DENSE.
+  for (i, layer) in encoder_layers(&model.encoder).iter().enumerate() {
+    assert!(
+      !adapter_linear(layer, 1).is_quantized(),
+      "layer {i} adapter linear_1 must load DENSE after a dense overlay"
+    );
+    assert!(
+      !adapter_linear(layer, 2).is_quantized(),
+      "layer {i} adapter linear_2 must load DENSE after a dense overlay"
+    );
+  }
+  // The NON-overlaid base layers keep their quantization (the attention q_proj
+  // was packed in the base and not touched by the adapter).
+  let layer0 = &encoder_layers(&model.encoder)[0];
+  assert!(
+    layer0.attention.q_proj.is_quantized(),
+    "a non-overlaid base attention projection must stay quantized"
+  );
+  // A forward must run finite (no dtype/shape blow-up from a mis-read layer).
+  let waveform = ramp(&[1, 400], 0.2);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("the hybrid model must forward");
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+/// Write a QUANTIZED MMS checkpoint whose adapter file is quantized BUT has its
+/// per-group affine `.biases` stripped from every overlaid prefix — a truncated
+/// quantized adapter (it supplies `.weight` + `.scales` but no `.biases`). The
+/// base remains a complete quantized checkpoint (every base prefix keeps its own
+/// `.scales` + `.biases`). Returns the dir.
+fn write_quant_mms_checkpoint_adapter_missing_biases(
+  config: &Config,
+  config_json: &str,
+  lang: &str,
+  tag: &str,
+) -> std::path::PathBuf {
+  let hs = config.hidden_size;
+  let d = config.adapter_attn_dim.unwrap();
+  // Base: a COMPLETE quantized checkpoint (the language-agnostic backbone +
+  // adapter init + lm_head, every Linear packed with its own scales + biases).
+  let mut base = hf_layout_prefixed_weights(config, "wav2vec2.");
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}.adapter_layer");
+    base.insert(format!("{p}.norm.weight"), filled(&[hs], 1.0));
+    base.insert(format!("{p}.norm.bias"), filled(&[hs], 0.0));
+    base.insert(format!("{p}.linear_1.weight"), ramp(&[d, hs], 0.2));
+    base.insert(format!("{p}.linear_1.bias"), filled(&[d], 0.0));
+    base.insert(format!("{p}.linear_2.weight"), ramp(&[hs, d], 0.2));
+    base.insert(format!("{p}.linear_2.bias"), filled(&[hs], 0.0));
+  }
+  quantize_weight_in_place(
+    &mut base,
+    "wav2vec2.feature_projection.projection",
+    MMS_QGROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut base, &format!("{p}.attention.{proj}"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      MMS_QGROUP,
+    );
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.output_dense"),
+      MMS_QGROUP,
+    );
+    let ap = format!("{p}.adapter_layer");
+    quantize_weight_in_place(&mut base, &format!("{ap}.linear_1"), MMS_QGROUP);
+    quantize_weight_in_place(&mut base, &format!("{ap}.linear_2"), MMS_QGROUP);
+  }
+  quantize_weight_in_place(&mut base, "lm_head", MMS_QGROUP);
+
+  // Adapter: quantize every overlaid Linear, then STRIP its `.biases` — leaving a
+  // truncated affine triple (`.weight` + `.scales`, no `.biases`).
+  let mut adapter = adapter_file_weights(config, 0.5);
+  let strip_biases = |w: &mut HashMap<String, Array>, prefix: &str| {
+    quantize_weight_in_place(w, prefix, MMS_QGROUP);
+    assert!(
+      w.remove(&format!("{prefix}.biases")).is_some(),
+      "the quantized adapter prefix must have produced a .biases to strip"
+    );
+  };
+  for i in 0..(config.num_hidden_layers as usize) {
+    let ap = format!("encoder.layers.{i}.adapter_layer");
+    strip_biases(&mut adapter, &format!("{ap}.linear_1"));
+    strip_biases(&mut adapter, &format!("{ap}.linear_2"));
+  }
+  strip_biases(&mut adapter, "lm_head");
+
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_qmms_{tag}_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &base).unwrap();
+  crate::io::save_safetensors(&dir.join(format!("adapter.{lang}.safetensors")), &adapter).unwrap();
+  dir
+}
+
+#[test]
+fn mms_quant_adapter_missing_biases_is_typed_error() {
+  // Quant-sidecar self-containment: a QUANTIZED adapter that supplies `.weight` +
+  // `.scales` but is MISSING `.biases` must NOT inherit the base prefix's
+  // `.biases` (a silent hybrid = adapter weight+scales over BASE biases). With
+  // both stale base sidecars removed per overlaid `.weight`, the truncated affine
+  // triple has no
+  // `.biases` anywhere, so it fails the downstream quant-triple validation
+  // (build_linear -> QuantizedLinear::from_parts) with a typed error.
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  let dir = write_quant_mms_checkpoint_adapter_missing_biases(
+    &config,
+    &config_json,
+    "eng",
+    "missing_biases",
+  );
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match loaded {
+    Ok(_) => panic!(
+      "a quantized adapter missing .biases must FAIL as incomplete (not silently build a hybrid \
+       with the base's .biases)"
+    ),
+    // `affine` mode requires per-group biases — from_parts rejects the truncated
+    // triple. The exact variant is InvariantViolation (mlx's `if (!biases) throw`).
+    Err(Error::InvariantViolation(_)) => {}
+    Err(e) => {
+      panic!("expected a typed InvariantViolation for the missing affine .biases, got {e:?}")
+    }
+  }
+}
+
+#[test]
+fn mms_quant_base_quant_adapter_overlay_loads_quantized() {
+  // Property 3 (the converse): a QUANTIZED MMS base + a QUANTIZED adapter overlay
+  // (the adapter supplies its OWN `.scales`/`.biases`) must load the overlaid
+  // prefixes QUANTIZED — the overlay's quant identity wins, the layers are NOT
+  // forced dense.
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  let dir = write_quant_mms_checkpoint(
+    &config,
+    &config_json,
+    0.2,
+    "eng",
+    0.5,
+    false,
+    "quant_overlay",
+  );
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("a quantized base with a quantized adapter overlay must load, got {e:?}"),
+  };
+  // The overlaid lm_head + adapter-layer linears load QUANTIZED at MMS_QGROUP.
+  assert!(
+    model.lm_head.is_quantized(),
+    "a quantized lm_head overlay must load QUANTIZED"
+  );
+  for (i, layer) in encoder_layers(&model.encoder).iter().enumerate() {
+    assert_eq!(
+      loaded_group_size(adapter_linear(layer, 1)),
+      Some(MMS_QGROUP),
+      "layer {i} adapter linear_1 must load quantized at MMS_QGROUP"
+    );
+    assert_eq!(
+      loaded_group_size(adapter_linear(layer, 2)),
+      Some(MMS_QGROUP),
+      "layer {i} adapter linear_2 must load quantized at MMS_QGROUP"
+    );
+  }
+  let waveform = ramp(&[1, 400], 0.2);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("the quantized model must forward");
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+#[test]
+fn mms_quant_adapter_extra_foreign_key_is_typed_error() {
+  // Exact allowed key set: an MMS adapter that carries an
+  // EXTRA/foreign key — one NOT in the adapter-layer + lm_head weights/biases
+  // (+ optional matching sidecars) — must be REJECTED with a typed error naming
+  // the offending key, BEFORE any merge. Concretely a stray
+  // `encoder.layers.0.attention.q_proj.scales` (an attention-projection sidecar
+  // the adapter never overlays): a merely-required-keys check would blindly
+  // insert it, clobbering the base packed q_proj's `.scales` while leaving the
+  // base `.weight` + `.biases` — a silent quantized hybrid from mismatched parts.
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  // A QUANTIZED base + a complete QUANTIZED adapter (so the foreign key is the
+  // ONLY defect, not a missing/dense-mismatch one).
+  let dir = write_quant_mms_checkpoint(&config, &config_json, 0.2, "eng", 0.5, false, "extra_key");
+  {
+    // Rebuild the (quantized) adapter file exactly, then inject a foreign key:
+    // an `encoder.layers.0.attention.q_proj.scales` (a real-looking quant sidecar
+    // for a layer the adapter does NOT overlay — not in the expected key set).
+    let mut adapter = adapter_file_weights(&config, 0.5);
+    for i in 0..(config.num_hidden_layers as usize) {
+      let ap = format!("encoder.layers.{i}.adapter_layer");
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_1"), MMS_QGROUP);
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_2"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(&mut adapter, "lm_head", MMS_QGROUP);
+    // The foreign key (a stray attention-projection sidecar). Its exact shape is
+    // irrelevant — it must be rejected purely for being outside the allowed set.
+    adapter.insert(
+      "encoder.layers.0.attention.q_proj.scales".to_string(),
+      filled(&[config.hidden_size, 1], 0.01),
+    );
+    crate::io::save_safetensors(&dir.join("adapter.eng.safetensors"), &adapter).unwrap();
+  }
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match loaded {
+    Ok(_) => panic!(
+      "an MMS adapter carrying a foreign key (a sidecar for a layer it does not overlay) must be \
+       REJECTED, not silently build a quantized hybrid by clobbering a base tensor"
+    ),
+    Err(Error::KeyCollision(p)) => assert!(
+      p.key().contains("attention.q_proj.scales"),
+      "the error must name the offending foreign key, got {:?}",
+      p.key()
+    ),
+    Err(e) => panic!("expected a typed KeyCollision naming the foreign key, got {e:?}"),
+  }
+}
+
+#[test]
+fn mms_quant_adapter_orphan_sidecar_is_typed_error() {
+  // Orphan sidecar: an MMS adapter whose `<prefix>.scales` has NO
+  // matching `<prefix>.weight` in the overlay is an orphan — it would define a
+  // quant identity for a layer the overlay does not actually replace. It must be
+  // REJECTED with a typed error naming the absent companion `.weight`. Built by
+  // dropping `lm_head.weight` while leaving an `lm_head.scales` behind (the
+  // sidecar without its weight).
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  let dir = write_quant_mms_checkpoint(
+    &config,
+    &config_json,
+    0.2,
+    "eng",
+    0.5,
+    false,
+    "orphan_sidecar",
+  );
+  {
+    // A complete quantized adapter, then strip lm_head.weight + lm_head.biases
+    // but KEEP lm_head.scales → an orphan sidecar (scales without its weight).
+    let mut adapter = adapter_file_weights(&config, 0.5);
+    for i in 0..(config.num_hidden_layers as usize) {
+      let ap = format!("encoder.layers.{i}.adapter_layer");
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_1"), MMS_QGROUP);
+      quantize_weight_in_place(&mut adapter, &format!("{ap}.linear_2"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(&mut adapter, "lm_head", MMS_QGROUP);
+    // Drop the weight + biases, leaving lm_head.scales orphaned.
+    assert!(adapter.remove("lm_head.weight").is_some());
+    assert!(adapter.remove("lm_head.biases").is_some());
+    assert!(
+      adapter.contains_key("lm_head.scales"),
+      "lm_head.scales must remain as the orphan sidecar"
+    );
+    crate::io::save_safetensors(&dir.join("adapter.eng.safetensors"), &adapter).unwrap();
+  }
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match loaded {
+    Ok(_) => panic!(
+      "an MMS adapter with an orphan sidecar (lm_head.scales without lm_head.weight) must be \
+       REJECTED, not silently apply a quant identity to a layer it does not overlay"
+    ),
+    Err(Error::MissingKey(p)) => assert!(
+      p.key().contains("lm_head.weight"),
+      "the error must name the absent companion weight, got {:?}",
+      p.key()
+    ),
+    Err(e) => panic!("expected a typed MissingKey naming the absent companion weight, got {e:?}"),
+  }
+}
+
+#[test]
+fn mms_quant_complete_adapter_with_sidecars_still_overlays() {
+  // Well-formed adapter still overlays: a complete adapter — EXACTLY the expected
+  // adapter-layer + lm_head weights/biases plus their matching `.scales`/`.biases`
+  // sidecars, and nothing else — must still overlay + load under the exact-key
+  // validation (the structural close rejects only EXTRA/orphan keys, never a
+  // conforming quantized adapter).
+  let config_json = mms_quant_config_json();
+  let config = Config::from_json(&config_json).unwrap();
+  let dir = write_quant_mms_checkpoint(&config, &config_json, 0.2, "eng", 0.5, false, "exact_ok");
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("a well-formed complete quantized adapter must overlay + load, got {e:?}"),
+  };
+  // The overlaid prefixes loaded quantized from their OWN sidecars (the exact-key
+  // path did not strip or reject the conforming sidecars).
+  assert!(
+    model.lm_head.is_quantized(),
+    "the conforming quantized lm_head overlay must load quantized"
+  );
+  let waveform = ramp(&[1, 400], 0.2);
+  let mut logits = model.forward(&waveform).expect("the model must forward");
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+// ───────────── MMS strict vocab for the selected adapter language ─────────────
+// Vocab/adapter language alignment: when an adapter file is selected (the MMS
+// per-language path) the selected language MUST have an exact entry in a nested
+// {lang:{token:id}} vocab.json — no silent fallback to another language's token
+// table. The lenient eng/en/smallest fallback is kept ONLY for the no-adapter /
+// flat-vocab path.
+
+#[test]
+fn vocab_from_json_for_lang_strict_requires_exact_nested_entry() {
+  // A nested {lang: {token: id}} vocab that LACKS the requested language must be
+  // a typed MissingKey under the strict parser (no fallback to eng/en/smallest).
+  let nested = r#"{
+    "eng": {"<pad>": 0, "A": 1, "B": 2},
+    "deu": {"<pad>": 0, "X": 1, "Y": 2}
+  }"#;
+  match Vocab::from_json_for_lang_strict(nested, "fra") {
+    Err(Error::MissingKey(_)) => {}
+    Ok(_) => panic!(
+      "the strict parser must NOT fall back to another language's table when the selected lang \
+       (fra) is absent from the nested vocab"
+    ),
+    Err(e) => panic!("expected a typed MissingKey for the absent selected lang, got {e:?}"),
+  }
+  // The exact requested language is used when present.
+  let fra = Vocab::from_json_for_lang_strict(
+    r#"{
+      "eng": {"<pad>": 0, "A": 1},
+      "fra": {"<pad>": 0, "E": 1, "T": 2}
+    }"#,
+    "fra",
+  )
+  .unwrap();
+  assert_eq!(fra.token(1), Some("E"), "strict fra entry: id 1 = E");
+  assert_eq!(fra.token(2), Some("T"), "strict fra entry: id 2 = T");
+}
+
+#[test]
+fn vocab_from_json_for_lang_strict_flat_vocab_used_as_is() {
+  // A FLAT (non-nested) vocab.json is language-agnostic and is used as-is under
+  // the strict parser regardless of the requested language (unchanged behavior).
+  let flat = Vocab::from_json_for_lang_strict(r#"{"<pad>": 0, "Z": 1}"#, "fra").unwrap();
+  assert_eq!(
+    flat.token(1),
+    Some("Z"),
+    "a flat vocab is language-agnostic and used as-is even under strict"
+  );
+}
+
+#[test]
+fn vocab_from_json_for_lang_lenient_still_falls_back() {
+  // The lenient (no-adapter path) parser keeps the eng/en/smallest fallback —
+  // an absent requested language falls back to eng (the prior behavior, kept
+  // green for the no-adapter / plain-checkpoint path).
+  let nested = r#"{
+    "eng": {"<pad>": 0, "A": 1},
+    "deu": {"<pad>": 0, "X": 1}
+  }"#;
+  let v = Vocab::from_json_for_lang(nested, "fra").unwrap();
+  assert_eq!(
+    v.token(1),
+    Some("A"),
+    "the lenient parser still falls back to eng when the requested lang is absent"
+  );
+}
+
+#[test]
+fn mms_load_strict_vocab_rejects_missing_selected_lang() {
+  // Language alignment (load path): adapter.fra selected + a nested vocab.json
+  // LACKING a "fra" entry must FAIL with a typed error — NOT silently decode the
+  // French adapter's logits with another language's token table.
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  let dir = write_mms_checkpoint(
+    config_json,
+    &config,
+    0.2,
+    &[("fra", 0.4)],
+    "strict_vocab_miss",
+  );
+  // A nested multilingual vocab that has eng/deu but NO fra (the selected lang).
+  let nested_vocab = r#"{
+    "eng": {"<pad>": 0, "A": 1, "B": 2},
+    "deu": {"<pad>": 0, "X": 1, "Y": 2}
+  }"#;
+  std::fs::write(dir.join("vocab.json"), nested_vocab).unwrap();
+  // Request fra exactly → the fra adapter is selected → vocab_lang = "fra".
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("fra"));
+  let _ = std::fs::remove_dir_all(&dir);
+  match loaded {
+    Ok(_) => panic!(
+      "a selected adapter language absent from the nested vocab must FAIL (not silently use \
+       another language's vocab)"
+    ),
+    Err(Error::MissingKey(_)) => {}
+    Err(e) => panic!("expected a typed MissingKey for the missing fra vocab entry, got {e:?}"),
+  }
+}
+
+#[test]
+fn mms_load_strict_vocab_uses_exact_selected_lang() {
+  // Language alignment (positive): adapter.fra selected + a nested vocab WITH
+  // "fra" must load and decode with the fra map (the strict path accepts an exact
+  // entry).
+  let config_json = mms_config_json_str();
+  let config = Config::from_json(config_json).unwrap();
+  let dir = write_mms_checkpoint(
+    config_json,
+    &config,
+    0.2,
+    &[("fra", 0.4)],
+    "strict_vocab_hit",
+  );
+  let nested_vocab = r#"{
+    "eng": {"<pad>": 0, "A": 1, "B": 2},
+    "fra": {"<pad>": 0, "E": 1, "T": 2}
+  }"#;
+  std::fs::write(dir.join("vocab.json"), nested_vocab).unwrap();
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("fra"));
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("an exact fra request with a matching nested vocab must load, got {e:?}"),
+  };
+  assert_eq!(model.vocab.token(1), Some("E"), "fra vocab id 1 = E");
+  assert_eq!(model.vocab.token(2), Some("T"), "fra vocab id 2 = T");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────── adapter-overlay key-restriction applies to EVERY overlay ───────────
+// The structural close of the sidecar-hybrid class is not limited to the MMS
+// (`require_complete`) path: the foreign-key + orphan-sidecar checks run for ANY
+// overlay regardless of `require_complete`, so a sidecar-only stray adapter can
+// never clobber a base packed weight's `.scales`/`.biases` and build a silent
+// quantized hybrid. (In the LOADER, discovery+overlay are additionally gated on
+// an MMS config, so a non-MMS checkpoint never even reads a stray adapter file —
+// faithful to mms.py, where only the MMS `Model` defines `post_load_hook`. These
+// function-level tests pin the in-function defense in depth directly.)
+
+#[test]
+fn overlay_adapter_weights_key_restricts_foreign_key_when_not_complete() {
+  // A sidecar-only stray adapter — an `encoder.layers.0.attention.q_proj.scales`
+  // with NO matching `q_proj.weight` — overlaid with `require_complete = false`
+  // (the non-MMS / not-required path) must STILL be rejected as a foreign key,
+  // BEFORE any merge. Previously the foreign-key check was gated on
+  // `require_complete`, so this stray sidecar would have been blindly inserted —
+  // clobbering the base packed q_proj's `.scales` while leaving the base
+  // `.weight` + `.biases` (the silent quantized hybrid this closes).
+  let config = quant_config_json(""); // non-MMS (no adapter_attn_dim), post-norm
+  assert_eq!(config.adapter_attn_dim, None);
+  // A base map carrying a packed q_proj (weight + scales + biases) — the tensor a
+  // stray `q_proj.scales` overlay would partially clobber.
+  let mut base: HashMap<String, Array> = HashMap::new();
+  base.insert(
+    "encoder.layers.0.attention.q_proj.weight".to_string(),
+    ramp(&[config.hidden_size, config.hidden_size], 0.3),
+  );
+  quantize_weight_in_place(&mut base, "encoder.layers.0.attention.q_proj", MMS_QGROUP);
+  // The stray adapter: ONLY `q_proj.scales` (a sidecar with no matching .weight),
+  // a foreign key for a layer no adapter overlays.
+  let stray: HashMap<String, Array> = HashMap::from([(
+    "encoder.layers.0.attention.q_proj.scales".to_string(),
+    filled(&[config.hidden_size, 1], 0.01),
+  )]);
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_stray_overlay_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let stray_path = dir.join("adapter.eng.safetensors");
+  crate::io::save_safetensors(&stray_path, &stray).unwrap();
+  // require_complete = false (the non-MMS path) must STILL reject the foreign key.
+  let res = overlay_adapter_weights(&mut base, &stray_path, &config, false);
+  let _ = std::fs::remove_dir_all(&dir);
+  match res {
+    Ok(()) => panic!(
+      "a sidecar-only stray adapter must be rejected even when require_complete = false (the \
+       key-restriction applies to EVERY overlay, not just the MMS path)"
+    ),
+    Err(Error::KeyCollision(p)) => assert!(
+      p.key().contains("attention.q_proj.scales"),
+      "the error must name the foreign key, got {:?}",
+      p.key()
+    ),
+    Err(e) => panic!("expected a typed KeyCollision for the foreign sidecar, got {e:?}"),
+  }
+}
+
+#[test]
+fn non_mms_quant_checkpoint_with_stray_adapter_loads_base_not_hybrid() {
+  // Loader gating (non-MMS): a QUANTIZED NON-MMS (post-norm, no
+  // adapter_attn_dim) checkpoint that happens to carry a stray sidecar-only
+  // `adapter.eng.safetensors` must load the BASE unchanged — the stray adapter is
+  // NOT discovered/overlaid (discovery is gated on an MMS config), so there is no
+  // silent quantized hybrid. Faithful to mms.py: a plain `Wav2Vec2ForCTC` has no
+  // `post_load_hook` adapter overlay.
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 64,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "quantization": {{ "group_size": {MMS_QGROUP}, "bits": {QBITS} }}
+    }}"#
+  );
+  let config = Config::from_json(&config_json).unwrap();
+  assert_eq!(
+    config.adapter_attn_dim, None,
+    "this fixture is a NON-MMS checkpoint"
+  );
+  // A quantized non-MMS backbone (every eligible Linear packed). No adapter init.
+  let mut base = hf_layout_prefixed_weights(&config, "wav2vec2.");
+  quantize_weight_in_place(
+    &mut base,
+    "wav2vec2.feature_projection.projection",
+    MMS_QGROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut base, &format!("{p}.attention.{proj}"), MMS_QGROUP);
+    }
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      MMS_QGROUP,
+    );
+    quantize_weight_in_place(
+      &mut base,
+      &format!("{p}.feed_forward.output_dense"),
+      MMS_QGROUP,
+    );
+  }
+  quantize_weight_in_place(&mut base, "lm_head", MMS_QGROUP);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_nonmms_stray_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), &config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &base).unwrap();
+  // A stray sidecar-only adapter (ONLY a q_proj.scales — no matching .weight).
+  // If it were discovered+overlaid, it would clobber the base packed q_proj's
+  // scales and build a hybrid (or fail). It must instead be IGNORED.
+  let stray: HashMap<String, Array> = HashMap::from([(
+    "encoder.layers.0.attention.q_proj.scales".to_string(),
+    filled(&[config.hidden_size, 1], 0.01),
+  )]);
+  crate::io::save_safetensors(&dir.join("adapter.eng.safetensors"), &stray).unwrap();
+
+  let loaded = Model::<Standard>::load_with_target_lang(&dir.to_string_lossy(), Some("eng"));
+  let _ = std::fs::remove_dir_all(&dir);
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!(
+      "a non-MMS quantized checkpoint with a stray adapter must load the BASE unchanged (the stray \
+       adapter is not overlaid), got {e:?}"
+    ),
+  };
+  // The base q_proj loaded QUANTIZED at the base group size — i.e. the base's own
+  // packed triple, NOT a hybrid built from the stray sidecar. (A hybrid would
+  // have replaced the scales with the stray's mis-shaped one; here the base is
+  // intact.)
+  for (i, layer) in encoder_layers(&model.encoder).iter().enumerate() {
+    assert_eq!(
+      loaded_group_size(&layer.attention.q_proj),
+      Some(MMS_QGROUP),
+      "layer {i} base q_proj must load quantized at the base group size (stray adapter ignored)"
+    );
+  }
+  // And the model forwards to finite logits (a corrupt hybrid would not).
+  let waveform = ramp(&[1, 400], 0.2);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("the base-only quantized model must forward");
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+// ───────────── adapter discovery never builds a path from target_lang ─────────────
+// Enumerate-and-match (no interpolation): the exact-adapter selection enumerates
+// the real on-disk `adapter.*.safetensors` files and matches `target_lang`
+// against the EXTRACTED `<lang>` (a single path component), instead of
+// interpolating `target_lang` into `adapter.{target_lang}.safetensors`. So a
+// `target_lang` carrying path separators or `..` cannot select a file outside the
+// model directory.
+
+#[test]
+fn adapter_file_for_path_traversal_target_lang_cannot_escape_dir() {
+  // A model dir with exactly ONE in-dir adapter (adapter.eng.safetensors). A
+  // hostile `target_lang` ("../evil" / "a/b" / "..") must NEVER resolve to a file
+  // outside the dir: enumerate-and-match means such a target_lang matches no
+  // extracted `<lang>`, so discovery falls back to the in-dir eng adapter (a real
+  // directory entry), never an interpolated out-of-dir path.
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_traversal_in_{}",
+    std::process::id()
+  ));
+  // A SIBLING dir holding a decoy adapter the traversal would target if a path
+  // were built from target_lang (../<sibling-relative> style). It must NOT be
+  // selected.
+  let sibling = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_traversal_evil_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  let _ = std::fs::remove_dir_all(&sibling);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::create_dir_all(&sibling).unwrap();
+  // The single legitimate in-dir adapter.
+  let one: HashMap<String, Array> =
+    HashMap::from([("lm_head.bias".to_string(), filled(&[2], 0.0))]);
+  crate::io::save_safetensors(&dir.join("adapter.eng.safetensors"), &one).unwrap();
+  // A decoy outside the model dir, named so a naive
+  // `dir.join("adapter.{target_lang}.safetensors")` with target_lang
+  // `"../<sibling>/adapter.x"`-style could have reached it. (We do not even need
+  // it to be reachable; its presence proves selection stays in-dir.)
+  crate::io::save_safetensors(&sibling.join("adapter.evil.safetensors"), &one).unwrap();
+
+  for hostile in ["..", "../x", "a/b", "eng/../../x", "x\\y"] {
+    let selected = adapter_file_for(&dir, hostile)
+      .unwrap_or_else(|e| panic!("discovery for target_lang {hostile:?} must not error: {e:?}"));
+    let selected = selected.unwrap_or_else(|| {
+      panic!("discovery must fall back to the in-dir eng adapter for target_lang {hostile:?}")
+    });
+    // The selected file is the in-dir eng adapter (the only real entry), NOT a
+    // path built from the hostile target_lang.
+    assert_eq!(
+      selected.path.file_name().and_then(|n| n.to_str()),
+      Some("adapter.eng.safetensors"),
+      "a hostile target_lang {hostile:?} must select the in-dir fallback, never an interpolated path"
+    );
+    assert_eq!(
+      selected.lang, "eng",
+      "the selected language is the in-dir file's extracted <lang>, not the hostile target_lang"
+    );
+    // The selected path is the CANONICALIZED in-dir adapter: the returned path is
+    // the validated canonical path, so it lives under the canonicalized model dir
+    // — compare against the canonicalized dir because the macOS temp dir is itself
+    // a symlink, e.g. /var → /private/var.
+    let canon_dir = dir.canonicalize().unwrap();
+    assert_eq!(
+      selected.path.parent(),
+      Some(canon_dir.as_path()),
+      "the selected adapter must live in the (canonicalized) model dir for target_lang {hostile:?}"
+    );
+  }
+  let _ = std::fs::remove_dir_all(&dir);
+  let _ = std::fs::remove_dir_all(&sibling);
+}
+
+#[test]
+fn adapter_file_for_legit_lang_selects_its_adapter_via_enumeration() {
+  // The enumerate-and-match path still selects an EXACT legitimate language and
+  // still falls back to the smallest when the requested language is absent —
+  // unchanged behavior, now without interpolating target_lang into a path.
+  let dir = std::env::temp_dir().join(format!("mlxrs_wav2vec2_enum_match_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let one: HashMap<String, Array> =
+    HashMap::from([("lm_head.bias".to_string(), filled(&[2], 0.0))]);
+  crate::io::save_safetensors(&dir.join("adapter.eng.safetensors"), &one).unwrap();
+  crate::io::save_safetensors(&dir.join("adapter.fra.safetensors"), &one).unwrap();
+  // Exact match on fra → the fra file, lang "fra".
+  let fra = adapter_file_for(&dir, "fra").unwrap().unwrap();
+  assert_eq!(
+    fra.path.file_name().and_then(|n| n.to_str()),
+    Some("adapter.fra.safetensors")
+  );
+  assert_eq!(fra.lang, "fra");
+  // Absent language (deu) → fallback to the lexicographically-smallest (eng).
+  let fallback = adapter_file_for(&dir, "deu").unwrap().unwrap();
+  assert_eq!(
+    fallback.path.file_name().and_then(|n| n.to_str()),
+    Some("adapter.eng.safetensors"),
+    "an absent requested language falls back to the smallest in-dir adapter"
+  );
+  assert_eq!(fallback.lang, "eng");
+  let _ = std::fs::remove_dir_all(&dir);
 }

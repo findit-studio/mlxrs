@@ -46,7 +46,7 @@
 //! Always compiled (no feature gate) so every model feature can rely on it.
 
 use std::{
-  collections::{HashMap, TryReserveError},
+  collections::{HashMap, HashSet, TryReserveError},
   hash::Hash,
 };
 
@@ -605,9 +605,10 @@ pub fn reserve_or_error<R: TryReserve>(
 }
 
 /// Collections that support a fallible exact reservation — the abstraction
-/// behind [`reserve_or_error`]. Implemented for [`Vec`] and [`HashMap`] (the
-/// two config-sized host buffers the loaders build). The trailing-underscore
-/// method name avoids shadowing the inherent `try_reserve_exact`.
+/// behind [`reserve_or_error`]. Implemented for [`Vec`], [`HashMap`], and
+/// [`HashSet`] (the config-sized host buffers the loaders build, including the
+/// MMS adapter overlay's allowed-key set). The trailing-underscore method name
+/// avoids shadowing the inherent `try_reserve_exact`.
 pub trait TryReserve {
   /// Reserve capacity for exactly `additional` more elements, forwarding the
   /// collection's own `try_reserve_exact`.
@@ -629,6 +630,19 @@ where
   fn try_reserve_exact_(&mut self, additional: usize) -> std::result::Result<(), TryReserveError> {
     // `HashMap` exposes only `try_reserve` (no `_exact`); it reserves at least
     // `additional`, which satisfies the "room for `additional` more" contract.
+    self.try_reserve(additional)
+  }
+}
+
+impl<T, S: std::hash::BuildHasher> TryReserve for HashSet<T, S>
+where
+  T: Eq + Hash,
+{
+  #[inline]
+  fn try_reserve_exact_(&mut self, additional: usize) -> std::result::Result<(), TryReserveError> {
+    // Like `HashMap`, `HashSet` exposes only `try_reserve` (no `_exact`); it
+    // reserves at least `additional`, satisfying the "room for `additional`
+    // more" contract.
     self.try_reserve(additional)
   }
 }
