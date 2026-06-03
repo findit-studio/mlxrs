@@ -47,9 +47,9 @@ use crate::{
   array::Array,
   dtype::Dtype,
   error::{
-    ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
-    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload,
-    RankMismatchPayload, Result,
+    ArithmeticOverflowPayload, Error, InvariantViolationPayload, KeyCollisionPayload,
+    LengthMismatchPayload, MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload,
+    ParsePayload, RankMismatchPayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -78,7 +78,7 @@ pub use linear::resolve_quantization;
 
 use crate::model_validation::{
   checked_add, checked_mul, require_cardinality, require_divisible, require_even, require_in_range,
-  reserve_or_error, take_if,
+  require_positive_finite_f32, reserve_or_error, take_if,
 };
 
 /// `mlx_pad`'s constant-fill mode string.
@@ -235,58 +235,62 @@ where
 /// `full_attn_idxs` derivation (`__post_init__`) is reproduced by
 /// [`attention_layer_indices`](TextConfig::attention_layer_indices).
 ///
+/// `Deserialize` is **hand-written** (via a private `RawTextConfig` mirror)
+/// rather than derived, so that `__post_init__`'s RoPE-base precedence
+/// ([`apply_rope_parameters_override`](Self::apply_rope_parameters_override),
+/// `lfm2.py:40-42`) is applied intrinsically on **every** deserialization path —
+/// a direct `serde_json::from_str::<TextConfig>`, the `text_config` field nested
+/// inside the LFM2-VL [`ModelConfig`](crate::vlm::models::lfm2_vl::ModelConfig)'s
+/// derived `Deserialize`, and [`from_json`](Self::from_json) alike. A derived
+/// `Deserialize` would silently skip the override on the direct / nested paths.
+///
 /// [`from_json`]: TextConfig::from_json
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TextConfig {
   /// Architecture id (`"lfm2"`).
-  #[serde(default = "default_model_type")]
   pub model_type: String,
   /// Hidden / embedding dimension.
-  #[serde(default = "default_hidden_size")]
   pub hidden_size: i32,
   /// Number of decoder layers.
-  #[serde(default = "default_num_hidden_layers")]
   pub num_hidden_layers: i32,
   /// Number of attention (query) heads.
-  #[serde(default = "default_num_attention_heads")]
   pub num_attention_heads: i32,
   /// Number of key/value heads (GQA).
-  #[serde(default = "default_num_key_value_heads")]
   pub num_key_value_heads: i32,
   /// Maximum positional context (carried; not used by the forward pass).
-  #[serde(default = "default_max_position_embeddings")]
   pub max_position_embeddings: i32,
-  /// RoPE base frequency.
-  #[serde(default = "default_rope_theta")]
+  /// RoPE base frequency. When [`rope_parameters`](Self::rope_parameters)
+  /// carries its own `rope_theta`, that value overrides this one during
+  /// deserialization (upstream `__post_init__`, `lfm2.py:40-42`).
   pub rope_theta: f32,
+  /// Optional RoPE parameter map (mlx-lm `lfm2.py`'s `rope_parameters`). When
+  /// present and carrying a `rope_theta`, that value overrides the top-level
+  /// [`rope_theta`](Self::rope_theta) — upstream `__post_init__`
+  /// (`lfm2.py:40-42`): `if rope_parameters is not None and "rope_theta" in
+  /// rope_parameters: self.rope_theta = rope_parameters["rope_theta"]`. Absent
+  /// (serde default `None`) ⇒ the top-level `rope_theta` is used unchanged. No
+  /// released LFM2 checkpoint sets this; it is modeled for forward
+  /// compatibility with a variant that does.
+  pub rope_parameters: Option<RopeParameters>,
   /// Vocabulary size (logits last-axis width).
-  #[serde(default = "default_vocab_size")]
   pub vocab_size: i32,
   /// RMSNorm variance floor.
-  #[serde(default = "default_norm_eps")]
   pub norm_eps: f32,
   /// Whether the MLP applies the SwiGLU `auto_adjust_ff_dim` reduction.
-  #[serde(default = "default_true")]
   pub block_auto_adjust_ff_dim: bool,
   /// MLP input/output width (equals `hidden_size`).
-  #[serde(default = "default_hidden_size")]
   pub block_dim: i32,
   /// MLP feed-forward width before any `auto_adjust_ff_dim` reduction.
-  #[serde(default = "default_block_ff_dim")]
   pub block_ff_dim: i32,
   /// `auto_adjust_ff_dim` post-multiplier.
-  #[serde(default = "default_block_ffn_dim_multiplier")]
   pub block_ffn_dim_multiplier: f32,
   /// `auto_adjust_ff_dim` rounding granularity.
-  #[serde(default = "default_block_multiple_of")]
   pub block_multiple_of: i32,
   /// Depthwise-conv kernel length (the cache window is `conv_L_cache - 1`).
   /// The `config.json` key is `conv_L_cache` (mlx-lm's field name).
-  #[serde(rename = "conv_L_cache", default = "default_conv_l_cache")]
   pub conv_l_cache: i32,
   /// Whether the conv / its projections carry a bias.
-  #[serde(default)]
   pub conv_bias: bool,
   /// Explicit per-layer kind list (`"full_attention"` vs the conv default).
   /// `None` ⇒ every layer is a conv layer unless [`full_attn_idxs`] names it.
@@ -297,7 +301,6 @@ pub struct TextConfig {
   /// [`attention_layer_indices`](TextConfig::attention_layer_indices) cap runs.
   ///
   /// [`full_attn_idxs`]: TextConfig::full_attn_idxs
-  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
   pub layer_types: Option<Vec<String>>,
   /// Explicit attention-layer index list. When present it is authoritative;
   /// otherwise it is derived from `layer_types` (`__post_init__`).
@@ -306,8 +309,115 @@ pub struct TextConfig {
   /// `deserialize_bounded_opt_vec` shim) so a hostile array cannot over-allocate
   /// before the
   /// [`attention_layer_indices`](TextConfig::attention_layer_indices) cap runs.
-  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
   pub full_attn_idxs: Option<Vec<i32>>,
+}
+
+/// Private `#[derive(Deserialize)]` mirror of [`TextConfig`] — one field per
+/// `TextConfig` field, carrying that field's serde attributes **verbatim**
+/// (`#[serde(default = …)]`, the `conv_L_cache` rename, the bounded-sequence
+/// `deserialize_with`). It exists solely so [`TextConfig`]'s hand-written
+/// `Deserialize` can parse the raw JSON exactly as a derived impl would, then
+/// apply `__post_init__`'s RoPE-base precedence
+/// ([`TextConfig::apply_rope_parameters_override`], `lfm2.py:40-42`) before
+/// handing back the public struct. Keeping the attributes identical to
+/// [`TextConfig`]'s former derive is load-bearing: any divergence in a default /
+/// rename / bound would change checkpoint parsing.
+#[derive(serde::Deserialize)]
+struct RawTextConfig {
+  #[serde(default = "default_model_type")]
+  model_type: String,
+  #[serde(default = "default_hidden_size")]
+  hidden_size: i32,
+  #[serde(default = "default_num_hidden_layers")]
+  num_hidden_layers: i32,
+  #[serde(default = "default_num_attention_heads")]
+  num_attention_heads: i32,
+  #[serde(default = "default_num_key_value_heads")]
+  num_key_value_heads: i32,
+  #[serde(default = "default_max_position_embeddings")]
+  max_position_embeddings: i32,
+  #[serde(default = "default_rope_theta")]
+  rope_theta: f32,
+  #[serde(default)]
+  rope_parameters: Option<RopeParameters>,
+  #[serde(default = "default_vocab_size")]
+  vocab_size: i32,
+  #[serde(default = "default_norm_eps")]
+  norm_eps: f32,
+  #[serde(default = "default_true")]
+  block_auto_adjust_ff_dim: bool,
+  #[serde(default = "default_hidden_size")]
+  block_dim: i32,
+  #[serde(default = "default_block_ff_dim")]
+  block_ff_dim: i32,
+  #[serde(default = "default_block_ffn_dim_multiplier")]
+  block_ffn_dim_multiplier: f32,
+  #[serde(default = "default_block_multiple_of")]
+  block_multiple_of: i32,
+  #[serde(rename = "conv_L_cache", default = "default_conv_l_cache")]
+  conv_l_cache: i32,
+  #[serde(default)]
+  conv_bias: bool,
+  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
+  layer_types: Option<Vec<String>>,
+  #[serde(default, deserialize_with = "deserialize_bounded_opt_vec")]
+  full_attn_idxs: Option<Vec<i32>>,
+}
+
+impl<'de> serde::Deserialize<'de> for TextConfig {
+  /// Deserialize a [`TextConfig`] via the private `RawTextConfig` mirror, then
+  /// apply `__post_init__`'s RoPE-base precedence
+  /// ([`apply_rope_parameters_override`], `lfm2.py:40-42`) intrinsically — so
+  /// EVERY path that materializes a `TextConfig` (a direct
+  /// `serde_json::from_str::<TextConfig>`, the nested `text_config` of the VLM
+  /// [`ModelConfig`](crate::vlm::models::lfm2_vl::ModelConfig), and
+  /// [`from_json`](Self::from_json)) carries the override and cannot bypass it.
+  ///
+  /// [`apply_rope_parameters_override`]: Self::apply_rope_parameters_override
+  fn deserialize<D: serde::Deserializer<'de>>(
+    deserializer: D,
+  ) -> std::result::Result<Self, D::Error> {
+    let raw = RawTextConfig::deserialize(deserializer)?;
+    let mut cfg = TextConfig {
+      model_type: raw.model_type,
+      hidden_size: raw.hidden_size,
+      num_hidden_layers: raw.num_hidden_layers,
+      num_attention_heads: raw.num_attention_heads,
+      num_key_value_heads: raw.num_key_value_heads,
+      max_position_embeddings: raw.max_position_embeddings,
+      rope_theta: raw.rope_theta,
+      rope_parameters: raw.rope_parameters,
+      vocab_size: raw.vocab_size,
+      norm_eps: raw.norm_eps,
+      block_auto_adjust_ff_dim: raw.block_auto_adjust_ff_dim,
+      block_dim: raw.block_dim,
+      block_ff_dim: raw.block_ff_dim,
+      block_ffn_dim_multiplier: raw.block_ffn_dim_multiplier,
+      block_multiple_of: raw.block_multiple_of,
+      conv_l_cache: raw.conv_l_cache,
+      conv_bias: raw.conv_bias,
+      layer_types: raw.layer_types,
+      full_attn_idxs: raw.full_attn_idxs,
+    };
+    cfg.apply_rope_parameters_override();
+    Ok(cfg)
+  }
+}
+
+/// The optional `rope_parameters` map (mlx-lm `lfm2.py`'s `Optional[dict]`).
+///
+/// Only `rope_theta` participates in the LFM2 forward pass — when present it
+/// overrides [`TextConfig::rope_theta`] in [`TextConfig::from_json`]
+/// (`lfm2.py:41-42`). Any other keys an upstream scaling variant might add are
+/// ignored (serde does not `deny_unknown_fields`), mirroring mlx-lm reading only
+/// `rope_parameters["rope_theta"]` here.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[non_exhaustive]
+pub struct RopeParameters {
+  /// The RoPE base frequency override. `Some` ⇒ replaces the top-level
+  /// `rope_theta`; `None` (key absent) ⇒ the top-level value is kept.
+  #[serde(default)]
+  pub rope_theta: Option<f32>,
 }
 
 fn default_model_type() -> String {
@@ -358,9 +468,12 @@ impl TextConfig {
   ///
   /// A serde failure (malformed JSON) maps to [`Error::Parse`]; missing keys
   /// fall back to the reference defaults rather than erroring (mlx-lm
-  /// `from_dict` semantics). The parsed fields are then [`validate`]d so a
-  /// malformed config (zero / negative / non-divisible / oversized dimension)
-  /// is a recoverable error here rather than a panic downstream.
+  /// `from_dict` semantics). `__post_init__`'s RoPE-base precedence
+  /// (`lfm2.py:40-42`) is applied by [`TextConfig`]'s hand-written
+  /// `Deserialize` during the `serde_json::from_str` here, so it needs no
+  /// separate step. The parsed fields are then [`validate`]d so a malformed
+  /// config (zero / negative / non-divisible / oversized dimension) is a
+  /// recoverable error here rather than a panic downstream.
   ///
   /// [`validate`]: TextConfig::validate
   pub fn from_json(json: &str) -> Result<TextConfig> {
@@ -373,6 +486,29 @@ impl TextConfig {
     })?;
     cfg.validate()?;
     Ok(cfg)
+  }
+
+  /// Apply `__post_init__`'s RoPE-base precedence (`lfm2.py:40-42`): when
+  /// [`rope_parameters`](Self::rope_parameters) carries a `rope_theta`, that
+  /// value overrides the top-level [`rope_theta`](Self::rope_theta) — upstream
+  /// `if self.rope_parameters is not None and "rope_theta" in
+  /// self.rope_parameters: self.rope_theta = self.rope_parameters["rope_theta"]`.
+  /// An absent map / a map without a `rope_theta` leaves the top-level value
+  /// unchanged.
+  ///
+  /// This normalization is intrinsic to the type's `from_dict` analogue and runs
+  /// automatically inside [`TextConfig`]'s hand-written `Deserialize`, so EVERY
+  /// path that materializes a [`TextConfig`] carries it: a direct
+  /// `serde_json::from_str::<TextConfig>`, the `text_config` nested inside the
+  /// LFM2-VL [`ModelConfig`](crate::vlm::models::lfm2_vl::ModelConfig)'s derived
+  /// `Deserialize`, and the LM [`from_json`](Self::from_json) alike. It is exposed
+  /// for callers that mutate `rope_parameters` post-construction and want to
+  /// re-normalize. Idempotent: once applied, `rope_theta` already equals the
+  /// override, so a second call is a no-op.
+  pub fn apply_rope_parameters_override(&mut self) {
+    if let Some(theta) = self.rope_parameters.as_ref().and_then(|p| p.rope_theta) {
+      self.rope_theta = theta;
+    }
   }
 
   /// Reject a structurally invalid configuration before it can panic the
@@ -405,6 +541,14 @@ impl TextConfig {
   ///   resulting `auto_adjust_ff_dim` width must itself stay within the width
   ///   cap — a huge multiplier would otherwise saturate / overflow the `i32`
   ///   MLP-width arithmetic at load time.
+  /// - the **effective** `rope_theta` (after
+  ///   [`apply_rope_parameters_override`](TextConfig::apply_rope_parameters_override),
+  ///   `lfm2.py:40-42`, so the `rope_parameters` override is included) must be
+  ///   **finite and positive** — it is the base of the attention
+  ///   [`Rope::new(head_dim)`](crate::lm::nn::rope::Rope::new) the layers build,
+  ///   so a `0.0` / negative / `NaN` value (from the top-level field or the
+  ///   override) would otherwise install non-finite rotation frequencies and
+  ///   poison the logits.
   ///
   /// Returns the first violation as [`Error::OutOfRange`] /
   /// [`Error::DivisibilityConstraint`] / [`Error::NonFiniteScalar`]; `Ok(())`
@@ -493,6 +637,20 @@ impl TextConfig {
         format_smolstr!("adjusted_ff_dim={adjusted}"),
       )));
     }
+    // The EFFECTIVE `rope_theta` is the base frequency of the attention
+    // `Rope::new(head_dim, …, rope_theta, …)`; a non-finite or non-positive base
+    // yields invalid rotation frequencies (a `NaN`/`Inf` poisons every logit, a
+    // `<= 0` base inverts / collapses the geometric progression). The
+    // `rope_parameters` override (`lfm2.py:40-42`) has already folded into
+    // `self.rope_theta` — on deserialization (the hand-written `Deserialize`) and
+    // again at the builder chokepoint before this `validate` runs — so checking
+    // `self.rope_theta` here covers both the top-level field and the override
+    // source. Narrowing to f32 first also rejects an f64 that overflows /
+    // underflows the field's own type.
+    require_positive_finite_f32(
+      "TextConfig::validate (rope_theta)",
+      f64::from(self.rope_theta),
+    )?;
     Ok(())
   }
 
@@ -640,6 +798,186 @@ fn adjusted_ff_dim(ff_dim: i32, multiple_of: i32, adjust: bool, multiplier: f32)
 
 // ───────────────────────── attention ─────────────────────────
 
+/// The three bias-free query/key/value projections of an [`Attention`] layer,
+/// either fused into one matmul or kept separate.
+///
+/// `lfm2.py:87` runs `self.q_proj(x), self.k_proj(x), self.v_proj(x)` — three
+/// independent `nn.Linear`s over the same input `x`. Because each projection is
+/// `y = x @ Wᵀ` over a shared `x`, stacking the three weights along their output
+/// axis and running ONE matmul, then splitting the output back into the q / k / v
+/// slices, yields a **bit-identical** result (every output element is the same
+/// dot product, in the same order) while issuing one GEMM instead of three. The
+/// checkpoint still ships separate `q_proj` / `k_proj` / `v_proj` tensors; the
+/// fusion is a load-time rearrangement of the *dense* weights only.
+///
+/// A quantized projection holds a packed `uint32` weight with its own per-output
+/// `scales` / `biases`, not a plain dense matrix, so the three quantized
+/// projections are kept separate ([`Split`](Self::Split)) and run as three
+/// `quantized_matmul`s — faithful to the per-projection quantized layout, with
+/// no packed-weight concatenation.
+#[derive(Debug)]
+enum QkvProj {
+  /// All three projections were dense: one fused `(q_out + k_out + v_out, hidden)`
+  /// matmul whose output is split at `[q_out, q_out + k_out]` back into q / k / v
+  /// (the v slice is the remainder, so only the two leading widths are stored).
+  Fused {
+    proj: Linear,
+    q_out: i32,
+    k_out: i32,
+  },
+  /// At least one projection is quantized: keep the three separate.
+  Split { q: Linear, k: Linear, v: Linear },
+}
+
+impl QkvProj {
+  /// Build the QKV projection from three already-loaded q / k / v [`Linear`]s.
+  ///
+  /// When all three are dense their `(out, in)` weights are concatenated along
+  /// the output axis into a single fused projection (an exact, numerically
+  /// identical rearrangement — see the type docs); if any is quantized the three
+  /// are kept separate.
+  ///
+  /// LFM2's q / k / v projections are bias-free (`bias=False`, `lfm2.py:68-70`),
+  /// so on a faithful checkpoint none of the three carries a bias and the fused
+  /// projection has `None`. The bias is nonetheless handled faithfully for a
+  /// (hypothetical) biased dense checkpoint: the three `(out,)` biases are
+  /// concatenated into the fused `(q_out + k_out + v_out,)` bias the same way the
+  /// weights are, so the fused split reproduces each projection's bias add
+  /// bit-for-bit. A *mixed* set (some projections carry a bias, some do not) is a
+  /// malformed checkpoint and is a typed error rather than a silent drop.
+  ///
+  /// # Errors
+  /// - [`Error::RankMismatch`] if any dense projection weight (`q`, `k`, or `v`)
+  ///   is not rank-2 — all three are rank-validated before the fused concat /
+  ///   any shape indexing;
+  /// - [`Error::KeyCollision`] if the dense q / k / v biases are mixed (some
+  ///   present, some absent);
+  /// - [`Error::OutOfRange`] if a projection's output width exceeds `i32`;
+  /// - propagates the weight / bias concatenate op errors.
+  fn new(q: Linear, k: Linear, v: Linear) -> Result<Self> {
+    match (q.dense_weight(), k.dense_weight(), v.dense_weight()) {
+      (Some(wq), Some(wk), Some(wv)) => {
+        let q_out = dense_proj_out_features(wq)?;
+        let k_out = dense_proj_out_features(wk)?;
+        // Validate `wv`'s rank too before it reaches the `concatenate` FFI: a
+        // rank-0 / rank-1 `v_proj.weight` must surface the same typed
+        // [`Error::RankMismatch`] as `wq` / `wk`, not panic inside or past the
+        // concat. The v width is the remainder of the split (not stored), so the
+        // returned value is discarded — only the rank guard matters here.
+        let _ = dense_proj_out_features(wv)?;
+        // Stack `[Wq; Wk; Wv]` along the output axis (axis 0): `x @ Wᵀ` then
+        // selects columns `[0, q_out)` / `[q_out, q_out+k_out)` / … so the split
+        // output equals the three separate matmuls element-for-element.
+        let fused = concatenate(&[wq, wk, wv], 0)?;
+        // Carry the biases the same way: `[bq; bk; bv]` along axis 0 so the
+        // fused split's per-slice bias add equals each separate projection's.
+        // LFM2 is bias-free so all three are `None` (→ fused `None`); a biased
+        // checkpoint concatenates all three; a mixed set is malformed.
+        let bias = fuse_qkv_bias(q.dense_bias(), k.dense_bias(), v.dense_bias())?;
+        Ok(QkvProj::Fused {
+          proj: Linear::new(fused, bias),
+          q_out,
+          k_out,
+        })
+      }
+      _ => Ok(QkvProj::Split { q, k, v }),
+    }
+  }
+
+  /// Project `x` into the `(queries, keys, values)` triple — one fused matmul +
+  /// split (the [`Fused`](Self::Fused) arm) or three separate matmuls (the
+  /// [`Split`](Self::Split) arm). The returned slices are identical to
+  /// `q_proj(x)`, `k_proj(x)`, `v_proj(x)` respectively.
+  fn project(&self, x: &Array) -> Result<(Array, Array, Array)> {
+    match self {
+      QkvProj::Fused { proj, q_out, k_out } => {
+        let fused = proj.forward(x)?;
+        // `mx.split(fused, [q_out, q_out + k_out], axis=-1)` — the two cut points
+        // recover the q / k / v slices.
+        let cut1 = *q_out;
+        let cut2 = checked_add(
+          "QkvProj split: q_out + k_out",
+          "q_out",
+          *q_out,
+          "k_out",
+          *k_out,
+        )?;
+        let parts = split_sections(&fused, &[cut1, cut2], -1)?;
+        Ok((
+          parts[0].try_clone()?,
+          parts[1].try_clone()?,
+          parts[2].try_clone()?,
+        ))
+      }
+      QkvProj::Split { q, k, v } => Ok((q.forward(x)?, k.forward(x)?, v.forward(x)?)),
+    }
+  }
+
+  /// `true` if the three projections were fused (all dense).
+  #[cfg(test)]
+  fn is_fused(&self) -> bool {
+    matches!(self, QkvProj::Fused { .. })
+  }
+}
+
+/// A dense `(out, in)` projection weight's output-feature count (`shape[0]`),
+/// as `i32`, after validating the weight is rank-2.
+///
+/// The fused-QKV builder reads `shape[0]` (and concatenates along axis 0), so a
+/// malformed rank-0 / rank-1 checkpoint tensor must be rejected with a typed
+/// error here rather than panicking on the out-of-bounds `shape[0]` slice
+/// index. An `nn.Linear` weight is always `(out, in)` (rank-2); anything else is
+/// a malformed checkpoint.
+///
+/// # Errors
+/// - [`Error::RankMismatch`] if the weight is not rank-2;
+/// - [`Error::OutOfRange`] if the count exceeds `i32::MAX` (a corrupt huge weight).
+fn dense_proj_out_features(weight: &Array) -> Result<i32> {
+  let shape = weight.shape();
+  if shape.len() != 2 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "QkvProj: dense projection weight must be rank-2 (out, in)",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  let rows = shape[0];
+  i32::try_from(rows).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "QkvProj: projection output width",
+      "must fit in i32",
+      format_smolstr!("{rows}"),
+    ))
+  })
+}
+
+/// Fuse the optional dense q / k / v output biases for the fused QKV projection.
+///
+/// Mirrors the weight concatenation: when all three projections carry a `(out,)`
+/// bias they are concatenated into the fused `(q_out + k_out + v_out,)` bias
+/// (`[bq; bk; bv]` along axis 0) so the fused output's split reproduces each
+/// projection's bias add exactly; when none carries one the fused projection is
+/// bias-free (the faithful LFM2 case, `bias=False`, `lfm2.py:68-70`).
+///
+/// A *mixed* set — some projections with a bias, some without — cannot be a
+/// faithful LFM2 checkpoint (the three projections share one `bias=False` flag);
+/// it is rejected as a typed [`Error::KeyCollision`] rather than silently
+/// dropping or zero-filling the missing biases.
+fn fuse_qkv_bias(
+  bq: Option<&Array>,
+  bk: Option<&Array>,
+  bv: Option<&Array>,
+) -> Result<Option<Array>> {
+  match (bq, bk, bv) {
+    (None, None, None) => Ok(None),
+    (Some(bq), Some(bk), Some(bv)) => Ok(Some(concatenate(&[bq, bk, bv], 0)?)),
+    _ => Err(Error::KeyCollision(KeyCollisionPayload::new(
+      "QkvProj: dense q/k/v biases must be all present or all absent (LFM2 shares one bias=False flag across the three projections)",
+      "self_attn.{q,k,v}_proj.bias",
+    ))),
+  }
+}
+
 /// Grouped-query attention with per-head QK-norm (`lfm2.py:53-109`).
 #[derive(Debug)]
 struct Attention {
@@ -648,9 +986,7 @@ struct Attention {
   scale: f32,
   q_layernorm: RMSNorm,
   k_layernorm: RMSNorm,
-  q_proj: Linear,
-  k_proj: Linear,
-  v_proj: Linear,
+  qkv_proj: QkvProj,
   out_proj: Linear,
   rope: Rope,
 }
@@ -666,9 +1002,10 @@ impl Attention {
     let shape = x.shape();
     let (b, l) = (shape[0] as i32, shape[1] as i32);
 
-    let queries = self.q_proj.forward(x)?;
-    let keys = self.k_proj.forward(x)?;
-    let values = self.v_proj.forward(x)?;
+    // `queries, keys, values = q_proj(x), k_proj(x), v_proj(x)` — fused into one
+    // matmul + split when the three projections are dense (an exact, numerically
+    // identical rearrangement), else three separate matmuls.
+    let (queries, keys, values) = self.qkv_proj.project(x)?;
 
     // Per-head reshape `(B, L, n_heads, head_dim)`, q/k RMSNorm over the last
     // axis, then transpose to `(B, n_heads, L, head_dim)`. The reference
@@ -1350,10 +1687,20 @@ impl Lfm2 {
   ///   [`Embedding::quantized`](crate::lm::models::lfm2) structural validation
   ///   of the quantized triple.
   pub fn from_weights_quantized(
-    config: TextConfig,
+    mut config: TextConfig,
     mut weights: std::collections::HashMap<String, Array>,
     quantization: Option<&PerLayerQuantization>,
   ) -> Result<Lfm2> {
+    // Re-apply `__post_init__`'s RoPE-base precedence at the point where
+    // `rope_theta` is consumed to build the attention RoPE (`lfm2.py:40-42`:
+    // `rope_parameters["rope_theta"]` wins over the top-level `rope_theta` on
+    // EVERY construction). `TextConfig`'s `Deserialize` already normalizes this,
+    // so for a freshly deserialized config this is a no-op; it is corrective for
+    // a config materialized then mutated post-deserialize (the fields are
+    // public) into a stale `rope_parameters` / `rope_theta` pair. The builder is
+    // the chokepoint that reads `rope_theta`, so normalizing here closes the
+    // last path to a model built from a stale base.
+    config.apply_rope_parameters_override();
     config.validate()?;
     let attn_idxs = config.attention_layer_indices()?;
     let eps = config.norm_eps;
@@ -1439,21 +1786,25 @@ impl Lfm2 {
           ),
           // The four attention projections are bias-free (`bias=False`,
           // `lfm2.py:68-71`); quantized iff the layer carries a `.scales`
-          // sibling.
-          q_proj: Linear::from_weights(
-            &mut weights,
-            &format!("{q}.q_proj"),
-            quant_for(&format!("{q}.q_proj")),
-          )?,
-          k_proj: Linear::from_weights(
-            &mut weights,
-            &format!("{q}.k_proj"),
-            quant_for(&format!("{q}.k_proj")),
-          )?,
-          v_proj: Linear::from_weights(
-            &mut weights,
-            &format!("{q}.v_proj"),
-            quant_for(&format!("{q}.v_proj")),
+          // sibling. The q/k/v triple is fused into one matmul when all three
+          // are dense (an exact rearrangement), else kept as three separate
+          // (quantized) matmuls — `QkvProj::new` decides per layer.
+          qkv_proj: QkvProj::new(
+            Linear::from_weights(
+              &mut weights,
+              &format!("{q}.q_proj"),
+              quant_for(&format!("{q}.q_proj")),
+            )?,
+            Linear::from_weights(
+              &mut weights,
+              &format!("{q}.k_proj"),
+              quant_for(&format!("{q}.k_proj")),
+            )?,
+            Linear::from_weights(
+              &mut weights,
+              &format!("{q}.v_proj"),
+              quant_for(&format!("{q}.v_proj")),
+            )?,
           )?,
           out_proj: Linear::from_weights(
             &mut weights,

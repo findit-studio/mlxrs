@@ -240,7 +240,14 @@ fn token_count_rejects_degenerate() {
 fn expand_single_image_no_brackets() {
   // input "a <image> b" with one image, grid (4, 4), factor 2 -> 4 image
   // tokens replace the single placeholder. Ids: a=1, <image>=396, b=2.
-  let cfg = tiny_cfg(16); // no special tokens
+  // `use_image_special_tokens` defaults to `true` (upstream), but no bracket id
+  // is supplied, so the emit gate (`&& image_start_token.is_some()`) is off and
+  // no bracket appears — the run is the bare image tokens.
+  let cfg = tiny_cfg(16);
+  assert!(
+    cfg.use_image_special_tokens(),
+    "use_image_special_tokens defaults to true (upstream parity)"
+  );
   let ids = [1, 396, 2];
   let grids = [(4, 4)];
   let out = expand_image_tokens(&ids, &grids, &cfg).unwrap();

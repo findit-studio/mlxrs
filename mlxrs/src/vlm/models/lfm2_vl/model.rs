@@ -147,10 +147,21 @@ impl Lfm2Vl {
   /// - propagates the vision / projector / LM sub-builder validation (including
   ///   the quantized-triple checks).
   pub fn from_weights(
-    config: ModelConfig,
+    mut config: ModelConfig,
     mut weights: HashMap<String, Array>,
     quantization: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
+    // Re-apply `__post_init__`'s RoPE-base precedence (`lfm2.py:40-42`:
+    // `text_config.rope_parameters["rope_theta"]` wins over the top-level
+    // `text_config.rope_theta`) on the nested text config BEFORE it is validated,
+    // handed to the LM builder, and stored. `TextConfig`'s `Deserialize` already
+    // normalizes a freshly parsed config, so this is a no-op there; it is
+    // corrective for a `ModelConfig` materialized then mutated post-deserialize
+    // (the `text_config` field is public) into a stale `rope_parameters` /
+    // `rope_theta` pair. Normalizing the STORED config here — not just the clone
+    // passed to the LM builder below — keeps `config().text_config.rope_theta` in
+    // agreement with the RoPE the built LM actually uses.
+    config.text_config.apply_rope_parameters_override();
     config.validate()?;
 
     // Per-layer scheme resolver over the FULL VL module path namespace — the
@@ -206,6 +217,11 @@ impl Lfm2Vl {
     // keyed under the VL `language_model.` prefix would be an edge case the
     // checkpoint does not use; the global default — what the checkpoint carries
     // — applies regardless.)
+    // `config.text_config` was already RoPE-normalized above, so this clone — and
+    // the model the LM builder constructs from it — share the same effective
+    // `rope_theta` as the `config` stored on `self` below. (The LM builder also
+    // re-applies the override defensively; for this already-normalized clone that
+    // is a no-op.)
     let lm = Lfm2::from_weights_quantized(config.text_config.clone(), lm_weights, quantization)?;
     let language_model = LanguageModel::new(lm);
 

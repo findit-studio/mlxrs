@@ -192,3 +192,29 @@ fn model_config_propagates_invalid_tower_config() {
   let err = cfg.validate().unwrap_err();
   assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
 }
+
+#[test]
+fn model_config_applies_rope_parameters_override_on_nested_text_config() {
+  // `__post_init__` (`lfm2.py:41-42`): a `text_config.rope_parameters.rope_theta`
+  // overrides the top-level `text_config.rope_theta`. The VLM `ModelConfig`
+  // deserializes `text_config` via serde derive (NOT `TextConfig::from_json`), so
+  // `ModelConfig::from_json` must apply the override on the nested config too —
+  // otherwise the wrapped LM attention RoPE is built with the wrong base. Here
+  // the nested top-level is 1000 and the override is 5000, so the effective
+  // `text_config.rope_theta` on the VLM path must be 5000.
+  let json = r#"{
+    "vision_config": {},
+    "text_config": {
+      "hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+      "num_hidden_layers": 2, "rope_theta": 1000.0,
+      "rope_parameters": {"rope_theta": 5000.0}
+    }
+  }"#;
+  let cfg = ModelConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.text_config.rope_theta, 5000.0,
+    "text_config.rope_parameters.rope_theta must win on the VLM nested path"
+  );
+  // The override leaves an otherwise-valid config valid.
+  cfg.validate().unwrap();
+}

@@ -126,7 +126,16 @@ impl Lfm2VlProcessorConfig {
   /// patch_size, max_num_patches)` quad — the four fields the model wiring
   /// supplies from the validated [`ModelConfig`](super::config::ModelConfig) —
   /// with the SigLIP defaults for everything else (`num_channels = 3`,
-  /// `image_mean = image_std = 0.5`, no special-token brackets).
+  /// `image_mean = image_std = 0.5`).
+  ///
+  /// `use_image_special_tokens` defaults to `true` (upstream
+  /// `processing_lfm2_vl.py:331` / `config.py:87`), so an image is bracketed by
+  /// the `image_start` / `image_end` ids once those are supplied. They start as
+  /// `None`, so no bracket is emitted until [`with_special_tokens`] (or the
+  /// individual setters) provide the ids — matching upstream, where the brackets
+  /// appear only when the tokenizer carries them.
+  ///
+  /// [`with_special_tokens`]: Self::with_special_tokens
   ///
   /// Use the `with_*` builders to set the per-channel mean / std (from the
   /// checkpoint's `preprocessor_config.json`) and the `image_start` /
@@ -161,7 +170,10 @@ impl Lfm2VlProcessorConfig {
       image_token,
       image_start_token: None,
       image_end_token: None,
-      use_image_special_tokens: false,
+      // Upstream default (`config.py:87`, `processing_lfm2_vl.py:331`):
+      // `use_image_special_tokens = True`. The bracket ids start `None`, so no
+      // bracket emits until `with_special_tokens` supplies them.
+      use_image_special_tokens: true,
     })
   }
 
@@ -214,6 +226,14 @@ impl Lfm2VlProcessorConfig {
   #[inline(always)]
   pub fn image_token(&self) -> i32 {
     self.image_token
+  }
+
+  /// Whether images are bracketed by the `image_start` / `image_end` ids when
+  /// those ids are set. Defaults to `true` (upstream `config.py:87` /
+  /// `processing_lfm2_vl.py:331`).
+  #[inline(always)]
+  pub fn use_image_special_tokens(&self) -> bool {
+    self.use_image_special_tokens
   }
 }
 

@@ -331,6 +331,12 @@ impl ModelConfig {
   /// Parse a [`ModelConfig`] from an in-memory `config.json` string. A
   /// malformed-JSON failure maps to [`Error::Parse`]; absent keys take their
   /// checkpoint defaults; unmodeled keys are ignored.
+  ///
+  /// The nested `text_config` is the LFM2 LM [`TextConfig`], whose hand-written
+  /// `Deserialize` applies `__post_init__`'s RoPE-base precedence
+  /// (`lfm2.py:40-42`) intrinsically — so it runs here too, during the
+  /// `ModelConfig` derive's deserialization of `text_config`, and on a direct
+  /// `serde_json::from_str::<ModelConfig>` alike, with no separate step.
   pub fn from_json(json: &str) -> Result<Self> {
     serde_json::from_str(json).map_err(|e| {
       Error::Parse(ParsePayload::new(
