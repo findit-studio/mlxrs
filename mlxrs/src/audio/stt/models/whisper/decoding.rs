@@ -140,6 +140,32 @@ impl Default for DecodingOptions {
   }
 }
 
+impl DecodingOptions {
+  /// Clone every field **except** [`prompt`](Self::prompt), which is returned
+  /// empty.
+  ///
+  /// The seek loop overwrites the prompt every window with the running history
+  /// tail (`whisper.py:1033`), so the caller's original (possibly unbounded)
+  /// `prompt` is never used by the per-window decode. Cloning `self` and then
+  /// clearing `prompt` would copy that whole vector just to drop it; this skips
+  /// the copy entirely. Behavior is unchanged — `prompt` is the only field the
+  /// loop sets, and it is set to the same value either way.
+  fn clone_without_prompt(&self) -> Self {
+    Self {
+      task: self.task,
+      language: self.language.clone(),
+      temperature: self.temperature,
+      sample_len: self.sample_len,
+      prompt: Vec::new(),
+      prefix: self.prefix.clone(),
+      suppress_tokens: self.suppress_tokens.clone(),
+      suppress_blank: self.suppress_blank,
+      without_timestamps: self.without_timestamps,
+      max_initial_timestamp: self.max_initial_timestamp,
+    }
+  }
+}
+
 /// The `suppress_tokens` option (`decoding.py:139-141`): either the
 /// reference's `"-1"` non-speech default or an explicit id list.
 #[derive(Debug, Clone)]
@@ -1446,6 +1472,29 @@ pub struct TranscribeOptions {
   /// this threshold (seconds) around a detected hallucination
   /// (`whisper.py:808`, `:1171-1237`). `None` disables the heuristic.
   pub hallucination_silence_threshold: Option<f64>,
+  /// Feed the previous window's decoded tokens as the next window's prompt
+  /// (`whisper.py:801`). `true` (the reference default) conditions each window
+  /// on the running transcript; `false` resets the prompt every window
+  /// (`whisper.py:1279-1281`), trading cross-window consistency for resistance
+  /// to repetition / timestamp-drift failure loops. A window decoded at
+  /// `temperature > 0.5` also resets the prompt regardless of this flag.
+  pub condition_on_previous_text: bool,
+  /// Optional text prompting the **first** window (`whisper.py:802`, `:990-994`)
+  /// — e.g. a custom vocabulary or proper nouns to bias the decode. The text is
+  /// encoded (with a leading space) and seeded into the running token history
+  /// before the seek loop; it conditions the first window's decode but is never
+  /// emitted as transcript (`whisper.py:1299` strips it).
+  pub initial_prompt: Option<String>,
+  /// Seconds timestamps of the clips to process — `clip_timestamps`
+  /// (`whisper.py:807`, `:915-931`), the reference's `List[float]` form.
+  ///
+  /// The list pairs up as `(start, end, start, end, …)`; each pair restricts the
+  /// seek loop to `[start, end)` (converted to frames). An odd-length list
+  /// leaves the final clip open-ended (its end defaults to the end of the
+  /// audio). Empty (the default) reproduces the reference default `"0"` →
+  /// `[0.0]` → one clip spanning the whole audio, so the seek loop is
+  /// byte-identical to the unclipped path.
+  pub clip_timestamps: Vec<f64>,
 }
 
 impl Default for TranscribeOptions {
@@ -1460,8 +1509,239 @@ impl Default for TranscribeOptions {
       prepend_punctuations: super::timing::PREPEND_PUNCTUATIONS.to_string(),
       append_punctuations: super::timing::APPEND_PUNCTUATIONS.to_string(),
       hallucination_silence_threshold: None,
+      condition_on_previous_text: true,
+      initial_prompt: None,
+      clip_timestamps: Vec::new(),
     }
   }
+}
+
+/// The running prompt history threaded across the seek loop's windows —
+/// `whisper.py`'s `all_tokens` / `prompt_reset_since` (`:986-994`, `:1033`,
+/// `:1271-1281`).
+///
+/// `all_tokens` accumulates the optional `initial_prompt` tokens (seeded once,
+/// before the loop) followed by every window's decoded tokens;
+/// `prompt_reset_since` is the index from which the next window's prompt is
+/// sliced. Conditioning a window resets to a different slice; resetting (the
+/// `condition_on_previous_text == false` or `temperature > 0.5` case) moves
+/// `prompt_reset_since` to the current tail so no prior text leaks forward.
+///
+/// This mirrors the reference exactly: the prompt fed to window *N* is
+/// `all_tokens[prompt_reset_since:]` (`:1033`), the window's tokens are appended
+/// after decoding (`:1271-1277`), and the reset condition is
+/// `not condition_on_previous_text or result.temperature > 0.5` (`:1279-1281`).
+struct PromptHistory {
+  /// The initial-prompt tokens + every decoded window's tokens, in order.
+  all_tokens: Vec<u32>,
+  /// The index into [`Self::all_tokens`] the next window's prompt starts at.
+  prompt_reset_since: usize,
+  /// Whether to keep conditioning on previous text
+  /// ([`TranscribeOptions::condition_on_previous_text`]).
+  condition_on_previous_text: bool,
+}
+
+impl PromptHistory {
+  /// Seed the history with the first window's prompt context.
+  ///
+  /// Precedence (documented on [`transcribe`]): `initial_prompt` wins when set —
+  /// the reference's documented knob (`whisper.py:990-994`), encoded with a
+  /// single leading space and a stripped body, then prepended to `all_tokens`.
+  /// When `initial_prompt` is `None`, the lower-level `decode_prompt`
+  /// ([`DecodingOptions::prompt`]) is used as the seed instead, so a caller who
+  /// only set `decode.prompt` still conditions the first window (the reference
+  /// overwrites `decode_options["prompt"]` at `:1033`, but mlxrs honors the
+  /// caller's value as the initial context rather than silently dropping it).
+  /// The first window's prompt is therefore exactly these seed tokens, since
+  /// [`Self::window_prompt`] returns `all_tokens[prompt_reset_since..]` and
+  /// `prompt_reset_since` starts at 0.
+  ///
+  /// The seed is bounded to the decoder-visible tail — the **last**
+  /// `n_text_ctx / 2 - 1` tokens of the chosen prompt — because that is the only
+  /// part [`Self::window_prompt`] ever returns (it always yields the last
+  /// `n_text_ctx / 2 - 1` of `all_tokens[prompt_reset_since..]`). This is
+  /// byte-identical to seeding the full prompt: for every window the decoder sees
+  /// `last_K(seed ++ decoded_so_far)`, and `last_K(tail ++ decoded) ==
+  /// last_K(full ++ decoded)` for any decoded suffix (taking the last `K` of a
+  /// sequence ignores everything before its final `K` elements, and the tail
+  /// already *is* those final `K` of the full seed). Across a reset
+  /// `prompt_reset_since` advances past the entire seed in both cases, so the
+  /// seeded prefix no longer participates at all — again identical. Storing only
+  /// the tail avoids copying an unbounded caller prompt whose leading tokens the
+  /// decoder never sees; the running history still accumulates every decoded
+  /// window whole.
+  ///
+  /// # Errors
+  /// Propagates the tokenizer encode error for the initial prompt.
+  fn seed(
+    tokenizer: &HFTokenizerWrapper<'_>,
+    initial_prompt: Option<&str>,
+    decode_prompt: &[u32],
+    condition_on_previous_text: bool,
+    n_text_ctx: usize,
+  ) -> Result<Self> {
+    // `window_prompt` only ever exposes the last `n_text_ctx / 2 - 1` tokens
+    // (`build_initial_tokens`'s `keep`), so retain only that tail of the seed —
+    // the leading prefix is unreachable by any window. Byte-identical to seeding
+    // the full prompt (see the doc comment's `last_K` equivalence).
+    let keep = (n_text_ctx / 2).saturating_sub(1);
+    let all_tokens = match initial_prompt {
+      Some(text) => {
+        let encoded = tokenizer.encode(&format!(" {}", text.trim()))?;
+        let start = encoded.len().saturating_sub(keep);
+        encoded[start..].to_vec()
+      }
+      None => {
+        let start = decode_prompt.len().saturating_sub(keep);
+        decode_prompt[start..].to_vec()
+      }
+    };
+    Ok(Self {
+      all_tokens,
+      prompt_reset_since: 0,
+      condition_on_previous_text,
+    })
+  }
+
+  /// The prompt for the next window — the decoder-visible tail of
+  /// `all_tokens[prompt_reset_since:]` (`whisper.py:1033`).
+  ///
+  /// The reference assigns the whole `all_tokens[prompt_reset_since:]` slice to
+  /// `decode_options["prompt"]`, but [`build_initial_tokens`]
+  /// (`decoding.py:539-549`) then keeps only its **last** `n_text_ctx / 2 - 1`
+  /// tokens (`keep = (n_ctx / 2) - 1`, tail-truncated). Returning that same tail
+  /// here is byte-identical to returning the full slice: taking the last `keep`
+  /// tokens and then having `build_initial_tokens` keep the last `keep` of those
+  /// yields the identical token sequence, while avoiding cloning the leading
+  /// tokens the decoder never sees. `n_text_ctx` is the model's text context
+  /// length ([`ModelDimensions::n_text_ctx`]); the bound matches
+  /// `build_initial_tokens` exactly so the decode result is unchanged.
+  ///
+  /// `all_tokens` itself still accumulates every window's tokens whole (the
+  /// reset-window logic reads `prompt_reset_since` into the full vector); only
+  /// the returned slice is bounded to the decoder window.
+  fn window_prompt(&self, n_text_ctx: usize) -> &[u32] {
+    let active = &self.all_tokens[self.prompt_reset_since.min(self.all_tokens.len())..];
+    // `build_initial_tokens` keeps `(n_ctx / 2) - 1` prompt tokens (the tail).
+    let keep = (n_text_ctx / 2).saturating_sub(1);
+    let start = active.len().saturating_sub(keep);
+    &active[start..]
+  }
+
+  /// Record a decoded window's tokens then apply the reset rule
+  /// (`whisper.py:1271-1281`): the window's tokens are appended to `all_tokens`,
+  /// and the prompt window is reset to the new tail when
+  /// `!condition_on_previous_text` **or** the window's `temperature > 0.5` (a
+  /// high-temperature fallback result must not condition the next window).
+  fn push_window<'a, I>(&mut self, window_tokens: I, temperature: f32)
+  where
+    I: IntoIterator<Item = &'a u32>,
+  {
+    self.all_tokens.extend(window_tokens.into_iter().copied());
+    if !self.condition_on_previous_text || temperature > 0.5 {
+      self.prompt_reset_since = self.all_tokens.len();
+    }
+  }
+}
+
+/// Convert the `clip_timestamps` seconds list into `(start, end)` frame seek
+/// clips — `whisper.py:915-931`.
+///
+/// Each timestamp is rounded to a frame index (`round(ts * FRAMES_PER_SECOND)`).
+/// An empty list yields one clip spanning `[0, content_frames)` (the reference's
+/// `"0"` default after its `if len == 0: append(0)` then odd-length fill); an
+/// odd-length list leaves the final clip open-ended (its end is
+/// `content_frames`); an even-length list clamps the final end to
+/// `content_frames` (`whisper.py:928`). The flat list pairs as `(points[0],
+/// points[1]), (points[2], points[3]), …` — `zip(points[::2], points[1::2])`.
+///
+/// Every `(start, end)` is additionally saturated into `[0, content_frames]` —
+/// not just the final end — so a malformed earlier pair (a start or end beyond
+/// the real audio length, as is reachable through user `clip_timestamps`) cannot
+/// drive the seek loop past the content frames. A degenerate clip (zero-length
+/// or inverted, `start >= end` after clamping) is dropped: it contributes no
+/// windows, matching the reference's effective frame math (`content_frames -
+/// seek` / `seek_clip_end - seek` would yield a non-positive `segment_size` for
+/// such a clip, so it produces nothing). An empty `clip_timestamps` stays
+/// byte-identical to the full-audio path: it yields the single `[0,
+/// content_frames)` clip unchanged.
+///
+/// A non-finite clip timestamp (`NaN` / `±inf`) is rejected with
+/// [`Error::OutOfRange`] before rounding, matching CPython's `round()`, which
+/// raises `ValueError` on `round(nan)` and `OverflowError` on `round(inf)`
+/// (`whisper.py:921`). Rust's `f64 as usize` cast would otherwise silently
+/// saturate `NaN → 0` and `inf → usize::MAX`, turning a bogus value into a
+/// degenerate (or full-audio) clip instead of an error. Finite values —
+/// including negatives, which [`round_to_frames`] clamps to `0` — are unchanged.
+///
+/// The frame product `ts * FRAMES_PER_SECOND` is *also* required to be finite:
+/// a finite-but-huge timestamp (e.g. `1e307`) overflows the product to `±inf`,
+/// which [`round_to_frames`]'s `f64 as usize` cast would again saturate
+/// (`+inf → usize::MAX`, `-inf → 0`), silently turning the bogus clip into a
+/// full-audio or empty one. CPython instead raises `OverflowError` from
+/// `round(finite * FRAMES_PER_SECOND)` the moment the product is infinite, so
+/// the product is checked here (before rounding and before any integer cast) and
+/// a non-finite product is rejected with the same typed error.
+///
+/// # Errors
+/// [`Error::OutOfRange`] if any `clip_timestamps` value — or its
+/// `FRAMES_PER_SECOND` frame product — is not finite.
+fn compute_seek_clips(
+  clip_timestamps: &[f64],
+  content_frames: usize,
+) -> Result<Vec<(usize, usize)>> {
+  let mut seek_points: Vec<usize> = Vec::with_capacity(clip_timestamps.len());
+  for &ts in clip_timestamps {
+    // CPython's `round()` raises on `nan`/`inf`; the `f64 as usize` cast below
+    // (inside `round_to_frames`) would instead silently coerce them, so reject
+    // non-finite values here to preserve the reference's failure semantics.
+    if !ts.is_finite() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "clip_timestamps: timestamp (seconds)",
+        "must be finite",
+        format_smolstr!("{ts}"),
+      )));
+    }
+    // A finite-but-huge timestamp overflows `ts * FRAMES_PER_SECOND` to `±inf`,
+    // which the `f64 as usize` cast inside `round_to_frames` would saturate
+    // (`+inf → usize::MAX`, `-inf → 0`) into a bogus full-audio / empty clip.
+    // CPython's `round(finite * FRAMES_PER_SECOND)` raises `OverflowError` once
+    // the product is infinite, so reject a non-finite product here too — before
+    // `round_to_frames` rounds and casts. (`round_to_frames` recomputes the same
+    // product internally; verifying it here keeps that call's cast on a finite
+    // value.)
+    let frame_product = ts * FRAMES_PER_SECOND as f64;
+    if !frame_product.is_finite() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "clip_timestamps: timestamp (seconds) × FRAMES_PER_SECOND",
+        "frame product must be finite",
+        format_smolstr!("{frame_product}"),
+      )));
+    }
+    seek_points.push(round_to_frames(ts));
+  }
+  if seek_points.is_empty() {
+    seek_points.push(0);
+  }
+  if seek_points.len() % 2 == 1 {
+    seek_points.push(content_frames);
+  }
+  // `zip(points[::2], points[1::2])` — even/odd interleave into (start, end).
+  // Clamp BOTH endpoints of EVERY pair to `[0, content_frames]` (the reference
+  // clamps only the final end at `:928`, but its in-loop `content_frames - seek`
+  // / `seek_clip_end - seek` math effectively bounds the rest; here the clamp is
+  // explicit to keep the seek loop's subtraction non-negative). Drop degenerate
+  // clips (`start >= end` after clamping) so they yield no windows.
+  Ok(
+    seek_points
+      .chunks_exact(2)
+      .filter_map(|pair| {
+        let start = pair[0].min(content_frames);
+        let end = pair[1].min(content_frames);
+        (start < end).then_some((start, end))
+      })
+      .collect(),
+  )
 }
 
 /// Transcribe a (possibly long) mel by sliding a 30-second window over it —
@@ -1495,10 +1775,38 @@ impl Default for TranscribeOptions {
 /// gate), and either fast-forwards a window or advances to the last in-window
 /// timestamp.
 ///
+/// Each window is conditioned on the running transcript
+/// ([`TranscribeOptions::condition_on_previous_text`], `whisper.py:1033`): the
+/// previous windows' decoded tokens (seeded with the first-window prompt) are
+/// fed as the window's prompt, reset when conditioning is disabled or a
+/// high-temperature fallback was used (`whisper.py:1279-1281`).
+///
+/// **First-window prompt precedence.** The initial context is seeded from
+/// [`TranscribeOptions::initial_prompt`] when set (the reference's documented
+/// knob, `whisper.py:990-994`); otherwise it falls back to the lower-level
+/// [`DecodingOptions::prompt`] on `options.decode`. `initial_prompt` wins if
+/// both are set. A caller-supplied `decode.prompt` is therefore honored as the
+/// first window's context rather than silently dropped — the per-window prompt
+/// overwrite (`whisper.py:1033`) is correct because the seed is already part of
+/// the running history for window 0. Whichever seed is used only conditions the
+/// decode; it is never part of the emitted transcript (the accumulated text is
+/// built from the per-window segment texts, which never contain the prompt — the
+/// reference achieves the same end via its `all_tokens[len(initial_prompt):]`
+/// strip at `whisper.py:1299`).
+///
+/// Decoding is restricted to [`TranscribeOptions::clip_timestamps`]
+/// (`whisper.py:1018-1026`); an empty clip list spans the whole audio. Each clip
+/// is saturated into the real content-frame range, so any user clip list
+/// terminates with a bounded window count (no hang, panic, or underflow) — a
+/// degenerate or out-of-range clip simply contributes no windows.
+///
 /// # Errors
 /// - [`Error::RankMismatch`] if `mel` is not rank 2;
-/// - propagates [`detect_language`], [`decode_with_fallback`], and the
-///   mel-slice op errors.
+/// - [`Error::OutOfRange`] if any [`TranscribeOptions::clip_timestamps`] value
+///   is not finite (`NaN` / `±inf`), or if its `FRAMES_PER_SECOND` frame product
+///   overflows to a non-finite value (a finite-but-huge timestamp);
+/// - propagates [`detect_language`], [`decode_with_fallback`], the initial-
+///   prompt encode, and the mel-slice op errors.
 pub fn transcribe(
   model: &WhisperModel,
   tokenizer: &HFTokenizerWrapper<'_>,
@@ -1538,6 +1846,9 @@ pub fn transcribe(
   let tokenizer = &tokenizer.with_language(&language);
 
   let timestamp_begin = tokenizer.timestamp_begin();
+  // The decoder's text context length, used to bound each window's prompt slice
+  // to exactly the tail `build_initial_tokens` keeps (`n_text_ctx / 2 - 1`).
+  let n_text_ctx = model.dims().n_text_ctx();
   // mel frames per output token (`input_stride = N_FRAMES / n_audio_ctx = 2`).
   let input_stride = N_FRAMES / model.dims().n_audio_ctx().max(1);
   // time per output token (`input_stride * HOP / SR ≈ 0.02 s`).
@@ -1545,107 +1856,172 @@ pub fn transcribe(
 
   let mut segments: Vec<Segment> = Vec::new();
   let mut all_text = String::new();
-  let mut seek = 0usize;
   // `last_speech_timestamp` (`whisper.py:1017`) — the running end of the last
   // emitted word, used by the word-timestamp duration hacks and the
   // hallucination heuristic. Unused on the no-word-timestamp path.
   let mut last_speech_timestamp = 0.0f64;
 
-  while seek < content_frames {
-    let time_offset = seek as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
-    let segment_size = N_FRAMES.min(content_frames - seek);
+  // Clips to process (`whisper.py:915-931`, `:1018`): an empty `clip_timestamps`
+  // yields one clip spanning the whole audio, so the loop is byte-identical to
+  // the unclipped path. Each clip seeks to its start and bounds windows by its
+  // end.
+  let seek_clips = compute_seek_clips(&options.clip_timestamps, content_frames)?;
+  // The running prompt history (`all_tokens` / `prompt_reset_since`), seeded
+  // with the optional initial prompt (`whisper.py:986-994`). The seed retains
+  // only the decoder-visible tail (`n_text_ctx / 2 - 1`), which is byte-identical
+  // to seeding the full prompt since `window_prompt` only ever returns that tail.
+  let mut history = PromptHistory::seed(
+    tokenizer,
+    options.initial_prompt.as_deref(),
+    &options.decode.prompt,
+    options.condition_on_previous_text,
+    n_text_ctx,
+  )?;
 
-    // mel[seek : seek + segment_size], padded to N_FRAMES.
-    let mel_segment = slice_frames(mel, seek, segment_size)?;
-    let mel_segment = pad_or_trim(&mel_segment, N_FRAMES, 0)?;
+  // Per-window decode template. Every window decodes with `options.decode`
+  // except its `prompt`, which the reference overwrites each iteration with the
+  // running history tail (`whisper.py:1033`). Build the template by cloning every
+  // field EXCEPT the prompt (left empty), so the caller's original
+  // `decode.prompt` (used solely to seed `history` above, and possibly large) is
+  // never cloned by this path at all — not even once to immediately drop it. The
+  // per-window clone below then copies the (empty) template plus the bounded
+  // `window_prompt` tail. The decode result is byte-identical to cloning
+  // `options.decode` and overwriting `prompt` in-loop, since `prompt` is the only
+  // field the loop ever changes.
+  let decode_template = options.decode.clone_without_prompt();
 
-    let result = decode_with_fallback(
-      model,
-      tokenizer,
-      &mel_segment,
-      &options.decode,
-      &language,
-      &options.temperatures,
-      options.compression_ratio_threshold,
-      options.logprob_threshold,
-      options.no_speech_threshold,
-    )?;
-
-    // No-voice-activity skip (`whisper.py:1038-1050`): skip silent windows,
-    // unless the logprob is high enough to override.
-    if let Some(nst) = options.no_speech_threshold {
-      let mut should_skip = result.no_speech_prob > nst;
-      if let Some(lpt) = options.logprob_threshold
-        && result.avg_logprob > lpt
-      {
-        should_skip = false;
+  for (seek_clip_start, seek_clip_end) in seek_clips {
+    let mut seek = seek_clip_start;
+    // `compute_seek_clips` saturates every clip into `[0, content_frames]` and
+    // drops inverted/zero-length clips, so `seek_clip_end <= content_frames` and
+    // `seek_clip_start < seek_clip_end` always hold here. The extra `seek <
+    // content_frames` guard plus the saturating `segment_size` below are belt-
+    // and-braces: even a degenerate clip would contribute no windows (a zero
+    // `segment_size` exits the loop) rather than spin or underflow.
+    while seek < seek_clip_end && seek < content_frames {
+      let time_offset = seek as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+      // Bound the window by the clip end as well as the audio end
+      // (`whisper.py:1024-1026`). Saturating subtraction keeps `segment_size`
+      // non-negative for any clip: a window that has run out of content frames
+      // yields `segment_size == 0`, ending the loop instead of underflowing.
+      let segment_size = N_FRAMES
+        .min(content_frames.saturating_sub(seek))
+        .min(seek_clip_end.saturating_sub(seek));
+      if segment_size == 0 {
+        break;
       }
-      if should_skip {
-        seek += segment_size;
-        continue;
-      }
-    }
 
-    let previous_seek = seek;
-    // Timestamp-aware segment cut (`whisper.py:1081-1149`): find consecutive
-    // timestamp pairs to cut sub-segments, else one segment for the whole
-    // window. Collect into a per-window `current_segments` (the reference's
-    // local list) — the global `segments` / `all_text` are extended below, so
-    // the word-timestamp / hallucination pass can adjust this window first.
-    let tokens = &result.tokens;
-    let mut current_segments: Vec<Segment> = Vec::new();
-    let (advance, single_timestamp_ending) = advance_and_collect_segments(
-      tokens,
-      timestamp_begin,
-      time_offset,
-      time_precision,
-      segment_size,
-      input_stride,
-      &result,
-      tokenizer,
-      &mut current_segments,
-    )?;
-    seek += advance;
+      // mel[seek : seek + segment_size], padded to N_FRAMES.
+      let mel_segment = slice_frames(mel, seek, segment_size)?;
+      let mel_segment = pad_or_trim(&mel_segment, N_FRAMES, 0)?;
 
-    if options.word_timestamps {
-      // Attach per-word timings + apply the duration hacks (`whisper.py:1151-
-      // 1161`), then re-derive `seek` from the last word end and run the
-      // hallucination-silence skip. `skip_window` signals the reference's
-      // leading-silence `continue` (the window's segments are dropped).
-      let outcome = apply_word_timestamps(
+      // Condition this window on the running transcript
+      // (`whisper.py:1033`: `decode_options["prompt"] = all_tokens[reset:]`).
+      // `window_prompt` already trims to the decoder-visible tail
+      // (`build_initial_tokens` keeps only the last `n_text_ctx / 2 - 1`), so
+      // this clones exactly the tokens the decode will use. `decode_template`
+      // already has an empty `prompt`, so this clone copies no caller prompt.
+      let mut decode_options = decode_template.clone();
+      decode_options.prompt = history.window_prompt(n_text_ctx).to_vec();
+
+      let result = decode_with_fallback(
         model,
         tokenizer,
         &mel_segment,
-        segment_size,
-        time_offset,
-        previous_seek,
-        seek,
-        single_timestamp_ending,
-        &mut current_segments,
-        &mut last_speech_timestamp,
-        content_frames,
-        options,
+        &decode_options,
+        &language,
+        &options.temperatures,
+        options.compression_ratio_threshold,
+        options.logprob_threshold,
+        options.no_speech_threshold,
       )?;
-      seek = outcome.seek;
-      if outcome.skip_window {
-        continue;
+
+      // No-voice-activity skip (`whisper.py:1038-1050`): skip silent windows,
+      // unless the logprob is high enough to override.
+      if let Some(nst) = options.no_speech_threshold {
+        let mut should_skip = result.no_speech_prob > nst;
+        if let Some(lpt) = options.logprob_threshold
+          && result.avg_logprob > lpt
+        {
+          should_skip = false;
+        }
+        if should_skip {
+          seek += segment_size;
+          continue;
+        }
       }
 
-      // Clear degenerate segments before accumulating (`whisper.py:1253-1261`):
-      // a segment that is instantaneous (`start == end`) or whose text is
-      // whitespace-only has its text, tokens, and words emptied. This is part of
-      // the word-timestamp finalization, so it is gated to the word-timestamp
-      // path: the default `word_timestamps == false` path stays byte-identical
-      // to the pre-feature behavior (every segment emitted with its sampled
-      // tokens / text intact), which callers reading `Segment.tokens` rely on.
-      clear_degenerate_segments(&mut current_segments);
-    }
+      let previous_seek = seek;
+      // Timestamp-aware segment cut (`whisper.py:1081-1149`): find consecutive
+      // timestamp pairs to cut sub-segments, else one segment for the whole
+      // window. Collect into a per-window `current_segments` (the reference's
+      // local list) — the global `segments` / `all_text` are extended below, so
+      // the word-timestamp / hallucination pass can adjust this window first.
+      let tokens = &result.tokens;
+      let mut current_segments: Vec<Segment> = Vec::new();
+      let (advance, single_timestamp_ending) = advance_and_collect_segments(
+        tokens,
+        timestamp_begin,
+        time_offset,
+        time_precision,
+        segment_size,
+        input_stride,
+        &result,
+        tokenizer,
+        &mut current_segments,
+      )?;
+      seek += advance;
 
-    // Append this window's segments + their text to the running totals.
-    for segment in &current_segments {
-      all_text.push_str(&segment.text);
+      if options.word_timestamps {
+        // Attach per-word timings + apply the duration hacks (`whisper.py:1151-
+        // 1161`), then re-derive `seek` from the last word end and run the
+        // hallucination-silence skip. `skip_window` signals the reference's
+        // leading-silence `continue` (the window's segments are dropped).
+        let outcome = apply_word_timestamps(
+          model,
+          tokenizer,
+          &mel_segment,
+          segment_size,
+          time_offset,
+          previous_seek,
+          seek,
+          single_timestamp_ending,
+          &mut current_segments,
+          &mut last_speech_timestamp,
+          content_frames,
+          options,
+        )?;
+        seek = outcome.seek;
+        if outcome.skip_window {
+          continue;
+        }
+
+        // Clear degenerate segments before accumulating (`whisper.py:1253-1261`):
+        // a segment that is instantaneous (`start == end`) or whose text is
+        // whitespace-only has its text, tokens, and words emptied. This is part of
+        // the word-timestamp finalization, so it is gated to the word-timestamp
+        // path: the default `word_timestamps == false` path stays byte-identical
+        // to the pre-feature behavior (every segment emitted with its sampled
+        // tokens / text intact), which callers reading `Segment.tokens` rely on.
+        clear_degenerate_segments(&mut current_segments);
+      }
+
+      // Thread this window's decoded tokens into the prompt history, then apply
+      // the reset rule (`whisper.py:1271-1281`). This runs only for non-skipped
+      // windows (the silence / leading-silence `continue` paths above bypass it,
+      // matching the reference's bottom-of-loop `all_tokens.extend`), so a skipped
+      // window leaves the next window's prompt unchanged.
+      history.push_window(
+        current_segments.iter().flat_map(|s| s.tokens.iter()),
+        result.temperature,
+      );
+
+      // Append this window's segments + their text to the running totals.
+      for segment in &current_segments {
+        all_text.push_str(&segment.text);
+      }
+      segments.append(&mut current_segments);
     }
-    segments.append(&mut current_segments);
   }
 
   Ok(TranscribeResult {
@@ -1927,8 +2303,20 @@ fn is_segment_anomaly_at(segments: &[Segment], idx: usize) -> bool {
 
 /// `round(seconds * FRAMES_PER_SECOND)` clamped non-negative — the seek
 /// frame conversion (`whisper.py`'s `round(... * FRAMES_PER_SECOND)`).
+///
+/// Python's `round()` rounds halves to the nearest **even** integer (banker's
+/// rounding: `round(12.5) == 12`, `round(13.5) == 14`), whereas Rust's
+/// [`f64::round`] rounds halves **away from zero** (`12.5 → 13`). A clip
+/// timestamp landing exactly on a half-frame would therefore map to a different
+/// frame than the reference and shift a clip boundary by one frame, so this
+/// uses [`f64::round_ties_even`] to match Python's `round()` exactly. Every
+/// caller mirrors a reference `round(... * FRAMES_PER_SECOND)` (the
+/// `clip_timestamps` seek points at `whisper.py:921` and the word-timestamp /
+/// hallucination seek re-derivations at `:1169`, `:1182`, `:1193`, `:1226`);
+/// the `last_timestamp_pos * input_stride` advance at `:1127` is integer
+/// arithmetic with no rounding and is computed without this helper.
 fn round_to_frames(seconds: f64) -> usize {
-  let frames = (seconds * FRAMES_PER_SECOND as f64).round();
+  let frames = (seconds * FRAMES_PER_SECOND as f64).round_ties_even();
   if frames <= 0.0 { 0 } else { frames as usize }
 }
 

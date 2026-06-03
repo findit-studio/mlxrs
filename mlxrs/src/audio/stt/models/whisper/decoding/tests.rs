@@ -1795,6 +1795,1030 @@ fn transcribe_word_timestamps_attaches_monotonic_words() {
   assert!(saw_words, "word_timestamps should attach at least one word");
 }
 
+// ──────────────── condition_on_previous_text + initial_prompt ──────────────
+
+/// A text-context length large enough that `window_prompt`'s tail bound
+/// (`n_text_ctx / 2 - 1`) is a no-op for the short prompts these threading /
+/// reset / seed tests use, so they assert the full active slice exactly as the
+/// reference threads it. (Whisper's real `n_text_ctx` is 448; any value whose
+/// `n / 2 - 1` exceeds the test prompt lengths works.) The bound itself is
+/// exercised separately by [`window_prompt_bounds_to_decoder_tail`].
+const WIDE_CTX: usize = 448;
+
+#[test]
+fn prompt_history_threads_previous_window_tokens() {
+  // The seek loop's prompt mechanism (`whisper.py:1033`, `:1271-1277`): the
+  // prompt for window N+1 is `all_tokens[prompt_reset_since:]`, which (with
+  // conditioning on) accumulates every prior window's decoded tokens. Starts
+  // empty, then each pushed window's tokens appear in the next window's prompt.
+  let dir = fresh_dir("prompt_thread");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let mut history = PromptHistory::seed(
+    &w,
+    None,
+    /* decode_prompt */ &[],
+    /* condition */ true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  // First window: no prior text → empty prompt.
+  assert!(history.window_prompt(WIDE_CTX).is_empty());
+
+  // After window 1 (tokens [12, 13], greedy temp 0.0), window 2's prompt is
+  // exactly those tokens.
+  history.push_window([12u32, 13].iter(), 0.0);
+  assert_eq!(history.window_prompt(WIDE_CTX), &[12, 13]);
+
+  // After window 2 (tokens [0, 1]), window 3's prompt contains BOTH windows'
+  // tokens, in order.
+  history.push_window([0u32, 1].iter(), 0.0);
+  assert_eq!(history.window_prompt(WIDE_CTX), &[12, 13, 0, 1]);
+}
+
+#[test]
+fn window_prompt_bounds_to_decoder_tail() {
+  // `window_prompt(n_text_ctx)` returns only the LAST `n_text_ctx / 2 - 1`
+  // tokens of the active slice — exactly the tail `build_initial_tokens`
+  // (`decoding.py:539-549`) keeps. With n_text_ctx = 8 the bound is
+  // `(8 / 2) - 1 = 3`, so a history longer than 3 tokens yields its last 3.
+  let dir = fresh_dir("window_prompt_bound");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  const N_CTX: usize = 8;
+  let keep = (N_CTX / 2) - 1; // 3
+
+  let mut history = PromptHistory::seed(&w, None, /* decode_prompt */ &[], true, N_CTX).unwrap();
+  // Accumulate 5 tokens across two windows (> keep), conditioning on.
+  history.push_window([10u32, 11, 12].iter(), 0.0);
+  history.push_window([13u32, 14].iter(), 0.0);
+  // Active slice would be [10, 11, 12, 13, 14]; the bound keeps the last 3.
+  let bounded = history.window_prompt(N_CTX);
+  assert_eq!(
+    bounded.len(),
+    keep,
+    "window_prompt must cap at n_text_ctx / 2 - 1"
+  );
+  assert_eq!(
+    bounded,
+    &[12, 13, 14],
+    "the kept tokens are the active-slice tail"
+  );
+
+  // A history shorter than `keep` is returned whole (no padding, no panic).
+  let mut short = PromptHistory::seed(&w, None, &[], true, N_CTX).unwrap();
+  short.push_window([20u32, 21].iter(), 0.0);
+  assert_eq!(short.window_prompt(N_CTX), &[20, 21]);
+}
+
+#[test]
+fn window_prompt_bound_is_byte_identical_to_build_initial_tokens() {
+  // Behavior preservation: bounding the prompt slice to the last `n / 2 - 1`
+  // tokens cannot change the decode, because `build_initial_tokens` itself keeps
+  // only the last `n / 2 - 1` prompt tokens. Feeding it the FULL active slice
+  // and feeding it `window_prompt`'s bounded tail must yield byte-identical
+  // initial tokens (the prompt prefix the decoder actually sees). We assert that
+  // equivalence directly against the real `build_initial_tokens`.
+  let dir = fresh_dir("window_prompt_equiv");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  const N_CTX: usize = 8;
+  let sot_sequence = w.sot_sequence();
+  let sample_len = 3usize; // any fixed sample budget — does not affect the prompt tail
+
+  // A long active prompt (> the `n / 2 - 1 = 3` bound).
+  let full_prompt: Vec<u32> = vec![1, 2, 3, 12, 13, 0, 1];
+  let bounded_prompt: Vec<u32> = {
+    let mut history = PromptHistory::seed(&w, None, &[], true, N_CTX).unwrap();
+    history.push_window(full_prompt.iter(), 0.0);
+    history.window_prompt(N_CTX).to_vec()
+  };
+  // The slice handed to the decoder is strictly shorter (prefix dropped).
+  assert!(
+    bounded_prompt.len() < full_prompt.len(),
+    "the bound must drop the unused prefix for a long history"
+  );
+
+  let init_full = build_initial_tokens(
+    &w,
+    &sot_sequence,
+    &DecodingOptions {
+      prompt: full_prompt,
+      ..Default::default()
+    },
+    N_CTX,
+    sample_len,
+  );
+  let init_bounded = build_initial_tokens(
+    &w,
+    &sot_sequence,
+    &DecodingOptions {
+      prompt: bounded_prompt,
+      ..Default::default()
+    },
+    N_CTX,
+    sample_len,
+  );
+  assert_eq!(
+    init_full, init_bounded,
+    "bounding the prompt to the decoder tail must not change the initial tokens"
+  );
+}
+
+#[test]
+fn prompt_history_condition_false_resets_each_window() {
+  // `condition_on_previous_text == false` (`whisper.py:1279-1281`): every
+  // window resets the prompt window to the running tail, so a window is never
+  // conditioned on the previous one (the next window's prompt is empty).
+  let dir = fresh_dir("prompt_no_cond");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let mut history = PromptHistory::seed(
+    &w,
+    None,
+    /* decode_prompt */ &[],
+    /* condition */ false,
+    WIDE_CTX,
+  )
+  .unwrap();
+  history.push_window([12u32, 13].iter(), 0.0);
+  assert!(
+    history.window_prompt(WIDE_CTX).is_empty(),
+    "condition_on_previous_text=false must reset the prompt each window"
+  );
+  history.push_window([0u32].iter(), 0.0);
+  assert!(history.window_prompt(WIDE_CTX).is_empty());
+}
+
+#[test]
+fn prompt_history_high_temperature_resets() {
+  // A window whose result temperature > 0.5 resets the prompt regardless of
+  // conditioning (`whisper.py:1279`: `or result.temperature > 0.5`) — a
+  // high-temperature fallback decode must not condition the next window.
+  let dir = fresh_dir("prompt_high_temp");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let mut history = PromptHistory::seed(
+    &w,
+    None,
+    /* decode_prompt */ &[],
+    /* condition */ true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  // A low-temperature window conditions normally.
+  history.push_window([12u32].iter(), 0.5); // exactly 0.5 is NOT > 0.5 → keep
+  assert_eq!(history.window_prompt(WIDE_CTX), &[12]);
+  // A window at temperature > 0.5 resets: the next window's prompt is empty.
+  history.push_window([13u32].iter(), 0.6);
+  assert!(
+    history.window_prompt(WIDE_CTX).is_empty(),
+    "temperature > 0.5 must reset the prompt window"
+  );
+}
+
+#[test]
+fn prompt_history_initial_prompt_seeds_first_window() {
+  // `initial_prompt` (`whisper.py:990-994`) is encoded (with a leading space,
+  // stripped body) and seeds `all_tokens`, so the FIRST window's prompt is
+  // exactly the initial-prompt tokens.
+  let dir = fresh_dir("prompt_initial");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  // " c d" → tokens [12, 13] under the fixture tokenizer (whitespace pre-tok,
+  // word-level vocab). The leading-space + strip matches the reference's
+  // `encode(" " + initial_prompt.strip())`.
+  let expected = w.encode(" c d").unwrap();
+  let history = PromptHistory::seed(
+    &w,
+    Some("  c d  "),
+    /* decode_prompt */ &[],
+    /* condition */ true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  assert_eq!(
+    history.window_prompt(WIDE_CTX),
+    expected.as_slice(),
+    "initial_prompt must seed the first window's prompt (leading space, trimmed)"
+  );
+  assert!(
+    !expected.is_empty(),
+    "fixture initial prompt must be non-empty"
+  );
+}
+
+#[test]
+fn transcribe_initial_prompt_absent_from_final_text() {
+  // The initial prompt conditions the decode but is NEVER part of the emitted
+  // transcript (`whisper.py:1299` strips it; mlxrs builds the text from segment
+  // texts, which never contain the prompt). The decoded text here is the biased
+  // token "b" (id 1), so the prompt word "d" must not leak into the result.
+  let dir = fresh_dir("transcribe_initial_prompt");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1); // bias decode toward "b"
+
+  let mel = tiny_mel();
+  let mut options = TranscribeOptions::default();
+  options.decode.language = Some("en".into());
+  options.decode.without_timestamps = true;
+  options.decode.suppress_blank = false;
+  options.decode.suppress_tokens = SuppressSpec::None;
+  options.decode.sample_len = Some(3);
+  options.temperatures = vec![0.0];
+  options.compression_ratio_threshold = None;
+  options.logprob_threshold = None;
+  options.no_speech_threshold = None;
+  options.initial_prompt = Some("d".to_string()); // "d" is id 13
+
+  let result = transcribe(
+    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+  )
+  .unwrap();
+  assert!(
+    !result.text.contains('d'),
+    "initial_prompt text must not leak into the transcript, got {:?}",
+    result.text
+  );
+}
+
+#[test]
+fn transcribe_condition_on_previous_text_runs_both_modes() {
+  // The conditioning wiring must drive the seek loop to completion in BOTH
+  // modes (true / false) over a multi-window mel, producing segments and never
+  // panicking — a smoke test that the per-window prompt plumbing is sound.
+  let dir = fresh_dir("transcribe_cond_modes");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1); // bias decode toward "b"
+
+  // Two real content windows: a (2*N_FRAMES + pad)-frame mel, content_frames =
+  // 2*N_FRAMES so the seek loop decodes exactly two windows.
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+
+  for condition in [true, false] {
+    let mut options = TranscribeOptions::default();
+    options.decode.language = Some("en".into());
+    options.decode.without_timestamps = true;
+    options.decode.suppress_blank = false;
+    options.decode.suppress_tokens = SuppressSpec::None;
+    options.decode.sample_len = Some(2);
+    options.temperatures = vec![0.0];
+    options.compression_ratio_threshold = None;
+    options.logprob_threshold = None;
+    options.no_speech_threshold = None;
+    options.condition_on_previous_text = condition;
+
+    let result = transcribe(
+      &model,
+      &w,
+      &mel,
+      /* content_frames */ 2 * N_FRAMES,
+      &options,
+    )
+    .unwrap();
+    assert!(
+      result.segments.len() >= 2,
+      "two content windows should yield >= 2 segments (condition={condition}), got {}",
+      result.segments.len()
+    );
+  }
+}
+
+// ────────────────────────────── clip_timestamps ───────────────────────────
+
+#[test]
+fn compute_seek_clips_empty_spans_whole_audio() {
+  // An empty `clip_timestamps` reproduces the reference default `"0"` → `[0.0]`
+  // → one clip `[0, content_frames)` (`whisper.py:923-931`).
+  assert_eq!(compute_seek_clips(&[], 5000).unwrap(), vec![(0, 5000)]);
+}
+
+#[test]
+fn compute_seek_clips_even_list_pairs_and_clamps_last() {
+  // An even-length list pairs as (start, end) and clamps the final end to
+  // `content_frames` (`whisper.py:928`). At 100 frames/s, 1.0 s → 100 frames,
+  // 2.0 s → 200; with content_frames = 150 the last end clamps to 150.
+  assert_eq!(
+    compute_seek_clips(&[1.0, 2.0], 150).unwrap(),
+    vec![(100, 150)]
+  );
+  // No clamp needed when within bounds.
+  assert_eq!(
+    compute_seek_clips(&[1.0, 2.0], 5000).unwrap(),
+    vec![(100, 200)]
+  );
+}
+
+#[test]
+fn compute_seek_clips_odd_list_open_ended_last() {
+  // An odd-length list leaves the final clip open-ended: its end defaults to
+  // `content_frames` (`whisper.py:925-926`).
+  assert_eq!(compute_seek_clips(&[1.0], 5000).unwrap(), vec![(100, 5000)]);
+  assert_eq!(
+    compute_seek_clips(&[1.0, 2.0, 3.0], 5000).unwrap(),
+    vec![(100, 200), (300, 5000)]
+  );
+}
+
+#[test]
+fn compute_seek_clips_multiple_pairs() {
+  // A flat list interleaves into (start, end) pairs via zip(points[::2],
+  // points[1::2]) (`whisper.py:929-931`).
+  assert_eq!(
+    compute_seek_clips(&[1.0, 2.0, 3.0, 4.0], 5000).unwrap(),
+    vec![(100, 200), (300, 400)]
+  );
+}
+
+#[test]
+fn compute_seek_clips_clamps_every_earlier_pair() {
+  // Soundness: an EARLIER pair whose end exceeds `content_frames` is clamped to
+  // `content_frames` (not just the final pair) so the seek loop's `content_frames
+  // - seek` / `seek_clip_end - seek` arithmetic can never underflow and the loop
+  // cannot spin past the real audio. `[0.0, 9999.0, 0.01, 0.02]` at 100 frames/s
+  // → points `[0, 999900, 1, 2]`; with content_frames=150 the first end clamps
+  // to 150, and the (1, 2) clip survives unchanged.
+  assert_eq!(
+    compute_seek_clips(&[0.0, 9999.0, 0.01, 0.02], 150).unwrap(),
+    vec![(0, 150), (1, 2)]
+  );
+  // A start beyond `content_frames` clamps to `content_frames`, making the clip
+  // degenerate (`start >= end`), so it is dropped — it would contribute no
+  // windows. `[99.0, 100.0]` → `[9900, 10000]`; with content_frames=150 both
+  // clamp to 150 ⇒ inverted ⇒ dropped.
+  assert!(compute_seek_clips(&[99.0, 100.0], 150).unwrap().is_empty());
+}
+
+#[test]
+fn compute_seek_clips_drops_inverted_and_zero_length() {
+  // An inverted clip (`start > end`) is dropped — it has no frames to decode.
+  // `[2.0, 1.0]` → `[200, 100]` ⇒ start > end ⇒ dropped.
+  assert!(compute_seek_clips(&[2.0, 1.0], 5000).unwrap().is_empty());
+  // A zero-length clip (`start == end`) is likewise dropped.
+  assert!(compute_seek_clips(&[1.0, 1.0], 5000).unwrap().is_empty());
+  // An inverted EARLIER pair is dropped while a valid later pair survives.
+  assert_eq!(
+    compute_seek_clips(&[2.0, 1.0, 3.0, 4.0], 5000).unwrap(),
+    vec![(300, 400)]
+  );
+}
+
+#[test]
+fn compute_seek_clips_fully_out_of_range_is_empty() {
+  // A clip list entirely beyond `content_frames` yields no clips at all (every
+  // pair clamps to `content_frames` and inverts to zero-length), so the seek
+  // loop runs zero windows rather than hanging or underflowing.
+  assert!(
+    compute_seek_clips(&[100.0, 200.0, 300.0, 400.0], 50)
+      .unwrap()
+      .is_empty()
+  );
+}
+
+#[test]
+fn compute_seek_clips_zero_content_frames_is_empty() {
+  // With no content frames the single default clip `[0, 0)` is zero-length and
+  // dropped: the loop runs nothing (equivalent to the pre-clamp `[(0, 0)]`,
+  // whose `while seek < 0` never executed).
+  assert!(compute_seek_clips(&[], 0).unwrap().is_empty());
+}
+
+#[test]
+fn round_to_frames_rounds_ties_to_even() {
+  // Python's `round()` (used for the `clip_timestamps` → frame conversion at
+  // `whisper.py:921` and the seek re-derivations) rounds halves to the nearest
+  // EVEN integer, unlike Rust's away-from-zero `f64::round`. At 100 frames/s a
+  // half-frame second `frame / 100` must therefore land on the even neighbor:
+  // 12.5 → 12, 13.5 → 14, 0.5 → 0, 1.5 → 2. (Verified against CPython's
+  // `round(x * 100)` for the same inputs.)
+  assert_eq!(round_to_frames(0.125), 12); // 12.5 → 12 (even), NOT 13
+  assert_eq!(round_to_frames(0.135), 14); // 13.5 → 14 (even)
+  assert_eq!(round_to_frames(0.005), 0); //  0.5 → 0  (even)
+  assert_eq!(round_to_frames(0.015), 2); //  1.5 → 2  (even)
+  // Non-half values round to the nearest as usual.
+  assert_eq!(round_to_frames(0.124), 12); // 12.4 → 12
+  assert_eq!(round_to_frames(0.126), 13); // 12.6 → 13
+  // Negative / zero seconds clamp to 0 (no negative seek frame).
+  assert_eq!(round_to_frames(-1.0), 0);
+}
+
+#[test]
+fn compute_seek_clips_half_frame_pairs_use_ties_even() {
+  // A clip whose endpoints land exactly on half-frames must map to the same
+  // frame boundaries CPython produces. start 0.115 s (11.5 frames) and end
+  // 0.135 s (13.5 frames): ties-even gives (12, 14). Away-from-zero rounding
+  // would have given (12, 14) here too for the end, but the boundary-shift case
+  // below is where the two diverge — this pins the non-degenerate mapping.
+  assert_eq!(
+    compute_seek_clips(&[0.115, 0.135], 5000).unwrap(),
+    vec![(12, 14)]
+  );
+  // start 0.125 s (12.5 → 12 even) end 0.145 s (14.5 → 14 even) ⇒ (12, 14).
+  assert_eq!(
+    compute_seek_clips(&[0.125, 0.145], 5000).unwrap(),
+    vec![(12, 14)]
+  );
+}
+
+#[test]
+fn compute_seek_clips_ties_even_collapses_degenerate_pair() {
+  // The faithfulness-critical case: a pair that is NON-empty under Rust's
+  // away-from-zero rounding but reference-DEGENERATE under Python's ties-even,
+  // so the reference drops it. start 0.115 s (11.5 frames) and end 0.125 s
+  // (12.5 frames):
+  //   away-from-zero: 11.5 → 12, 12.5 → 13  ⇒ (12, 13) — a spurious 1-frame clip
+  //   ties-even     : 11.5 → 12, 12.5 → 12  ⇒ (12, 12) — degenerate ⇒ dropped
+  // Matching Python, mlxrs must drop it (emit no clip), not decode a stray frame.
+  assert!(
+    compute_seek_clips(&[0.115, 0.125], 5000)
+      .unwrap()
+      .is_empty(),
+    "a ties-even-degenerate clip must be dropped, matching Python round()"
+  );
+}
+
+#[test]
+fn compute_seek_clips_rejects_non_finite() {
+  // Python parity + soundness: CPython's `round()` raises on `round(nan)`
+  // (`ValueError`) and `round(inf)` (`OverflowError`) (`whisper.py:921`), but a
+  // Rust `f64 as usize` cast would silently coerce `NaN → 0` and `inf →
+  // usize::MAX`, turning a bogus `clip_timestamps` value into a degenerate (or
+  // full-audio) clip instead of an error. Each non-finite value must therefore
+  // be rejected with a typed `Error::OutOfRange` (not a silent wrong-range clip).
+  for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    let err = compute_seek_clips(&[bad], 5000)
+      .expect_err("a non-finite clip timestamp must be rejected, not coerced");
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(p.context(), "clip_timestamps: timestamp (seconds)");
+        assert_eq!(p.requirement(), "must be finite");
+      }
+      other => panic!("expected Error::OutOfRange for {bad}, got {other:?}"),
+    }
+  }
+  // A non-finite value anywhere in the list (not just first) is still rejected,
+  // before any clip is produced.
+  assert!(
+    matches!(
+      compute_seek_clips(&[1.0, 2.0, f64::NAN, 4.0], 5000),
+      Err(Error::OutOfRange(_))
+    ),
+    "a non-finite value at a later position must still be rejected"
+  );
+  // Finite lists (including the degenerate/negative cases above) and the empty
+  // list keep working unchanged — only non-finite input is rejected.
+  assert_eq!(
+    compute_seek_clips(&[1.0, 2.0], 5000).unwrap(),
+    vec![(100, 200)]
+  );
+  assert_eq!(compute_seek_clips(&[], 5000).unwrap(), vec![(0, 5000)]);
+}
+
+#[test]
+fn compute_seek_clips_rejects_overflowing_frame_product() {
+  // Python parity + soundness (finding 1): a FINITE but huge clip timestamp
+  // passes the `is_finite()` input check, yet `ts * FRAMES_PER_SECOND` overflows
+  // to `±inf`. CPython's `round(finite * FRAMES_PER_SECOND)` raises
+  // `OverflowError` the moment that product is infinite (`whisper.py:921`),
+  // whereas Rust's `f64 as usize` cast inside `round_to_frames` would silently
+  // saturate it (`+inf → usize::MAX`, `-inf → 0`) — turning the bogus clip into a
+  // full-audio (`+1e307`) or empty (`-1e307`) one. The product overflow must
+  // therefore be rejected with a typed `Error::OutOfRange`, never coerced.
+  // (`1e307 * 100 == 1e309 > f64::MAX ⇒ inf`; the input itself is finite.)
+  for bad in [1e307_f64, -1e307_f64, f64::MAX, -f64::MAX] {
+    assert!(bad.is_finite(), "the input timestamp must itself be finite");
+    let err = compute_seek_clips(&[bad], 5000)
+      .expect_err("a finite timestamp whose FRAMES_PER_SECOND product overflows must be rejected");
+    match err {
+      Error::OutOfRange(p) => {
+        assert_eq!(
+          p.context(),
+          "clip_timestamps: timestamp (seconds) × FRAMES_PER_SECOND"
+        );
+        assert_eq!(p.requirement(), "frame product must be finite");
+      }
+      other => panic!("expected Error::OutOfRange for {bad}, got {other:?}"),
+    }
+  }
+  // The overflowing value is caught even at a later list position, before any
+  // clip is produced (mirrors the non-finite-input behavior).
+  assert!(
+    matches!(
+      compute_seek_clips(&[1.0, 2.0, 1e307, 4.0], 5000),
+      Err(Error::OutOfRange(_))
+    ),
+    "an overflowing product at a later position must still be rejected"
+  );
+  // A merely large — but non-overflowing — finite timestamp is NOT rejected: its
+  // product stays finite, it rounds, and the out-of-range frame index is clamped
+  // to `content_frames` by the normal pairing path (not an error). `1e6 s` →
+  // `1e8` frames, finite, clamped to `content_frames`.
+  assert_eq!(
+    compute_seek_clips(&[0.0, 1e6], 5000).unwrap(),
+    vec![(0, 5000)],
+    "a large-but-finite product must round + clamp, not error"
+  );
+}
+
+#[test]
+fn transcribe_clip_timestamps_restricts_windows() {
+  // A clip list restricts decoding to the specified frame range: with a single
+  // clip `[N_FRAMES, 2*N_FRAMES)` over a two-window mel, the loop seeks PAST the
+  // first window, so every emitted segment starts at or after the clip start
+  // time (`whisper.py:1018-1026`). The clip start is N_FRAMES frames = 30 s.
+  let dir = fresh_dir("transcribe_clip_restrict");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1); // bias decode toward "b"
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let clip_start_secs = N_FRAMES as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+  let clip_end_secs = 2.0 * clip_start_secs;
+
+  let mut options = TranscribeOptions::default();
+  options.decode.language = Some("en".into());
+  options.decode.without_timestamps = true;
+  options.decode.suppress_blank = false;
+  options.decode.suppress_tokens = SuppressSpec::None;
+  options.decode.sample_len = Some(2);
+  options.temperatures = vec![0.0];
+  options.compression_ratio_threshold = None;
+  options.logprob_threshold = None;
+  options.no_speech_threshold = None;
+  options.clip_timestamps = vec![clip_start_secs, clip_end_secs];
+
+  let result = transcribe(
+    &model,
+    &w,
+    &mel,
+    /* content_frames */ 2 * N_FRAMES,
+    &options,
+  )
+  .unwrap();
+  assert!(
+    !result.segments.is_empty(),
+    "the clip window should still decode"
+  );
+  for seg in &result.segments {
+    assert!(
+      seg.start + 1e-6 >= clip_start_secs,
+      "segment start {} is before the clip start {clip_start_secs}",
+      seg.start
+    );
+  }
+}
+
+#[test]
+fn transcribe_empty_clip_timestamps_matches_full_audio() {
+  // Regression guard: an empty `clip_timestamps` (the default) produces byte-
+  // identical output to today's full-audio path — same segment count + texts +
+  // timings + final text. Compares a default-clip run against an explicit
+  // empty-clip run over the same two-window mel.
+  let dir = fresh_dir("transcribe_clip_regression");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let base = || {
+    let mut o = TranscribeOptions::default();
+    o.decode.language = Some("en".into());
+    o.decode.without_timestamps = true;
+    o.decode.suppress_blank = false;
+    o.decode.suppress_tokens = SuppressSpec::None;
+    o.decode.sample_len = Some(2);
+    o.temperatures = vec![0.0];
+    o.compression_ratio_threshold = None;
+    o.logprob_threshold = None;
+    o.no_speech_threshold = None;
+    o
+  };
+
+  // Default options (clip_timestamps already empty).
+  let full = transcribe(&model, &w, &mel, 2 * N_FRAMES, &base()).unwrap();
+  // Explicit empty clip list → must match.
+  let mut clipped = base();
+  clipped.clip_timestamps = Vec::new();
+  let same = transcribe(&model, &w, &mel, 2 * N_FRAMES, &clipped).unwrap();
+
+  assert_eq!(full.text, same.text);
+  assert_eq!(full.segments.len(), same.segments.len());
+  for (a, b) in full.segments.iter().zip(same.segments.iter()) {
+    assert_eq!(a.text, b.text);
+    assert_eq!(a.tokens, b.tokens);
+    assert_eq!(a.start, b.start);
+    assert_eq!(a.end, b.end);
+  }
+}
+
+/// Shared decode knobs for the clip-soundness / prompt-seed transcribe tests:
+/// deterministic greedy decode, no fallback thresholds, two-token windows.
+fn clip_test_options() -> TranscribeOptions {
+  let mut o = TranscribeOptions::default();
+  o.decode.language = Some("en".into());
+  o.decode.without_timestamps = true;
+  o.decode.suppress_blank = false;
+  o.decode.suppress_tokens = SuppressSpec::None;
+  o.decode.sample_len = Some(2);
+  o.temperatures = vec![0.0];
+  o.compression_ratio_threshold = None;
+  o.logprob_threshold = None;
+  o.no_speech_threshold = None;
+  o
+}
+
+#[test]
+fn transcribe_earlier_overlong_clip_terminates_bounded() {
+  // Soundness (finding 1): a multi-pair clip list whose EARLIER pair end exceeds
+  // the audio length must NOT spin a zero-progress decode loop or underflow. The
+  // first clip `[0, 9999s]` clamps to `[0, content_frames]`; the loop terminates
+  // with a bounded window count (at most one window per `N_FRAMES` stride). A
+  // two-window mel (content_frames = 2*N_FRAMES) yields at most 2 windows ⇒ a
+  // bounded number of segments.
+  let dir = fresh_dir("transcribe_clip_overlong");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let mut options = clip_test_options();
+  // points: [0, 999900, 1, 2]; first end overshoots content_frames=2*N_FRAMES.
+  options.clip_timestamps = vec![0.0, 9999.0, 0.01, 0.02];
+
+  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  // The clamped first clip spans the whole audio ⇒ at most two `N_FRAMES`
+  // windows. Each window emits at least one segment but the total is bounded:
+  // assert termination with a finite, small segment count.
+  assert!(
+    result.segments.len() <= 4,
+    "earlier-overlong clip must terminate with a bounded window count, got {} segments",
+    result.segments.len()
+  );
+}
+
+#[test]
+fn transcribe_clip_start_beyond_eof_contributes_no_windows() {
+  // Soundness (finding 1): a clip whose START is beyond the content frames must
+  // not underflow `content_frames - seek`; the clip simply contributes no
+  // windows. With a lone clip starting at 9999 s over a 60 s mel, the clip is
+  // dropped by `compute_seek_clips` (clamped start == clamped end), so transcribe
+  // returns no segments without panicking.
+  let dir = fresh_dir("transcribe_clip_start_eof");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let mut options = clip_test_options();
+  options.clip_timestamps = vec![9999.0, 10000.0]; // start (and end) past EOF
+
+  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  assert!(
+    result.segments.is_empty(),
+    "a clip starting past EOF must contribute no windows, got {} segments",
+    result.segments.len()
+  );
+}
+
+#[test]
+fn transcribe_fully_out_of_range_clip_list_terminates_empty() {
+  // Soundness (finding 1): a clip list entirely beyond the audio terminates with
+  // empty output (zero windows), never a hang or panic.
+  let dir = fresh_dir("transcribe_clip_oob");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let mut options = clip_test_options();
+  options.clip_timestamps = vec![1000.0, 2000.0, 3000.0, 4000.0];
+
+  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  assert!(
+    result.segments.is_empty(),
+    "a fully out-of-range clip list must yield no segments, got {}",
+    result.segments.len()
+  );
+}
+
+#[test]
+fn transcribe_inverted_clip_is_skipped() {
+  // Soundness (finding 1): an inverted clip (`start > end`) is skipped, while a
+  // following valid clip still decodes. The inverted `[60s, 0s]` pair is dropped;
+  // the `[0s, 60s]` pair (full audio) decodes normally.
+  let dir = fresh_dir("transcribe_clip_inverted");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let full_secs = 2.0 * N_FRAMES as f64 * HOP_LENGTH as f64 / SAMPLE_RATE as f64;
+  let mut options = clip_test_options();
+  options.clip_timestamps = vec![full_secs, 0.0, 0.0, full_secs];
+
+  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  assert!(
+    !result.segments.is_empty() && result.segments.len() <= 4,
+    "inverted clip skipped, the valid clip decodes a bounded window count, got {}",
+    result.segments.len()
+  );
+}
+
+#[test]
+fn prompt_history_falls_back_to_decode_prompt() {
+  // Finding 2: with no `initial_prompt`, the lower-level `decode_prompt`
+  // (`DecodingOptions::prompt`) seeds `all_tokens`, so the FIRST window's prompt
+  // is exactly those caller tokens — honored, not silently dropped.
+  let dir = fresh_dir("prompt_decode_seed");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let history = PromptHistory::seed(
+    &w,
+    /* initial */ None,
+    /* decode_prompt */ &[7, 8, 9],
+    true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  assert_eq!(
+    history.window_prompt(WIDE_CTX),
+    &[7, 8, 9],
+    "decode.prompt must seed the first window when initial_prompt is absent"
+  );
+}
+
+#[test]
+fn prompt_history_initial_prompt_wins_over_decode_prompt() {
+  // Finding 2 precedence: when BOTH are set, `initial_prompt` wins (the
+  // documented knob); `decode_prompt` is ignored in favour of it.
+  let dir = fresh_dir("prompt_initial_wins");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let expected = w.encode(" c d").unwrap();
+  let history = PromptHistory::seed(
+    &w,
+    Some("c d"),
+    /* decode_prompt */ &[7, 8, 9],
+    true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  assert_eq!(
+    history.window_prompt(WIDE_CTX),
+    expected.as_slice(),
+    "initial_prompt must take precedence over decode.prompt when both are set"
+  );
+  assert_ne!(history.window_prompt(WIDE_CTX), &[7, 8, 9]);
+}
+
+#[test]
+fn transcribe_decode_prompt_conditions_first_window() {
+  // Finding 2 end-to-end: a `TranscribeOptions` with `decode.prompt` set (no
+  // `initial_prompt`) still conditions the first window — the first window's
+  // prompt fed to the decoder contains the caller's tokens. We capture window-0's
+  // prompt via a probe model that records the decode prompt it sees.
+  let dir = fresh_dir("transcribe_decode_prompt");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  let mel = tiny_mel();
+  let mut options = clip_test_options();
+  options.decode.sample_len = Some(2);
+  // Seed the caller's lower-level prompt; `initial_prompt` stays None.
+  options.decode.prompt = w.encode(" c d").unwrap();
+  let seed = options.decode.prompt.clone();
+  assert!(!seed.is_empty(), "fixture decode prompt must be non-empty");
+
+  // The seed is honored: build the same history the loop builds for window 0 and
+  // assert it carries the caller's tokens (the loop overwrites
+  // `decode_options.prompt = history.window_prompt(WIDE_CTX)`, which now includes them).
+  let history = PromptHistory::seed(
+    &w,
+    options.initial_prompt.as_deref(),
+    &options.decode.prompt,
+    true,
+    WIDE_CTX,
+  )
+  .unwrap();
+  assert_eq!(
+    history.window_prompt(WIDE_CTX),
+    seed.as_slice(),
+    "decode.prompt must condition window 0"
+  );
+
+  // And the full transcribe runs to completion with that seed (no panic, the
+  // prompt is not rejected).
+  let result = transcribe(&model, &w, &mel, N_FRAMES, &options).unwrap();
+  assert!(
+    !result.segments.is_empty(),
+    "the window should still decode"
+  );
+}
+
+#[test]
+fn transcribe_oversized_decode_prompt_is_byte_identical_to_bounded_tail() {
+  // Behavior-preservation: the seek loop builds each window's decode
+  // options from a `decode_template` whose `prompt` is emptied once before the
+  // loop, then installs only the bounded `window_prompt` tail (the last
+  // `n_text_ctx / 2 - 1` tokens, here 3) — the caller's (potentially large)
+  // `decode.prompt` prefix is never re-cloned per window AND never reaches the
+  // decoder beyond that tail. Proof it is byte-identical: a run with an oversized
+  // `decode.prompt` must produce the SAME segments/text as a run whose
+  // `decode.prompt` is pre-truncated to just that tail. (`tiny_model`'s
+  // n_text_ctx = 8 ⇒ keep = 3.)
+  let dir = fresh_dir("transcribe_oversized_prompt");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  // Two-window mel so the per-window construction runs more than once.
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let keep = (model.dims().n_text_ctx() / 2).saturating_sub(1); // == 3
+
+  // An oversized caller prompt: well beyond `keep` tokens. Only its last `keep`
+  // tokens are decoder-visible; the leading prefix is discarded.
+  let oversized: Vec<u32> = vec![1; keep + 12];
+  let tail: Vec<u32> = oversized[oversized.len() - keep..].to_vec();
+  assert_eq!(
+    tail.len(),
+    keep,
+    "control prompt is exactly the bounded tail"
+  );
+
+  let run = |prompt: Vec<u32>| {
+    let mut o = clip_test_options();
+    o.decode.prompt = prompt;
+    transcribe(&model, &w, &mel, 2 * N_FRAMES, &o).unwrap()
+  };
+
+  let big = run(oversized);
+  let bounded = run(tail);
+
+  // Byte-identical decode: same text, same segment count, same per-segment
+  // tokens/text/timings. The discarded prefix changed nothing.
+  assert_eq!(big.text, bounded.text);
+  assert_eq!(big.segments.len(), bounded.segments.len());
+  for (a, b) in big.segments.iter().zip(bounded.segments.iter()) {
+    assert_eq!(a.tokens, b.tokens);
+    assert_eq!(a.text, b.text);
+    assert_eq!(a.start, b.start);
+    assert_eq!(a.end, b.end);
+  }
+}
+
+#[test]
+fn seed_oversized_initial_prompt_retains_only_bounded_tail() {
+  // Finding 2(a) unit: an oversized `initial_prompt` is encoded then bounded to
+  // the decoder-visible tail (`n_text_ctx / 2 - 1`), so `all_tokens` holds at
+  // most `keep` tokens right after seeding — the leading prefix the decoder never
+  // sees is never stored. The retained tail is exactly the last `keep` tokens of
+  // the full encoding.
+  let dir = fresh_dir("seed_oversized_initial");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  const N_CTX: usize = 8;
+  let keep = (N_CTX / 2).saturating_sub(1); // == 3
+
+  // A long initial prompt: `keep + 12` copies of "d" → that many tokens (id 13)
+  // under the fixture tokenizer (leading space + strip ⇒ no extra/blank token).
+  let words = "d ".repeat(keep + 12);
+  let full_encoded = w.encode(&format!(" {}", words.trim())).unwrap();
+  assert!(
+    full_encoded.len() > keep,
+    "the encoded initial prompt must exceed the bound"
+  );
+
+  let history =
+    PromptHistory::seed(&w, Some(&words), /* decode_prompt */ &[], true, N_CTX).unwrap();
+  // Only the bounded tail is retained, not the whole encoding.
+  assert!(
+    history.all_tokens.len() <= keep,
+    "seed must retain only the bounded tail of the initial prompt (<= keep), got {}",
+    history.all_tokens.len()
+  );
+  // And it is exactly the LAST `keep` encoded tokens (the decoder-visible tail).
+  assert_eq!(
+    history.window_prompt(N_CTX),
+    &full_encoded[full_encoded.len() - keep..],
+    "the retained tail must be the last `keep` tokens of the full encoding"
+  );
+}
+
+#[test]
+fn transcribe_oversized_initial_prompt_is_byte_identical_to_bounded_tail() {
+  // Behavior-preservation (finding 2(a)): an oversized `initial_prompt` decodes
+  // byte-identically to a run seeded with only that prompt's decoder-visible tail
+  // — bounding the seed to the last `n_text_ctx / 2 - 1` tokens cannot change the
+  // decode, because `window_prompt` only ever exposes that tail. Control: the
+  // SAME tail fed as a raw `decode.prompt` (no `initial_prompt`) seeds the
+  // identical `all_tokens`, so the two runs must produce identical
+  // segments/text/timings. (`tiny_model`'s n_text_ctx = 8 ⇒ keep = 3.)
+  let dir = fresh_dir("transcribe_oversized_initial");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(1);
+
+  // Two-window mel so the per-window construction runs more than once.
+  let mel = Array::ones::<f32>(&(2 * N_FRAMES + 8, 4usize)).unwrap();
+  let keep = (model.dims().n_text_ctx() / 2).saturating_sub(1); // == 3
+
+  // An oversized initial prompt + the exact decoder-visible tail it bounds to.
+  let words = "d ".repeat(keep + 12);
+  let full_encoded = w.encode(&format!(" {}", words.trim())).unwrap();
+  let tail: Vec<u32> = full_encoded[full_encoded.len() - keep..].to_vec();
+  assert_eq!(tail.len(), keep, "control tail is exactly `keep` tokens");
+
+  // Run A: the oversized initial prompt (bounded internally to its tail).
+  let mut opts_initial = clip_test_options();
+  opts_initial.initial_prompt = Some(words);
+  let from_initial = transcribe(&model, &w, &mel, 2 * N_FRAMES, &opts_initial).unwrap();
+
+  // Run B: the same tail fed as the lower-level decode.prompt (no initial_prompt)
+  // — seeds the identical `all_tokens`, so the decode must match exactly.
+  let mut opts_tail = clip_test_options();
+  opts_tail.decode.prompt = tail;
+  let from_tail = transcribe(&model, &w, &mel, 2 * N_FRAMES, &opts_tail).unwrap();
+
+  assert_eq!(from_initial.text, from_tail.text);
+  assert_eq!(from_initial.segments.len(), from_tail.segments.len());
+  for (a, b) in from_initial.segments.iter().zip(from_tail.segments.iter()) {
+    assert_eq!(a.tokens, b.tokens);
+    assert_eq!(a.text, b.text);
+    assert_eq!(a.start, b.start);
+    assert_eq!(a.end, b.end);
+  }
+}
+
+#[test]
+fn window_prompt_carries_only_bounded_tail_across_windows() {
+  // The per-window prompt is only the bounded tail: the seek loop
+  // installs `history.window_prompt(n_text_ctx)` into each window's decode
+  // options. Even after the running history grows across windows AND starts from
+  // an oversized seed, the prompt handed to every window is only the last
+  // `n_text_ctx / 2 - 1` tokens — the large prefix is never carried per window.
+  let dir = fresh_dir("window_prompt_bounded_tail");
+  let tok = write_tokenizer(dir.as_path());
+  let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+
+  let n_text_ctx = 8usize; // matches `tiny_model`'s dims
+  let keep = (n_text_ctx / 2).saturating_sub(1); // == 3
+
+  // Seed with an oversized decode prompt (no initial_prompt).
+  let oversized: Vec<u32> = (0..(keep as u32 + 20)).collect();
+  let mut history = PromptHistory::seed(&w, None, &oversized, true, n_text_ctx).unwrap();
+
+  // `seed` itself retains only the decoder-visible tail: `all_tokens` holds at
+  // most `keep` tokens right after seeding, never the whole oversized prompt.
+  assert!(
+    history.all_tokens.len() <= keep,
+    "seed must retain only the bounded tail (<= keep), got {} tokens",
+    history.all_tokens.len()
+  );
+
+  // Window 0: the prompt is exactly the bounded tail of the oversized seed — the
+  // large prefix is NOT carried.
+  let w0 = history.window_prompt(n_text_ctx).to_vec();
+  assert_eq!(
+    w0.len(),
+    keep,
+    "window-0 prompt must be the bounded tail length"
+  );
+  assert_eq!(
+    w0.as_slice(),
+    &oversized[oversized.len() - keep..],
+    "window-0 prompt must be exactly the last `keep` seed tokens"
+  );
+
+  // Grow the history across several windows (the loop appends each window's
+  // tokens); the per-window prompt stays bounded to `keep` and tracks the newest
+  // tail, never re-accumulating the discarded prefix.
+  for win in 0..4u32 {
+    history.push_window(&[100 + win, 101 + win], /* temperature */ 0.0);
+    let p = history.window_prompt(n_text_ctx).to_vec();
+    assert_eq!(
+      p.len(),
+      keep,
+      "every window's prompt must stay bounded to `keep` tokens"
+    );
+    // None of the oversized prefix (ids < keep) is ever carried once the history
+    // has grown past it.
+    assert!(
+      p.iter().all(|&t| t >= keep as u32),
+      "the discarded oversized prefix must never reappear in a window prompt"
+    );
+  }
+}
+
 /// A sub-token alignment window (`num_frames / 2 == 0`, i.e. `num_frames < 2`)
 /// has no audio-token columns to align: `find_alignment` must return no word
 /// timings (the faithful degenerate-window result) with no panic and never a
