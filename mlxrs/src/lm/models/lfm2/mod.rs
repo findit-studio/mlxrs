@@ -223,6 +223,38 @@ where
   Ok(opt.map(|b| b.0))
 }
 
+/// `#[serde(deserialize_with)]` shim that materializes a present JSON field —
+/// including an explicit `null` — as `Some`, distinguishing it from an absent
+/// key. Paired with `#[serde(default)]` it produces a "double `Option`":
+///
+/// - absent key ⇒ `None` (from `default`);
+/// - present `null` ⇒ `Some(None)`;
+/// - present value ⇒ `Some(Some(value))`.
+///
+/// Serde's plain `Option<T>` collapses an absent key and an explicit `null` into
+/// the same `None`. [`RawRopeParameters::rope_theta`] uses this so the
+/// raw→public conversion in [`TextConfig`]'s `Deserialize` can tell an EXPLICIT
+/// `rope_parameters.rope_theta: null` apart from an ABSENT `rope_theta`, and
+/// handle the null case as a deliberate, documented fallback rather than an
+/// accidental serde collapse.
+///
+/// The field type is `Option<T>` (here `Option<f32>`); paired with
+/// `#[serde(default)]` the struct field is `Option<Option<f32>>`. This fn only
+/// runs when the key is present (an absent key is filled by the `default` as the
+/// outer `None`), so wrapping the parsed inner `Option<T>` in `Some` yields the
+/// outer `Some(...)`, distinguishing present-null (`Some(None)`) from a value
+/// (`Some(Some(v))`).
+fn deserialize_double_option<'de, D, T>(
+  deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+  T: serde::Deserialize<'de>,
+{
+  let inner: Option<T> = serde::Deserialize::deserialize(deserializer)?;
+  Ok(Some(inner))
+}
+
 // ───────────────────────── config ─────────────────────────
 
 /// LFM2 text-model configuration — mirrors `mlx-vlm`'s `lfm2_vl/config.py`
@@ -269,9 +301,15 @@ pub struct TextConfig {
   /// [`rope_theta`](Self::rope_theta) — upstream `__post_init__`
   /// (`lfm2.py:40-42`): `if rope_parameters is not None and "rope_theta" in
   /// rope_parameters: self.rope_theta = rope_parameters["rope_theta"]`. Absent
-  /// (serde default `None`) ⇒ the top-level `rope_theta` is used unchanged. No
-  /// released LFM2 checkpoint sets this; it is modeled for forward
-  /// compatibility with a variant that does.
+  /// (serde default `None`) ⇒ the top-level `rope_theta` is used unchanged.
+  ///
+  /// An EXPLICIT `rope_parameters.rope_theta: null` is deliberately handled as a
+  /// graceful fallback to the top-level `rope_theta` (parsed via a double
+  /// `Option` in the private `RawRopeParameters` mirror so absent-vs-null is
+  /// distinguished intentionally, not collapsed accidentally). Upstream would
+  /// set `rope_theta = None` and then crash the RoPE construction; mlxrs falls
+  /// back robustly instead. No released LFM2 checkpoint sets this; it is modeled
+  /// for forward compatibility with a variant that does.
   pub rope_parameters: Option<RopeParameters>,
   /// Vocabulary size (logits last-axis width).
   pub vocab_size: i32,
@@ -339,7 +377,7 @@ struct RawTextConfig {
   #[serde(default = "default_rope_theta")]
   rope_theta: f32,
   #[serde(default)]
-  rope_parameters: Option<RopeParameters>,
+  rope_parameters: Option<RawRopeParameters>,
   #[serde(default = "default_vocab_size")]
   vocab_size: i32,
   #[serde(default = "default_norm_eps")]
@@ -364,6 +402,28 @@ struct RawTextConfig {
   full_attn_idxs: Option<Vec<i32>>,
 }
 
+/// Private `#[derive(Deserialize)]` mirror of [`RopeParameters`] used inside
+/// [`RawTextConfig`]. Its `rope_theta` is a **double `Option`**
+/// (`Option<Option<f32>>` via [`deserialize_double_option`]) so the raw→public
+/// conversion in [`TextConfig`]'s `Deserialize` can distinguish three states
+/// that a plain `Option<f32>` collapses into two:
+///
+/// - the `rope_theta` key is ABSENT (`None`) ⇒ no override, keep the top-level
+///   `rope_theta`;
+/// - the key is present with a value (`Some(Some(v))`) ⇒ override
+///   (`lfm2.py:40-42`);
+/// - the key is present and EXPLICITLY `null` (`Some(None)`) ⇒ a deliberate,
+///   documented fallback to the top-level `rope_theta` (see the conversion in
+///   [`TextConfig`]'s `Deserialize`).
+///
+/// The public [`RopeParameters`] keeps its plain `Option<f32>` (no API change);
+/// this raw mirror exists only to drive that three-way decision.
+#[derive(serde::Deserialize)]
+struct RawRopeParameters {
+  #[serde(default, deserialize_with = "deserialize_double_option")]
+  rope_theta: Option<Option<f32>>,
+}
+
 impl<'de> serde::Deserialize<'de> for TextConfig {
   /// Deserialize a [`TextConfig`] via the private `RawTextConfig` mirror, then
   /// apply `__post_init__`'s RoPE-base precedence
@@ -378,6 +438,34 @@ impl<'de> serde::Deserialize<'de> for TextConfig {
     deserializer: D,
   ) -> std::result::Result<Self, D::Error> {
     let raw = RawTextConfig::deserialize(deserializer)?;
+    // Collapse the raw `rope_parameters` (whose `rope_theta` is a double
+    // `Option`) back to the public [`RopeParameters`] (a plain `Option<f32>`),
+    // deliberately distinguishing an EXPLICIT `rope_parameters.rope_theta: null`
+    // from an ABSENT `rope_theta`:
+    //
+    // - the outer map absent ⇒ `None`: no override, keep the top-level
+    //   `rope_theta`;
+    // - `Some(Some(v))` (present value) ⇒ override path, public `rope_theta =
+    //   Some(v)` (`lfm2.py:40-42`); the value flows into the top-level field via
+    //   `apply_rope_parameters_override` below;
+    // - `Some(None)` (EXPLICIT `null`) and a present map whose `rope_theta` is
+    //   ABSENT both map to public `rope_theta = None`, so the override is a
+    //   no-op and the top-level `rope_theta` is kept.
+    //
+    // The `Some(None)` arm is a DELIBERATE robust fallback: a checkpoint that
+    // writes `rope_parameters.rope_theta: null` is handled gracefully — mlxrs
+    // falls back to the top-level `rope_theta` rather than crashing. Upstream
+    // (`lfm2.py:40-42`) reads `rope_parameters["rope_theta"]` unconditionally
+    // once the key is present, so an explicit `null` would set `rope_theta =
+    // None` and then crash the RoPE construction; mlxrs intentionally diverges
+    // here for robustness. Distinguishing the null via the double `Option`
+    // makes this handling intentional and testable rather than an accidental
+    // serde collapse of absent-vs-null.
+    let rope_parameters = raw.rope_parameters.map(|raw_rp| RopeParameters {
+      // `flatten()`: `Some(Some(v)) -> Some(v)` (override),
+      // `Some(None) -> None` (explicit-null fallback), `None -> None` (absent).
+      rope_theta: raw_rp.rope_theta.flatten(),
+    });
     let mut cfg = TextConfig {
       model_type: raw.model_type,
       hidden_size: raw.hidden_size,
@@ -386,7 +474,7 @@ impl<'de> serde::Deserialize<'de> for TextConfig {
       num_key_value_heads: raw.num_key_value_heads,
       max_position_embeddings: raw.max_position_embeddings,
       rope_theta: raw.rope_theta,
-      rope_parameters: raw.rope_parameters,
+      rope_parameters,
       vocab_size: raw.vocab_size,
       norm_eps: raw.norm_eps,
       block_auto_adjust_ff_dim: raw.block_auto_adjust_ff_dim,

@@ -1548,6 +1548,121 @@ fn rope_parameters_absent_or_without_theta_keeps_top_level() {
 }
 
 #[test]
+fn rope_parameters_explicit_null_theta_falls_back_to_top_level_without_error() {
+  // A present `rope_parameters` whose `rope_theta` is EXPLICITLY `null`. The
+  // double-`Option` raw mirror (`RawRopeParameters`) distinguishes this from an
+  // absent `rope_theta`, and the raw->public conversion deliberately treats the
+  // explicit null as a graceful fallback to the top-level `rope_theta`. Upstream
+  // (`lfm2.py:40-42`) would set `rope_theta = None` and crash; mlxrs falls back
+  // robustly and does NOT error. The config must load (validate) with the
+  // top-level value preserved.
+  let null_theta = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {"rope_theta": null}}"#;
+  let cfg = TextConfig::from_json(null_theta)
+    .expect("explicit-null rope_parameters.rope_theta must load (robust fallback, no error)");
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "explicit-null rope_theta falls back to the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an explicit-null rope_theta"
+  );
+
+  // It must also BUILD: a model constructed from the config carries the
+  // top-level base in its attention RoPE (the null did not poison the build).
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let build_json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 4242.0,
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let build_cfg = TextConfig::from_json(&build_json)
+    .expect("explicit-null rope_parameters.rope_theta must load for the build path");
+  let model = Lfm2::from_weights(build_cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 4242.0,
+      "the attention RoPE base falls back to the top-level rope_theta on explicit null"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn rope_parameters_empty_map_keeps_top_level() {
+  // A present but EMPTY `rope_parameters` map (the inner `rope_theta` key is
+  // ABSENT). The double-`Option` mirror yields `None` for the missing key, so
+  // the override is a no-op and the top-level `rope_theta` is kept.
+  let empty = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {}}"#;
+  let cfg = TextConfig::from_json(empty).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "an empty rope_parameters map keeps the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an empty rope_parameters map"
+  );
+}
+
+#[test]
+fn rope_parameters_present_value_overrides_to_5000() {
+  // A present `rope_parameters.rope_theta` value (`Some(Some(v))`) overrides the
+  // top-level `rope_theta` (`lfm2.py:40-42`): top-level 1000 -> effective 5000.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000}}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "a present rope_parameters.rope_theta overrides the top-level value to 5000"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    Some(5000.0),
+    "the public override value is Some(5000) for a present rope_theta"
+  );
+}
+
+#[test]
+fn rope_parameters_explicit_null_and_absent_yield_the_same_effective_theta() {
+  // Pin the deliberate fallback as intentional: an EXPLICIT
+  // `rope_parameters.rope_theta: null` and an ABSENT `rope_parameters` must
+  // produce the SAME effective `rope_theta` (both keep the top-level value). The
+  // double-`Option` mirror distinguishes the two JSON shapes during parsing, but
+  // the resolved RoPE base is identical by design.
+  let top_level = 9001.0;
+  let explicit_null = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level},
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let absent = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level}}}"#
+  );
+  let null_theta = TextConfig::from_json(&explicit_null).unwrap().rope_theta;
+  let absent_theta = TextConfig::from_json(&absent).unwrap().rope_theta;
+  assert_eq!(
+    null_theta, absent_theta,
+    "explicit-null and absent rope_parameters must yield the same effective rope_theta"
+  );
+  assert_eq!(
+    null_theta, top_level,
+    "both resolve to the top-level rope_theta"
+  );
+}
+
+#[test]
 fn rope_parameters_override_reaches_the_built_attention_rope() {
   // The override is applied in `from_json` (the `__post_init__` analogue), so a
   // model built from the overridden config carries the override in its attention
