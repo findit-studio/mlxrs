@@ -146,6 +146,80 @@ fn require_positive_accepts_positive_rejects_zero_and_negative() {
 }
 
 #[test]
+fn require_positive_f64_accepts_positive_rejects_nonpositive_and_nonfinite() {
+  assert!(require_positive_f64("rms_norm_eps", 1e-6).is_ok());
+  assert!(require_positive_f64("rope_theta", 1e6).is_ok());
+  for bad in [0.0, -0.0, -1e-6, -1.0] {
+    match require_positive_f64("rms_norm_eps", bad).unwrap_err() {
+      Error::OutOfRange(p) => assert_eq!(p.context(), "rms_norm_eps"),
+      other => panic!("expected OutOfRange for {bad}, got {other:?}"),
+    }
+  }
+  for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    match require_positive_f64("rope_theta", bad).unwrap_err() {
+      Error::NonFiniteScalar(p) => assert_eq!(p.context(), "rope_theta"),
+      other => panic!("expected NonFiniteScalar for {bad}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn require_positive_finite_f32_validates_the_narrowed_value() {
+  // Values that are finite-and-positive in BOTH f64 and f32 pass.
+  for ok in [1e-6, 1.0, 256.0, 1e6, 1e30] {
+    assert!(
+      require_positive_finite_f32("rope_theta", ok).is_ok(),
+      "{ok} should pass"
+    );
+    // f32::MAX is finite; f64 values up to ~3.4e38 narrow within range.
+    assert_eq!(ok as f32, ok as f32); // narrowing is finite (not NaN)
+  }
+
+  // f64-finite-positive but OVERFLOWS f32 to +Inf → NonFiniteScalar. The
+  // payload carries the original f64 (the config value), not the ±Inf form.
+  for huge in [1e39, 1e40, f64::MAX] {
+    assert!((huge as f32).is_infinite(), "{huge} must overflow f32");
+    match require_positive_finite_f32("rope_theta", huge).unwrap_err() {
+      Error::NonFiniteScalar(p) => {
+        assert_eq!(p.context(), "rope_theta");
+        assert_eq!(p.value(), huge);
+      }
+      other => panic!("expected NonFiniteScalar for {huge}, got {other:?}"),
+    }
+  }
+
+  // f64-finite-positive but UNDERFLOWS f32 to 0.0 → OutOfRange. (`1e-45` is the
+  // boundary that still rounds to f32's smallest subnormal — it does NOT
+  // underflow — so it is correctly accepted just below; these are strictly
+  // smaller and round to exactly 0.0.)
+  for tiny in [1e-46, 1e-50, f64::MIN_POSITIVE] {
+    assert_eq!(tiny as f32, 0.0, "{tiny} must underflow f32 to 0");
+    match require_positive_finite_f32("query_pre_attn_scalar", tiny).unwrap_err() {
+      Error::OutOfRange(p) => assert_eq!(p.context(), "query_pre_attn_scalar"),
+      other => panic!("expected OutOfRange for {tiny}, got {other:?}"),
+    }
+  }
+  // A tiny f64 that still narrows to a nonzero positive f32 subnormal is
+  // accepted — the check rejects only what actually reaches `0.0` in f32.
+  assert!((1e-45f64 as f32) > 0.0);
+  assert!(require_positive_finite_f32("rope_theta", 1e-45).is_ok());
+
+  // Plain non-positive / non-finite sources are still rejected.
+  for bad in [0.0, -0.0, -1.0] {
+    assert!(matches!(
+      require_positive_finite_f32("rms_norm_eps", bad),
+      Err(Error::OutOfRange(_))
+    ));
+  }
+  for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    assert!(matches!(
+      require_positive_finite_f32("rms_norm_eps", bad),
+      Err(Error::NonFiniteScalar(_))
+    ));
+  }
+}
+
+#[test]
 fn require_in_range_accepts_endpoints_rejects_outside() {
   assert!(require_in_range("groups", 1, 1, 64).is_ok()); // low endpoint
   assert!(require_in_range("groups", 64, 1, 64).is_ok()); // high endpoint

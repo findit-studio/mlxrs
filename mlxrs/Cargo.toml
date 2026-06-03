@@ -35,8 +35,10 @@ siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]     
 whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
 qwen3-asr            = ["qwen3", "audio", "dep:serde", "dep:serde_json"]           # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
 qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
+embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
 unstable-ops-overload = []
 gguf                 = []
+npz                  = ["dep:zip", "dep:memmapix"]                                # NumPy .npy (single array) + .npz (ZIP of <name>.npy members); mirrors mx.save/savez/savez_compressed (stored + deflate). memmapix memory-maps the file on load (peak ~3x→~1x)
 
 [dependencies]
 mlxrs-sys.workspace = true
@@ -72,6 +74,8 @@ unicode-general-category = { version = "1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] } # NumPy .npz ZIP read/write (stored + DEFLATE members) for the `npz` feature
+memmapix = { version = "0.9", optional = true } # memory-map .npy / .npz files on load (peak load memory ~3x→~1x); memmap2-compatible API
 
 [target.'cfg(unix)'.dependencies]
 xattr = { version = "1", optional = true }

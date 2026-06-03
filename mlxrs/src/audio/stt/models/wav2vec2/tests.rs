@@ -93,28 +93,15 @@ fn vocab_empty_is_empty() {
 }
 
 #[test]
-fn vocab_rejects_enormous_id_before_allocating() {
-  // A single enormous id (here i64::MAX) would, if used as a dense-table
-  // length, drive a multi-exabyte `vec![None; len]` and abort the process.
-  // It must instead be rejected with a typed CapExceeded — and the observed
-  // value carried in the payload must equal the offending id, computed here
-  // independently of the implementation.
-  let json = format!(r#"{{"<pad>": 0, "X": {}}}"#, i64::MAX);
-  match Vocab::from_json(&json) {
-    Err(Error::CapExceeded(p)) => {
-      assert_eq!(p.observed(), i64::MAX as u64);
-      assert_eq!(p.cap(), (1u64 << 20));
-    }
-    other => panic!("expected CapExceeded for an enormous id, got {other:?}"),
-  }
-  // An id one past the cap is rejected; the cap itself (2^20) is accepted.
-  let over = format!(r#"{{"A": {}}}"#, (1i64 << 20) + 1);
-  assert!(matches!(
-    Vocab::from_json(&over),
-    Err(Error::CapExceeded(_))
-  ));
-  let at_cap = format!(r#"{{"A": {}}}"#, 1i64 << 20);
-  let vocab = Vocab::from_json(&at_cap).unwrap();
+fn vocab_accepts_large_but_valid_id() {
+  // The library imposes no magnitude ceiling on a token id: a large-but-valid
+  // id allocates its dense `id → token` table and parses. (Bounding a
+  // legitimately large vocabulary is the caller's concern; a pathological id is
+  // bounded by fallible allocation, not a fixed cap.) 2^20 is a ~1M-slot table,
+  // trivially within memory yet well past any pinned ceiling.
+  let high = 1i64 << 20;
+  let json = format!(r#"{{"A": {high}}}"#);
+  let vocab = Vocab::from_json(&json).unwrap();
   // Highest id is exactly 2^20 -> 2^20 + 1 slots, only the top one populated.
   assert_eq!(vocab.len(), (1usize << 20) + 1);
   assert_eq!(vocab.token(1 << 20), Some("A"));
@@ -240,6 +227,80 @@ fn sanitize_swaps_conv_axes_renames_params_drops_training_keeps_lm_head() {
 }
 
 #[test]
+fn sanitize_strips_supported_backbone_prefixes() {
+  // Each `*ForCTC` nests its backbone under a different prefix: Wav2Vec2ForCTC
+  // under `wav2vec2.`, HubertForCTC under `hubert.`. sanitize must strip BOTH
+  // to the same unprefixed `feature_extractor.*` / `encoder.*` keys the
+  // builders expect, while leaving the top-level `lm_head.*` untouched. (The
+  // earlier tests fed already-unprefixed synthetic keys; this pins the strip
+  // itself for both backbones.)
+  for prefix in ["wav2vec2.", "hubert."] {
+    let mut weights: HashMap<String, Array> = HashMap::new();
+    // A non-conv backbone tensor (no axis swap) under the backbone prefix.
+    weights.insert(
+      format!("{prefix}encoder.layer_norm.weight"),
+      Array::from_slice::<f32>(&[1.0, 2.0], &[2]).unwrap(),
+    );
+    // A conv weight under the backbone prefix (also exercises the axis swap on
+    // the post-strip key).
+    weights.insert(
+      format!("{prefix}feature_extractor.conv_layers.0.conv.weight"),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 1, 3]).unwrap(),
+    );
+    // The CTC head is top-level (no backbone prefix) and must be kept verbatim.
+    weights.insert(
+      "lm_head.weight".to_string(),
+      Array::from_slice::<f32>(&[0.0, 1.0], &[2, 1]).unwrap(),
+    );
+
+    let out = sanitize(weights).unwrap();
+
+    // Prefix stripped from both backbone keys.
+    assert!(
+      out.contains_key("encoder.layer_norm.weight"),
+      "{prefix}: encoder.layer_norm.weight must lose its backbone prefix"
+    );
+    let conv = out
+      .get("feature_extractor.conv_layers.0.conv.weight")
+      .unwrap_or_else(|| panic!("{prefix}: conv key must lose its backbone prefix"));
+    // (out=2, in=1, k=3) -> (out=2, k=3, in=1) after the axis swap.
+    assert_eq!(conv.shape(), vec![2, 3, 1], "{prefix}: conv axis-swapped");
+    // The prefixed forms must be gone.
+    assert!(!out.contains_key(&format!("{prefix}encoder.layer_norm.weight")));
+    assert!(!out.contains_key(&format!(
+      "{prefix}feature_extractor.conv_layers.0.conv.weight"
+    )));
+    // lm_head untouched.
+    assert!(out.contains_key("lm_head.weight"));
+  }
+}
+
+#[test]
+fn sanitize_rejects_hubert_prefixed_unprefixed_collision() {
+  // The collision guard covers the hubert backbone too: a checkpoint carrying
+  // both `hubert.lm_head.weight` (rule 1 strips to `lm_head.weight`) and the
+  // unprefixed `lm_head.weight` maps two source keys onto one destination. The
+  // source is a `HashMap`, so a bare overwrite would keep an arbitrary survivor;
+  // sanitize must reject it with a typed KeyCollision regardless of order.
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert(
+    "hubert.lm_head.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &[2, 1]).unwrap(),
+  );
+  weights.insert(
+    "lm_head.weight".to_string(),
+    Array::from_slice::<f32>(&[3.0, 4.0], &[2, 1]).unwrap(),
+  );
+  match sanitize(weights) {
+    Err(Error::KeyCollision(p)) => {
+      assert_eq!(p.context(), "Wav2Vec2 sanitize");
+      assert_eq!(p.key(), "lm_head.weight");
+    }
+    other => panic!("expected KeyCollision for hubert-prefixed+unprefixed lm_head, got {other:?}"),
+  }
+}
+
+#[test]
 fn sanitize_conv_axis_swap_values() {
   // (out=1, in=2, k=2) HF tensor, row-major:
   //   [[ [a,b], [c,d] ]]  with values [1,2,3,4] meaning in0=[1,2], in1=[3,4].
@@ -345,6 +406,11 @@ fn config_parses_base_960h_defaults_and_ignores_unknown() {
   assert!(!config.add_adapter);
   assert_eq!(config.adapter_attn_dim, None);
   assert_eq!(config.pad_token_id, 0);
+  // HuBERT-only flags fall back to their HF defaults (the wired arm) when
+  // absent — feat_proj_layer_norm = true (apply the projection LayerNorm),
+  // conv_pos_batch_norm = false (weight-norm positional conv).
+  assert!(config.feat_proj_layer_norm);
+  assert!(!config.conv_pos_batch_norm);
 }
 
 #[test]
@@ -363,17 +429,8 @@ fn config_validate_accepts_base_960h() {
 }
 
 #[test]
-fn config_validate_rejects_unsupported_arms() {
-  // (a) The pre-norm stable-layer-norm arm is not ported -> InvariantViolation.
-  let stable = Wav2Vec2Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
-  match stable.validate() {
-    Err(Error::InvariantViolation(p)) => {
-      assert!(p.context().contains("do_stable_layer_norm"));
-    }
-    other => panic!("expected InvariantViolation for stable layer norm, got {other:?}"),
-  }
-
-  // (b) A non-"group" feat_extract_norm is not ported -> UnknownEnumValue,
+fn config_validate_rejects_out_of_scope_arms() {
+  // (a) The "layer" feature-encoder arm is out of scope -> UnknownEnumValue,
   // and the payload carries the rejected value + the supported set.
   let layer = Wav2Vec2Config::from_json(r#"{"feat_extract_norm": "layer"}"#).unwrap();
   match layer.validate() {
@@ -383,108 +440,102 @@ fn config_validate_rejects_unsupported_arms() {
     }
     other => panic!("expected UnknownEnumValue for feat_extract_norm, got {other:?}"),
   }
+
+  // (b) The stable-layer-norm arm is now SUPPORTED: a `do_stable_layer_norm`
+  // config (otherwise default) must validate (the both-directions check that
+  // the relaxation actually took effect, not just that the rejection moved).
+  let stable = Wav2Vec2Config::from_json(r#"{"do_stable_layer_norm": true}"#).unwrap();
+  assert!(stable.do_stable_layer_norm);
+  assert!(
+    stable.validate().is_ok(),
+    "the stable-layer-norm arm must validate (it is now wired)"
+  );
 }
 
 #[test]
-fn config_validate_rejects_conv_bias() {
-  // The port's ConvLayer stores no bias and `forward` adds none, so a
-  // `conv_bias == true` checkpoint would load (its bias tensors silently
-  // dropped) and run wrong. `validate` must reject it BEFORE any tensor is
-  // built, with a typed InvariantViolation naming the field.
+fn config_validate_accepts_conv_bias() {
+  // `conv_bias == true` is now wired (every ConvLayer loads and adds its
+  // conv.bias), so a `conv_bias` config (otherwise default) must validate.
   let biased = Wav2Vec2Config::from_json(r#"{"conv_bias": true}"#).unwrap();
   assert!(biased.conv_bias);
-  match biased.validate() {
-    Err(Error::InvariantViolation(p)) => {
-      assert!(
-        p.context().contains("conv_bias"),
-        "context should name conv_bias, got {:?}",
-        p.context()
-      );
-    }
-    other => panic!("expected InvariantViolation for conv_bias = true, got {other:?}"),
-  }
+  assert!(
+    biased.validate().is_ok(),
+    "a conv_bias config must validate (the bias is now wired)"
+  );
 }
 
 #[test]
-fn config_validate_rejects_oversized_count() {
-  // An unbounded count must not pass validate only to blow up later at the
-  // per-layer allocation loop. Pinning num_hidden_layers to its base-960h
-  // value (12) bounds it: an oversized count is rejected here, before the
-  // builder's `Vec::with_capacity(num_layers)` / weight-fetch loop. The
-  // OutOfRange payload names the offending value and the expected one.
-  let oversized = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
-  match oversized.validate() {
-    Err(Error::OutOfRange(p)) => {
-      assert!(
-        p.context().contains("num_hidden_layers"),
-        "context should name num_hidden_layers, got {:?}",
-        p.context()
-      );
-      // The value carries both the offending count and the base-960h expectation.
-      assert!(
-        p.value().contains("1000000") && p.value().contains("12"),
-        "value should name the offending count and the expected one, got {:?}",
-        p.value()
-      );
-    }
-    other => panic!("expected OutOfRange for an oversized num_hidden_layers, got {other:?}"),
-  }
+fn config_validate_accepts_large_positive_layer_count() {
+  // A large positive layer count is a valid (if deep) variant, not something
+  // `validate` rejects: `validate` only checks positivity (it allocates no
+  // per-layer `Vec`), and the builder reserves the layer `Vec`s fallibly, so a
+  // pathological count surfaces later as a typed allocation error, never a
+  // magnitude cap here. (`validate` itself does no allocation, so this check is
+  // cheap regardless of the count.)
+  let deep = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 1000000}"#).unwrap();
+  assert!(
+    deep.validate().is_ok(),
+    "a large positive num_hidden_layers must validate (no magnitude cap)"
+  );
+  // A zero / negative count is still rejected as malformed (OutOfRange) — that
+  // is a positivity/soundness check, not a magnitude cap.
+  let zero = Wav2Vec2Config::from_json(r#"{"num_hidden_layers": 0}"#).unwrap();
+  assert!(matches!(zero.validate(), Err(Error::OutOfRange(_))));
+  let negative = Wav2Vec2Config::from_json(r#"{"num_feat_extract_layers": -1}"#).unwrap();
+  assert!(matches!(negative.validate(), Err(Error::OutOfRange(_))));
 }
 
 #[test]
-fn config_validate_rejects_deviating_dimension() {
-  // A scalar architecture field that deviates from base-960h is a different
-  // (unsupported) architecture — the port reads weight shapes from the
-  // checkpoint, so it would load-and-run silently wrong. Reject with a typed
-  // OutOfRange naming the field + value.
-  let wide = Wav2Vec2Config::from_json(r#"{"hidden_size": 1024}"#).unwrap();
-  match wide.validate() {
-    Err(Error::OutOfRange(p)) => {
+fn config_validate_relaxes_dimensions_but_enforces_structure() {
+  // A wider hidden_size is no longer rejected as a "deviation" — it is a valid
+  // larger variant. The full large config (1024 hidden, 16 heads, 24 layers,
+  // 4096 intermediate, stable-LN) must validate.
+  let large = Wav2Vec2Config::from_json(
+    r#"{"hidden_size": 1024, "num_attention_heads": 16, "num_hidden_layers": 24,
+        "intermediate_size": 4096, "do_stable_layer_norm": true}"#,
+  )
+  .unwrap();
+  assert!(
+    large.validate().is_ok(),
+    "a large stable-LN config must validate"
+  );
+
+  // But the structural invariants are still enforced: a hidden_size not
+  // divisible by num_attention_heads is a DivisibilityConstraint (the per-head
+  // split would not be exact), and a non-positive width is OutOfRange.
+  let indivisible =
+    Wav2Vec2Config::from_json(r#"{"hidden_size": 1000, "num_attention_heads": 12}"#).unwrap();
+  match indivisible.validate() {
+    Err(Error::DivisibilityConstraint(p)) => {
       assert!(
-        p.context().contains("hidden_size"),
-        "context should name hidden_size, got {:?}",
-        p.context()
-      );
-      assert!(
-        p.value().contains("1024") && p.value().contains("768"),
-        "value should name the offending dim and the expected one, got {:?}",
-        p.value()
+        p.name_dividend().contains("hidden_size")
+          && p.name_divisor().contains("num_attention_heads"),
+        "the constraint should name hidden_size / num_attention_heads, got {p:?}"
       );
     }
-    other => panic!("expected OutOfRange for a deviating hidden_size, got {other:?}"),
+    other => {
+      panic!("expected DivisibilityConstraint for an indivisible hidden_size, got {other:?}")
+    }
   }
+  let nonpos = Wav2Vec2Config::from_json(r#"{"hidden_size": 0}"#).unwrap();
+  assert!(matches!(nonpos.validate(), Err(Error::OutOfRange(_))));
 }
 
 #[test]
-fn config_validate_rejects_deviating_conv_array() {
-  // A conv-stack array that deviates from base-960h is rejected: a wrong
-  // length is LengthMismatch; a wrong element is OutOfRange naming the index +
-  // value + expectation.
-  //
-  // (a) Deviating element (same length, one stride changed 2 -> 3 at index 1).
-  let bad_elem = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#).unwrap();
-  match bad_elem.validate() {
-    Err(Error::OutOfRange(p)) => {
-      assert!(
-        p.context().contains("conv_stride"),
-        "context should name conv_stride, got {:?}",
-        p.context()
-      );
-      // index 1, offending value 3, expected 2.
-      assert!(
-        p.value().contains("element 1")
-          && p.value().contains("= 3")
-          && p.value().contains("expected 2"),
-        "value should name the index, value, and expectation, got {:?}",
-        p.value()
-      );
-    }
-    other => panic!("expected OutOfRange for a deviating conv_stride element, got {other:?}"),
-  }
+fn config_validate_relaxes_conv_arrays_but_enforces_length_and_positivity() {
+  // A conv-stack array whose values merely DIFFER from base-960h (but are
+  // positive and the right length) is now accepted — different strides are a
+  // different valid variant, not a rejection.
+  let diff_stride = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#).unwrap();
+  assert!(
+    diff_stride.validate().is_ok(),
+    "a conv_stride array with positive entries of the right length must validate"
+  );
 
-  // (b) Wrong length (a 6-element conv_kernel instead of 7) -> LengthMismatch.
-  let bad_len = Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#).unwrap();
-  match bad_len.validate() {
+  // (a) An array shorter than num_feat_extract_layers is still LengthMismatch
+  // (the builder would index past the end).
+  let short = Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#).unwrap();
+  match short.validate() {
     Err(Error::LengthMismatch(p)) => {
       assert!(
         p.context().contains("conv_kernel"),
@@ -494,36 +545,119 @@ fn config_validate_rejects_deviating_conv_array() {
       assert_eq!(p.expected(), 7);
       assert_eq!(p.actual(), 6);
     }
-    other => panic!("expected LengthMismatch for a wrong-length conv_kernel, got {other:?}"),
+    other => panic!("expected LengthMismatch for a short conv_kernel, got {other:?}"),
+  }
+
+  // (b) A non-positive conv entry is still OutOfRange naming the index + value
+  // (a zero / negative width, kernel, or stride is structurally invalid).
+  let nonpos = Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 0, 2, 2, 2, 2, 2]}"#).unwrap();
+  match nonpos.validate() {
+    Err(Error::OutOfRange(p)) => {
+      assert!(
+        p.context().contains("conv_stride"),
+        "context should name conv_stride, got {:?}",
+        p.context()
+      );
+      assert!(
+        p.value().contains("element 1") && p.value().contains("= 0"),
+        "value should name the offending index and value, got {:?}",
+        p.value()
+      );
+    }
+    other => panic!("expected OutOfRange for a non-positive conv_stride entry, got {other:?}"),
   }
 }
 
 #[test]
-fn config_validate_rejects_deviating_layer_norm_eps() {
-  // `layer_norm_eps` is shared by every LayerNorm and the L0 GroupNorm, so a
-  // deviating value silently runs a numerically different graph. `validate`
-  // must reject it with a typed OutOfRange naming the field + the offending
-  // and expected values (the helper widens the f32 field to f64 for the
-  // compare, so the message carries the f64 forms).
-  let bad = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e-6}"#).unwrap();
-  // The parsed field is the deviating value.
-  assert!((bad.layer_norm_eps - 1e-6).abs() < 1e-12);
-  match bad.validate() {
+fn config_validate_rejects_conv_array_longer_than_num_feat_extract_layers() {
+  // The conv arrays must have EXACTLY `num_feat_extract_layers` entries. A
+  // LONGER array (here a trailing extra entry, length 8 vs the default 7) used
+  // to slip through the old `len < n` check while only the first n entries were
+  // consumed — desyncing the feature encoder (which builds n layers, output
+  // width conv_dim[n-1]) from build_feature_projection (which reads
+  // conv_dim.last(), a LATER trailing entry of a different width). It must now
+  // be rejected with a typed LengthMismatch naming the field and the
+  // expected/actual lengths.
+  let long_dim =
+    Wav2Vec2Config::from_json(r#"{"conv_dim": [512, 512, 512, 512, 512, 512, 512, 128]}"#).unwrap();
+  assert_eq!(long_dim.conv_dim.len(), 8);
+  assert_eq!(long_dim.num_feat_extract_layers, 7);
+  match long_dim.validate() {
+    Err(Error::LengthMismatch(p)) => {
+      assert!(
+        p.context().contains("conv_dim"),
+        "context should name conv_dim, got {:?}",
+        p.context()
+      );
+      assert_eq!(
+        p.expected(),
+        7,
+        "expected length is num_feat_extract_layers"
+      );
+      assert_eq!(p.actual(), 8, "actual length is the over-long array");
+    }
+    other => panic!("expected LengthMismatch for an over-long conv_dim, got {other:?}"),
+  }
+
+  // The same exact-length rule applies to conv_stride and conv_kernel: a
+  // trailing extra entry on either is likewise rejected.
+  let long_stride =
+    Wav2Vec2Config::from_json(r#"{"conv_stride": [5, 2, 2, 2, 2, 2, 2, 2]}"#).unwrap();
+  assert!(matches!(
+    long_stride.validate(),
+    Err(Error::LengthMismatch(_))
+  ));
+  let long_kernel =
+    Wav2Vec2Config::from_json(r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 2, 2]}"#).unwrap();
+  assert!(matches!(
+    long_kernel.validate(),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // The exact-length boundary: shrinking num_feat_extract_layers to match the
+  // longer arrays makes the SAME arrays valid (proving the rule is exact
+  // equality, not a one-sided floor) — 8-entry arrays with
+  // num_feat_extract_layers = 8 must validate. (The matching transformer dims
+  // are kept default; only the conv stack + layer count change.)
+  let exact = Wav2Vec2Config::from_json(
+    r#"{"num_feat_extract_layers": 8,
+        "conv_dim": [512, 512, 512, 512, 512, 512, 512, 512],
+        "conv_stride": [5, 2, 2, 2, 2, 2, 2, 2],
+        "conv_kernel": [10, 3, 3, 3, 3, 2, 2, 2]}"#,
+  )
+  .unwrap();
+  assert!(
+    exact.validate().is_ok(),
+    "8-entry conv arrays with num_feat_extract_layers = 8 must validate (exact-length match)"
+  );
+}
+
+#[test]
+fn config_validate_rejects_non_positive_or_non_finite_layer_norm_eps() {
+  // `layer_norm_eps` varies across the family, so it is no longer pinned to a
+  // magnitude — a different positive finite value (e.g. the lv60 1e-5, or any
+  // other positive eps) is accepted. Only a non-finite or non-positive value
+  // is rejected (it would drive a non-finite / degenerate denominator).
+  let smaller = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 1e-6}"#).unwrap();
+  assert!(
+    smaller.validate().is_ok(),
+    "a different positive finite eps must validate (eps is not pinned)"
+  );
+  // Zero eps is OutOfRange.
+  let zero = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": 0.0}"#).unwrap();
+  match zero.validate() {
     Err(Error::OutOfRange(p)) => {
       assert!(
         p.context().contains("layer_norm_eps"),
         "context should name layer_norm_eps, got {:?}",
         p.context()
       );
-      // The value names both the offending eps and the expected base-960h one.
-      assert!(
-        p.value().contains("expected"),
-        "value should name the expected eps, got {:?}",
-        p.value()
-      );
     }
-    other => panic!("expected OutOfRange for a deviating layer_norm_eps, got {other:?}"),
+    other => panic!("expected OutOfRange for a zero layer_norm_eps, got {other:?}"),
   }
+  // Negative eps is OutOfRange.
+  let neg = Wav2Vec2Config::from_json(r#"{"layer_norm_eps": -1e-5}"#).unwrap();
+  assert!(matches!(neg.validate(), Err(Error::OutOfRange(_))));
 }
 
 #[test]
@@ -549,36 +683,111 @@ fn config_validate_rejects_non_finite_layer_norm_eps() {
 }
 
 #[test]
-fn config_validate_rejects_deviating_hidden_act() {
-  // The port hardcodes GELU in every block, so a config whose `hidden_act`
-  // names a different activation would silently run a different graph.
-  // `validate` must reject it with a typed UnknownEnumValue carrying the
-  // offending value and the supported set.
+fn config_validate_rejects_unsupported_hidden_act() {
+  // An activation the port does not wire (e.g. relu) is rejected with a typed
+  // UnknownEnumValue carrying the offending value and the supported set.
   let relu = Wav2Vec2Config::from_json(r#"{"hidden_act": "relu"}"#).unwrap();
   assert_eq!(relu.hidden_act, "relu");
   match relu.validate() {
     Err(Error::UnknownEnumValue(p)) => {
       assert_eq!(p.value(), "relu");
-      assert_eq!(p.supported(), &["gelu"]);
+      assert_eq!(
+        p.supported(),
+        &["gelu", "gelu_new", "gelu_pytorch_tanh", "silu", "swish"]
+      );
     }
-    other => panic!("expected UnknownEnumValue for a deviating hidden_act, got {other:?}"),
+    other => panic!("expected UnknownEnumValue for an unsupported hidden_act, got {other:?}"),
   }
 }
 
 #[test]
-fn config_validate_rejects_deviating_feat_extract_activation() {
-  // The feature-encoder convs hardcode GELU, so a config naming a different
-  // `feat_extract_activation` would silently run a different feature encoder.
-  // Rejected with a typed UnknownEnumValue carrying the value + supported set.
+fn config_validate_rejects_unsupported_feat_extract_activation() {
+  // Same dispatch for the feature-encoder activation: an unsupported name is a
+  // typed UnknownEnumValue carrying the value + supported set.
   let relu = Wav2Vec2Config::from_json(r#"{"feat_extract_activation": "relu"}"#).unwrap();
   assert_eq!(relu.feat_extract_activation, "relu");
   match relu.validate() {
     Err(Error::UnknownEnumValue(p)) => {
       assert_eq!(p.value(), "relu");
-      assert_eq!(p.supported(), &["gelu"]);
+      assert_eq!(
+        p.supported(),
+        &["gelu", "gelu_new", "gelu_pytorch_tanh", "silu", "swish"]
+      );
     }
     other => {
-      panic!("expected UnknownEnumValue for a deviating feat_extract_activation, got {other:?}")
+      panic!("expected UnknownEnumValue for an unsupported feat_extract_activation, got {other:?}")
+    }
+  }
+}
+
+#[test]
+fn config_validate_accepts_supported_activations() {
+  // Every supported HF activation name on both fields validates.
+  for act in ["gelu", "gelu_new", "gelu_pytorch_tanh", "silu", "swish"] {
+    let hidden = Wav2Vec2Config::from_json(&format!(r#"{{"hidden_act": "{act}"}}"#)).unwrap();
+    assert!(hidden.validate().is_ok(), "hidden_act={act} must validate");
+    let feat =
+      Wav2Vec2Config::from_json(&format!(r#"{{"feat_extract_activation": "{act}"}}"#)).unwrap();
+    assert!(
+      feat.validate().is_ok(),
+      "feat_extract_activation={act} must validate"
+    );
+  }
+}
+
+#[test]
+fn activation_resolve_maps_hf_names() {
+  // The HF activation-name mapping (ACT2FN): gelu -> exact GELU; gelu_new /
+  // gelu_pytorch_tanh -> tanh-approx GELU; silu / swish -> SiLU. An unsupported
+  // name is a typed UnknownEnumValue carrying the field + value.
+  assert_eq!(
+    Activation::resolve("gelu", "test").unwrap(),
+    Activation::Gelu
+  );
+  assert_eq!(
+    Activation::resolve("gelu_new", "test").unwrap(),
+    Activation::GeluApprox
+  );
+  assert_eq!(
+    Activation::resolve("gelu_pytorch_tanh", "test").unwrap(),
+    Activation::GeluApprox
+  );
+  assert_eq!(
+    Activation::resolve("silu", "test").unwrap(),
+    Activation::Silu
+  );
+  assert_eq!(
+    Activation::resolve("swish", "test").unwrap(),
+    Activation::Silu
+  );
+  match Activation::resolve("relu", "test field") {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.type_name(), "test field");
+      assert_eq!(p.value(), "relu");
+    }
+    other => panic!("expected UnknownEnumValue for an unsupported name, got {other:?}"),
+  }
+}
+
+#[test]
+fn activation_forward_dispatches_to_primitive() {
+  // Each Activation::forward must match the corresponding free function in
+  // `lm::nn::activations` exactly (the dispatch wires the right kernel). The
+  // oracle is the standalone primitive over the same input.
+  use crate::lm::nn::activations;
+  let probe = Array::from_slice::<f32>(&[-2.0, -0.5, 0.0, 0.7, 2.0], &[5]).unwrap();
+  for act in [Activation::Gelu, Activation::GeluApprox, Activation::Silu] {
+    let mut got = act.forward(&probe).unwrap();
+    let mut want = match act {
+      Activation::Gelu => activations::gelu(&probe),
+      Activation::GeluApprox => activations::gelu_approx(&probe),
+      Activation::Silu => activations::silu(&probe),
+    }
+    .unwrap();
+    let g = got.to_vec::<f32>().unwrap();
+    let w = want.to_vec::<f32>().unwrap();
+    for (a, b) in g.iter().zip(w.iter()) {
+      assert!((a - b).abs() < 1e-6, "{act:?}: {a} vs {b}");
     }
   }
 }
@@ -653,67 +862,198 @@ fn config_validate_rejects_deviating_pad_token_id() {
   }
 }
 
-/// Parametric drift-guard: each architecture / graph-affecting field, when set
-/// to a value that deviates from `base-960h`, makes `validate()` reject the
-/// config — so no deviating checkpoint can load and run silently wrong. The
-/// companion `config_validate_accepts_base_960h` /
-/// `base_960h_constants_match_defaults` tests assert the all-default config
-/// still passes, completing the both-directions guard.
 #[test]
-fn config_validate_rejects_every_graph_affecting_deviation() {
-  // (config-json overriding ONE field to a deviating value) — each must error.
-  let deviations: &[&str] = &[
+fn config_validate_rejects_non_default_feat_proj_layer_norm() {
+  // `feat_proj_layer_norm` is a HuBERT-only flag (HF default `true`); the wired
+  // FeatureProjection unconditionally applies the LayerNorm, so the `false`
+  // (no-LayerNorm) arm is not implemented this phase. A `false` value must be
+  // rejected with a typed InvariantViolation naming the field, BEFORE any
+  // tensor is built — never silently run the normalizing graph on a config that
+  // asked for the un-normalized one.
+  let cfg = Wav2Vec2Config::from_json(r#"{"feat_proj_layer_norm": false}"#).unwrap();
+  assert!(!cfg.feat_proj_layer_norm);
+  match cfg.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(
+        p.context().contains("feat_proj_layer_norm"),
+        "context should name feat_proj_layer_norm, got {:?}",
+        p.context()
+      );
+    }
+    other => panic!("expected InvariantViolation for feat_proj_layer_norm = false, got {other:?}"),
+  }
+  // The default (`true`, the wired arm) validates — the HF default for HuBERT
+  // and the implicit value for every wav2vec2 config — proving the gate rejects
+  // only the non-default arm, not the supported one.
+  let default_true = Wav2Vec2Config::from_json(r#"{"feat_proj_layer_norm": true}"#).unwrap();
+  assert!(default_true.feat_proj_layer_norm);
+  assert!(
+    default_true.validate().is_ok(),
+    "the default feat_proj_layer_norm = true (the wired arm) must validate"
+  );
+  // Absent (the common case: wav2vec2 configs never carry the field, HuBERT
+  // defaults it true) falls back to the wired arm and validates.
+  let absent = Wav2Vec2Config::from_json("{}").unwrap();
+  assert!(
+    absent.feat_proj_layer_norm,
+    "feat_proj_layer_norm must default to true when absent"
+  );
+  assert!(absent.validate().is_ok());
+}
+
+#[test]
+fn config_validate_rejects_non_default_conv_pos_batch_norm() {
+  // `conv_pos_batch_norm` is a HuBERT-only flag (HF default `false`); the wired
+  // PositionalConvEmbedding reconstructs the fused kernel from the weight-norm
+  // `weight_g` / `weight_v` pair, so the `true` (batch-norm) arm selects a
+  // different module (a BatchNorm1d over a plain conv whose checkpoint carries
+  // no weight_g/weight_v) that is not implemented this phase. A `true` value
+  // must be rejected with a typed InvariantViolation naming the field, BEFORE
+  // any tensor is built.
+  let cfg = Wav2Vec2Config::from_json(r#"{"conv_pos_batch_norm": true}"#).unwrap();
+  assert!(cfg.conv_pos_batch_norm);
+  match cfg.validate() {
+    Err(Error::InvariantViolation(p)) => {
+      assert!(
+        p.context().contains("conv_pos_batch_norm"),
+        "context should name conv_pos_batch_norm, got {:?}",
+        p.context()
+      );
+    }
+    other => panic!("expected InvariantViolation for conv_pos_batch_norm = true, got {other:?}"),
+  }
+  // The default (`false`, the weight-norm arm) validates — the HF default for
+  // HuBERT and the implicit value for every wav2vec2 config.
+  let default_false = Wav2Vec2Config::from_json(r#"{"conv_pos_batch_norm": false}"#).unwrap();
+  assert!(!default_false.conv_pos_batch_norm);
+  assert!(
+    default_false.validate().is_ok(),
+    "the default conv_pos_batch_norm = false (the weight-norm arm) must validate"
+  );
+  // Absent falls back to the wired (weight-norm) arm and validates.
+  let absent = Wav2Vec2Config::from_json("{}").unwrap();
+  assert!(
+    !absent.conv_pos_batch_norm,
+    "conv_pos_batch_norm must default to false when absent"
+  );
+  assert!(absent.validate().is_ok());
+}
+
+#[test]
+fn default_hubert_flags_build_and_forward() {
+  // A HuBERT config that spells out both HuBERT-only flags at their HF defaults
+  // (feat_proj_layer_norm = true, conv_pos_batch_norm = false) selects the wired
+  // graph (LayerNorm feature projection + weight-norm positional conv), so it
+  // must build and forward to the right logits shape — the both-directions
+  // proof that the pins reject ONLY the non-default arm, while a default HuBERT
+  // checkpoint is faithfully served end to end.
+  let config = tiny_config_json(
+    r#", "model_type": "hubert", "feat_proj_layer_norm": true, "conv_pos_batch_norm": false"#,
+  );
+  assert_eq!(config.model_type(), "hubert");
+  assert!(config.feat_proj_layer_norm);
+  assert!(!config.conv_pos_batch_norm);
+  assert_forward_shape(config, 400);
+}
+
+/// Parametric guard: family variants and dimension overrides that are merely
+/// *different* from base-960h now VALIDATE (the port is generic), while the
+/// genuinely out-of-scope arms and structurally-invalid configs are rejected.
+#[test]
+fn config_validate_accepts_family_variants_rejects_out_of_scope() {
+  // (a) Different-but-valid family configs — each must validate.
+  let accepted: &[&str] = &[
+    // model_type family members (plain self-attention only; wavlm is NOT here —
+    // its gated relative-position-bias attention is not wired this phase).
     r#"{"model_type": "hubert"}"#,
-    r#"{"hidden_size": 1024}"#,
-    r#"{"num_hidden_layers": 24}"#,
-    r#"{"num_attention_heads": 16}"#,
-    r#"{"intermediate_size": 4096}"#,
+    // A larger vocab (different CTC head width).
     r#"{"vocab_size": 33}"#,
-    r#"{"pad_token_id": 1}"#,
+    // A different positive eps.
     r#"{"layer_norm_eps": 1e-6}"#,
-    r#"{"feat_extract_norm": "layer"}"#,
-    r#"{"hidden_act": "relu"}"#,
-    r#"{"feat_extract_activation": "relu"}"#,
+    // The stable-layer-norm arm and conv_bias.
     r#"{"do_stable_layer_norm": true}"#,
     r#"{"conv_bias": true}"#,
-    r#"{"add_adapter": true}"#,
-    r#"{"adapter_attn_dim": 16}"#,
-    r#"{"num_conv_pos_embeddings": 64}"#,
-    r#"{"num_conv_pos_embedding_groups": 8}"#,
-    r#"{"num_feat_extract_layers": 8}"#,
+    // The supported non-gelu activations.
+    r#"{"hidden_act": "gelu_new"}"#,
+    r#"{"feat_extract_activation": "silu"}"#,
+    // The HuBERT-only flags spelled out at their HF defaults (the wired arm).
+    r#"{"model_type": "hubert", "feat_proj_layer_norm": true}"#,
+    r#"{"model_type": "hubert", "conv_pos_batch_norm": false}"#,
+    // A consistent larger transformer (hidden divisible by heads + groups).
+    r#"{"hidden_size": 1024, "num_attention_heads": 16,
+        "num_conv_pos_embedding_groups": 16}"#,
+    r#"{"intermediate_size": 4096}"#,
+    r#"{"num_hidden_layers": 24}"#,
+    // A different-but-positive conv stack of the right length.
     r#"{"conv_dim": [512, 512, 512, 512, 512, 512, 256]}"#,
     r#"{"conv_stride": [5, 3, 2, 2, 2, 2, 2]}"#,
     r#"{"conv_kernel": [10, 3, 3, 3, 3, 2, 3]}"#,
   ];
-  for json in deviations {
+  for json in accepted {
+    let cfg = Wav2Vec2Config::from_json(json).unwrap();
+    assert!(
+      cfg.validate().is_ok(),
+      "a valid family variant must pass validate(), but this one was rejected: {json}"
+    );
+  }
+
+  // (b) Out-of-scope arms / structurally-invalid configs — each must error.
+  let rejected: &[&str] = &[
+    // Out-of-scope (not wired this phase).
+    r#"{"model_type": "unknown_arch"}"#,
+    // WavLM needs gated relative-position-bias attention (not wired this
+    // phase); admitting it would run its rel-pos tensors through the plain
+    // attention path unconsumed (silent corruption), so it is rejected.
+    r#"{"model_type": "wavlm"}"#,
+    r#"{"feat_extract_norm": "layer"}"#,
+    r#"{"hidden_act": "relu"}"#,
+    r#"{"feat_extract_activation": "relu"}"#,
+    r#"{"add_adapter": true}"#,
+    r#"{"adapter_attn_dim": 16}"#,
+    r#"{"pad_token_id": 1}"#,
+    // The HuBERT-only graph arms not wired this phase: the no-LayerNorm feature
+    // projection and the batch-norm positional conv.
+    r#"{"feat_proj_layer_norm": false}"#,
+    r#"{"conv_pos_batch_norm": true}"#,
+    // Structurally invalid.
+    r#"{"hidden_size": 0}"#,
+    r#"{"hidden_size": 1000, "num_attention_heads": 12}"#,
+    r#"{"num_attention_heads": 0}"#,
+    r#"{"intermediate_size": -1}"#,
+    r#"{"vocab_size": 0}"#,
+    r#"{"num_hidden_layers": 0}"#,
+    r#"{"num_feat_extract_layers": 0}"#,
+    r#"{"layer_norm_eps": 0.0}"#,
+    r#"{"num_conv_pos_embedding_groups": 7}"#,
+    r#"{"conv_kernel": [10, 3, 3, 3, 3, 2]}"#,
+    r#"{"conv_stride": [5, 0, 2, 2, 2, 2, 2]}"#,
+  ];
+  for json in rejected {
     let cfg = Wav2Vec2Config::from_json(json).unwrap();
     assert!(
       cfg.validate().is_err(),
-      "a deviating config must be rejected by validate(), but this one passed: {json}"
+      "an out-of-scope / invalid config must be rejected by validate(), but this one passed: {json}"
     );
   }
-  // Each deviation overrides exactly one field of the otherwise-default
-  // (base-960h) config, so the un-overridden baseline must itself validate —
-  // proving the rejections above are caused by the override, not a baseline
-  // that already fails.
+
+  // The all-default baseline must itself validate, proving the rejections are
+  // caused by the override, not a baseline that already fails.
   assert!(
     Wav2Vec2Config::from_json("{}").unwrap().validate().is_ok(),
-    "the all-default base-960h config must pass validate()"
+    "the all-default config must pass validate()"
   );
 }
 
 #[test]
-fn base_960h_constants_match_defaults() {
-  // The validate() pin-constants and the serde `default_*` fns must agree:
-  // a default-constructed config (the base-960h checkpoint) must pass
-  // validate(). This guards against the two sources of truth drifting — if
-  // they did, the all-defaults config below would fail to validate.
+fn defaults_match_base_960h_and_validate() {
+  // The serde `default_*` fns describe `facebook/wav2vec2-base-960h`, and the
+  // default config must pass validate() (the all-default checkpoint loads).
   let defaults = Wav2Vec2Config::from_json("{}").unwrap();
   assert!(
     defaults.validate().is_ok(),
-    "the all-default (base-960h) config must pass the validate() pins"
+    "the all-default (base-960h) config must pass validate()"
   );
-  // Spot-check the exact base-960h values the pins enforce.
+  // Spot-check the base-960h default values.
   assert_eq!(defaults.hidden_size, 768);
   assert_eq!(defaults.num_hidden_layers, 12);
   assert_eq!(defaults.num_attention_heads, 12);
@@ -729,9 +1069,14 @@ fn base_960h_constants_match_defaults() {
   assert_eq!(defaults.hidden_act, "gelu");
   assert_eq!(defaults.feat_extract_activation, "gelu");
   assert!((defaults.layer_norm_eps - 1e-5).abs() < 1e-12);
+  assert!(!defaults.do_stable_layer_norm);
+  assert!(!defaults.conv_bias);
   assert!(!defaults.add_adapter);
   assert_eq!(defaults.adapter_attn_dim, None);
   assert_eq!(defaults.pad_token_id, 0);
+  // HuBERT-only flag defaults match the wired graph.
+  assert!(defaults.feat_proj_layer_norm);
+  assert!(!defaults.conv_pos_batch_norm);
 }
 
 // ───────────────────────── test 2: feature-encoder time chain ─────────────────────────
@@ -892,18 +1237,22 @@ fn normalize_waveform_promotes_1d_to_2d() {
   assert_eq!(out.shape(), vec![1, 4]);
 }
 
-// ───────────────────────── linear helper ─────────────────────────
+// ───────────────────────── linear wrapper ─────────────────────────
 
 #[test]
-fn linear_with_and_without_bias() {
-  // x (1, 2) = [1, 2]; weight (out=2, in=2) = [[1,0],[0,1]] (identity);
-  // y = x @ wᵀ = [1, 2]. With bias [10, 20] -> [11, 22].
+fn dense_linear_with_and_without_bias() {
+  // The dense `Linear` wrapper (the adoption of the shared `MaybeQuantizedLinear`)
+  // computes `y = x @ wᵀ (+ bias)`. x (1, 2) = [1, 2]; weight (out=2, in=2) =
+  // [[1,0],[0,1]] (identity); y = x @ wᵀ = [1, 2]. With bias [10, 20] -> [11, 22].
   let x = Array::from_slice::<f32>(&[1.0, 2.0], &[1, 2]).unwrap();
   let w = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &[2, 2]).unwrap();
-  let mut y = linear(&x, &w, None).unwrap();
+  let no_bias = Linear::new(w.try_clone().unwrap(), None);
+  let mut y = no_bias.forward(&x).unwrap();
   assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 2.0]);
+  assert!(!no_bias.is_quantized(), "a bare-weight Linear is dense");
   let bias = Array::from_slice::<f32>(&[10.0, 20.0], &[2]).unwrap();
-  let mut yb = linear(&x, &w, Some(&bias)).unwrap();
+  let with_bias = Linear::new(w, Some(bias));
+  let mut yb = with_bias.forward(&x).unwrap();
   assert_eq!(yb.to_vec::<f32>().unwrap(), vec![11.0, 22.0]);
 }
 
@@ -1234,5 +1583,1661 @@ fn load_errors_when_safetensors_absent() {
   assert!(
     matches!(err, Err(Error::MissingKey(_))),
     "expected MissingKey for a dir with no model.safetensors"
+  );
+}
+
+/// Build a complete **HF pre-sanitize** checkpoint map for `config`, with every
+/// backbone key carrying `prefix` (`"wav2vec2."` / `"hubert."`) and `lm_head.*`
+/// top-level — exactly the on-disk `*ForCTC` layout the PUBLIC
+/// [`Wav2Vec2Ctc::load`] path feeds through [`sanitize`]. This is the faithful
+/// inverse of what `from_weights` consumes: the conv weights are in HF
+/// `(out, in, k)` order (sanitize swaps them to MLX `(out, k, in)`), and the
+/// positional weight-norm pair is stored under the PyTorch parametrization names
+/// `...parametrizations.weight.original0` / `original1` in HF order (sanitize
+/// renames + axis-swaps them to `weight_g` / `weight_v`). Every other tensor
+/// (biases, LayerNorm affines, the projection and CTC-head Linears) passes
+/// through sanitize unchanged, so it is stored at the same shape `from_weights`
+/// expects, merely prefixed.
+///
+/// Shapes are written longhand (not read from the code under test) so a
+/// regression in the production sanitize/shape derivation cannot also shift this
+/// oracle.
+fn hf_layout_prefixed_weights(c: &Wav2Vec2Config, prefix: &str) -> HashMap<String, Array> {
+  let mut w: HashMap<String, Array> = HashMap::new();
+  let bb = |k: &str| format!("{prefix}{k}"); // backbone-prefixed key
+  let hs = c.hidden_size;
+  let inter = c.intermediate_size;
+  let groups = c.num_conv_pos_embedding_groups;
+  let kpos = c.num_conv_pos_embeddings;
+  // Feature encoder. HF conv weight is (out, in, k) — sanitize swaps (1,2) to
+  // the MLX (out, k, in) the builder pins.
+  for i in 0..(c.num_feat_extract_layers as usize) {
+    let out = c.conv_dim[i];
+    let k = c.conv_kernel[i];
+    let in_ch = if i == 0 { 1 } else { c.conv_dim[i - 1] };
+    w.insert(
+      bb(&format!("feature_extractor.conv_layers.{i}.conv.weight")),
+      ramp(&[out, in_ch, k], 0.3),
+    );
+    if c.conv_bias {
+      w.insert(
+        bb(&format!("feature_extractor.conv_layers.{i}.conv.bias")),
+        filled(&[out], 0.0),
+      );
+    }
+    if i == 0 {
+      w.insert(
+        bb("feature_extractor.conv_layers.0.layer_norm.weight"),
+        filled(&[out], 1.0),
+      );
+      w.insert(
+        bb("feature_extractor.conv_layers.0.layer_norm.bias"),
+        filled(&[out], 0.0),
+      );
+    }
+  }
+  let last = *c.conv_dim.last().unwrap();
+  // Feature projection (no sanitize transform — stored verbatim, prefixed).
+  w.insert(
+    bb("feature_projection.layer_norm.weight"),
+    filled(&[last], 1.0),
+  );
+  w.insert(
+    bb("feature_projection.layer_norm.bias"),
+    filled(&[last], 0.0),
+  );
+  w.insert(
+    bb("feature_projection.projection.weight"),
+    ramp(&[hs, last], 0.3),
+  );
+  w.insert(bb("feature_projection.projection.bias"), filled(&[hs], 0.0));
+  // Positional conv: HF stores the weight-norm reparametrization as
+  // `...parametrizations.weight.original0` (the magnitude → weight_g) and
+  // `original1` (the direction → weight_v). sanitize renames them and swaps
+  // (1,2), so the HF shapes are the (1,2)-swap of the MLX shapes the builder
+  // pins: weight_g MLX (1, kpos, 1) ⟸ HF (1, 1, kpos); weight_v MLX
+  // (hs, kpos, hs/groups) ⟸ HF (hs, hs/groups, kpos).
+  w.insert(
+    bb("encoder.pos_conv_embed.conv.parametrizations.weight.original0"),
+    filled(&[1, 1, kpos], 1.0),
+  );
+  w.insert(
+    bb("encoder.pos_conv_embed.conv.parametrizations.weight.original1"),
+    ramp(&[hs, hs / groups, kpos], 0.3),
+  );
+  w.insert(bb("encoder.pos_conv_embed.conv.bias"), filled(&[hs], 0.0));
+  w.insert(bb("encoder.layer_norm.weight"), filled(&[hs], 1.0));
+  w.insert(bb("encoder.layer_norm.bias"), filled(&[hs], 0.0));
+  // Transformer layers (no sanitize transform — stored verbatim, prefixed).
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      w.insert(
+        bb(&format!("{p}.attention.{proj}.weight")),
+        ramp(&[hs, hs], 0.3),
+      );
+      w.insert(
+        bb(&format!("{p}.attention.{proj}.bias")),
+        filled(&[hs], 0.0),
+      );
+    }
+    w.insert(bb(&format!("{p}.layer_norm.weight")), filled(&[hs], 1.0));
+    w.insert(bb(&format!("{p}.layer_norm.bias")), filled(&[hs], 0.0));
+    w.insert(
+      bb(&format!("{p}.feed_forward.intermediate_dense.weight")),
+      ramp(&[inter, hs], 0.3),
+    );
+    w.insert(
+      bb(&format!("{p}.feed_forward.intermediate_dense.bias")),
+      filled(&[inter], 0.0),
+    );
+    w.insert(
+      bb(&format!("{p}.feed_forward.output_dense.weight")),
+      ramp(&[hs, inter], 0.3),
+    );
+    w.insert(
+      bb(&format!("{p}.feed_forward.output_dense.bias")),
+      filled(&[hs], 0.0),
+    );
+    w.insert(
+      bb(&format!("{p}.final_layer_norm.weight")),
+      filled(&[hs], 1.0),
+    );
+    w.insert(
+      bb(&format!("{p}.final_layer_norm.bias")),
+      filled(&[hs], 0.0),
+    );
+  }
+  // CTC head: top-level (NOT backbone-prefixed), no sanitize transform.
+  w.insert("lm_head.weight".to_string(), ramp(&[c.vocab_size, hs], 0.3));
+  w.insert("lm_head.bias".to_string(), filled(&[c.vocab_size], 0.0));
+  w
+}
+
+/// Drive the PUBLIC `load()` path end to end for a backbone-prefixed checkpoint:
+/// write a `config.json` + a prefixed HF-layout `model.safetensors` to a temp
+/// dir, then `Wav2Vec2Ctc::load` it (exercising `sanitize` on real prefixed,
+/// HF-ordered keys, not `from_weights` with pre-sanitized ones) and forward to
+/// the right logits shape. `config_json` selects the `model_type`; `prefix` is
+/// its backbone prefix.
+fn assert_load_path_strips_prefix(config_json: &str, prefix: &str) {
+  let config = Wav2Vec2Config::from_json(config_json).unwrap();
+  // The on-disk checkpoint carries the backbone prefix + HF tensor order that
+  // load()'s sanitize must strip and swap.
+  let prefixed = hf_layout_prefixed_weights(&config, prefix);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_loadpath_{}_{}",
+    prefix.trim_end_matches('.'),
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), config_json).unwrap();
+  // Save the PREFIXED weights so load()'s sanitize must strip the backbone
+  // prefix — the path the synthetic from_weights tests bypass.
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &prefixed).unwrap();
+
+  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("public load() must sanitize the {prefix} prefix and build, got {e:?}"),
+  };
+  // A real forward proves the prefixed backbone keys were correctly stripped to
+  // the unprefixed names the builders consume (a stale prefix would have failed
+  // load() with MissingKey above).
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("forward after load must succeed");
+  let expected_t = feature_out_len(&config, 400);
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+    "logits must be (1, T'={expected_t}, vocab={})",
+    config.vocab_size
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all logits must be finite after the public load path"
+  );
+}
+
+#[test]
+fn load_path_strips_hubert_backbone_prefix() {
+  // A real HubertForCTC checkpoint nests its backbone under `hubert.`. The
+  // PUBLIC load() path must strip it via sanitize so the builders find the
+  // unprefixed `feature_extractor.*` / `encoder.*` keys — without this, load()
+  // would fail with MissingKey. This exercises load()/sanitize end to end
+  // (config.json + a prefixed model.safetensors on disk), not from_weights with
+  // pre-sanitized synthetic keys.
+  let json = r#"{
+    "model_type": "hubert",
+    "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+    "num_hidden_layers": 2, "vocab_size": 12,
+    "num_feat_extract_layers": 3,
+    "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+    "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4
+  }"#;
+  assert_load_path_strips_prefix(json, "hubert.");
+}
+
+#[test]
+fn load_path_strips_wav2vec2_backbone_prefix() {
+  // The wav2vec2 backbone prefix (`wav2vec2.`) is likewise stripped by the
+  // public load() path — the same end-to-end round-trip for the Wav2Vec2ForCTC
+  // layout, so neither backbone family relies on pre-sanitized inputs.
+  let json = r#"{
+    "model_type": "wav2vec2",
+    "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+    "num_hidden_layers": 2, "vocab_size": 12,
+    "num_feat_extract_layers": 3,
+    "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+    "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4
+  }"#;
+  assert_load_path_strips_prefix(json, "wav2vec2.");
+}
+
+// ───────────────── newly-unlocked variants: build + forward shape ─────────────────
+
+/// A small constant-filled tensor — non-zero so the forward isn't numerically
+/// degenerate (the norms still well-behave: a constant input has zero variance,
+/// eps-stabilized).
+fn filled(shape: &[i32], v: f32) -> Array {
+  Array::full::<f32>(&shape, v).unwrap()
+}
+
+/// A deterministic, **element-varying** tensor of the given shape (a bounded
+/// pseudo-random ramp). Varied values across the feature axis are what make the
+/// post-norm vs stable-LN block orderings produce different outputs: a single
+/// constant fill collapses both arms to the same fixed point (the LayerNorms
+/// become trivial on a feature-uniform tensor), masking the structural
+/// difference. Values lie in roughly `[-scale, scale]`.
+fn ramp(shape: &[i32], scale: f32) -> Array {
+  let n: usize = shape.iter().map(|&d| d.max(0) as usize).product();
+  let mut data = Vec::with_capacity(n);
+  // A simple deterministic LCG-style sequence folded into [-scale, scale];
+  // no RNG dependency, fully reproducible.
+  let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+  for _ in 0..n {
+    state = state
+      .wrapping_mul(6364136223846793005)
+      .wrapping_add(1442695040888963407);
+    let frac = ((state >> 33) as f32) / ((1u64 << 31) as f32); // [0, 2)
+    data.push((frac - 1.0) * scale);
+  }
+  Array::from_slice::<f32>(&data, &shape).unwrap()
+}
+
+/// Build a complete **post-sanitize** weight map for an arbitrary
+/// [`Wav2Vec2Config`] — the exact layout `from_weights` consumes, every tensor
+/// at the shape the config implies. Norm affines are ones (weight) / zeros
+/// (bias); every other tensor is a small constant. Used to drive a real
+/// forward over newly-unlocked (large / conv_bias / non-gelu) configs at tiny
+/// synthetic dims. Shapes are written longhand (not read from the code under
+/// test) so a regression in the production shape derivation cannot also shift
+/// this oracle.
+fn synthetic_weights(c: &Wav2Vec2Config) -> HashMap<String, Array> {
+  let mut w: HashMap<String, Array> = HashMap::new();
+  let hs = c.hidden_size;
+  let inter = c.intermediate_size;
+  let groups = c.num_conv_pos_embedding_groups;
+  let kpos = c.num_conv_pos_embeddings;
+  // Feature encoder.
+  for i in 0..(c.num_feat_extract_layers as usize) {
+    let out = c.conv_dim[i];
+    let k = c.conv_kernel[i];
+    let in_ch = if i == 0 { 1 } else { c.conv_dim[i - 1] };
+    w.insert(
+      format!("feature_extractor.conv_layers.{i}.conv.weight"),
+      ramp(&[out, k, in_ch], 0.3),
+    );
+    if c.conv_bias {
+      w.insert(
+        format!("feature_extractor.conv_layers.{i}.conv.bias"),
+        filled(&[out], 0.0),
+      );
+    }
+    if i == 0 {
+      // L0 GroupNorm affine (ones weight, zeros bias).
+      w.insert(
+        "feature_extractor.conv_layers.0.layer_norm.weight".to_string(),
+        filled(&[out], 1.0),
+      );
+      w.insert(
+        "feature_extractor.conv_layers.0.layer_norm.bias".to_string(),
+        filled(&[out], 0.0),
+      );
+    }
+  }
+  let last = *c.conv_dim.last().unwrap();
+  // Feature projection.
+  w.insert(
+    "feature_projection.layer_norm.weight".to_string(),
+    filled(&[last], 1.0),
+  );
+  w.insert(
+    "feature_projection.layer_norm.bias".to_string(),
+    filled(&[last], 0.0),
+  );
+  w.insert(
+    "feature_projection.projection.weight".to_string(),
+    ramp(&[hs, last], 0.3),
+  );
+  w.insert(
+    "feature_projection.projection.bias".to_string(),
+    filled(&[hs], 0.0),
+  );
+  // Positional conv (weight-norm pair) + encoder LayerNorm.
+  w.insert(
+    "encoder.pos_conv_embed.conv.weight_g".to_string(),
+    filled(&[1, kpos, 1], 1.0),
+  );
+  w.insert(
+    "encoder.pos_conv_embed.conv.weight_v".to_string(),
+    ramp(&[hs, kpos, hs / groups], 0.3),
+  );
+  w.insert(
+    "encoder.pos_conv_embed.conv.bias".to_string(),
+    filled(&[hs], 0.0),
+  );
+  w.insert("encoder.layer_norm.weight".to_string(), filled(&[hs], 1.0));
+  w.insert("encoder.layer_norm.bias".to_string(), filled(&[hs], 0.0));
+  // Transformer layers.
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      w.insert(format!("{p}.attention.{proj}.weight"), ramp(&[hs, hs], 0.3));
+      w.insert(format!("{p}.attention.{proj}.bias"), filled(&[hs], 0.0));
+    }
+    w.insert(format!("{p}.layer_norm.weight"), filled(&[hs], 1.0));
+    w.insert(format!("{p}.layer_norm.bias"), filled(&[hs], 0.0));
+    w.insert(
+      format!("{p}.feed_forward.intermediate_dense.weight"),
+      ramp(&[inter, hs], 0.3),
+    );
+    w.insert(
+      format!("{p}.feed_forward.intermediate_dense.bias"),
+      filled(&[inter], 0.0),
+    );
+    w.insert(
+      format!("{p}.feed_forward.output_dense.weight"),
+      ramp(&[hs, inter], 0.3),
+    );
+    w.insert(
+      format!("{p}.feed_forward.output_dense.bias"),
+      filled(&[hs], 0.0),
+    );
+    w.insert(format!("{p}.final_layer_norm.weight"), filled(&[hs], 1.0));
+    w.insert(format!("{p}.final_layer_norm.bias"), filled(&[hs], 0.0));
+  }
+  // CTC head.
+  w.insert("lm_head.weight".to_string(), ramp(&[c.vocab_size, hs], 0.3));
+  w.insert("lm_head.bias".to_string(), filled(&[c.vocab_size], 0.0));
+  w
+}
+
+/// The conv-output length recurrence (no padding, dilation 1) over the config's
+/// conv stack, computed independently of the model.
+fn feature_out_len(c: &Wav2Vec2Config, t_in: i64) -> i64 {
+  let mut l = t_in;
+  for i in 0..(c.num_feat_extract_layers as usize) {
+    l = (l - i64::from(c.conv_kernel[i])) / i64::from(c.conv_stride[i]) + 1;
+  }
+  l
+}
+
+/// A tiny synthetic config (overriding the small dims onto the JSON the test
+/// supplies) so a full forward is cheap. Uses 3 feat-extract layers, 2
+/// transformer layers, hidden 32 / heads 4 / inter 64, kpos 16 / groups 4.
+fn tiny_config_json(extra: &str) -> Wav2Vec2Config {
+  let json = format!(
+    r#"{{
+      "hidden_size": 32, "num_attention_heads": 4, "intermediate_size": 64,
+      "num_hidden_layers": 2, "vocab_size": 12,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [16, 16, 16], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4
+      {extra}
+    }}"#
+  );
+  Wav2Vec2Config::from_json(&json).unwrap()
+}
+
+/// Forward a tiny model over a `(1, t_in)` waveform and assert the logits shape
+/// is `(1, T', vocab)` where `T'` is the analytic feature-encoder output length
+/// — exercising the full build + forward graph for a newly-unlocked config.
+fn assert_forward_shape(config: Wav2Vec2Config, t_in: i32) {
+  let expected_t = feature_out_len(&config, i64::from(t_in));
+  assert!(expected_t > 0, "choose a longer input: T' = {expected_t}");
+  let vocab = config.vocab_size as usize;
+  let weights = synthetic_weights(&config);
+  let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default())
+    .expect("a valid family config must build");
+  let waveform = filled(&[1, t_in], 0.1);
+  let mut logits = model.forward(&waveform).expect("forward must succeed");
+  let shape = logits.shape();
+  assert_eq!(
+    shape,
+    vec![1, expected_t as usize, vocab],
+    "logits must be (1, T'={expected_t}, vocab={vocab})"
+  );
+  // The graph must produce finite logits (no NaN/Inf from the norms / convs).
+  let data = logits.to_vec::<f32>().unwrap();
+  assert!(
+    data.iter().all(|v| v.is_finite()),
+    "all logits must be finite"
+  );
+}
+
+#[test]
+fn large_stable_layer_norm_config_builds_and_forwards() {
+  // A large-style stable-LN variant (do_stable_layer_norm = true) at tiny
+  // synthetic dims: it must parse, build the pre-norm encoder arm, and forward
+  // to the right logits shape. Exercises the stable-LN block ordering + the
+  // encoder-level LayerNorm-at-the-end placement end to end.
+  let config = tiny_config_json(r#", "do_stable_layer_norm": true"#);
+  assert!(config.do_stable_layer_norm);
+  assert_forward_shape(config, 400);
+}
+
+#[test]
+fn full_large_lv60_style_config_parses_and_validates() {
+  // The real large-960h-lv60-self transformer dims (1024 hidden / 16 heads / 24
+  // layers / 4096 intermediate, stable-LN) must parse and validate (the
+  // feat_extract_norm stays "group" here — the "layer" arm is out of scope).
+  let json = r#"{
+    "model_type": "wav2vec2",
+    "hidden_size": 1024, "num_attention_heads": 16, "num_hidden_layers": 24,
+    "intermediate_size": 4096, "vocab_size": 32,
+    "do_stable_layer_norm": true,
+    "num_conv_pos_embeddings": 128, "num_conv_pos_embedding_groups": 16
+  }"#;
+  let config = Wav2Vec2Config::from_json(json).unwrap();
+  assert_eq!(config.hidden_size, 1024);
+  assert_eq!(config.num_hidden_layers, 24);
+  assert!(config.do_stable_layer_norm);
+  assert!(config.validate().is_ok());
+}
+
+#[test]
+fn conv_bias_config_builds_and_forwards() {
+  // A conv_bias = true variant: every ConvLayer must load and add its
+  // conv.bias. The model must build (the bias tensors are consumed, not
+  // dropped) and forward to the right shape.
+  let config = tiny_config_json(r#", "conv_bias": true"#);
+  assert!(config.conv_bias);
+  assert_forward_shape(config, 400);
+}
+
+#[test]
+fn conv_bias_config_requires_bias_tensors() {
+  // With conv_bias = true, the builder consumes a `.conv.bias` per layer; a
+  // checkpoint missing one is a clear MissingKey (not a silent drop).
+  let config = tiny_config_json(r#", "conv_bias": true"#);
+  let mut weights = synthetic_weights(&config);
+  weights.remove("feature_extractor.conv_layers.1.conv.bias");
+  match Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()) {
+    Err(Error::MissingKey(p)) => {
+      assert!(
+        p.key().contains("conv_layers.1.conv.bias"),
+        "the missing key should name the absent conv bias, got {:?}",
+        p.key()
+      );
+    }
+    Err(other) => panic!("expected MissingKey for an absent conv bias, got {other:?}"),
+    Ok(_) => panic!("expected MissingKey for an absent conv bias, but the model built"),
+  }
+}
+
+#[test]
+fn non_gelu_activation_config_builds_and_forwards() {
+  // A non-gelu activation variant (silu feed-forward + tanh-approx-gelu feature
+  // encoder) must parse, build, and forward to the right shape — the dispatch
+  // wires the configured activations rather than hardcoding GELU.
+  let config = tiny_config_json(r#", "hidden_act": "silu", "feat_extract_activation": "gelu_new""#);
+  assert_eq!(config.hidden_act, "silu");
+  assert_eq!(config.feat_extract_activation, "gelu_new");
+  assert_forward_shape(config, 400);
+}
+
+#[test]
+fn hubert_model_type_builds_and_forwards() {
+  // The hubert CTC checkpoint shares the plain self-attention transformer wired
+  // here (HuBERT reuses the wav2vec2 encoder architecture); a `hubert` config
+  // must build and forward to the right shape.
+  let config = tiny_config_json(r#", "model_type": "hubert""#);
+  assert_eq!(config.model_type(), "hubert");
+  assert_forward_shape(config, 400);
+}
+
+#[test]
+fn wavlm_model_type_is_rejected() {
+  // WavLM's defining feature is gated relative-position-bias attention, which
+  // this phase does not implement, and it has no plain-attention variant. So a
+  // `wavlm` checkpoint cannot be run faithfully through the plain attention
+  // path (its relative-position tensors would go unconsumed = silent
+  // corruption). `validate` must REJECT it with a typed UnknownEnumValue
+  // carrying the offending value and the (wavlm-free) supported set — never
+  // silently accept a model this phase cannot serve.
+  let config = tiny_config_json(r#", "model_type": "wavlm""#);
+  assert_eq!(config.model_type(), "wavlm");
+  match config.validate() {
+    Err(Error::UnknownEnumValue(p)) => {
+      assert_eq!(p.value(), "wavlm");
+      assert_eq!(
+        p.supported(),
+        &["wav2vec2", "hubert"],
+        "the supported model_type set must be wav2vec2 + hubert only (no wavlm)"
+      );
+    }
+    other => panic!("expected UnknownEnumValue rejecting wavlm, got {other:?}"),
+  }
+  // The rejection is also enforced at the construction boundary: from_weights
+  // runs `validate` first, so a wavlm config never builds a model (even with an
+  // otherwise-complete weight set).
+  let weights = synthetic_weights(&tiny_config_json(r#", "model_type": "wavlm""#));
+  assert!(
+    matches!(
+      Wav2Vec2Ctc::from_weights(
+        tiny_config_json(r#", "model_type": "wavlm""#),
+        weights,
+        Vocab::default()
+      ),
+      Err(Error::UnknownEnumValue(_))
+    ),
+    "from_weights must reject a wavlm config via the validate gate"
+  );
+}
+
+#[test]
+fn post_norm_and_stable_layer_norm_differ() {
+  // The two encoder arms must produce DIFFERENT logits from the same weights
+  // and input — confirming the stable-LN arm is a distinct graph (different
+  // block ordering + encoder-LayerNorm placement), not an accidental alias of
+  // the post-norm arm.
+  let post = tiny_config_json("");
+  let stable = tiny_config_json(r#", "do_stable_layer_norm": true"#);
+  assert!(!post.do_stable_layer_norm);
+  assert!(stable.do_stable_layer_norm);
+
+  let waveform = filled(&[1, 400], 0.1);
+  let mut post_logits = Wav2Vec2Ctc::from_weights(
+    post,
+    synthetic_weights(&tiny_config_json("")),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  let mut stable_logits = Wav2Vec2Ctc::from_weights(
+    stable,
+    synthetic_weights(&tiny_config_json(r#", "do_stable_layer_norm": true"#)),
+    Vocab::default(),
+  )
+  .unwrap()
+  .forward(&waveform)
+  .unwrap();
+  // Same shape, different values.
+  assert_eq!(post_logits.shape(), stable_logits.shape());
+  let a = post_logits.to_vec::<f32>().unwrap();
+  let b = stable_logits.to_vec::<f32>().unwrap();
+  assert!(
+    a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-6),
+    "post-norm and stable-LN arms must differ"
+  );
+}
+
+// ───────────────────── positional-conv activation ─────────────────────
+
+/// VALUE-LEVEL: the positional conv embedding must apply the configured
+/// `feat_extract_activation` (HF's `ACT2FN[config.feat_extract_activation]`),
+/// **not** a hardcoded GELU. For a non-gelu activation (silu / gelu_new) the
+/// output must equal that activation applied to the conv+bias+SamePad result —
+/// a hardcoded GELU would diverge from this oracle.
+///
+/// The oracle recomputes the pre-activation tensor through the **public** conv
+/// op (`ops::conv::conv1d` + the bias add + the SamePad crop), independently of
+/// `PositionalConvEmbedding::forward`, then applies the standalone activation
+/// primitive — so it pins which activation `forward` applies (a shape assertion
+/// alone cannot, since every activation preserves shape).
+#[test]
+fn positional_conv_applies_configured_activation() {
+  use crate::lm::nn::activations;
+
+  // A tiny grouped positional conv: hidden 8, groups 2 (in/group = 4), an EVEN
+  // kernel 4 (so SamePad crops one trailing frame, exercising that branch too),
+  // padding = kernel/2 = 2. Channels-last (B, T, C) input.
+  let hidden = 8i32;
+  let groups = 2i32;
+  let kernel = 4i32;
+  let in_per_group = hidden / groups;
+  // Deterministic, element-varying weight/bias/input so the activation's
+  // nonlinearity is actually exercised (a constant fill would not distinguish
+  // silu from gelu well).
+  let weight = ramp(&[hidden, kernel, in_per_group], 0.4);
+  let bias = ramp(&[hidden], 0.2);
+  let x = ramp(&[1, 12, hidden], 0.5);
+
+  for (name, act) in [
+    ("silu", Activation::Silu),
+    ("gelu_new", Activation::GeluApprox),
+  ] {
+    let pos = PositionalConvEmbedding {
+      weight: weight.try_clone().unwrap(),
+      bias: bias.try_clone().unwrap(),
+      groups,
+      padding: kernel / 2,
+      num_pad_remove: 1, // even kernel
+      activation: act,
+    };
+    let mut got = pos.forward(&x).unwrap();
+
+    // Oracle pre-activation: conv1d + bias + SamePad crop, via the public ops
+    // (NOT through pos.forward), then the standalone activation primitive.
+    let conv = ops::conv::conv1d(&x, &weight, 1, kernel / 2, 1, groups).unwrap();
+    let pre = conv.add(&bias).unwrap();
+    // SamePad: drop the single trailing time frame (axis 1 in (B, T, C)).
+    let shape = pre.shape();
+    let stop: Vec<i32> = shape
+      .iter()
+      .enumerate()
+      .map(|(ax, &d)| if ax == 1 { d as i32 - 1 } else { d as i32 })
+      .collect();
+    let start = vec![0i32; shape.len()];
+    let strides = vec![1i32; shape.len()];
+    let cropped = ops::indexing::slice(&pre, &start, &stop, &strides).unwrap();
+    let mut want = match act {
+      Activation::Silu => activations::silu(&cropped),
+      Activation::GeluApprox => activations::gelu_approx(&cropped),
+      Activation::Gelu => activations::gelu(&cropped),
+    }
+    .unwrap();
+
+    assert_eq!(
+      got.shape(),
+      want.shape(),
+      "{name}: positional-conv output shape must match the oracle"
+    );
+    let g = got.to_vec::<f32>().unwrap();
+    let w = want.to_vec::<f32>().unwrap();
+    for (a, b) in g.iter().zip(w.iter()) {
+      assert!(
+        (a - b).abs() < 1e-5,
+        "{name}: positional conv must apply the configured activation \
+         (got {a}, want {b}) — a hardcoded GELU would diverge here"
+      );
+    }
+
+    // Cross-check: the same input through the EXACT-GELU embedding must NOT
+    // match the silu/gelu_new oracle (proving the activation is honoured, not a
+    // GELU that happens to be close). Skipped for the gelu_new case only where
+    // the tanh-approx is numerically near exact GELU; silu is unambiguously
+    // distinct.
+    if matches!(act, Activation::Silu) {
+      let gelu_pos = PositionalConvEmbedding {
+        weight: weight.try_clone().unwrap(),
+        bias: bias.try_clone().unwrap(),
+        groups,
+        padding: kernel / 2,
+        num_pad_remove: 1,
+        activation: Activation::Gelu,
+      };
+      let mut gelu_out = gelu_pos.forward(&x).unwrap();
+      let go = gelu_out.to_vec::<f32>().unwrap();
+      assert!(
+        go.iter().zip(w.iter()).any(|(x, y)| (x - y).abs() > 1e-4),
+        "a hardcoded exact-GELU positional conv must differ from the silu oracle"
+      );
+    }
+  }
+}
+
+// ───────────────────── dtype preservation ─────────────────────
+
+/// Cast every tensor in a (post-sanitize) weight map to `dtype`, for the
+/// half-precision dtype-preservation tests. Norm affines / biases / weights all
+/// move to the target dtype, mirroring a real F16 / BF16 checkpoint.
+fn cast_weights(
+  weights: HashMap<String, Array>,
+  dtype: crate::dtype::Dtype,
+) -> HashMap<String, Array> {
+  weights
+    .into_iter()
+    .map(|(k, v)| (k, v.astype(dtype).unwrap()))
+    .collect()
+}
+
+/// ISOLATED ATTENTION: the attention block's query scale must be
+/// built in the operand dtype, so a half-precision (F16 / BF16) input stays
+/// half-precision through attention. A bare F32 scale would promote the whole
+/// block to F32 under MLX type promotion (breaking mixed-precision numerics +
+/// inflating memory / the KV-cache). Asserts the attention OUTPUT dtype equals
+/// the input dtype (i.e. does NOT silently become F32).
+#[test]
+fn attention_preserves_half_precision_dtype() {
+  let hidden = 8i32;
+  let heads = 2i32;
+  let head_dim = hidden / heads;
+  for dtype in [crate::dtype::Dtype::F16, crate::dtype::Dtype::BF16] {
+    let mk = |shape: &[i32], scale: f32| ramp(shape, scale).astype(dtype).unwrap();
+    // Build each projection as a dense quantize-aware `Linear` (the adoption of
+    // the shared `MaybeQuantizedLinear`); the dtype-preservation contract is on
+    // the dense path here.
+    let mk_proj = |scale_w: f32, scale_b: f32| {
+      Linear::new(mk(&[hidden, hidden], scale_w), Some(mk(&[hidden], scale_b)))
+    };
+    let attn = Attention {
+      q_proj: mk_proj(0.3, 0.1),
+      k_proj: mk_proj(0.3, 0.1),
+      v_proj: mk_proj(0.3, 0.1),
+      out_proj: mk_proj(0.3, 0.1),
+      num_heads: heads,
+      head_dim,
+      scaling: (head_dim as f32).powf(-0.5),
+    };
+    let x = ramp(&[1, 5, hidden], 0.5).astype(dtype).unwrap();
+    let out = attn.forward(&x).unwrap();
+    assert_eq!(
+      out.dtype().unwrap(),
+      dtype,
+      "attention must preserve {dtype:?} — a bare F32 query scale would promote it to F32"
+    );
+  }
+}
+
+/// WHOLE-FORWARD dtype preservation: a tiny model built
+/// from F16 / BF16 weights, forwarded over a same-dtype waveform, must produce
+/// logits of that same dtype — the final output dtype must equal the
+/// weight/input dtype, never silently F32. Covers every dtype-meets-activation
+/// site on the real forward path (attention scale, positional conv,
+/// activations, the norms), which the f32-only suite misses.
+#[test]
+fn forward_preserves_half_precision_dtype() {
+  for dtype in [crate::dtype::Dtype::F16, crate::dtype::Dtype::BF16] {
+    let config = tiny_config_json("");
+    let weights = cast_weights(synthetic_weights(&tiny_config_json("")), dtype);
+    let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()).unwrap();
+    let waveform = ramp(&[1, 400], 0.5).astype(dtype).unwrap();
+    let logits = model.forward(&waveform).unwrap();
+    assert_eq!(
+      logits.dtype().unwrap(),
+      dtype,
+      "the whole forward must preserve {dtype:?} (no f32-built scalar / scale / \
+       eps may promote the activations) — final logits dtype must match the weights"
+    );
+    // The half-precision graph must still be finite (no NaN/Inf). Read back via
+    // an explicit f32 upcast (the logits are half-precision, so a direct
+    // `to_vec::<f32>` would dtype-mismatch — the upcast is test-only).
+    let data = logits
+      .astype(crate::dtype::Dtype::F32)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap();
+    assert!(
+      data.iter().all(|v| v.is_finite()),
+      "all {dtype:?} logits must be finite"
+    );
+  }
+}
+
+/// WHOLE-FORWARD, stable-LN arm: the pre-norm encoder must likewise preserve
+/// half precision (it runs the same attention + positional conv + activations,
+/// only reordered), so cover it too.
+#[test]
+fn forward_stable_ln_preserves_half_precision_dtype() {
+  for dtype in [crate::dtype::Dtype::F16, crate::dtype::Dtype::BF16] {
+    let extra = r#", "do_stable_layer_norm": true"#;
+    let config = tiny_config_json(extra);
+    let weights = cast_weights(synthetic_weights(&tiny_config_json(extra)), dtype);
+    let model = Wav2Vec2Ctc::from_weights(config, weights, Vocab::default()).unwrap();
+    let waveform = ramp(&[1, 400], 0.5).astype(dtype).unwrap();
+    let logits = model.forward(&waveform).unwrap();
+    assert_eq!(
+      logits.dtype().unwrap(),
+      dtype,
+      "the stable-LN forward must preserve {dtype:?}"
+    );
+    let data = logits
+      .astype(crate::dtype::Dtype::F32)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap();
+    assert!(
+      data.iter().all(|v| v.is_finite()),
+      "all stable-LN {dtype:?} logits must be finite"
+    );
+  }
+}
+
+// ───────────────────── quantized-checkpoint loading ─────────────────────
+//
+// No local 8-bit wav2vec2 checkpoint is available, so the quantized load path
+// is covered by a SYNTHETIC quantized checkpoint: a tiny config whose every
+// quantized Linear's input width (`hidden_size`, `intermediate_size`,
+// `conv_dim[-1]`) is divisible by the affine `group_size` (mlx requires
+// `group_size ∈ {32, 64, 128}`), with every encoder attention / feed-forward
+// projection, the feature projection, and the CTC `lm_head` weight replaced by
+// the real `ops::quantized::quantize` `(weight, scales, biases)` triple — the
+// exact on-disk layout an mlx-community 8-bit checkpoint ships. The model must
+// then construct (building `MaybeQuantizedLinear::Quantized` layers) and run a
+// full forward to the right CTC-logits shape with finite output. The
+// convolutional feature extractor + positional conv stay DENSE (the
+// `class_predicate` only quantizes `nn.Linear`).
+
+/// A valid mlx affine group size (`group_size ∈ {32, 64, 128}`).
+const QGROUP: i32 = 32;
+/// 8-bit affine — the common mlx-community quantized scheme.
+const QBITS: i32 = 8;
+
+/// A tiny quant-friendly config: every quantized Linear's input width
+/// (`hidden_size = 64`, `intermediate_size = 128`, `conv_dim[-1] = 64`) is a
+/// whole number of `QGROUP` groups. 3 feat-extract layers, 2 transformer layers.
+fn quant_config_json(extra: &str) -> Wav2Vec2Config {
+  let json = format!(
+    r#"{{
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4
+      {extra}
+    }}"#
+  );
+  Wav2Vec2Config::from_json(&json).unwrap()
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`) at the given affine `group_size`,
+/// mirroring how an mlx-community quantized checkpoint stores a quantized
+/// `Linear`. The `<prefix>.bias` (dense output bias), if any, is left untouched.
+/// `group_size` must divide `<prefix>.weight`'s last (input) axis.
+fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str, group_size: i32) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .unwrap_or_else(|| panic!("dense weight {prefix}.weight present"));
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, group_size, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Build a synthetic post-sanitize quantized wav2vec2 checkpoint at an EXPLICIT
+/// affine `group_size`: the dense `synthetic_weights` for `config`, then every
+/// quantized-eligible Linear (encoder attention `q/k/v/out`, feed-forward
+/// `intermediate` / `output`, the feature projection, and the CTC `lm_head`)
+/// replaced by the 8-bit affine triple. The conv feature extractor + positional
+/// conv stay DENSE — only `nn.Linear` is quantized, matching mlx-audio / MLX.
+/// `group_size` must divide every quantized Linear's input width
+/// (`hidden_size` / `intermediate_size` / `conv_dim[-1]`).
+fn quant_weights_at(config: &Wav2Vec2Config, group_size: i32) -> HashMap<String, Array> {
+  let mut w = synthetic_weights(config);
+  // Feature projection Linear.
+  quantize_weight_in_place(&mut w, "feature_projection.projection", group_size);
+  // Per-layer attention + feed-forward projections.
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.attention.{proj}"), group_size);
+    }
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      group_size,
+    );
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.output_dense"),
+      group_size,
+    );
+  }
+  // CTC head Linear.
+  quantize_weight_in_place(&mut w, "lm_head", group_size);
+  w
+}
+
+/// The synthetic quantized checkpoint at the module-default `QGROUP` — the
+/// shape an mlx-community 8-bit checkpoint ships for these dims.
+fn quant_weights(config: &Wav2Vec2Config) -> HashMap<String, Array> {
+  quant_weights_at(config, QGROUP)
+}
+
+/// The parsed global 8-bit affine quantization config for the synthetic
+/// checkpoint (the analogue of the `config.json` `quantization` block).
+fn quant_config() -> PerLayerQuantization {
+  PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(QGROUP, QBITS))
+}
+
+#[test]
+fn from_weights_quantized_builds_quantized_layers() {
+  // With a quantization config and a checkpoint whose Linear weights carry
+  // `.scales`/`.biases`, the model builds quantized layers — and still builds
+  // (a packed `uint32` weight of a DIFFERENT shape than the dense `(out, in)`
+  // would otherwise be rejected by the dense shape gate).
+  let config = quant_config_json("");
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    config,
+    quant_weights(&quant_config_json("")),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .expect("an 8-bit quantized checkpoint must build through the quantized path");
+  // The CTC head is the quantized variant (a dense `.weight` would have made
+  // `is_quantized()` false).
+  assert!(
+    model.lm_head.is_quantized(),
+    "the CTC lm_head must load as a quantized projection"
+  );
+  // The conv feature extractor stays dense (it is not a `nn.Linear`); its first
+  // conv weight is still a plain f32 tensor, never quantized.
+  let conv0 = &model.feature_encoder.conv_layers[0].weight;
+  assert_eq!(
+    conv0.dtype().unwrap(),
+    crate::dtype::Dtype::F32,
+    "the conv feature extractor must stay dense (never quantized)"
+  );
+}
+
+#[test]
+fn from_weights_quantized_runs_forward_to_finite_ctc_logits() {
+  // The real GOAL contract on a synthetic stand-in: an 8-bit checkpoint loads
+  // AND runs the full forward to FINITE per-frame CTC logits of the right shape
+  // (the quantized attention / feed-forward / projection / lm_head
+  // `quantized_matmul` all execute through mlx-c, the conv front-end runs dense).
+  let config = quant_config_json("");
+  let expected_t = feature_out_len(&config, 400);
+  assert!(expected_t > 0, "choose a longer input: T' = {expected_t}");
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    quant_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("quantized forward must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, vocab],
+    "quantized logits must be (1, T'={expected_t}, vocab={vocab})"
+  );
+  let data = logits.to_vec::<f32>().unwrap();
+  assert!(
+    data.iter().all(|v| v.is_finite()),
+    "all quantized CTC logits must be finite"
+  );
+}
+
+#[test]
+fn from_weights_quantized_stable_ln_runs_forward() {
+  // The stable-LN (pre-norm) encoder arm must likewise load + forward a
+  // quantized checkpoint (it runs the same quantized projections, only
+  // reordered) to finite logits of the right shape.
+  let config = quant_config_json(r#", "do_stable_layer_norm": true"#);
+  assert!(config.do_stable_layer_norm);
+  let expected_t = feature_out_len(&config, 400);
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(r#", "do_stable_layer_norm": true"#),
+    quant_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model.forward(&waveform).unwrap();
+  assert_eq!(logits.shape(), vec![1, expected_t as usize, vocab]);
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "stable-LN quantized logits must be finite"
+  );
+}
+
+#[test]
+fn from_weights_quantized_dense_checkpoint_unchanged() {
+  // A NON-quantized checkpoint loads identically whether or not a quantization
+  // config is threaded (the `.scales` sibling is the load-bearing signal; a
+  // dense checkpoint has none, so the dense path runs regardless). Produces the
+  // same logits shape as the plain `from_weights` path.
+  let config = quant_config_json("");
+  let expected_t = feature_out_len(&config, 400);
+  let vocab = config.vocab_size as usize;
+  let model = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+    Some(&quant_config()),
+  )
+  .expect("a dense checkpoint loads even when a quantization config is supplied");
+  // None of its projections is quantized (no `.scales` siblings present).
+  assert!(
+    !model.lm_head.is_quantized(),
+    "a dense checkpoint's lm_head must stay dense even with a quant config"
+  );
+  let waveform = filled(&[1, 400], 0.1);
+  let logits = model.forward(&waveform).unwrap();
+  assert_eq!(logits.shape(), vec![1, expected_t as usize, vocab]);
+}
+
+#[test]
+fn from_weights_quantized_scales_without_config_errors() {
+  // Weights say quantized (`.scales` present) but no quantization config
+  // resolved scheme params → a typed InvariantViolation, not a silent wrong
+  // load. Thread an empty per-layer config with no global default so
+  // `quantization_for` returns None for the quantized layer.
+  let config = quant_config_json("");
+  let empty_cfg = PerLayerQuantization::new(None, HashMap::new());
+  // `Wav2Vec2Ctc` is not `Debug` (it holds `Array`s), so match rather than
+  // `.unwrap_err()` (which would need the `Ok` value to be `Debug`).
+  match Wav2Vec2Ctc::from_weights_quantized(
+    config,
+    quant_weights(&quant_config_json("")),
+    Vocab::default(),
+    Some(&empty_cfg),
+  ) {
+    Err(Error::InvariantViolation(_)) => {}
+    Err(other) => {
+      panic!(
+        "expected InvariantViolation for `.scales` present but no resolved params, got {other:?}"
+      )
+    }
+    Ok(_) => panic!("expected an error for a `.scales` sibling with no resolved scheme params"),
+  }
+}
+
+#[test]
+fn from_weights_quantized_dense_path_identical_to_from_weights() {
+  // The dense path is byte-for-byte unchanged: `from_weights` (the public
+  // non-quantized entry) and `from_weights_quantized(.., None)` over the same
+  // dense checkpoint must produce identical logits (same graph, same weights).
+  let config = quant_config_json("");
+  let waveform = ramp(&[1, 400], 0.5);
+
+  let model_plain = Wav2Vec2Ctc::from_weights(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+  )
+  .unwrap();
+  let mut logits_plain = model_plain.forward(&waveform).unwrap();
+
+  let model_none = Wav2Vec2Ctc::from_weights_quantized(
+    quant_config_json(""),
+    synthetic_weights(&config),
+    Vocab::default(),
+    None,
+  )
+  .unwrap();
+  let mut logits_none = model_none.forward(&waveform).unwrap();
+
+  assert_eq!(
+    logits_plain.to_vec::<f32>().unwrap(),
+    logits_none.to_vec::<f32>().unwrap(),
+    "from_weights and from_weights_quantized(.., None) must be identical on a dense checkpoint"
+  );
+}
+
+// ───────────────── on-disk quantized `load()` path ─────────────────
+//
+// The `from_weights_quantized` tests above thread an already-parsed
+// `PerLayerQuantization` straight into the constructor, so they never exercise
+// how the public `load()` entry resolves the `config.json` quantization block.
+// `load()` must resolve it through the shared audio resolver
+// `crate::audio::load::apply_quantization`, which (mirroring mlx-audio) accepts
+// EITHER a top-level `quantization` block OR the HF `quantization_config` key
+// and defaults a missing `group_size` to 64. These tests drive a real on-disk
+// checkpoint (a `config.json` + a quantized `model.safetensors`) through the
+// full `load()` path — `sanitize` included — for exactly those two shapes.
+
+/// A whole-checkpoint **HF pre-sanitize** layout with every quantized-eligible
+/// `nn.Linear` replaced by its `ops::quantized::quantize` affine triple at
+/// `group_size`. Starts from [`hf_layout_prefixed_weights`] (so the conv /
+/// positional weights are in the on-disk HF order [`sanitize`] swaps) and
+/// quantizes only the Linear weights — which `sanitize` passes through
+/// unchanged, so quantizing them in their on-disk (prefixed / top-level) form is
+/// exactly what an mlx-community quantized `*ForCTC` checkpoint ships. The conv
+/// feature extractor and positional conv stay DENSE (only `nn.Linear`
+/// quantizes). `group_size` must divide every quantized Linear's input width.
+fn hf_quant_layout_weights(
+  c: &Wav2Vec2Config,
+  prefix: &str,
+  group_size: i32,
+) -> HashMap<String, Array> {
+  let mut w = hf_layout_prefixed_weights(c, prefix);
+  // Backbone Linears keep the backbone prefix on disk; `lm_head` is top-level.
+  quantize_weight_in_place(
+    &mut w,
+    &format!("{prefix}feature_projection.projection"),
+    group_size,
+  );
+  for i in 0..(c.num_hidden_layers as usize) {
+    let p = format!("{prefix}encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.attention.{proj}"), group_size);
+    }
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      group_size,
+    );
+    quantize_weight_in_place(
+      &mut w,
+      &format!("{p}.feed_forward.output_dense"),
+      group_size,
+    );
+  }
+  quantize_weight_in_place(&mut w, "lm_head", group_size);
+  w
+}
+
+/// Drive the PUBLIC `load()` path for a quantized checkpoint whose `config.json`
+/// expresses its quantization scheme via the verbatim `quant_block` JSON
+/// fragment (e.g. `"quantization_config": {...}` or a `"quantization"` block
+/// without `group_size`). The on-disk `model.safetensors` is the HF pre-sanitize
+/// layout with its Linears quantized at `weight_group_size` (the group size the
+/// resolved scheme must agree on). Writes the `config.json` + weights to a temp
+/// dir, calls `Wav2Vec2Ctc::load`, and asserts the quantized path was taken (the
+/// CTC head loaded quantized) and a real forward produces finite CTC logits of
+/// the right shape. The model dims are pinned here (mirroring
+/// `quant_config_json("")`) so the saved quantized weights line up with the
+/// config the loader parses.
+fn assert_quant_load_path(quant_block: &str, tag: &str, weight_group_size: i32) {
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      {quant_block}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+  let weights = hf_quant_layout_weights(&config, "wav2vec2.", weight_group_size);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_quantload_{tag}_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), &config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+
+  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => {
+      panic!("public load() must resolve the {tag} quantization block and build, got {e:?}")
+    }
+  };
+  // A dense `.weight` would have made `is_quantized()` false — proving the
+  // quantization block was resolved (not silently dropped, the bug this guards)
+  // is exactly that the CTC head loaded as a quantized projection.
+  assert!(
+    model.lm_head.is_quantized(),
+    "the {tag} checkpoint must load its CTC lm_head through the quantized path"
+  );
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("quantized forward after load must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+    "{tag} quantized logits must be (1, T'={expected_t}, vocab={})",
+    config.vocab_size
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all {tag} quantized CTC logits must be finite after the public load path"
+  );
+}
+
+#[test]
+fn load_path_resolves_hf_quantization_config_key() {
+  // The exact case the LM-only parser dropped: a VALID 8-bit checkpoint whose
+  // `config.json` expresses quantization under the HF `quantization_config` key
+  // (NOT a top-level `quantization` block). The shared audio resolver falls back
+  // to that key, so `load()` must take the quantized path; the LM parser would
+  // have returned `None` and the dense shape gate would then reject the packed
+  // uint32 weight, failing a valid checkpoint to load.
+  let block = format!(r#""quantization_config": {{ "group_size": {QGROUP}, "bits": {QBITS} }}"#);
+  assert_quant_load_path(&block, "hf_quantization_config", QGROUP);
+}
+
+#[test]
+fn load_path_defaults_missing_group_size_to_64() {
+  // A `quantization` block that OMITS `group_size` must default it to 64 (the
+  // mlx-audio convention the shared resolver applies); the LM parser rejects a
+  // missing `group_size` outright. The on-disk weights are quantized at
+  // group_size 64 so they line up with the defaulted scheme — a successful load
+  // + forward proves the default was applied (a wrong default would mis-shape
+  // the `.scales` and be rejected).
+  let block = format!(r#""quantization": {{ "bits": {QBITS} }}"#);
+  assert_quant_load_path(&block, "missing_group_size", 64);
+}
+
+/// The quantization `group_size` a built [`Linear`] (the wav2vec2 wrapper) was
+/// loaded with, or `None` when the layer is dense. Reads the wrapper's inner
+/// [`MaybeQuantizedLinear`] (a private field reachable from this child module),
+/// proving which scheme a layer actually resolved — the exact fact the per-layer
+/// override reprojection must get right.
+fn loaded_group_size(layer: &super::Linear) -> Option<i32> {
+  match &layer.inner {
+    crate::nn::MaybeQuantizedLinear::Quantized(q) => Some(q.group_size()),
+    crate::nn::MaybeQuantizedLinear::Dense(_) => None,
+  }
+}
+
+/// The transformer layer stack of a built [`Encoder`], regardless of its
+/// (post-norm / stable-LN) arm — both arms share the same `EncoderInner` layout.
+fn encoder_layers(encoder: &super::Encoder) -> &[super::EncoderLayer] {
+  match encoder {
+    super::Encoder::PostNorm(inner) | super::Encoder::StableLayerNorm(inner) => &inner.layers,
+  }
+}
+
+#[test]
+fn load_path_applies_hf_keyed_per_layer_quant_override() {
+  // The finding this guards: a per-layer quantization override keyed in the
+  // on-disk HF form (carrying the `wav2vec2.` backbone prefix) must reach the
+  // layer it names. `load()` runs the weights through `sanitize` (which strips
+  // that prefix) and the builders then resolve a layer's scheme by its SANITIZED
+  // prefix, so an override keyed `wav2vec2.encoder.layers.0.attention.q_proj`
+  // would never match the `encoder.layers.0.attention.q_proj` lookup and the
+  // layer would silently fall back to the GLOBAL scheme. With the reprojection,
+  // the override's per-layer `group_size` must win for exactly that one layer
+  // while every other quantized layer keeps the global `group_size`.
+  const GLOBAL_GROUP: i32 = 64;
+  const OVERRIDE_GROUP: i32 = 32;
+  // Sanity: the two group sizes differ, so reading back `OVERRIDE_GROUP` on the
+  // overridden layer can only mean the override was applied (not the global).
+  assert_ne!(GLOBAL_GROUP, OVERRIDE_GROUP);
+
+  // The override is keyed in the HF on-disk form (with the backbone prefix); its
+  // `group_size` differs from the global default.
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "quantization": {{
+        "group_size": {GLOBAL_GROUP}, "bits": {QBITS},
+        "wav2vec2.encoder.layers.0.attention.q_proj": {{ "group_size": {OVERRIDE_GROUP}, "bits": {QBITS} }}
+      }}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+
+  // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
+  // each quantized-eligible Linear at its scheme's group size — the single
+  // overridden layer at the OVERRIDE size, every other eligible Linear at the
+  // GLOBAL size — quantizing each layer exactly once from its dense weight so
+  // the on-disk `.scales` line up with the per-layer scheme the config declares
+  // (a mismatch would be caught by the shape gate). The conv feature extractor +
+  // positional conv stay dense (only `nn.Linear` quantizes).
+  let mut weights = hf_layout_prefixed_weights(&config, "wav2vec2.");
+  const OVERRIDE_LAYER: &str = "wav2vec2.encoder.layers.0.attention.q_proj";
+  quantize_weight_in_place(
+    &mut weights,
+    "wav2vec2.feature_projection.projection",
+    GLOBAL_GROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      let prefix = format!("{p}.attention.{proj}");
+      let group = if prefix == OVERRIDE_LAYER {
+        OVERRIDE_GROUP
+      } else {
+        GLOBAL_GROUP
+      };
+      quantize_weight_in_place(&mut weights, &prefix, group);
+    }
+    quantize_weight_in_place(
+      &mut weights,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      GLOBAL_GROUP,
+    );
+    quantize_weight_in_place(
+      &mut weights,
+      &format!("{p}.feed_forward.output_dense"),
+      GLOBAL_GROUP,
+    );
+  }
+  quantize_weight_in_place(&mut weights, "lm_head", GLOBAL_GROUP);
+
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs_wav2vec2_perlayer_override_{}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::write(dir.join("config.json"), &config_json).unwrap();
+  crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+
+  let loaded = Wav2Vec2Ctc::load(&dir.to_string_lossy());
+  let _ = std::fs::remove_dir_all(&dir);
+
+  let model = match loaded {
+    Ok(m) => m,
+    Err(e) => panic!("public load() must apply the HF-keyed per-layer override, got {e:?}"),
+  };
+
+  let layers = encoder_layers(&model.encoder);
+  let layer0 = &layers[0];
+  // The overridden layer 0 `q_proj` must load quantized at the OVERRIDE group
+  // size — proving the HF-keyed override reached the sanitized lookup (the bug:
+  // it would otherwise have silently fallen back to GLOBAL_GROUP here).
+  assert_eq!(
+    loaded_group_size(&layer0.attention.q_proj),
+    Some(OVERRIDE_GROUP),
+    "the HF-keyed per-layer override must apply its group_size to encoder.layers.0.attention.q_proj"
+  );
+  // Its siblings in the SAME layer carry no override, so they keep the global
+  // scheme — confirming the override is scoped to exactly the named layer.
+  assert_eq!(
+    loaded_group_size(&layer0.attention.k_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  assert_eq!(
+    loaded_group_size(&layer0.attention.out_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  // A different layer is likewise untouched by the layer-0 override.
+  assert_eq!(
+    loaded_group_size(&layers[1].attention.q_proj),
+    Some(GLOBAL_GROUP),
+    "a different layer must keep the global group_size"
+  );
+  // The CTC head (top-level `lm_head`, never backbone-prefixed) stays global.
+  assert_eq!(
+    loaded_group_size(&model.lm_head),
+    Some(GLOBAL_GROUP),
+    "the top-level lm_head must keep the global group_size"
+  );
+
+  // And the model still runs the full forward to finite CTC logits.
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("mixed-quant forward after load must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all mixed-quant CTC logits must be finite after the public load path"
+  );
+}
+
+#[test]
+fn reproject_quant_keys_strips_backbone_prefix_and_keeps_global() {
+  // Each per-layer override key has its backbone prefix (`wav2vec2.` / `hubert.`)
+  // stripped to the sanitized lookup namespace; an already-unprefixed key (the
+  // top-level `lm_head`) is left as-is; the global default is carried through.
+  let global = crate::lm::quant::Quantization::affine(64, QBITS);
+  let layer_scheme = crate::lm::quant::Quantization::affine(32, QBITS);
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(layer_scheme),
+  );
+  per_layer.insert(
+    "hubert.encoder.layers.1.feed_forward.output_dense".to_string(),
+    QuantizationOption::Skip,
+  );
+  per_layer.insert("lm_head".to_string(), QuantizationOption::Quantize(global));
+
+  let out = reproject_quant_keys(&PerLayerQuantization::new(Some(global), per_layer))
+    .expect("a conflict-free per-layer map must reproject");
+
+  // The global default is preserved.
+  assert_eq!(out.quantization, Some(global));
+  let reprojected = out.per_layer_ref();
+  // The backbone prefixes are stripped to the sanitized lookup form.
+  assert_eq!(
+    reprojected.get("encoder.layers.0.attention.q_proj"),
+    Some(&QuantizationOption::Quantize(layer_scheme)),
+    "the wav2vec2.-prefixed override must reproject to the sanitized key"
+  );
+  assert_eq!(
+    reprojected.get("encoder.layers.1.feed_forward.output_dense"),
+    Some(&QuantizationOption::Skip),
+    "the hubert.-prefixed Skip override must reproject to the sanitized key"
+  );
+  // The already-unprefixed top-level key is unchanged.
+  assert_eq!(
+    reprojected.get("lm_head"),
+    Some(&QuantizationOption::Quantize(global)),
+    "an already-sanitized key (lm_head) must pass through unchanged"
+  );
+  // No backbone-prefixed key survives the reprojection.
+  assert!(
+    !reprojected
+      .keys()
+      .any(|k| k.starts_with("wav2vec2.") || k.starts_with("hubert.")),
+    "no reprojected key may retain a backbone prefix"
+  );
+}
+
+#[test]
+fn reproject_quant_keys_dedups_identical_collision() {
+  // Two source keys (a prefixed + an unprefixed form of the SAME layer) that
+  // reproject to the same sanitized key with the IDENTICAL scheme are a benign
+  // duplicate — deduplicated to a single entry, not an error.
+  let scheme = crate::lm::quant::Quantization::affine(32, QBITS);
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(scheme),
+  );
+  per_layer.insert(
+    "encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(scheme),
+  );
+
+  let out = reproject_quant_keys(&PerLayerQuantization::new(None, per_layer))
+    .expect("identical reprojected schemes must deduplicate, not error");
+  let reprojected = out.per_layer_ref();
+  assert_eq!(
+    reprojected.len(),
+    1,
+    "the identical duplicate must collapse to one entry"
+  );
+  assert_eq!(
+    reprojected.get("encoder.layers.0.attention.q_proj"),
+    Some(&QuantizationOption::Quantize(scheme)),
+  );
+}
+
+#[test]
+fn reproject_quant_keys_rejects_conflicting_collision() {
+  // Two source keys that reproject to the same sanitized key with CONFLICTING
+  // schemes are a genuine config contradiction — a typed `KeyCollision`, never a
+  // silent arbitrary-survivor overwrite.
+  let mut per_layer = HashMap::new();
+  per_layer.insert(
+    "wav2vec2.encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(32, QBITS)),
+  );
+  per_layer.insert(
+    "encoder.layers.0.attention.q_proj".to_string(),
+    QuantizationOption::Quantize(crate::lm::quant::Quantization::affine(64, QBITS)),
+  );
+
+  match reproject_quant_keys(&PerLayerQuantization::new(None, per_layer)) {
+    Err(Error::KeyCollision(p)) => {
+      assert_eq!(
+        p.key(),
+        "encoder.layers.0.attention.q_proj",
+        "the collision error must name the conflicting sanitized key"
+      );
+    }
+    Err(other) => {
+      panic!("expected KeyCollision for conflicting reprojected schemes, got {other:?}")
+    }
+    Ok(_) => panic!("conflicting reprojected schemes must not silently overwrite"),
+  }
+}
+
+#[test]
+fn from_weights_quantized_applies_hf_keyed_per_layer_override_via_public_api() {
+  // The finding this guards: a caller using the PUBLIC `from_weights_quantized`
+  // constructor directly — `sanitize(raw_weights)` + the parsed
+  // `PerLayerQuantization` from `apply_quantization(config_json)` — with a
+  // per-layer override keyed in the on-disk HF form (carrying the `wav2vec2.`
+  // backbone prefix) must still reach the layer it names. `sanitize` strips that
+  // prefix from the weight keys, and the builders resolve a layer's scheme by
+  // its SANITIZED prefix, so an override keyed
+  // `wav2vec2.encoder.layers.0.attention.q_proj` would never match the
+  // `encoder.layers.0.attention.q_proj` lookup and the layer would silently fall
+  // back to the GLOBAL scheme — unless `from_weights_quantized` itself
+  // normalizes the override keys (the single reprojection boundary, exercised
+  // here WITHOUT the `load()` wrapper). With that boundary fix, the override's
+  // per-layer `group_size` wins for exactly that one layer while every other
+  // quantized layer keeps the global `group_size`.
+  const GLOBAL_GROUP: i32 = 64;
+  const OVERRIDE_GROUP: i32 = 32;
+  // Sanity: the two group sizes differ, so reading back `OVERRIDE_GROUP` on the
+  // overridden layer can only mean the override was applied (not the global).
+  assert_ne!(GLOBAL_GROUP, OVERRIDE_GROUP);
+
+  // The override is keyed in the HF on-disk form (with the backbone prefix); its
+  // `group_size` differs from the global default.
+  let config_json = format!(
+    r#"{{
+      "model_type": "wav2vec2",
+      "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128,
+      "num_hidden_layers": 2, "vocab_size": 32,
+      "num_feat_extract_layers": 3,
+      "conv_dim": [64, 64, 64], "conv_kernel": [10, 3, 3], "conv_stride": [5, 2, 2],
+      "num_conv_pos_embeddings": 16, "num_conv_pos_embedding_groups": 4,
+      "quantization": {{
+        "group_size": {GLOBAL_GROUP}, "bits": {QBITS},
+        "wav2vec2.encoder.layers.0.attention.q_proj": {{ "group_size": {OVERRIDE_GROUP}, "bits": {QBITS} }}
+      }}
+    }}"#
+  );
+  let config = Wav2Vec2Config::from_json(&config_json).unwrap();
+
+  // On-disk HF-layout weights: start from the DENSE prefixed layout, then pack
+  // each quantized-eligible Linear at its scheme's group size — the single
+  // overridden layer at the OVERRIDE size, every other eligible Linear at the
+  // GLOBAL size — quantizing each layer exactly once from its dense weight so
+  // the `.scales` line up with the per-layer scheme the config declares. The
+  // conv feature extractor + positional conv stay dense (only `nn.Linear`
+  // quantizes).
+  let mut raw_weights = hf_layout_prefixed_weights(&config, "wav2vec2.");
+  const OVERRIDE_LAYER: &str = "wav2vec2.encoder.layers.0.attention.q_proj";
+  quantize_weight_in_place(
+    &mut raw_weights,
+    "wav2vec2.feature_projection.projection",
+    GLOBAL_GROUP,
+  );
+  for i in 0..(config.num_hidden_layers as usize) {
+    let p = format!("wav2vec2.encoder.layers.{i}");
+    for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+      let prefix = format!("{p}.attention.{proj}");
+      let group = if prefix == OVERRIDE_LAYER {
+        OVERRIDE_GROUP
+      } else {
+        GLOBAL_GROUP
+      };
+      quantize_weight_in_place(&mut raw_weights, &prefix, group);
+    }
+    quantize_weight_in_place(
+      &mut raw_weights,
+      &format!("{p}.feed_forward.intermediate_dense"),
+      GLOBAL_GROUP,
+    );
+    quantize_weight_in_place(
+      &mut raw_weights,
+      &format!("{p}.feed_forward.output_dense"),
+      GLOBAL_GROUP,
+    );
+  }
+  quantize_weight_in_place(&mut raw_weights, "lm_head", GLOBAL_GROUP);
+
+  // Drive the PUBLIC API exactly as a direct caller would (NOT via `load()`):
+  // sanitize the raw HF-keyed weight map ourselves (stripping the backbone
+  // prefix off the weight keys), parse the quantization config ourselves (the
+  // override is still HF-prefixed), and thread BOTH straight into
+  // `from_weights_quantized`.
+  let weights = sanitize(raw_weights).expect("the HF-keyed weight map must sanitize");
+  let quantization = crate::audio::load::apply_quantization(&config_json)
+    .expect("the quantization block must parse")
+    .expect("a `quantization` block is present, so the parse is Some");
+  // The parsed override is still keyed in the HF form — `from_weights_quantized`
+  // is responsible for normalizing it (the exact gap a direct caller hits).
+  assert!(
+    quantization.per_layer_ref().contains_key(OVERRIDE_LAYER),
+    "precondition: the parsed config carries the HF-prefixed override key the public constructor must normalize"
+  );
+
+  let model = match Wav2Vec2Ctc::from_weights_quantized(
+    config.clone(),
+    weights,
+    Vocab::default(),
+    Some(&quantization),
+  ) {
+    Ok(m) => m,
+    Err(e) => panic!(
+      "the public from_weights_quantized constructor must apply the HF-keyed per-layer override, got {e:?}"
+    ),
+  };
+
+  let layers = encoder_layers(&model.encoder);
+  let layer0 = &layers[0];
+  // The overridden layer 0 `q_proj` must load quantized at the OVERRIDE group
+  // size — proving the HF-keyed override reached the sanitized lookup THROUGH
+  // THE PUBLIC CONSTRUCTOR (the bug: it would otherwise have silently fallen
+  // back to GLOBAL_GROUP here for a direct caller).
+  assert_eq!(
+    loaded_group_size(&layer0.attention.q_proj),
+    Some(OVERRIDE_GROUP),
+    "the HF-keyed per-layer override must apply its group_size via the public constructor"
+  );
+  // Its siblings in the SAME layer carry no override, so they keep the global
+  // scheme — confirming the override is scoped to exactly the named layer.
+  assert_eq!(
+    loaded_group_size(&layer0.attention.k_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  assert_eq!(
+    loaded_group_size(&layer0.attention.out_proj),
+    Some(GLOBAL_GROUP),
+    "a sibling with no override must keep the global group_size"
+  );
+  // A different layer is likewise untouched by the layer-0 override.
+  assert_eq!(
+    loaded_group_size(&layers[1].attention.q_proj),
+    Some(GLOBAL_GROUP),
+    "a different layer must keep the global group_size"
+  );
+  // The CTC head (top-level `lm_head`, never backbone-prefixed) stays global.
+  assert_eq!(
+    loaded_group_size(&model.lm_head),
+    Some(GLOBAL_GROUP),
+    "the top-level lm_head must keep the global group_size"
+  );
+
+  // And the model still runs the full forward to finite CTC logits.
+  let expected_t = feature_out_len(&config, 400);
+  let waveform = filled(&[1, 400], 0.1);
+  let mut logits = model
+    .forward(&waveform)
+    .expect("mixed-quant forward via the public constructor must succeed");
+  assert_eq!(
+    logits.shape(),
+    vec![1, expected_t as usize, config.vocab_size as usize],
+  );
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "all mixed-quant CTC logits must be finite via the public constructor"
   );
 }

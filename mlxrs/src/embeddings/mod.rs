@@ -105,6 +105,9 @@
 pub mod colvision;
 pub mod config;
 pub mod embed;
+#[cfg(feature = "embeddinggemma")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embeddinggemma")))]
+pub mod embeddinggemma;
 pub mod encode;
 pub mod factory;
 pub mod fast;
