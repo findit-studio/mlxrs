@@ -102,6 +102,9 @@
 //!   and calls the model's text embedding (mirrors python `utils.generate` +
 //!   swift `EmbedderModelContainer.perform`).
 
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub mod clap;
 pub mod colvision;
 pub mod config;
 pub mod embed;
