@@ -28,10 +28,13 @@ lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm",
 llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
 vlm                  = ["lm", "dep:image"]
 lfm2-vl              = ["vlm"]                                                     # LFM2 hybrid conv+attention LM + (later) the LFM2.5-VL vision-language wrapper
+qwen3                = ["lm", "dep:serde", "dep:serde_json"]                       # Qwen3 dense text transformer (GQA + per-head Q/K-norm + SwiGLU): config + forward + tied head
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
 wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
 siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]        # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
 whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
+qwen3-asr            = ["qwen3", "audio", "dep:serde", "dep:serde_json"]           # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
+qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
 embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
 unstable-ops-overload = []
 gguf                 = []
@@ -67,6 +70,7 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 cpal = { version = "0.17", optional = true }
 flate2 = { version = "1", optional = true } # zlib DEFLATE for the Whisper decode compression-ratio fallback heuristic
 unicode-normalization = { version = "0.1", optional = true }
+unicode-general-category = { version = "1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }

@@ -20,6 +20,13 @@
 //!   each [`Transcribe::transcribe`] call — no model-stored `RefCell`, no
 //!   cross-utterance or concurrent sharing.
 //!
+//! A separate [`ForcedAligner<Input>`] contract covers forced alignment (a
+//! known transcript localized in time, rather than recognition). It is generic
+//! over its transcript **input** modality — the same generic-over-input shape as
+//! [`crate::embeddings::Embed`] — so the model owns how the transcript is
+//! represented and tokenized while the shared contract stays object-safe and
+//! model-agnostic.
+//!
 //! Per the project's no-per-model-arch rule, mlxrs ships **no** concrete STT
 //! model implementations: those (the conv subsampling + transformer for
 //! whisper, the conformer for parakeet, etc.) live in user code on top of
@@ -511,6 +518,160 @@ impl Transcription {
   #[inline(always)]
   pub fn segments_slice(&self) -> &[Segment] {
     &self.segments
+  }
+}
+
+// ───────────────────────── forced alignment ─────────────────────────
+
+/// The forced-alignment contract: a known transcript plus its audio in, the
+/// per-unit time spans out — generic over the **input** modality the model
+/// accepts the transcript in.
+///
+/// Distinct from [`Transcribe`] — which *recognizes* unknown speech — forced
+/// alignment is given the transcript and only localizes each aligned unit in
+/// time (the Qwen3 forced aligner, a wav2vec2 CTC aligner, …).
+///
+/// Like [`crate::embeddings::Embed`] this is generic over its `Input` (rather
+/// than carrying an associated input type), so a model implements it once per
+/// transcript representation it accepts and `Box<dyn ForcedAligner<Input>>` /
+/// `&dyn ForcedAligner<Input>` stay object-safe for a chosen `Input`. The
+/// `Input` is **model-defined**: a model that owns its tokenization accepts a
+/// raw transcript (its `align` splits + tokenizes internally); a model fed
+/// already-tokenized words accepts that pre-tokenized form. The shared contract
+/// here fixes only `audio` in and [`ForcedAlignment`] out, with no assumption
+/// about how the transcript is represented or tokenized.
+///
+/// The per-unit spans ([`AlignedSpan`]) are the whispery `Word { text, range }`
+/// equivalent: a `text` plus its `[start_time, end_time]` bounds in seconds —
+/// exactly the representation an IoU comparison against another aligner
+/// consumes.
+pub trait ForcedAligner<Input> {
+  /// Localize each unit of the `input` transcript in `audio` under `opts`,
+  /// returning one [`AlignedSpan`] per unit in transcript order.
+  ///
+  /// `audio` is the model's encoder input (for the Qwen3 aligner, the
+  /// precomputed log-mel features `(batch, n_mels, time)`); `input` is the
+  /// model-defined transcript representation (raw text + language, or an
+  /// already-tokenized word sequence). A model that owns its tokenization does
+  /// the word splitting + subword encoding inside this method.
+  fn align(&self, audio: &Array, input: Input, opts: &AlignOptions) -> Result<ForcedAlignment>;
+}
+
+/// Options controlling a [`ForcedAligner::align`] run.
+///
+/// The alignment algorithm is deterministic (an argmax over the timestamp
+/// head), so unlike [`TranscribeOptions`] there are no sampling knobs; the only
+/// field is the `language` label carried through to
+/// [`ForcedAlignment::language`]. It is purely a result label here — how the
+/// transcript is split into aligned units is the model's `align` concern (for a
+/// raw-text input the model splits + tokenizes per its own input type), not a
+/// knob on these shared options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlignOptions {
+  /// The transcript language label, carried through to the result. `None`
+  /// leaves the result's language unset.
+  language: Option<String>,
+}
+
+impl AlignOptions {
+  /// A new options bundle with no language label.
+  #[inline(always)]
+  pub const fn new() -> Self {
+    Self { language: None }
+  }
+
+  /// The configured language label, or `None`.
+  #[inline(always)]
+  pub fn language(&self) -> Option<&str> {
+    self.language.as_deref()
+  }
+
+  /// Set the language label.
+  #[inline(always)]
+  pub fn set_language(&mut self, language: impl Into<String>) -> &mut Self {
+    self.language = Some(language.into());
+    self
+  }
+
+  /// Return `self` with the language label set.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_language(mut self, language: impl Into<String>) -> Self {
+    self.language = Some(language.into());
+    self
+  }
+}
+
+/// One aligned unit span: the whispery `Word { text, range }` equivalent — a
+/// `text` and its `[start_time, end_time]` bounds in **seconds**.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlignedSpan {
+  /// The aligned unit's display text (the word / character the span localizes).
+  text: String,
+  /// Start time in seconds.
+  start_time: f64,
+  /// End time in seconds.
+  end_time: f64,
+}
+
+impl AlignedSpan {
+  /// Construct a span from its text and `[start_time, end_time]` bounds
+  /// (seconds).
+  #[inline(always)]
+  pub fn new(text: impl Into<String>, start_time: f64, end_time: f64) -> Self {
+    Self {
+      text: text.into(),
+      start_time,
+      end_time,
+    }
+  }
+
+  /// The aligned unit's display text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// Start time in seconds.
+  #[inline(always)]
+  pub const fn start_time(&self) -> f64 {
+    self.start_time
+  }
+
+  /// End time in seconds.
+  #[inline(always)]
+  pub const fn end_time(&self) -> f64 {
+    self.end_time
+  }
+}
+
+/// The result of a [`ForcedAligner::align`] run: one [`AlignedSpan`] per
+/// transcript word plus the language label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForcedAlignment {
+  /// One span per transcript word, in transcript order.
+  spans: Vec<AlignedSpan>,
+  /// The language label from [`AlignOptions::language`], or `None`.
+  language: Option<String>,
+}
+
+impl ForcedAlignment {
+  /// Construct an alignment from its spans and language label.
+  #[inline(always)]
+  pub fn new(spans: Vec<AlignedSpan>, language: Option<String>) -> Self {
+    Self { spans, language }
+  }
+
+  /// The per-word spans, in transcript order.
+  #[inline(always)]
+  pub fn spans(&self) -> &[AlignedSpan] {
+    &self.spans
+  }
+
+  /// The language label, or `None`.
+  #[inline(always)]
+  pub fn language(&self) -> Option<&str> {
+    self.language.as_deref()
   }
 }
 
