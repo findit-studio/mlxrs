@@ -22,6 +22,14 @@
 //!   downsample) + a transformer self-attention encoder, producing audio
 //!   embeddings for the Qwen3 forced aligner. Not a standalone transcriber —
 //!   it is the audio tower consumed by the (later) aligner/decoder.
+//! - `sensevoice` — SenseVoice-Small (`mlx-community/SenseVoiceSmall`): a
+//!   non-autoregressive CTC recognizer fronted by a Kaldi fbank + Low-Frame-Rate
+//!   stacking + CMVN front-end and built on the FunASR/Paraformer SANM (a
+//!   self-attention network with FSMN memory) encoder, with a CTC head and a
+//!   small prompt-embedding table injecting the rich-transcription query rows
+//!   (language / event / emotion / inverse-text-normalization). Inference is a
+//!   single forward followed by a greedy per-frame collapse, so it implements
+//!   [`crate::audio::stt::model::CtcModel`].
 
 #[cfg(feature = "wav2vec2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wav2vec2")))]
@@ -34,3 +42,7 @@ pub mod whisper;
 #[cfg(feature = "qwen3-asr")]
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr")))]
 pub mod qwen3_asr;
+
+#[cfg(feature = "sensevoice")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sensevoice")))]
+pub mod sensevoice;

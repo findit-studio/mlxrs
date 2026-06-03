@@ -384,6 +384,45 @@ impl KaldiWindow {
   }
 }
 
+/// How [`compute_fbank_kaldi`] treats the **first sample of each frame** under
+/// pre-emphasis. The body of the filter (`y[n] = x[n] - p * x[n-1]` for
+/// `n >= 1`) is identical for both variants; they differ only in `y[0]`, where
+/// there is no in-frame predecessor.
+///
+/// The two reference specifications disagree here, so the caller selects the
+/// one matching the model it feeds:
+/// - [`Preserve`](Self::Preserve) keeps `y[0] = x[0]` unchanged. This matches
+///   `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:913`: `first_col =
+///   strided_input[:, 0:1]`), the reference for the FunASR/SenseVoice family.
+/// - [`Scale`](Self::Scale) sets `y[0] = x[0] * (1 - p)`, the kaldi-asr
+///   `feature-window.cc` `Preemphasize` boundary (a self-reference predecessor,
+///   which torchaudio's `compliance.kaldi.fbank` matches via
+///   `pad(mode="replicate")`).
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+pub enum PreemphBoundary {
+  /// `y[0] = x[0]` (first sample passed through unchanged). Matches
+  /// `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:913`).
+  Preserve,
+  /// `y[0] = x[0] * (1 - preemphasis)` (kaldi-asr `feature-window.cc`
+  /// `Preemphasize` self-reference boundary). The default, preserving the
+  /// behavior of every existing caller.
+  #[default]
+  Scale,
+}
+
+impl PreemphBoundary {
+  /// A short lowercase tag for the boundary rule (`preserve` / `scale`).
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Preserve => "preserve",
+      Self::Scale => "scale",
+    }
+  }
+}
+
 /// Build the Kaldi-style analysis window of length `win_size`.
 ///
 /// CPU-built `Vec<f32>` (cheap; `win_size <= MAX_DECODED_SAMPLES` is
@@ -872,13 +911,13 @@ fn strided_frames_no_snip_edges(
 ///    or `dither_key = None` to skip; both routes return identical output.
 /// 3. **Remove DC offset** (subtract per-frame mean).
 /// 4. **Pre-emphasis** filter `y[n] = x[n] - preemphasis * x[n-1]` for
-///    `n >= 1`, with the **kaldi-asr** first-sample boundary
-///    `y[0] = x[0] * (1 - preemphasis)` (`feature-window.cc:101-107`).
-///    This **deliberately deviates** from `mlx_audio.dsp.compute_fbank_kaldi`
-///    (`dsp.py:911-915`), which keeps `x[0]` unchanged — see the inline
-///    comment for the rationale (Kaldi-trained models pin the
-///    `x[0] * (1 - p)` boundary, which torchaudio also implements via
-///    `pad(mode="replicate")` in `compliance.kaldi.fbank`).
+///    `n >= 1`. The first-sample boundary `y[0]` is selected by
+///    `preemph_boundary` (see [`PreemphBoundary`]): [`PreemphBoundary::Preserve`]
+///    keeps `y[0] = x[0]` (matching `mlx_audio.dsp.compute_fbank_kaldi`,
+///    `dsp.py:911-915`), while [`PreemphBoundary::Scale`] sets
+///    `y[0] = x[0] * (1 - preemphasis)` (the kaldi-asr `feature-window.cc`
+///    boundary, which torchaudio's `compliance.kaldi.fbank` matches via
+///    `pad(mode="replicate")`).
 /// 5. **Window** (Hamming / Hanning / Povey / Rectangular — see [`KaldiWindow`]).
 /// 6. **Pad** to `next_power_of_2(win_len)` and `rfft`.
 /// 7. **Mel-filterbank** (the `get_mel_banks_kaldi` matrix zero-padded by 1
@@ -914,6 +953,7 @@ pub fn compute_fbank_kaldi(
   low_freq: f32,
   high_freq: f32,
   dither_key: Option<&Array>,
+  preemph_boundary: PreemphBoundary,
 ) -> Result<Array> {
   // ---- input validation ------------------------------------------------
   let shape = waveform.shape();
@@ -1201,23 +1241,24 @@ pub fn compute_fbank_kaldi(
   let centered = ops::arithmetic::subtract(&dithered, &row_means)?;
 
   // ---- 4. pre-emphasis -------------------------------------------------
-  // Kaldi-asr `feature-window.cc:101-107` (`Preemphasize`) applies the filter
-  // `y[n] = x[n] - p * x[n-1]` for `n >= 1` AND treats the first sample
-  // through a self-reference: `y[0] = x[0] - p * x[0] = x[0] * (1 - p)`.
-  // torchaudio matches this via `pad(mode="replicate")` which replicates `x[0]`
-  // as its own predecessor (`docs.pytorch.org/audio/stable/_modules/torchaudio/
-  // compliance/kaldi.html`, `_get_window`).
+  // The filter body is `y[n] = x[n] - p * x[n-1]` for `n >= 1` in both
+  // specifications; they differ ONLY at `y[0]`, where there is no in-frame
+  // predecessor (see [`PreemphBoundary`]):
   //
-  // `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:911-915`) instead keeps
-  // `x[:,0:1]` UNCHANGED — that is a bug vs the Kaldi reference the rest of
-  // the function targets (preemphasis coefficient, window denominators, mel
-  // formula, `next_power_of_2` framing, `1e-8` floor are all Kaldi-faithful).
-  // We deliberately deviate from `mlx-audio` here to match the kaldi-asr
-  // reference + torchaudio (`compliance.kaldi.fbank`); a Kaldi-trained acoustic
-  // model expects the `x[0] * (1 - p)` boundary, NOT the passthrough.
+  // - [`PreemphBoundary::Preserve`] keeps `y[0] = x[0]`, matching
+  //   `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:911-915`, where
+  //   `first_col = strided_input[:, 0:1]` is concatenated unchanged). This is
+  //   the reference for the FunASR/SenseVoice family.
+  // - [`PreemphBoundary::Scale`] sets `y[0] = x[0] * (1 - p)`, the kaldi-asr
+  //   `feature-window.cc` `Preemphasize` self-reference boundary that
+  //   torchaudio's `compliance.kaldi.fbank` matches via `pad(mode="replicate")`.
+  //
+  // The caller picks the boundary that matches the model it feeds; the rest of
+  // the pipeline (preemphasis coefficient, window denominators, mel formula,
+  // `next_power_of_2` framing, `1e-8` floor) is Kaldi-faithful for both.
   let preemphasized = if preemphasis > 0.0 {
     // Slices keep ALL frames on axis 0 (`[0, num_frames_i32]`) and split
-    // the columns on axis 1: first column (scaled by `1 - p` below), columns
+    // the columns on axis 1: first column (boundary-handled below), columns
     // 1..win_len (the `y[n]` body), and columns 0..win_len-1 (the shifted
     // `x[n-1]` column for the body).
     let first_col = ops::indexing::slice(
@@ -1241,10 +1282,17 @@ pub fn compute_fbank_kaldi(
     let p_arr = Array::full::<f32>(&[0_i32; 0], preemphasis)?;
     let scaled_prev = ops::arithmetic::multiply(&prev, &p_arr)?;
     let other_cols = ops::arithmetic::subtract(&rest, &scaled_prev)?;
-    // Kaldi first-sample boundary: `y[0] = x[0] * (1 - p)`.
-    let one_minus_p = Array::full::<f32>(&[0_i32; 0], 1.0 - preemphasis)?;
-    let first_col_scaled = ops::arithmetic::multiply(&first_col, &one_minus_p)?;
-    ops::shape::concatenate(&[&first_col_scaled, &other_cols], 1)?
+    // First-sample boundary per the selected mode.
+    match preemph_boundary {
+      // `mlx_audio.dsp.compute_fbank_kaldi`: `y[0] = x[0]` (passthrough).
+      PreemphBoundary::Preserve => ops::shape::concatenate(&[&first_col, &other_cols], 1)?,
+      // kaldi-asr: `y[0] = x[0] * (1 - p)`.
+      PreemphBoundary::Scale => {
+        let one_minus_p = Array::full::<f32>(&[0_i32; 0], 1.0 - preemphasis)?;
+        let first_col_scaled = ops::arithmetic::multiply(&first_col, &one_minus_p)?;
+        ops::shape::concatenate(&[&first_col_scaled, &other_cols], 1)?
+      }
+    }
   } else {
     centered
   };
