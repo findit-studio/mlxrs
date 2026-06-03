@@ -22,7 +22,8 @@
 //! 1. **Field pinning** — [`pin_i32`] / [`pin_usize`] / [`pin_bool`] /
 //!    [`pin_str`] / [`pin_f64`] / [`pin_i32_slice`]: assert a config field
 //!    equals its reference value.
-//! 2. **Bounds** — [`require_positive`], [`require_in_range`],
+//! 2. **Bounds** — [`require_positive`], [`require_positive_f64`],
+//!    [`require_positive_finite_f32`], [`require_in_range`],
 //!    [`require_cardinality`], [`require_divisible`], [`require_even`].
 //! 3. **Checked arithmetic** — [`checked_mul`] / [`checked_add`] for
 //!    config-derived dimensions.
@@ -250,6 +251,92 @@ pub fn require_positive(field: &'static str, value: i32) -> Result<()> {
       field,
       "must be a positive integer (> 0)",
       format_smolstr!("{value}"),
+    )));
+  }
+  Ok(())
+}
+
+/// Require an `f64` config field to be finite and strictly positive (`> 0`).
+///
+/// A non-finite value (NaN / ±Inf) is rejected first with
+/// [`Error::NonFiniteScalar`]; a finite value `<= 0` (including `-0.0`) is then
+/// rejected with [`Error::OutOfRange`]. Use for a free-floating float a later
+/// step uses as an `eps`, a RoPE base, or any divisor / log argument — a
+/// zero / negative / non-finite value would otherwise produce a `NaN` / `Inf`
+/// (e.g. an `rms_norm_eps <= 0` or a `rope_theta` that yields invalid inverse
+/// frequencies) deep inside the graph instead of a clear typed error at load.
+///
+/// ```
+/// use mlxrs::model_validation::require_positive_f64;
+/// assert!(require_positive_f64("rms_norm_eps", 1e-6).is_ok());
+/// assert!(require_positive_f64("rope_theta", 0.0).is_err());
+/// assert!(require_positive_f64("rope_theta", -1.0).is_err());
+/// assert!(require_positive_f64("rope_theta", f64::NAN).is_err());
+/// assert!(require_positive_f64("rope_theta", f64::INFINITY).is_err());
+/// ```
+pub fn require_positive_f64(field: &'static str, value: f64) -> Result<()> {
+  if !value.is_finite() {
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      field, value,
+    )));
+  }
+  if value <= 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      field,
+      "must be a strictly positive, finite float (> 0)",
+      format_smolstr!("{value}"),
+    )));
+  }
+  Ok(())
+}
+
+/// Require the `f32`-narrowed form of an `f64` config field to be finite and
+/// strictly positive (`> 0`).
+///
+/// Use for an `f64` config scalar that is later **narrowed to `f32`** before
+/// it drives the graph (an SDPA scale, an `RMSNorm` eps, a RoPE base). A value
+/// that is finite-and-positive in `f64` can still become invalid once narrowed:
+/// a huge magnitude (e.g. `1e39`) overflows to `f32::INFINITY`, and a tiny
+/// positive (e.g. `1e-50`) underflows to `0.0`. Validating the original `f64`
+/// would pass both, then install an infinite or zero scale / base. This casts
+/// to `f32` first and validates the **result**, so the checkpoint is rejected
+/// at load with a clear typed error instead of poisoning inference.
+///
+/// The `f32` narrowing is strictly stronger than the `f64` positivity-and-
+/// finiteness check (every `f64` that survives narrowing was itself finite and
+/// positive), so this can replace [`require_positive_f64`] on a field that is
+/// narrowed — there is no need to run both.
+///
+/// The narrowed value is `f32::INFINITY` (overflow) or non-finite ⇒
+/// [`Error::NonFiniteScalar`]; the narrowed value `<= 0.0` (underflow, or a
+/// non-positive source) ⇒ [`Error::OutOfRange`]. Both payloads carry the
+/// original `f64` so the message names the offending config value.
+///
+/// ```
+/// use mlxrs::model_validation::require_positive_finite_f32;
+/// assert!(require_positive_finite_f32("rope_theta", 1e6).is_ok());
+/// // f64-finite-positive but overflows f32 to +Inf:
+/// assert!(require_positive_finite_f32("rope_theta", 1e39).is_err());
+/// // f64-finite-positive but underflows f32 to 0.0:
+/// assert!(require_positive_finite_f32("query_pre_attn_scalar", 1e-50).is_err());
+/// assert!(require_positive_finite_f32("rms_norm_eps", 0.0).is_err());
+/// assert!(require_positive_finite_f32("rms_norm_eps", f64::NAN).is_err());
+/// ```
+pub fn require_positive_finite_f32(field: &'static str, value: f64) -> Result<()> {
+  let narrowed = value as f32;
+  if !narrowed.is_finite() {
+    // Report the original f64 so the message names the config value (the
+    // narrowed form is just ±Inf / NaN). A huge finite f64 lands here once it
+    // overflows f32's range.
+    return Err(Error::NonFiniteScalar(NonFiniteScalarPayload::new(
+      field, value,
+    )));
+  }
+  if narrowed <= 0.0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      field,
+      "must be strictly positive and finite after narrowing to f32 (> 0)",
+      format_smolstr!("{value} (narrows to {narrowed} in f32)"),
     )));
   }
   Ok(())
