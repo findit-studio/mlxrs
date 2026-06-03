@@ -1016,6 +1016,283 @@ fn quantized_scales_without_resolvable_scheme_is_typed_error() {
   );
 }
 
+/// The `quant_config()` dims but WITHOUT a `quantization` block — a DENSE config
+/// over the quantized-fixture shapes. Used to prove a `.scales`-bearing
+/// checkpoint with no config quant block is rejected (the `.scales`-presence
+/// discriminator, not the config, decides the path).
+fn quant_dense_config() -> Gemma3Config {
+  let json = format!(
+    r#"{{
+      "model_type": "gemma3_text",
+      "vocab_size": {Q_VOCAB},
+      "hidden_size": {Q_HIDDEN},
+      "num_hidden_layers": {Q_LAYERS},
+      "intermediate_size": {Q_INTER},
+      "num_attention_heads": {Q_HEADS},
+      "head_dim": {Q_HEAD_DIM},
+      "rms_norm_eps": 1e-6,
+      "num_key_value_heads": {Q_KV_HEADS},
+      "rope_theta": 1000000.0,
+      "rope_local_base_freq": 10000.0,
+      "query_pre_attn_scalar": 256.0,
+      "sliding_window": 512,
+      "sliding_window_pattern": 6,
+      "max_position_embeddings": 2048
+    }}"#
+  );
+  let cfg = Gemma3Config::from_json(&json).unwrap();
+  cfg.validate().unwrap();
+  cfg
+}
+
+/// Insert a stale `<prefix>.scales` next to an otherwise-dense, correctly-shaped
+/// `<prefix>.weight` in `w`. The `.scales` shape is irrelevant: the
+/// `.scales`-presence gate enters the quantized branch and (with no resolvable
+/// scheme) errors BEFORE any `.scales` shape check, so a tiny placeholder
+/// suffices. Used to prove a DENSE-shaped weight carrying a stale `.scales` is
+/// rejected rather than silently loaded dense (the dense shape gate would have
+/// admitted the dense-shaped weight, masking the stale quant metadata).
+fn add_stale_scales(w: &mut HashMap<String, Array>, prefix: &str) {
+  assert!(
+    w.contains_key(&format!("{prefix}.weight")),
+    "{prefix}.weight must be a dense, correctly-shaped weight"
+  );
+  w.insert(format!("{prefix}.scales"), vec1(QGROUP));
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_projection_is_invariant_violation() {
+  // A DENSE-shaped `q_proj.weight` (the dense shape gate would accept it) that
+  // ALSO carries a stale `q_proj.scales`, under a config with NO quantization
+  // block, must NOT silently load dense (ignoring the quant metadata): the
+  // `.scales` presence ALONE routes it to the quantized branch, which — finding
+  // no scheme (`quant == None`) — fails with a typed `InvariantViolation`. The
+  // embedding is left clean dense so the projection (not the embedding) is the
+  // layer that fires.
+  let mut w = quant_dense_weights_in_dtype(crate::dtype::Dtype::F32);
+  add_stale_scales(&mut w, "model.layers.0.self_attn.q_proj");
+  let err = EmbeddingGemmaModel::from_weights(quant_dense_config(), w, None).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "a dense-shaped projection with a stale `.scales` and no quant config must be \
+     InvariantViolation, got {err:?}"
+  );
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_embedding_is_invariant_violation() {
+  // The token embedding: a dense-shaped `model.embed_tokens.weight` carrying a
+  // stale `model.embed_tokens.scales`, no quant config — the same
+  // `.scales`-presence gate rejects it with `InvariantViolation` rather than
+  // silently gathering against the dense-reinterpreted table.
+  let mut w = quant_dense_weights_in_dtype(crate::dtype::Dtype::F32);
+  add_stale_scales(&mut w, "model.embed_tokens");
+  let err = EmbeddingGemmaModel::from_weights(quant_dense_config(), w, None).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "a dense-shaped embedding with a stale `.scales` and no quant config must be \
+     InvariantViolation, got {err:?}"
+  );
+}
+
+#[test]
+fn quantized_scales_without_config_is_rejected() {
+  // A FULLY quantized checkpoint (every Linear/Embedding carries `.scales`/
+  // `.biases`) but a config with NO quantization block does NOT silently
+  // mis-load: the `.scales` sibling ALONE is the load-bearing "this layer is
+  // quantized" signal, so the layer takes the quantized branch and — finding no
+  // scheme to interpret the packed `uint32` weight — fails fast with a typed
+  // `InvariantViolation`, NEVER a silent dense reinterpret. The first consumed
+  // quantized weight fires it.
+  let model = EmbeddingGemmaModel::from_weights(quant_dense_config(), quant_weights(), None);
+  assert!(
+    matches!(model, Err(Error::InvariantViolation(_))),
+    "a quantized checkpoint with no quant config must be InvariantViolation, got {model:?}"
+  );
+}
+
+// ───────── dense load is robust to unused / foreign quant metadata ─────────
+//
+// The eager-parse fix: a DENSE checkpoint (no `.scales` on any egemma-consumed
+// layer) must NOT fatally parse the config's `quantization` block. The
+// `.scales`-presence pre-scan (`has_relevant_scales`) gates the
+// `config.quantization()` call, so a stale / foreign / malformed non-null
+// quantization block is simply never interpreted when no consumed layer is
+// quantized — the model loads dense and forwards. (Mirrors the qwen3 fix.) The
+// non-quant `config.validate()` still runs for these checkpoints; only the
+// quantization-SCHEME parse is gated.
+
+/// The `tiny_config()` shape but with an arbitrary `quantization` block spliced
+/// into the JSON (so the only difference from `tiny_config()` is the extra,
+/// possibly-malformed quant block). `validate()` does not touch the quant block,
+/// so a structurally-valid Gemma3 config with any `quantization` value still
+/// validates here.
+fn tiny_config_with_quant_block(quant_json: &str) -> Gemma3Config {
+  let json = format!(
+    r#"{{
+      "model_type": "gemma3_text",
+      "vocab_size": {VOCAB},
+      "hidden_size": {HIDDEN},
+      "num_hidden_layers": {LAYERS},
+      "intermediate_size": {INTER},
+      "num_attention_heads": {HEADS},
+      "head_dim": {HEAD_DIM},
+      "rms_norm_eps": 1e-6,
+      "num_key_value_heads": {KV_HEADS},
+      "rope_theta": 1000000.0,
+      "rope_local_base_freq": 10000.0,
+      "query_pre_attn_scalar": 256.0,
+      "sliding_window": 512,
+      "sliding_window_pattern": 6,
+      "max_position_embeddings": 2048,
+      "quantization": {quant_json}
+    }}"#
+  );
+  let cfg = Gemma3Config::from_json(&json).expect("config with quant block parses");
+  // The non-quant validation still passes — the quant block is not consulted by
+  // validate (only `quantization()` would parse it, and that is now gated).
+  cfg
+    .validate()
+    .expect("validate ignores the quantization block");
+  cfg
+}
+
+#[test]
+fn dense_checkpoint_with_malformed_quant_block_loads_dense() {
+  // A malformed `quantization` block (a partial object missing the required
+  // `bits` — what a stale / foreign quant-method tag might leave behind) makes
+  // `config.quantization()` a hard parse error. But this is a DENSE checkpoint
+  // (no `.scales` on any consumed layer), so the pre-scan never calls
+  // `quantization()`: the model loads dense and forwards, ignoring the unused
+  // metadata. Pre-fix, the eager `config.quantization()?` rejected this load.
+  let cfg = tiny_config_with_quant_block(r#"{ "group_size": 32 }"#);
+  // Guard the test premise: this block really IS unparseable (so the dense load
+  // succeeding is proof the parse was gated, not that the block was benign).
+  assert!(
+    cfg.quantization().is_err(),
+    "the malformed quant block must be a hard parse error if it were resolved"
+  );
+  let model = EmbeddingGemmaModel::from_weights(cfg, tiny_weights(), None)
+    .expect("a dense checkpoint must load despite a malformed unused quant block");
+  assert!(
+    !model.embedding_is_quantized() && !model.all_projections_quantized(),
+    "a dense checkpoint (no `.scales`) loads dense regardless of the quant block"
+  );
+  let out = model
+    .encode_text(&ids(2, 4), &full_mask(2, 4))
+    .expect("dense encode");
+  assert_eq!(out.shape(), vec![2, HIDDEN as usize]);
+  assert!(eval_to_vec(&out).iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn dense_checkpoint_with_foreign_non_object_quant_block_loads_dense() {
+  // A foreign non-null, non-object `quantization` value (e.g. an HF-style string
+  // tag `"fp8"` some checkpoints plant) also makes `config.quantization()` a hard
+  // error ("must be a JSON object"). A dense checkpoint still loads dense — the
+  // gated parse is never reached.
+  let cfg = tiny_config_with_quant_block(r#""fp8""#);
+  assert!(
+    cfg.quantization().is_err(),
+    "a non-object quant block must be a hard parse error if it were resolved"
+  );
+  let model = EmbeddingGemmaModel::from_weights(cfg, tiny_weights(), None)
+    .expect("a dense checkpoint must load despite a foreign non-object quant block");
+  assert!(
+    !model.embedding_is_quantized() && !model.all_projections_quantized(),
+    "dense load ignores the foreign quant block"
+  );
+  let out = model
+    .encode_text(&ids(1, 3), &full_mask(1, 3))
+    .expect("dense encode");
+  assert_eq!(out.shape(), vec![1, HIDDEN as usize]);
+}
+
+#[test]
+fn dense_checkpoint_with_null_quant_block_loads_dense() {
+  // A present-but-`null` quantization block is the explicit "no quantization"
+  // shape; a dense checkpoint loads dense (unchanged behavior — `quantization()`
+  // returns `Ok(None)` here anyway, but pin it alongside the gated-parse cases).
+  let cfg = tiny_config_with_quant_block("null");
+  assert!(
+    matches!(cfg.quantization(), Ok(None)),
+    "a null quant block resolves to no quantization"
+  );
+  let model = EmbeddingGemmaModel::from_weights(cfg, tiny_weights(), None)
+    .expect("dense load with null block");
+  assert!(!model.embedding_is_quantized() && !model.all_projections_quantized());
+  let out = model
+    .encode_text(&ids(1, 3), &full_mask(1, 3))
+    .expect("dense encode");
+  assert_eq!(out.shape(), vec![1, HIDDEN as usize]);
+}
+
+#[test]
+fn dense_checkpoint_with_no_quant_block_still_loads_dense() {
+  // The plain dense path is unchanged: no `quantization` block at all, a dense
+  // checkpoint loads dense and forwards (the baseline the gate must not regress).
+  let model = build_model();
+  assert!(!model.embedding_is_quantized() && !model.all_projections_quantized());
+  let out = model
+    .encode_text(&ids(2, 3), &full_mask(2, 3))
+    .expect("dense encode");
+  assert_eq!(out.shape(), vec![2, HIDDEN as usize]);
+}
+
+#[test]
+fn genuinely_quantized_checkpoint_still_parses_scheme_when_scales_present() {
+  // The other side of the gate: a genuinely quantized checkpoint (every consumed
+  // Linear/Embedding carries `.scales`) under a VALID quant block still resolves
+  // the scheme — because the pre-scan finds a relevant `.scales`, so
+  // `config.quantization()` IS called — and loads quantized. (If the gate had
+  // wrongly skipped the parse here, the `.scales`-bearing layers would fail with
+  // InvariantViolation, so a successful quantized load proves the scheme parsed.)
+  let model = EmbeddingGemmaModel::from_weights(quant_config(), quant_weights(), None)
+    .expect("quantized load");
+  assert!(
+    model.embedding_is_quantized()
+      && model.all_projections_quantized()
+      && model.dense_head_is_quantized(),
+    "a `.scales`-bearing checkpoint with a valid block still loads quantized (scheme parsed)"
+  );
+}
+
+#[test]
+fn malformed_quant_block_still_fatal_when_relevant_scales_present() {
+  // The gate must NOT mask a real config error: when a consumed layer DOES carry
+  // `.scales`, the pre-scan finds it, `config.quantization()` IS called, and a
+  // malformed block surfaces its parse error (here the quant config is malformed
+  // — missing `bits` — and the checkpoint is fully quantized). The fix only skips
+  // the parse for DENSE checkpoints; a quantized one must still see the error.
+  let json = format!(
+    r#"{{
+      "model_type": "gemma3_text",
+      "vocab_size": {Q_VOCAB},
+      "hidden_size": {Q_HIDDEN},
+      "num_hidden_layers": {Q_LAYERS},
+      "intermediate_size": {Q_INTER},
+      "num_attention_heads": {Q_HEADS},
+      "head_dim": {Q_HEAD_DIM},
+      "rms_norm_eps": 1e-6,
+      "num_key_value_heads": {Q_KV_HEADS},
+      "rope_theta": 1000000.0,
+      "rope_local_base_freq": 10000.0,
+      "query_pre_attn_scalar": 256.0,
+      "sliding_window": 512,
+      "sliding_window_pattern": 6,
+      "max_position_embeddings": 2048,
+      "quantization": {{ "group_size": {QGROUP} }}
+    }}"#
+  );
+  let cfg = Gemma3Config::from_json(&json).expect("parse");
+  cfg.validate().expect("validate ignores the quant block");
+  let err = EmbeddingGemmaModel::from_weights(cfg, quant_weights(), None).unwrap_err();
+  assert!(
+    matches!(err, Error::Parse(_)),
+    "a `.scales`-bearing checkpoint with a malformed quant block must surface the Parse error, got {err:?}"
+  );
+}
+
 /// Build the quantized checkpoint in the **raw** (un-sanitized) layout the real
 /// loader path sees: backbone keys without the `model.` prefix, and the Dense
 /// head as the SentenceTransformers `{n}_Dense.linear.<suffix>` modules rather

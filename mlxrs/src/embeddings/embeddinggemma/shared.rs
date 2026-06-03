@@ -15,10 +15,14 @@
 //! loads either a dense or an 8-bit/4-bit quantized checkpoint through one
 //! code path — the same adoption Whisper takes (see
 //! [`crate::audio::stt::models::whisper`]). The builders auto-detect the
-//! quantized variant from the `<prefix>.scales` sibling (mlx-embeddings'
-//! `class_predicate`, which quantizes every `nn.Linear` / `nn.Embedding`), with
-//! the per-layer `(group_size, bits, mode)` resolved from the parsed
-//! [`crate::lm::quant::PerLayerQuantization`]. The dense path is byte-for-byte
+//! quantized variant from the `<prefix>.scales` sibling ALONE (mlx-embeddings'
+//! `class_predicate`, which quantizes every `nn.Linear` / `nn.Embedding`) — the
+//! same `.scales`-presence discriminator the shared
+//! [`crate::nn::MaybeQuantizedLinear::from_weights`] uses — with the per-layer
+//! `(group_size, bits, mode)` resolved from the parsed
+//! [`crate::lm::quant::PerLayerQuantization`]. A `<prefix>.scales` present but
+//! no resolvable scheme is a typed [`Error::InvariantViolation`], never a silent
+//! dense fall-through. The dense path is byte-for-byte
 //! the prior `(out, in)`-shape-pinned [`crate::nn::Linear`] / dense gather.
 
 use std::collections::HashMap;
@@ -34,6 +38,15 @@ use crate::{
   nn::{MaybeQuantizedLinear, QuantizedLinear},
   ops,
 };
+
+/// The mlx-quantized layout's `<prefix>.scales` sibling-key suffix — the
+/// load-bearing "this layer is quantized" signal both [`Linear::from_weights`]
+/// and [`Embedding::from_weights`] key on. Exposed so the load-time pre-scan in
+/// [`super::has_relevant_scales`] builds the EXACT same `<prefix>.scales` key the
+/// loaders probe (no suffix / `ends_with` heuristic), so it can neither miss a
+/// consumed layer's scale nor match one no loader consults.
+#[cfg(feature = "embeddinggemma")]
+pub(crate) const SCALES_SUFFIX: &str = ".scales";
 
 /// An EmbeddingGemma linear projection `y = x @ Wᵀ` — quantize-aware, bias-free.
 ///
@@ -53,12 +66,15 @@ pub(crate) struct Linear {
 #[cfg(feature = "embeddinggemma")]
 impl Linear {
   /// Build a projection from the (sanitized) weight map: a [`QuantizedLinear`]
-  /// when `<prefix>.scales` is present AND a quantization config is threaded,
-  /// else the dense `(out, in)`-shape-pinned [`crate::nn::Linear`].
+  /// when `<prefix>.scales` is present, else the dense
+  /// `(out, in)`-shape-pinned [`crate::nn::Linear`].
   ///
-  /// The `<prefix>.scales` sibling is the load-bearing "this layer is quantized"
-  /// signal (mlx-embeddings' `class_predicate`, which quantizes every
-  /// `nn.Linear`). On the quantized path the per-layer `(group_size, bits,
+  /// The `<prefix>.scales` sibling ALONE is the load-bearing "this layer is
+  /// quantized" signal (mlx-embeddings' `class_predicate`, which quantizes every
+  /// `nn.Linear`) — the same `.scales`-presence discriminator the shared
+  /// [`crate::nn::MaybeQuantizedLinear::from_weights`] uses, so a layer carrying
+  /// `.scales` is NEVER reinterpreted as dense merely because the config quant
+  /// block is absent. On the quantized path the per-layer `(group_size, bits,
   /// mode)` is resolved from `quant` ([`PerLayerQuantization::quantization_for`]);
   /// the packed `uint32` triple's logical `(out, in)` is pinned to the
   /// config-derived extents by [`check_quantized_shape`] (the same load-time gate
@@ -66,10 +82,11 @@ impl Linear {
   /// from the dense `(out, in)` and cannot reach `take_shaped`), then the triple
   /// is built via [`QuantizedLinear::from_parts`]. The dense path is unchanged.
   ///
-  /// A `<prefix>.scales` present but `quant.quantization_for(prefix)` resolving
-  /// `None` (an explicit per-layer `Skip`, or no global default) is a
-  /// config/checkpoint inconsistency surfaced as a typed
-  /// [`Error::InvariantViolation`], never a guessed scheme.
+  /// A `<prefix>.scales` present but no resolvable scheme — `quant == None` (no
+  /// `quantization` block at all), an explicit per-layer `Skip`, or no global
+  /// default — is a config/checkpoint inconsistency surfaced as a typed
+  /// [`Error::InvariantViolation`], never a guessed scheme nor a silent dense
+  /// reinterpret of the packed weight.
   ///
   /// # Errors
   /// - [`Error::MissingKey`] if `<prefix>.weight` (or, quantized,
@@ -87,8 +104,8 @@ impl Linear {
     descriptor: &'static str,
     quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
-    let scales_key = format!("{prefix}.scales");
-    if quant.is_some() && weights.contains_key(&scales_key) {
+    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
+    if weights.contains_key(&scales_key) {
       let Some(q) = quant.and_then(|q| q.quantization_for(prefix)) else {
         return Err(Error::InvariantViolation(InvariantViolationPayload::new(
           "EmbeddingGemma: Linear carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
@@ -204,14 +221,19 @@ enum EmbeddingInner {
 #[cfg(feature = "embeddinggemma")]
 impl Embedding {
   /// Build the token embedding from the (sanitized) weight map: a quantized
-  /// table when `<prefix>.scales` is present AND a quantization config is
-  /// threaded, else the dense `(vocab, hidden)`-shape-pinned table.
+  /// table when `<prefix>.scales` is present, else the dense
+  /// `(vocab, hidden)`-shape-pinned table.
   ///
   /// Same auto-detect + load-time gate as [`Linear::from_weights`]: the
-  /// `<prefix>.scales` sibling signals a quantized table, the per-layer scheme
-  /// is resolved from `quant`, the packed triple's logical `(vocab, hidden)` is
-  /// pinned by [`check_quantized_shape`], and the triple is validated by the
-  /// shared [`crate::nn::quantized::validate_quantized_triple`].
+  /// `<prefix>.scales` sibling ALONE signals a quantized table (so a
+  /// `.scales`-bearing table is never reinterpreted as dense when the config
+  /// quant block is absent), the per-layer scheme is resolved from `quant`, the
+  /// packed triple's logical `(vocab, hidden)` is pinned by
+  /// [`check_quantized_shape`], and the triple is validated by the shared
+  /// [`crate::nn::quantized::validate_quantized_triple`]. A `<prefix>.scales`
+  /// present but no resolvable scheme (`quant == None`, an explicit per-layer
+  /// `Skip`, or no global default) is a typed [`Error::InvariantViolation`],
+  /// never a silent dense reinterpret.
   ///
   /// # Errors
   /// As [`Linear::from_weights`], plus the embedding-triple validation.
@@ -223,8 +245,8 @@ impl Embedding {
     descriptor: &'static str,
     quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
-    let scales_key = format!("{prefix}.scales");
-    if quant.is_some() && weights.contains_key(&scales_key) {
+    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
+    if weights.contains_key(&scales_key) {
       let Some(q) = quant.and_then(|q| q.quantization_for(prefix)) else {
         return Err(Error::InvariantViolation(InvariantViolationPayload::new(
           "EmbeddingGemma: embedding carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
