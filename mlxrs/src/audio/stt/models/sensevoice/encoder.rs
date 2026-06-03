@@ -400,8 +400,8 @@ impl MultiHeadedAttentionSANM {
     let fsmn_weight = take(weights, &format!("{prefix}.fsmn_block.weight"))?;
 
     // `in_feat` is consumed only as documentation of the fused-projection input
-    // width; the actual shape contract is pinned by the Phase 4 loader. Tie it
-    // to a no-op so the parameter is part of the seam without an unused warning.
+    // width; the actual shape contract is pinned by the loader. Tie it to a
+    // no-op so the parameter is part of the seam without an unused warning.
     let _ = in_feat;
 
     Ok(Self {
@@ -555,8 +555,8 @@ impl Encoder {
   /// `input_size` is the LFR feature width (`560`) fed to the width-changing
   /// first block; every later block is `output_size`-wide. `quant` carries the
   /// resolved `(group_size, bits, mode)` applied to every quantize-aware
-  /// linear (a dense checkpoint passes `None`); per-layer quant resolution is a
-  /// Phase 4 loader concern.
+  /// linear (a dense checkpoint passes `None`); quant resolution is the loader's
+  /// concern.
   ///
   /// # Errors
   /// - [`Error::OutOfRange`] if `num_blocks` / `tp_blocks` is negative;

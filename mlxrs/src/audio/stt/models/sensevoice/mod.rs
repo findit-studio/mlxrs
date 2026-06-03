@@ -32,20 +32,26 @@
 //!
 //! ## Status
 //!
-//! This module provides **Phase 1** (the [`config`] + [`frontend`] glue +
-//! `sanitize`), **Phase 2** (the SANM/FSMN [`encoder`]), and **Phase 3** (the
-//! CTC head, the query-prefix assembly, the rich-info extraction, the
-//! [`tokenizer`] decode, and the [`model::SenseVoiceModel`]
-//! [`crate::audio::stt::model::CtcModel`] /
-//! [`crate::audio::stt::model::Transcribe`] wiring). The file-loading factory +
-//! quant resolution + shard walk (Phase 4) arrive in a later change. The pieces
-//! here are exercised by shape + closed-form oracle tests (no checkpoint).
+//! This module is the feature-complete SenseVoice port: the [`config`] +
+//! [`frontend`] glue + `sanitize`, the SANM/FSMN [`encoder`], the CTC head +
+//! query-prefix assembly + rich-info extraction + [`tokenizer`] decode + the
+//! [`model::SenseVoiceModel`] [`crate::audio::stt::model::CtcModel`] /
+//! [`crate::audio::stt::model::Transcribe`] wiring, and the file-loading
+//! [`loader`]: `from_weights` / `from_weights_quantized` (with the
+//! `.scales`-presence quantization discriminator), the `am.mvn` / tokenizer
+//! asset loading (the `post_load_hook` equivalent), the safetensors shard walk,
+//! and the [`loader::load`] -> `Box<dyn Transcribe>` factory the STT registry
+//! dispatches `model_type == "sensevoice"` to. Every piece is exercised by
+//! shape + closed-form + synthetic-checkpoint oracle tests; the gated e2e
+//! numeric-parity test against the real `mlx-community/SenseVoiceSmall`
+//! checkpoint is a separate change.
 //!
 //! [sv]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/sensevoice/sensevoice.py
 
 pub mod config;
 pub mod encoder;
 pub mod frontend;
+pub mod loader;
 pub mod model;
 pub mod tokenizer;
 
@@ -55,5 +61,6 @@ pub use encoder::{
   SinusoidalPositionEncoder,
 };
 pub use frontend::{apply_cmvn, apply_lfr, compute_fbank, parse_am_mvn, sanitize};
+pub use loader::{has_relevant_scales, load};
 pub use model::{BLANK_ID, RichInfo, SenseVoiceModel, SenseVoiceResult, build_head};
 pub use tokenizer::SenseVoiceTokenizer;

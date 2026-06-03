@@ -43,7 +43,7 @@ const METASPACE: char = '\u{2581}';
 /// The SenseVoice detokenizer — the two-tier SentencePiece / `tokens.json`
 /// decode (`sensevoice.py:439-448`).
 ///
-/// Built once at load (the Phase 4 `post_load_hook` equivalent) from the model
+/// Built once at load (the `post_load_hook` equivalent) from the model
 /// directory's assets and consulted by [`super::model::SenseVoiceModel`]'s CTC
 /// decode. The three variants mirror the reference's three decode strategies in
 /// their precedence order; [`Self::decode`] dispatches on which assets were

@@ -5,15 +5,15 @@
 //! Faithful port of the `SenseVoiceSmall` class (`sensevoice.py:341-552`) and
 //! the swift `SenseVoiceModel` (`SenseVoiceModel.swift`). The model owns:
 //!
-//! - the [`Encoder`] tower (Phase 2) producing the `(B, T+4, output_size)`
+//! - the [`Encoder`] tower producing the `(B, T+4, output_size)`
 //!   hidden states;
 //! - `ctc_lo` — the quantize-aware CTC projection `output_size -> vocab`
 //!   (`sensevoice.py:347`), routed through [`MaybeQuantizedLinear`];
 //! - `embed` — the 16-row prompt-embedding table (`sensevoice.py:348`), routed
 //!   through the quantize-aware [`MaybeQuantizedEmbedding`], from which the four
 //!   query rows are gathered;
-//! - the [`SenseVoiceTokenizer`] (Phase 3) detokenizer + the optional CMVN
-//!   statistics (loaded by the Phase 4 factory).
+//! - the [`SenseVoiceTokenizer`] detokenizer + the optional CMVN statistics
+//!   (loaded by the [`super::loader`] factory).
 //!
 //! ## The forward (`__call__`, `sensevoice.py:426-437`)
 //!
@@ -265,9 +265,10 @@ pub struct SenseVoiceModel {
 impl SenseVoiceModel {
   /// Assemble a model from its already-built components.
   ///
-  /// The Phase 4 factory (`from_weights`) builds the [`Encoder`], `ctc_lo`, and
-  /// `embed` from a weight map and the [`SenseVoiceTokenizer`] + CMVN statistics
-  /// from the model directory, then calls this. The CMVN pair is `Some` together
+  /// The factory ([`SenseVoiceModel::from_weights`]) builds the [`Encoder`],
+  /// `ctc_lo`, and `embed` from a weight map and the [`SenseVoiceTokenizer`] +
+  /// CMVN statistics from the model directory, then calls this. The CMVN pair is
+  /// `Some` together
   /// or `None` together (the reference loads `means`/`istd` as a pair,
   /// `sensevoice.py:573-579`); a half-present pair is a loader bug, so the
   /// constructor is total and trusts its inputs.
@@ -752,7 +753,7 @@ impl Transcribe for SenseVoiceModel {
 }
 
 /// Build the `ctc_lo` CTC head + the `embed` query table from a checkpoint
-/// weight map — the quantize-aware Phase-3 head the Phase-4 factory composes
+/// weight map — the quantize-aware head the [`super::loader`] factory composes
 /// with the [`Encoder`]. `ctc_lo` projects `output_size -> vocab`
 /// (`sensevoice.py:347`); `embed` is the 16-row prompt table
 /// (`sensevoice.py:348`). Both auto-detect a quantized checkpoint via their
@@ -760,8 +761,7 @@ impl Transcribe for SenseVoiceModel {
 /// linears do.
 ///
 /// `quant` carries the resolved `(group_size, bits, mode)` scheme (a dense
-/// checkpoint passes `None`); per-layer quant resolution is a Phase-4 loader
-/// concern.
+/// checkpoint passes `None`); quant resolution is the loader's concern.
 ///
 /// # Errors
 /// - [`Error::MissingKey`] for an absent `ctc_lo.weight` / `embed.weight`;
