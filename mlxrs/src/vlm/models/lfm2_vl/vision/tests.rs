@@ -141,6 +141,13 @@ fn patch_mask(active: i32, num_patches: i32) -> Array {
   Array::from_slice::<i32>(&data, &(1usize, num_patches as usize)).unwrap()
 }
 
+/// A `(1, num_patches)` i32 patch attention mask from explicit per-row values —
+/// for constructing right-shaped but MALFORMED companions (the vision tower
+/// must ignore the content and derive the mask from `spatial_shapes`).
+fn patch_mask_from(vals: &[i32]) -> Array {
+  Array::from_slice::<i32>(vals, &(1usize, vals.len())).unwrap()
+}
+
 /// No-op quantization resolver (every layer dense).
 fn no_quant(_path: &str) -> Option<(i32, i32, &'static str)> {
   None
@@ -299,6 +306,88 @@ fn vision_mask_shape_mismatch_is_typed_error() {
   assert!(
     matches!(err, crate::error::Error::RankMismatch(_)),
     "got {err}"
+  );
+}
+
+#[test]
+fn vision_mask_content_ignored_derived_from_spatial_shapes() {
+  // The KEY soundness invariant: the additive attention mask is DERIVED from
+  // `spatial_shapes` (the source of truth), NOT from the companion
+  // `pixel_attention_mask`'s content. A right-shaped but MALFORMED companion —
+  // zeros in the active prefix, ones in the padding, or all-zero — must NOT
+  // corrupt the result: every such companion, driven by the same spatial_shape,
+  // produces output IDENTICAL to the well-formed-companion run.
+  let cfg = tiny_vision_config();
+  let mut w = tiny_vision_weights(LAYERS);
+  let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
+
+  let active = 2i32;
+  let (h_p, w_p) = (2i32, 1i32); // 2 active patches out of NUM_PATCHES (4)
+  let ss = spatial_shapes(&[(h_p, w_p)]);
+  let pv = pixel_values(1);
+
+  // Reference run: a well-formed companion (1,1,0,0) — active prefix set,
+  // padding clear. The mask is spatial_shapes-derived, so this is the
+  // ground-truth output for the (2,1) grid.
+  let reference = eval_to_vec(
+    &tower
+      .forward(&pv, &ss, Some(&patch_mask(active, NUM_PATCHES)))
+      .unwrap(),
+  );
+
+  // Three malformed-but-right-shaped companions that, if the content were
+  // trusted, would each corrupt attention differently:
+  //   - zeros in the active prefix + ones in the padding (fully inverted),
+  //   - all-zero (would all-mask every key → NaN softmax rows if trusted),
+  //   - ones in the padding only (re-admits padded keys if trusted).
+  for malformed in [
+    patch_mask_from(&[0, 0, 1, 1]), // inverted: active cleared, padding set
+    patch_mask_from(&[0, 0, 0, 0]), // all-zero
+    patch_mask_from(&[1, 1, 1, 1]), // padding re-admitted
+  ] {
+    let got = eval_to_vec(&tower.forward(&pv, &ss, Some(&malformed)).unwrap());
+    assert_eq!(
+      got.len(),
+      reference.len(),
+      "output length must be stable regardless of (ignored) companion content"
+    );
+    for (i, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+      assert!(
+        (g - r).abs() < 1e-6,
+        "elem {i}: malformed companion content must NOT change the output \
+         (derived-from-spatial_shapes mask): got {g} vs reference {r}"
+      );
+      // The reference output is itself finite (no all-masked NaN row): a sanity
+      // pin that the derived mask leaves at least the active keys unmasked.
+      assert!(r.is_finite(), "reference output elem {i} must be finite");
+    }
+  }
+}
+
+#[test]
+fn vision_rejects_out_of_range_spatial_shapes() {
+  // A spatial_shapes entry whose active grid H_p*W_p exceeds the patch budget
+  // (num_patches) is a typed OutOfRange, never a panic / OOB slice — even though
+  // its (N, 2) SHAPE is valid. (3*2 = 6 > NUM_PATCHES = 4.)
+  let cfg = tiny_vision_config();
+  let mut w = tiny_vision_weights(LAYERS);
+  let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
+  let pv = pixel_values(1);
+  let ss = spatial_shapes(&[(3, 2)]); // 6 > 4 patch budget
+  let err = tower
+    .forward(&pv, &ss, Some(&patch_mask(4, NUM_PATCHES)))
+    .unwrap_err();
+  assert!(
+    matches!(err, crate::error::Error::OutOfRange(_)),
+    "got {err}"
+  );
+
+  // A non-positive grid dimension (0 cols) is likewise a typed error.
+  let ss_zero = spatial_shapes(&[(2, 0)]);
+  let err0 = tower.forward(&pv, &ss_zero, None).unwrap_err();
+  assert!(
+    matches!(err0, crate::error::Error::OutOfRange(_)),
+    "got {err0}"
   );
 }
 

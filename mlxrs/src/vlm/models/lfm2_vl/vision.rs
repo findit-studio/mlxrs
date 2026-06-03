@@ -403,13 +403,17 @@ impl VisionModel {
   ///   processor's flattened patches; `N` is the per-call image/batch dim).
   /// - `spatial_shapes` — `(N, 2)` i32 `[H_patch, W_patch]` per image (the
   ///   active patch grid each image's position embedding is resized to).
-  /// - `pixel_attention_mask` — optional `(N, num_patches)` i32 (`1` for an
-  ///   active patch, `0` for a padded one). When `Some`, an additive key mask
-  ///   excludes the padded patches from every encoder layer's attention (so
-  ///   active patches cannot attend to the padded zero rows); when `None`, the
-  ///   tower runs full bidirectional attention over all `num_patches` rows.
+  /// - `pixel_attention_mask` — optional `(N, num_patches)` i32 companion. When
+  ///   `Some`, an additive key mask excludes the padded patches from every
+  ///   encoder layer's attention (so active patches cannot attend to the padded
+  ///   zero rows); when `None`, the tower runs full bidirectional attention over
+  ///   all `num_patches` rows. **The mask's *content* is not trusted**: it is
+  ///   shape-validated (a wrong-shape companion is a typed error) but the
+  ///   additive key mask is *derived from `spatial_shapes`*, the single source
+  ///   of truth for the active grid (see below). The companion's `Some`/`None`
+  ///   only selects whether key masking is applied at all.
   ///
-  /// ## Why the mask is load-bearing
+  /// ## Why the mask is load-bearing, and why it is derived from `spatial_shapes`
   ///
   /// The processor pads every image to `num_patches`, so an image whose active
   /// grid `H_p * W_p` is smaller than the patch budget carries padded zero
@@ -417,9 +421,21 @@ impl VisionModel {
   /// mask those padded keys attend and are attended to, contaminating every
   /// active patch's representation before the active-row slice — the HF
   /// LFM2-VL reference threads `pixel_attention_mask` into the vision tower
-  /// (`modeling_lfm2_vl.py`) for exactly this reason. The mask construction
-  /// mirrors the SigLIP2 NaFlex vision tower's
-  /// [`crate::embeddings::siglip2_naflex`] additive padded-key mask (real →
+  /// (`modeling_lfm2_vl.py`) for exactly this reason.
+  ///
+  /// `spatial_shapes` is the authoritative active grid: the processor lays the
+  /// active patches out FIRST in row-major order and zero-pads the suffix
+  /// (`processing_lfm2_vl.py` / [`super::processor::preprocess_image`]), and the
+  /// active-row slice downstream
+  /// ([`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs))
+  /// reads its active count as `H_p * W_p` from `spatial_shapes`. So the
+  /// additive key mask is built from `spatial_shapes` (the first `H_p * W_p`
+  /// keys active → `0.0`, the rest padded → `-inf`) rather than from the
+  /// companion mask's content — guaranteeing the mask can never disagree with
+  /// the active-row slice, even if a caller fed a malformed companion through
+  /// the public [`NativeResolution`](crate::vlm::model::NativeResolution) seam.
+  /// The construction mirrors the SigLIP2 NaFlex vision tower's
+  /// [`crate::embeddings::siglip2_naflex`] additive padded-key mask (active →
   /// `0.0`, padded → `-inf`, broadcast over heads + query positions by SDPA).
   ///
   /// Returns the post-LayerNorm hidden states `(N, num_patches, hidden)`
@@ -430,8 +446,8 @@ impl VisionModel {
   ///   `spatial_shapes` is not exactly `(N, 2)`, or `pixel_attention_mask`
   ///   (when `Some`) is not exactly `(N, num_patches)` (so a per-image-count or
   ///   trailing-axis mismatch is rejected here, not by a downstream broadcast);
-  /// - [`Error::OutOfRange`] if an image's active grid `H_p * W_p` exceeds the
-  ///   patch budget;
+  /// - [`Error::OutOfRange`] if an image's active grid `H_p * W_p` is
+  ///   non-positive or exceeds the patch budget;
   /// - propagates the embed / interp / attention op errors.
   pub fn forward(
     &self,
@@ -458,20 +474,38 @@ impl VisionModel {
       )));
     }
 
+    // Read every image's active grid `(H_p, W_p)` from `spatial_shapes` — the
+    // single source of truth for the active patch count — once, and validate it
+    // (positive dims, `H_p * W_p <= num_patches`) before it drives BOTH the
+    // position resize and the attention mask. Reused so the two stay consistent.
+    let shapes = read_spatial_shapes(spatial_shapes, n)?;
+    for &(h_p, w_p) in &shapes {
+      validate_active_grid(h_p, w_p, num_patches)?;
+    }
+
     // `patch_embeds = patch_embedding(pixel_values)` → (N, num_patches, hidden).
     let patch_embeds = self.patch_embedding.forward(pixel_values)?;
 
     // Per-image position embedding: resize the trained square grid to each
     // image's (H_p, W_p) and scatter into the active patch rows.
-    let pos = self.resize_positional_embeddings(spatial_shapes, n, num_patches)?;
+    let pos = self.resize_positional_embeddings(&shapes, num_patches)?;
     let mut h = patch_embeds.add(&pos)?;
 
-    // Build the additive key-padding mask from `pixel_attention_mask` (shape
-    // validated against the verified `(n, num_patches)` here, so a mismatched
-    // mask is a typed error, not a silent SDPA broadcast). Held in an
-    // `Option<Array>` so the `Mask` borrow below outlives every layer's use.
+    // Build the additive key-padding mask. When the companion
+    // `pixel_attention_mask` is present, shape-validate it against the verified
+    // `(n, num_patches)` (a mismatched shape is a typed error, not a silent SDPA
+    // broadcast), but DERIVE the mask content from `spatial_shapes` (the source
+    // of truth): the first `H_p * W_p` keys per image are active (`0.0`), the
+    // rest padded (`-inf`). The companion's content is intentionally NOT trusted
+    // — a malformed-but-right-shaped companion (passed through the public
+    // `NativeResolution` seam) therefore cannot drop real keys, re-admit padded
+    // keys, or all-mask a row. Held in an `Option<Array>` so the `Mask` borrow
+    // below outlives every layer's use.
     let attn_mask = match pixel_attention_mask {
-      Some(m) => Some(build_attention_mask(m, n, num_patches)?),
+      Some(m) => {
+        validate_mask_shape(m, n, num_patches)?;
+        Some(build_attention_mask(&shapes, n, num_patches)?)
+      }
       None => None,
     };
     let mask = match &attn_mask {
@@ -491,12 +525,11 @@ impl VisionModel {
   /// bicubic-resize it to that image's `(H_p, W_p)`, flatten to
   /// `(H_p * W_p, hidden)`, place into the active rows, and pad the remainder
   /// with the first resized position.
-  fn resize_positional_embeddings(
-    &self,
-    spatial_shapes: &Array,
-    n: usize,
-    num_patches: i32,
-  ) -> Result<Array> {
+  ///
+  /// `shapes` is the host-side per-image `(H_p, W_p)` grid the caller already
+  /// read + validated from `spatial_shapes` (so the position resize and the
+  /// attention mask are driven by the same source-of-truth values).
+  fn resize_positional_embeddings(&self, shapes: &[(i32, i32)], num_patches: i32) -> Result<Array> {
     let side = self.pos_grid_side as usize;
     let hidden = self.hidden as usize;
     // (num_positions, hidden) -> (side, side, hidden).
@@ -506,14 +539,10 @@ impl VisionModel {
     let grid_chw = ops::shape::transpose_axes(&grid, &[2, 0, 1])?;
     let grid_bchw = ops::shape::expand_dims_axes(&grid_chw, &[0])?;
 
-    // Read every image's (H_p, W_p) at once (host-side; the resize geometry is
-    // host-side per image).
-    let shapes = read_spatial_shapes(spatial_shapes, n)?;
-
     // Build one (1, num_patches, hidden) term per image and concatenate along N.
     let mut per_image: Vec<Array> = Vec::new();
-    reserve_or_error(&mut per_image, "lfm2_vl vision position term", n)?;
-    for &(h_p, w_p) in &shapes {
+    reserve_or_error(&mut per_image, "lfm2_vl vision position term", shapes.len())?;
+    for &(h_p, w_p) in shapes {
       per_image.push(self.resize_one_image(&grid_bchw, h_p, w_p, num_patches)?);
     }
     let refs: Vec<&Array> = per_image.iter().collect();
@@ -531,24 +560,11 @@ impl VisionModel {
     w_p: i32,
     num_patches: i32,
   ) -> Result<Array> {
-    require_positive("lfm2_vl vision: H_patch", h_p)?;
-    require_positive("lfm2_vl vision: W_patch", w_p)?;
-    let active = checked_mul(
-      "lfm2_vl vision: H_patch * W_patch",
-      "H_patch",
-      h_p,
-      "W_patch",
-      w_p,
-    )?;
-    if active > num_patches {
-      // The active grid cannot exceed the patch budget — the processor
-      // guarantees H_p*W_p <= num_patches.
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        "lfm2_vl vision: active patches (H_p * W_p)",
-        "must not exceed num_patches (the pixel_values patch dim)",
-        smol_str::format_smolstr!("{active} > {num_patches}"),
-      )));
-    }
+    // Validate + compute the active patch count from the (source-of-truth)
+    // grid (positive dims, `H_p * W_p <= num_patches`). `forward` already
+    // validates every image's grid up front; this keeps the private helper
+    // independently sound.
+    let active = validate_active_grid(h_p, w_p, num_patches)?;
     // (1, hidden, side, side) -> bicubic -> (1, hidden, H_p, W_p).
     let resized = bicubic_interpolate(grid_bchw, h_p as usize, w_p as usize)?;
     // `resized.reshape(hidden, h*w).transpose(1, 0)` -> (H_p*W_p, hidden).
@@ -572,23 +588,101 @@ impl VisionModel {
 
 // ───────────────────────── builders / helpers ─────────────────────────
 
-/// Build an additive attention key-mask `(N, 1, 1, num_patches)` from the
-/// `(N, num_patches)` `pixel_attention_mask` (`1` active, `0` padded): active →
-/// `0.0`, padded → `-inf`, so SDPA's softmax zeroes the padded keys for every
+/// Build an additive attention key-mask `(N, 1, 1, num_patches)` *derived from
+/// `spatial_shapes`* (the active-grid source of truth): for image `i` the first
+/// `H_p * W_p` keys are active → `0.0`, the remaining `num_patches - H_p * W_p`
+/// are padding → `-inf`, so SDPA's softmax zeroes the padded keys for every
 /// active query (the padded patches contribute nothing).
 ///
-/// Reuses the SigLIP2 NaFlex padded-key mask construction
-/// ([`crate::embeddings::siglip2_naflex`]'s `build_attention_mask`):
-/// `select(mask_bool, 0.0, -inf)`, reshaped to broadcast over `(B, heads, L_q,
-/// L_kv)`. Generalized to the LFM2-VL batched `(N, num_patches)` mask (SigLIP2's
-/// is a single-image `(num_patches,)`), so the broadcast leading axis is `N`
-/// rather than `1`.
+/// Deriving from `spatial_shapes` (rather than from the companion
+/// `pixel_attention_mask`'s content) guarantees the mask cannot disagree with
+/// the `H_p * W_p` active-row slice
+/// [`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs)
+/// takes from the same `spatial_shapes`: the NaFlex processor lays the active
+/// patches out FIRST and zero-pads the suffix
+/// ([`super::processor::preprocess_image`]), so `spatial_shapes` fully
+/// determines which keys are active. A malformed-but-right-shaped companion
+/// (fed through the public [`NativeResolution`](crate::vlm::model::NativeResolution)
+/// seam — zeros in the active prefix, ones in the padding, or all-zero) is
+/// therefore inert: it cannot drop a real key, re-admit a padded key, or
+/// all-mask a row.
 ///
-/// The mask shape is validated against the `(n, num_patches)` the caller
-/// already verified from `pixel_values`, so a mismatched mask is a typed
-/// [`Error::RankMismatch`] (no panic, no silent downstream broadcast).
+/// Mirrors the SigLIP2 NaFlex padded-key additive form
+/// ([`crate::embeddings::siglip2_naflex`]'s `build_attention_mask`: active →
+/// `0.0`, padded → `-inf`, reshaped to broadcast over `(B, heads, L_q, L_kv)`),
+/// generalized to the LFM2-VL batched leading axis `N`. The active counts in
+/// `shapes` are assumed already validated by [`validate_active_grid`] (positive
+/// dims, `H_p * W_p <= num_patches`); each is recomputed here with the same
+/// checked multiply for independent soundness.
 #[cfg(feature = "lfm2-vl")]
-fn build_attention_mask(pixel_attention_mask: &Array, n: usize, num_patches: i32) -> Result<Array> {
+fn build_attention_mask(shapes: &[(i32, i32)], n: usize, num_patches: i32) -> Result<Array> {
+  debug_assert_eq!(shapes.len(), n, "shapes already read for n images");
+  let np = num_patches as usize;
+  // Host-side additive mask: `n * num_patches` f32, each image's active prefix
+  // `0.0` and padded suffix `-inf`. Reserved fallibly (the element count is
+  // bounded by the already-validated patch budget).
+  let total = checked_mul(
+    "lfm2_vl vision: attention mask elements (N * num_patches)",
+    "N",
+    n as i32,
+    "num_patches",
+    num_patches,
+  )? as usize;
+  let mut data: Vec<f32> = Vec::new();
+  reserve_or_error(&mut data, "lfm2_vl vision attention mask", total)?;
+  data.resize(total, f32::NEG_INFINITY);
+  for (i, &(h_p, w_p)) in shapes.iter().enumerate() {
+    // Source of truth for image `i`'s active count (same checked multiply +
+    // budget bound as the position resize / the active-row slice).
+    let active = validate_active_grid(h_p, w_p, num_patches)? as usize;
+    let base = i * np;
+    for slot in data[base..base + active].iter_mut() {
+      *slot = 0.0;
+    }
+  }
+  // (N * num_patches,) host buffer → (N, 1, 1, num_patches) to broadcast over
+  // (B, heads, L_q, L_kv).
+  Array::from_slice::<f32>(&data, &(n, 1usize, 1usize, np))
+}
+
+/// Validate one image's active grid `(H_p, W_p)` against the patch budget and
+/// return the active patch count `H_p * W_p`: both dims must be positive and
+/// the product must not exceed `num_patches` (the `pixel_values` patch dim). A
+/// degenerate grid is a typed [`Error::OutOfRange`] / [`Error::ArithmeticOverflow`]
+/// — `spatial_shapes` is the source of truth for the active grid, so a grid that
+/// disagrees with the patch budget is rejected here, before it drives the
+/// position resize, the active-row slice, or the attention mask.
+#[cfg(feature = "lfm2-vl")]
+fn validate_active_grid(h_p: i32, w_p: i32, num_patches: i32) -> Result<i32> {
+  require_positive("lfm2_vl vision: H_patch", h_p)?;
+  require_positive("lfm2_vl vision: W_patch", w_p)?;
+  let active = checked_mul(
+    "lfm2_vl vision: H_patch * W_patch",
+    "H_patch",
+    h_p,
+    "W_patch",
+    w_p,
+  )?;
+  if active > num_patches {
+    // The active grid cannot exceed the patch budget — the processor guarantees
+    // H_p*W_p <= num_patches; an out-of-range spatial_shapes entry is rejected.
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "lfm2_vl vision: active patches (H_p * W_p)",
+      "must not exceed num_patches (the pixel_values patch dim)",
+      smol_str::format_smolstr!("{active} > {num_patches}"),
+    )));
+  }
+  Ok(active)
+}
+
+/// Shape-validate the companion `pixel_attention_mask` against the
+/// `(n, num_patches)` the caller already verified from `pixel_values`. The
+/// companion's *content* is not trusted (the additive mask is derived from
+/// `spatial_shapes` in [`build_attention_mask`]); this only rejects a
+/// wrong-shaped companion as a typed [`Error::RankMismatch`] (no panic, no
+/// silent downstream broadcast), keeping the shape contract faithful.
+#[cfg(feature = "lfm2-vl")]
+fn validate_mask_shape(pixel_attention_mask: &Array, n: usize, num_patches: i32) -> Result<()> {
   let shape = pixel_attention_mask.shape();
   if shape.as_slice() != [n, num_patches as usize] {
     return Err(Error::RankMismatch(RankMismatchPayload::new(
@@ -597,15 +691,7 @@ fn build_attention_mask(pixel_attention_mask: &Array, n: usize, num_patches: i32
       shape,
     )));
   }
-  // (N, num_patches) i32 → bool (nonzero = active), then
-  // select(active, 0.0, -inf): active keeps 0, padded gets -inf.
-  let mask_bool = ops::misc::astype(pixel_attention_mask, Dtype::Bool)?;
-  let zeros = Array::zeros::<f32>(&(n, num_patches as usize))?;
-  let neg_inf = Array::full::<f32>(&(n, num_patches as usize), f32::NEG_INFINITY)?;
-  let additive = ops::logical::select(&mask_bool, &zeros, &neg_inf)?;
-  // (N, num_patches) → (N, 1, 1, num_patches) to broadcast over
-  // (B, heads, L_q, L_kv).
-  ops::shape::reshape(&additive, &[n as i32, 1, 1, num_patches])
+  Ok(())
 }
 
 /// Build a `LayerNorm` from `{prefix}.weight` + `{prefix}.bias` with the given

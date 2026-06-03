@@ -283,14 +283,19 @@ impl Lfm2Vl {
     let ss = expand_dims_axes(&inputs.spatial_shapes, &[0])?;
     let pam = expand_dims_axes(&inputs.pixel_attention_mask, &[0])?;
     // `vision_tower(pixel_values, spatial_shapes, pixel_attention_mask)` →
-    // (1, num_patches, hidden). The native patch attention mask excludes the
-    // padded patch rows from every encoder layer's attention, so the active
-    // rows sliced below are uncontaminated by the padding (the HF LFM2-VL
-    // reference threads `pixel_attention_mask` into the vision tower).
+    // (1, num_patches, hidden). Passing `Some(&pam)` opts this native-resolution
+    // input into key masking; the tower DERIVES the additive key mask from
+    // `spatial_shapes` (the source of truth) rather than trusting the companion's
+    // content, so it always matches the `H_p * W_p` active-row slice taken below
+    // (a malformed companion cannot corrupt it). The mask excludes the padded
+    // patch rows from every encoder layer's attention, so the active rows are
+    // uncontaminated by the padding (the HF LFM2-VL reference threads
+    // `pixel_attention_mask` into the vision tower).
     let hidden_states = self.vision_tower.forward(&pv, &ss, Some(&pam))?;
     // Slice the active `H_p * W_p` patch rows (the reference's
-    // `feature[: img_feature_lengths[i], :]`). The grid is the authoritative
-    // active count (`pixel_attention_mask.sum() == H_p * W_p`).
+    // `feature[: img_feature_lengths[i], :]`). `spatial_shapes` is the
+    // authoritative active count (`pixel_attention_mask.sum() == H_p * W_p`),
+    // and the vision tower's mask above was derived from the same source.
     let hs_shape = hidden_states.shape();
     let num_patches = dim_i32(&hs_shape, 1, "lfm2_vl encode_image: num_patches")?;
     let hidden = dim_i32(&hs_shape, 2, "lfm2_vl encode_image: hidden")?;
