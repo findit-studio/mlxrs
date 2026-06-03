@@ -36,6 +36,7 @@ whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                 
 qwen3-asr            = ["qwen3", "audio", "dep:serde", "dep:serde_json"]           # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
 qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
 embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
+clap                 = ["embeddings", "audio", "npz", "dep:serde", "dep:serde_json"]  # CLAP-HTSAT-unfused dual-tower audio+text embeddings (laion/clap-htsat-unfused): config + Slaney mel front-end (reuses audio::dsp), HTSAT Swin + RoBERTa towers; npz for the .npy oracle fixtures
 unstable-ops-overload = []
 gguf                 = []
 npz                  = ["dep:zip", "dep:memmapix"]                                # NumPy .npy (single array) + .npz (ZIP of <name>.npy members); mirrors mx.save/savez/savez_compressed (stored + deflate). memmapix memory-maps the file on load (peak ~3x→~1x)
