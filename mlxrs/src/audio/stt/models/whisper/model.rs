@@ -1585,7 +1585,8 @@ impl Builder<'_> {
   /// when the architecture `bias` flag is `true`).
   ///
   /// **Quantized path** — when the checkpoint carries a `<prefix>.scales`
-  /// sibling AND a quantization config is threaded: the projection is built
+  /// sibling (PRESENCE ALONE, the same `.scales` discriminator the shared
+  /// [`MaybeQuantizedLinear::from_weights`] uses): the projection is built
   /// quantized via [`crate::nn::QuantizedLinear::from_parts`], running
   /// [`crate::ops::quantized::quantized_matmul`] over the packed
   /// `(weight, scales, biases)` triple with the per-layer-resolved
@@ -1619,15 +1620,21 @@ impl Builder<'_> {
   /// (`whisper.py:333`); on both paths that projection carries no dense output
   /// bias and any stray `<prefix>.bias` is dropped unused.
   fn linear(&mut self, prefix: &str, out: i32, in_features: i32, bias: bool) -> Result<Linear> {
-    // `<prefix>.scales` is the load-bearing "this layer is quantized" signal
-    // (mlx-audio whisper `class_predicate`). Only when it is present AND a
-    // quantization config is threaded do we take the quantized path.
+    // `<prefix>.scales` PRESENCE ALONE is the load-bearing "this layer is
+    // quantized" signal (mlx-audio whisper `class_predicate`) — the same
+    // discriminator the shared `MaybeQuantizedLinear::from_weights` uses. A
+    // layer carrying `.scales` takes the quantized path even when no quant
+    // config is threaded; the `let-else` below then surfaces the missing scheme
+    // as a typed error rather than silently reinterpreting the packed weight as
+    // dense.
     let scales_key = format!("{prefix}.scales");
-    if self.quantization.is_some() && self.weights.contains_key(&scales_key) {
-      // Resolve the per-layer `(group_size, bits, mode)` from the config. A
-      // `quantization_for` of `None` (an explicit per-layer `Skip`, or no
-      // global default) next to a present `.scales` is a config/checkpoint
-      // inconsistency — a typed error, never a guessed scheme.
+    if self.weights.contains_key(&scales_key) {
+      // Resolve the per-layer `(group_size, bits, mode)` from the config. No
+      // resolvable scheme — `self.quantization == None` (no config threaded at
+      // all), an explicit per-layer `Skip`, or no global default — next to a
+      // present `.scales` is a config/checkpoint inconsistency: a typed error,
+      // never a guessed scheme nor a silent dense reinterpret of the packed
+      // weight.
       let Some(q) = self.quantization.and_then(|q| q.quantization_for(prefix)) else {
         return Err(Error::InvariantViolation(InvariantViolationPayload::new(
           "WhisperModel: Linear carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
@@ -1699,7 +1706,8 @@ impl Builder<'_> {
   /// Build an [`Embedding`] from `<prefix>.weight`.
   ///
   /// **Quantized path** — when the checkpoint carries a `<prefix>.scales`
-  /// sibling AND a quantization config is threaded: the table is built
+  /// sibling (PRESENCE ALONE, the same `.scales` discriminator the shared
+  /// [`MaybeQuantizedLinear::from_weights`] uses): the table is built
   /// quantized ([`Embedding::quantized`], `mlx.nn.QuantizedEmbedding`), with
   /// the packed `(weight, scales, biases)` triple popped from the map and the
   /// `(group_size, bits, mode)` resolved per layer. The packed `uint32` weight
@@ -1718,11 +1726,14 @@ impl Builder<'_> {
     n_state: i32,
   ) -> Result<Embedding> {
     let scales_key = format!("{prefix}.scales");
-    if self.quantization.is_some() && self.weights.contains_key(&scales_key) {
-      // Quantized embedding: resolve the per-layer scheme params, then pop the
-      // packed triple. A present `.scales` with no resolvable params (an
-      // explicit `Skip`, or no global default) is a config/checkpoint
-      // inconsistency surfaced as a typed error below.
+    if self.weights.contains_key(&scales_key) {
+      // Quantized embedding: `.scales` PRESENCE ALONE routes here (the same
+      // discriminator the shared `MaybeQuantizedLinear::from_weights` uses).
+      // Resolve the per-layer scheme params, then pop the packed triple. A
+      // present `.scales` with no resolvable params — `self.quantization ==
+      // None` (no config threaded), an explicit `Skip`, or no global default —
+      // is a config/checkpoint inconsistency surfaced as a typed error below,
+      // never a silent dense reinterpret of the packed table.
       let Some(q) = self.quantization.and_then(|q| q.quantization_for(prefix)) else {
         return Err(Error::InvariantViolation(InvariantViolationPayload::new(
           "WhisperModel: embedding carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",

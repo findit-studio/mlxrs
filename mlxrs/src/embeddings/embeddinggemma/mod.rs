@@ -147,13 +147,18 @@ impl EmbeddingGemmaModel {
   /// `pooling` is absent the deployment default (mean + normalize + full
   /// dimension) is used.
   ///
-  /// A **quantized** checkpoint loads through the same path: the per-layer
-  /// scheme parameters are resolved from the config's `quantization` block (via
-  /// [`Gemma3Config::quantization`]) and each `nn.Linear` / the token embedding
-  /// is built quantized via the shared [`crate::nn::MaybeQuantizedLinear`] when
-  /// the checkpoint carries that layer's `.scales` sibling (the same per-layer
-  /// auto-detect Whisper uses); a dense checkpoint (no `.scales`) loads dense
-  /// regardless.
+  /// A **quantized** checkpoint loads through the same path: each `nn.Linear` /
+  /// the token embedding is built quantized via the shared
+  /// [`crate::nn::MaybeQuantizedLinear`] when the checkpoint carries that layer's
+  /// `.scales` sibling (the same per-layer auto-detect Whisper uses), with the
+  /// per-layer scheme parameters resolved from the config's `quantization` block
+  /// (via [`Gemma3Config::quantization`]). The scheme is resolved ONLY when a
+  /// relevant `.scales` is present (a one-pass pre-scan over the weight keys, the
+  /// load-time half of that same discriminator), so a **dense** checkpoint (no
+  /// `.scales`) loads dense regardless of any stale / foreign / partial
+  /// `quantization` block the config may still carry — the scheme is only needed
+  /// to interpret a scale that is actually present. The non-quant
+  /// [`Gemma3Config::validate`] always runs first.
   ///
   /// Every consumed tensor's shape is pinned to its exact config-derived
   /// dimensions (typed [`crate::Error::ShapePairMismatch`] wrapped in
@@ -166,10 +171,22 @@ impl EmbeddingGemmaModel {
     pooling: Option<&StPoolingConfig>,
   ) -> Result<Self> {
     config.validate()?;
-    // Resolve the per-layer quantization config (None for a dense checkpoint).
-    // Threaded to the backbone + Dense head, which pick quantized-vs-dense per
-    // layer by the `.scales` sibling.
-    let quant = config.quantization()?;
+    // Resolve the per-layer quantization scheme ONLY when the checkpoint actually
+    // carries a `.scales` sibling for some layer the model loads (the
+    // `.scales`-presence discriminator the per-layer `Linear` / `Embedding`
+    // loaders use, hoisted to the whole map). When no consumed layer is
+    // quantized the scheme is irrelevant, so a DENSE checkpoint loads through the
+    // unchanged dense path regardless of any stale / foreign / partial
+    // `quantization` (or `quantization_config`) block the config may still
+    // carry — only a present `.scales` makes an unresolvable scheme fatal (the
+    // per-layer typed `InvariantViolation`). The non-quant `config.validate()`
+    // above always runs. The result is threaded to the backbone + Dense head,
+    // which pick quantized-vs-dense per layer by the same `.scales` sibling.
+    let quant = if has_relevant_scales(&config, &weights) {
+      config.quantization()?
+    } else {
+      None
+    };
     let backbone = Gemma3Backbone::from_weights(&config, &mut weights, quant.as_ref())?;
     let dense_config = DenseConfig::from_hidden(config.hidden_size)?;
     let dense = DenseHead::from_weights(&dense_config, &mut weights, quant.as_ref())?;
@@ -311,6 +328,74 @@ fn resolve_pooling(pooling: Option<&StPoolingConfig>) -> Result<PoolingConfig> {
       false,
     )),
   }
+}
+
+/// `true` if `weights` carries a `<prefix>.scales` sibling for some layer the
+/// EmbeddingGemma loaders **actually consume** under this exact `config` — i.e.
+/// the checkpoint is (at least partly) a quantized one.
+///
+/// This is the load-time half of the `.scales`-presence discriminator the
+/// per-layer [`shared::Linear::from_weights`] / [`shared::Embedding::from_weights`]
+/// use: those gate on the exact `<prefix>.scales` key for one layer; this
+/// pre-scans the whole map once for the same signal across every layer the
+/// loaders consume, so [`EmbeddingGemmaModel::from_weights`] resolves the
+/// quantization scheme ([`Gemma3Config::quantization`]) ONLY when a scale
+/// actually needs interpreting. A dense checkpoint (no relevant `.scales`) then
+/// loads through the unchanged dense path regardless of any stale / foreign /
+/// partial `quantization` (or `quantization_config`) block the config may still
+/// carry — the scheme is irrelevant when no consumed layer is quantized.
+///
+/// The match is **exact and config-aware** (it runs after [`Gemma3Config::validate`]):
+/// the relevant keys are precisely the `<prefix>.scales` siblings the
+/// [`shared::Linear`] / [`shared::Embedding`] loaders build a `scales_key` for,
+/// with the SAME `<prefix>` strings and the shared [`shared::SCALES_SUFFIX`] —
+///
+/// - `model.embed_tokens.scales` (the token embedding, [`backbone::Gemma3Backbone::from_weights`]);
+/// - for each `i` in `0..config.num_hidden_layers` (the actual loaded layer
+///   count): the attention `model.layers.{i}.self_attn.{q,k,v,o}_proj.scales`
+///   and the MLP `model.layers.{i}.mlp.{gate,up,down}_proj.scales`;
+/// - the Dense head's `dense.0.scales` / `dense.1.scales`
+///   ([`dense::DenseHead::from_weights`]).
+///
+/// Building the loaders' exact `<prefix>.scales` strings and probing
+/// `weights.contains_key` (not a suffix / `ends_with` match) means a foreign key
+/// (`foreign.q_proj.scales`), an out-of-range layer index
+/// (`model.layers.{N}.…` for `N >= num_hidden_layers`), or a never-quantized
+/// tensor's stale `.scales` (`model.norm.scales`) is correctly IGNORED — exactly
+/// the keys no loader ever consults. Reads only the map's keys (cheap string
+/// lookups); no [`Array`] is touched.
+#[cfg(feature = "embeddinggemma")]
+fn has_relevant_scales(config: &Gemma3Config, weights: &HashMap<String, Array>) -> bool {
+  use crate::embeddings::embeddinggemma::shared::SCALES_SUFFIX;
+
+  // Probe the exact `<prefix>.scales` key the matching loader would build, with
+  // the SAME `<prefix>` format and shared suffix the `Linear` / `Embedding`
+  // loaders use.
+  let has_scales = |prefix: &str| weights.contains_key(&format!("{prefix}{SCALES_SUFFIX}"));
+
+  // The token embedding (backbone).
+  if has_scales("model.embed_tokens") {
+    return true;
+  }
+  // The Dense head's two bias-free projections (the `2_Dense` / `3_Dense`
+  // modules, sanitized to `dense.0` / `dense.1`).
+  if has_scales("dense.0") || has_scales("dense.1") {
+    return true;
+  }
+  // Every per-layer projection, for the ACTUAL loaded layer count — an
+  // out-of-range index `N >= num_hidden_layers` is never built, so its `.scales`
+  // is irrelevant. `num_hidden_layers` is a `validate`d positive `i32`.
+  (0..config.num_hidden_layers).any(|i| {
+    let q = format!("model.layers.{i}.self_attn");
+    let m = format!("model.layers.{i}.mlp");
+    has_scales(&format!("{q}.q_proj"))
+      || has_scales(&format!("{q}.k_proj"))
+      || has_scales(&format!("{q}.v_proj"))
+      || has_scales(&format!("{q}.o_proj"))
+      || has_scales(&format!("{m}.gate_proj"))
+      || has_scales(&format!("{m}.up_proj"))
+      || has_scales(&format!("{m}.down_proj"))
+  })
 }
 
 /// Rewrite a raw `google/embeddinggemma-300m` checkpoint into the layout

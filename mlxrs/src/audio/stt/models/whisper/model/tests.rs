@@ -1344,12 +1344,12 @@ fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str) {
   );
 }
 
-/// Build a synthetic MLX-format quantized Whisper checkpoint: the dense
-/// `quant_dims()` weights, then every attention/MLP `Linear` weight and the
-/// token-embedding weight quantized to the 8-bit affine triple. Conv weights,
-/// LayerNorms, and the positional embedding stay dense (the `class_predicate`
-/// in `whisper.py:674-676` only quantizes `nn.Linear` / `nn.Embedding`).
-fn quant_weights() -> HashMap<String, Array> {
+/// Build the fully-DENSE `quant_dims()`-sized Whisper weight map (the
+/// pre-quantize fixture): conv front-end, both blocks (self/cross attention +
+/// MLP), the token + positional embeddings, and every LayerNorm, all dense f32.
+/// [`quant_weights`] quantizes a subset of these in place; the stale-`.scales`
+/// tests splice a single `.scales` onto one dense weight here.
+fn dense_quant_sized_weights() -> HashMap<String, Array> {
   let n = QGROUP as usize; // n_state = 64
   let mut w = HashMap::new();
 
@@ -1367,7 +1367,7 @@ fn quant_weights() -> HashMap<String, Array> {
   put_block(&mut w, "encoder.blocks.0", n, false);
   put_ln(&mut w, "encoder.ln_post", n);
 
-  // decoder embeddings + block + final ln (DENSE first).
+  // decoder embeddings + block + final ln (DENSE).
   w.insert(
     "decoder.token_embedding.weight".to_string(),
     ones2(TINY.n_vocab, n),
@@ -1378,6 +1378,16 @@ fn quant_weights() -> HashMap<String, Array> {
   );
   put_block(&mut w, "decoder.blocks.0", n, true);
   put_ln(&mut w, "decoder.ln", n);
+  w
+}
+
+/// Build a synthetic MLX-format quantized Whisper checkpoint: the dense
+/// `quant_dims()` weights, then every attention/MLP `Linear` weight and the
+/// token-embedding weight quantized to the 8-bit affine triple. Conv weights,
+/// LayerNorms, and the positional embedding stay dense (the `class_predicate`
+/// in `whisper.py:674-676` only quantizes `nn.Linear` / `nn.Embedding`).
+fn quant_weights() -> HashMap<String, Array> {
+  let mut w = dense_quant_sized_weights();
 
   // Now quantize every Linear projection and the token embedding.
   for stack in ["encoder.blocks.0", "decoder.blocks.0"] {
@@ -1499,6 +1509,77 @@ fn from_weights_quantized_scales_without_config_errors() {
   assert!(
     matches!(err, Error::InvariantViolation(_)),
     "expected InvariantViolation for `.scales` present but no resolved params, got {err:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_none_config_with_scales_is_invariant_violation() {
+  // The `.scales`-presence discriminator: a FULLY quantized checkpoint (every
+  // Linear/Embedding carries `.scales`/`.biases`) loaded with NO quantization
+  // config at all (`None`) must NOT silently take the dense path and reinterpret
+  // the packed `uint32` weight. The `.scales` sibling ALONE routes the layer to
+  // the quantized branch, which — finding no scheme (`self.quantization ==
+  // None`) — fails fast with a typed `InvariantViolation`. (Before the
+  // discriminator fix, `None` config fell through to the dense path and the
+  // packed weight tripped the dense `(out, in)` shape gate as a `LayerKeyed`
+  // error — a DIFFERENT, shape-derived rejection that masked the missing-scheme
+  // contract.)
+  let err = WhisperModel::from_weights_quantized(quant_dims(), quant_weights(), Dtype::F32, None)
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "a quantized checkpoint with no quant config must be InvariantViolation, got {err:?}"
+  );
+}
+
+/// Insert a stale `<prefix>.scales` next to an otherwise-dense, correctly-shaped
+/// `<prefix>.weight` in `w`. The `.scales` shape is irrelevant: the
+/// `.scales`-presence gate enters the quantized branch and (with no resolvable
+/// scheme) errors BEFORE any `.scales` shape check, so a tiny placeholder
+/// suffices. Used to prove a DENSE-shaped weight carrying a stale `.scales` is
+/// rejected rather than silently loaded dense (the dense shape gate would have
+/// admitted the dense-shaped weight, masking the stale quant metadata).
+fn add_stale_scales(w: &mut HashMap<String, Array>, prefix: &str) {
+  assert!(
+    w.contains_key(&format!("{prefix}.weight")),
+    "{prefix}.weight must be a dense, correctly-shaped weight"
+  );
+  w.insert(format!("{prefix}.scales"), zeros1(QGROUP as usize));
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_linear_is_invariant_violation() {
+  // A DENSE-shaped `encoder.blocks.0.attn.query.weight` (the dense shape gate
+  // would accept it) that ALSO carries a stale `.scales`, with NO quant config,
+  // must NOT silently load dense (ignoring the quant metadata): the `.scales`
+  // presence ALONE routes it to the quantized branch, which — finding no scheme
+  // — fails with a typed `InvariantViolation`. The rest of the checkpoint is
+  // clean dense, so the encoder `query` projection is the layer that fires.
+  let mut w = dense_quant_sized_weights();
+  add_stale_scales(&mut w, "encoder.blocks.0.attn.query");
+  let err = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, None).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "a dense-shaped Linear with a stale `.scales` and no quant config must be \
+     InvariantViolation, got {err:?}"
+  );
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_embedding_is_invariant_violation() {
+  // The token embedding (the weight-tied logit head): a dense-shaped
+  // `decoder.token_embedding.weight` carrying a stale `.scales`, no quant config
+  // — the same `.scales`-presence gate rejects it with `InvariantViolation`
+  // rather than silently gathering against the dense-reinterpreted table. The
+  // encoder is clean dense, so loading reaches the decoder embedding, which
+  // fires.
+  let mut w = dense_quant_sized_weights();
+  add_stale_scales(&mut w, "decoder.token_embedding");
+  let err = WhisperModel::from_weights_quantized(quant_dims(), w, Dtype::F32, None).unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "a dense-shaped embedding with a stale `.scales` and no quant config must be \
+     InvariantViolation, got {err:?}"
   );
 }
 
