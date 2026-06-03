@@ -18,14 +18,17 @@
 //!   [`mel`] oracle).
 //!
 //! ## Phase status
-//! This module currently ships **phase 1**: the configuration
+//! This module currently ships **phases 1–2**: the configuration
 //! ([`config::ClapConfig`] = [`config::ClapAudioConfig`] +
-//! [`config::ClapTextConfig`] + projection dims) and the mel /
-//! spectrogram front-end ([`mel`]). The RoBERTa text tower, the HTSAT Swin
-//! audio tower, the projection heads, the model assembly + `classify`, the
-//! factory registration, and the end-to-end checkpoint-parity test land in
-//! later phases. The configuration struct is complete now so those phases can
-//! consume it.
+//! [`config::ClapTextConfig`] + projection dims), the mel / spectrogram
+//! front-end ([`mel`]), and the RoBERTa **text tower** ([`text::ClapTextModel`]
+//! — the `ClapTextModel` embeddings + post-norm encoder + CLS pooling + the
+//! text projection + L2-normalize, with the [`text::ClapTextModel`]
+//! [`crate::embeddings::TextEmbedder`] impl). The HTSAT Swin **audio** tower
+//! (phase 3), the full dual-tower `ClapModel` assembly + `classify` + the
+//! factory registration (phase 4), and the end-to-end checkpoint-parity test
+//! (phase 5) land in later phases; [`text::ClapTextModel`] exposes a clean
+//! `embed_text` the phase-4 assembly consumes as the text tower.
 //!
 //! ## Reuse
 //! The mel front-end reuses [`crate::audio::dsp`] —
@@ -45,9 +48,20 @@ pub mod config;
 pub mod mel;
 
 #[cfg(feature = "clap")]
+mod shared;
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub mod text;
+
+#[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub use config::{ClapAudioConfig, ClapConfig, ClapTextConfig};
 
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub use mel::{MelFrontEnd, N_MELS, T_FRAMES};
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub use text::ClapTextModel;
