@@ -618,6 +618,135 @@ fn forward_rejects_wrong_cardinality_cache() {
 
 // ════════════════════════════ weight loading ════════════════════════════
 
+// ════════════════════════ token-id range / embed table ════════════════════
+
+#[test]
+fn embed_tokens_rejects_out_of_range_ids() {
+  // The `embed_tokens` gather (MLX `take`) does not bound-check, so a negative id
+  // or an id `>= vocab` is an out-of-bounds embedding read (UB). Both must be a
+  // typed OutOfRange before the gather, and a valid id must still embed.
+  let w = tiny_weights(true);
+  let model = Qwen3::from_weights(tiny_config(true), tiny_weight_map(&w)).unwrap();
+  let vocab = TINY.5 as i32; // 5
+
+  // A negative id.
+  let neg = Array::from_slice::<i32>(&[-1], &(1usize, 1usize)).unwrap();
+  assert!(matches!(
+    model.model().embed_tokens(&neg),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // An id exactly one past the end (== vocab).
+  let past = Array::from_slice::<i32>(&[vocab], &(1usize, 1usize)).unwrap();
+  assert!(matches!(
+    model.model().embed_tokens(&past),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // The same out-of-range id reached through the public `forward` (which embeds
+  // via the same gather) is likewise a typed error, never an OOB read.
+  let mut cache = model.make_cache();
+  assert!(matches!(
+    model.forward(&past, &mut cache),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // A valid id (in `[0, vocab)`) still embeds to `(B, L, hidden)`.
+  let ok = Array::from_slice::<i32>(&[vocab - 1], &(1usize, 1usize)).unwrap();
+  let mut embedded = model.model().embed_tokens(&ok).unwrap();
+  assert_eq!(embedded.shape(), vec![1, 1, TINY.0]);
+  assert!(
+    embedded
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+}
+
+#[test]
+fn from_weights_rejects_undersized_embedding_table() {
+  // A checkpoint whose embedding table has FEWER rows than `config.vocab_size`
+  // must be rejected on load (else an id in `[rows, vocab_size)` — which
+  // `embed_tokens` admits against `vocab_size` — would gather out of bounds).
+  let w = tiny_weights(true);
+  let mut map = tiny_weight_map(&w);
+  // Replace the embedding table with one short of `vocab_size` rows.
+  let short = mat(TINY.5 - 1, TINY.0, 0.07, -0.2); // (vocab-1, hidden)
+  map.insert(
+    "model.embed_tokens.weight".to_string(),
+    mat_to_array(&short),
+  );
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(true), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+#[test]
+fn from_weights_rejects_wrong_embedding_width() {
+  // The embedding table's axis-1 (hidden) must equal `config.hidden_size`.
+  let w = tiny_weights(true);
+  let mut map = tiny_weight_map(&w);
+  let wide = mat(TINY.5, TINY.0 + 1, 0.07, -0.2); // (vocab, hidden+1)
+  map.insert("model.embed_tokens.weight".to_string(), mat_to_array(&wide));
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(true), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+// ════════════════════════ forward_embeddings rank / width ═══════════════════
+
+#[test]
+fn forward_hidden_rejects_non_rank3() {
+  // `forward_hidden` (reachable via `forward_embeddings`, whose
+  // `supports_input_embeddings` is true) is public and accepts an arbitrary
+  // `Array`; a rank-0 / rank-1 / rank-2 input must surface a typed RankMismatch,
+  // never an index-out-of-bounds panic on `shape[1]`.
+  let w = tiny_weights(true);
+  let model = Qwen3::from_weights(tiny_config(true), tiny_weight_map(&w)).unwrap();
+  let hidden = TINY.0 as i32;
+  for shape in [vec![], vec![hidden], vec![1, hidden]] {
+    let mut cache = model.make_cache();
+    let h = Array::full::<f32>(&shape, 0.1).unwrap();
+    assert!(
+      matches!(
+        model.forward_embeddings(&h, &mut cache),
+        Err(Error::RankMismatch(_))
+      ),
+      "rank-{} embeddings must be a RankMismatch",
+      shape.len()
+    );
+  }
+}
+
+#[test]
+fn forward_hidden_rejects_wrong_width() {
+  // A rank-3 input whose hidden axis disagrees with the token-embedding width
+  // must be a typed ShapePairMismatch, not a downstream matmul panic.
+  let w = tiny_weights(true);
+  let model = Qwen3::from_weights(tiny_config(true), tiny_weight_map(&w)).unwrap();
+  let mut cache = model.make_cache();
+  let h = Array::full::<f32>(&[1, 2, TINY.0 as i32 + 1], 0.1).unwrap();
+  assert!(matches!(
+    model.forward_embeddings(&h, &mut cache),
+    Err(Error::ShapePairMismatch(_))
+  ));
+}
+
+#[test]
+fn forward_hidden_accepts_correct_rank3() {
+  // A correct rank-3 `[batch, seq, hidden]` input still runs end to end and
+  // returns `[batch, seq, vocab]` logits.
+  let w = tiny_weights(true);
+  let model = Qwen3::from_weights(tiny_config(true), tiny_weight_map(&w)).unwrap();
+  let mut cache = model.make_cache();
+  let h = Array::full::<f32>(&[1, 2, TINY.0 as i32], 0.1).unwrap();
+  let logits = model.forward_embeddings(&h, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, TINY.5]);
+}
+
 #[test]
 fn from_weights_missing_key_is_typed_error() {
   let w = tiny_weights(true);
@@ -633,6 +762,109 @@ fn from_weights_missing_key_is_typed_error() {
   ));
 }
 
+// ════════════════════ decoder weight shape validation ═══════════════════════
+
+/// Replace one weight in a tied tiny map with `array`, then assert
+/// [`Qwen3::from_weights`] rejects it with a typed [`Error::LayerKeyed`] —
+/// i.e. the malformed shape is caught at load, not deferred into a later
+/// matmul / reshape / RMSNorm (or run as a different broadcastable graph).
+fn assert_tied_weight_shape_rejected(key: &str, array: Array) {
+  let mut map = tiny_weight_map(&tiny_weights(true));
+  assert!(
+    map.insert(key.to_string(), array).is_some(),
+    "{key} not in map"
+  );
+  assert!(
+    matches!(
+      Qwen3::from_weights(tiny_config(true), map),
+      Err(Error::LayerKeyed(_))
+    ),
+    "{key} with a bad shape must be a typed LayerKeyed load error"
+  );
+}
+
+#[test]
+fn from_weights_rejects_wrong_dimension_decoder_weights() {
+  // A representative sample of every dense decoder weight class — a q_proj, a
+  // layer norm, an MLP gate, an MLP down, and the final norm — each with a
+  // wrong DIMENSION (right rank) must be a typed load-time error, not a deferred
+  // MLX failure. (The same `take_shaped` pins every other layer tensor too.)
+  let (hidden, head_dim, n_heads, _n_kv, inter, _vocab) = TINY;
+  let p = "model.layers.0";
+
+  // q_proj: rows must be n_heads * head_dim; widen the rows by one head_dim.
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.self_attn.q_proj.weight"),
+    mat_to_array(&mat((n_heads + 1) * head_dim, hidden, 0.03, -0.1)),
+  );
+  // input_layernorm: must be (hidden,); make it one wider.
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.input_layernorm.weight"),
+    vec_to_array(&vecn(hidden + 1, 1.0, 0.05)),
+  );
+  // mlp gate_proj: rows must be intermediate; make it one short.
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.mlp.gate_proj.weight"),
+    mat_to_array(&mat(inter - 1, hidden, 0.02, -0.08)),
+  );
+  // mlp down_proj: cols must be intermediate; make them one wider.
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.mlp.down_proj.weight"),
+    mat_to_array(&mat(hidden, inter + 1, 0.04, -0.06)),
+  );
+  // final norm: must be (hidden,); make it one short.
+  assert_tied_weight_shape_rejected(
+    "model.norm.weight",
+    vec_to_array(&vecn(hidden - 1, 1.05, -0.02)),
+  );
+}
+
+#[test]
+fn from_weights_rejects_wrong_rank_decoder_weights() {
+  // The same representative sample, each with a wrong RANK, must be rejected on
+  // load by the shape check rather than reaching the forward.
+  let (hidden, head_dim, n_heads, _n_kv, inter, _vocab) = TINY;
+  let p = "model.layers.0";
+
+  // q_proj as a rank-1 vector instead of (n_heads*head_dim, hidden).
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.self_attn.q_proj.weight"),
+    vec_to_array(&vecn(n_heads * head_dim, 0.03, -0.1)),
+  );
+  // input_layernorm as a rank-2 matrix instead of (hidden,).
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.input_layernorm.weight"),
+    mat_to_array(&mat(hidden, 1, 1.0, 0.05)),
+  );
+  // mlp gate_proj as a rank-1 vector instead of (intermediate, hidden).
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.mlp.gate_proj.weight"),
+    vec_to_array(&vecn(inter, 0.02, -0.08)),
+  );
+  // mlp down_proj as a rank-1 vector instead of (hidden, intermediate).
+  assert_tied_weight_shape_rejected(
+    &format!("{p}.mlp.down_proj.weight"),
+    vec_to_array(&vecn(hidden, 0.04, -0.06)),
+  );
+  // final norm as a rank-2 matrix instead of (hidden,).
+  assert_tied_weight_shape_rejected(
+    "model.norm.weight",
+    mat_to_array(&mat(hidden, 1, 1.05, -0.02)),
+  );
+}
+
+#[test]
+fn from_weights_accepts_fully_correct_tied_checkpoint() {
+  // A fully correctly-shaped tied checkpoint still loads and forwards to
+  // `[B, S, vocab]` — the shape pins reject only malformed weights.
+  let w = tiny_weights(true);
+  let model = Qwen3::from_weights(tiny_config(true), tiny_weight_map(&w)).unwrap();
+  let mut cache = model.make_cache();
+  let tokens = Array::from_slice::<i32>(&[1, 4, 2], &(1usize, 3usize)).unwrap();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, TINY.5]);
+}
+
 #[test]
 fn untied_missing_lm_head_is_missing_key() {
   // An untied config without `lm_head.weight` must be a typed MissingKey.
@@ -643,6 +875,80 @@ fn untied_missing_lm_head_is_missing_key() {
     Qwen3::from_weights(tiny_config(false), map),
     Err(Error::MissingKey(_))
   ));
+}
+
+#[test]
+fn from_weights_rejects_oversized_untied_lm_head() {
+  // An untied `lm_head.weight` with MORE rows than `config.vocab_size` would emit
+  // `(B, S, vocab_size + 1)` logits — token ids outside the configured vocab —
+  // breaking the `Model` contract; it must be rejected on load like the
+  // embedding table.
+  let w = tiny_weights(false);
+  let mut map = tiny_weight_map(&w);
+  let tall = mat(TINY.5 + 1, TINY.0, -0.05, 0.2); // (vocab+1, hidden)
+  map.insert("lm_head.weight".to_string(), mat_to_array(&tall));
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(false), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+#[test]
+fn from_weights_rejects_undersized_untied_lm_head() {
+  // An untied `lm_head.weight` with FEWER rows than `config.vocab_size` must be
+  // rejected on load (the head's row count is the logits' vocab axis).
+  let w = tiny_weights(false);
+  let mut map = tiny_weight_map(&w);
+  let short = mat(TINY.5 - 1, TINY.0, -0.05, 0.2); // (vocab-1, hidden)
+  map.insert("lm_head.weight".to_string(), mat_to_array(&short));
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(false), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+#[test]
+fn from_weights_rejects_wrong_untied_lm_head_width() {
+  // The untied head's axis-1 (hidden) must equal `config.hidden_size`; a wrong
+  // width must be a typed load-time error here, not a deferred matmul failure in
+  // `Linear::forward`.
+  let w = tiny_weights(false);
+  let mut map = tiny_weight_map(&w);
+  let wide = mat(TINY.5, TINY.0 + 1, -0.05, 0.2); // (vocab, hidden+1)
+  map.insert("lm_head.weight".to_string(), mat_to_array(&wide));
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(false), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+#[test]
+fn from_weights_rejects_wrong_rank_untied_lm_head() {
+  // A `lm_head.weight` that is not rank 2 must be rejected on load by the same
+  // shape check, not reach `Linear::forward`.
+  let w = tiny_weights(false);
+  let mut map = tiny_weight_map(&w);
+  // A rank-1 `(vocab,)` tensor.
+  map.insert(
+    "lm_head.weight".to_string(),
+    vec_to_array(&vecn(TINY.5, -0.05, 0.2)),
+  );
+  assert!(matches!(
+    Qwen3::from_weights(tiny_config(false), map),
+    Err(Error::LayerKeyed(_))
+  ));
+}
+
+#[test]
+fn from_weights_accepts_correct_untied_lm_head() {
+  // A correctly shaped `(vocab_size, hidden_size)` untied head loads and forwards
+  // to `(B, S, vocab_size)` logits.
+  let w = tiny_weights(false);
+  let model = Qwen3::from_weights(tiny_config(false), tiny_weight_map(&w)).unwrap();
+  let mut cache = model.make_cache();
+  let tokens = Array::from_slice::<i32>(&[1, 2], &(1usize, 2usize)).unwrap();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, TINY.5]);
 }
 
 #[test]
@@ -790,6 +1096,55 @@ fn validate_rejects_nonnull_rope_scaling() {
   // null / absent rope_scaling is accepted.
   let null_json = r#"{"rope_scaling": null}"#;
   assert!(Qwen3Config::from_json(null_json).is_ok());
+}
+
+// ════════════ public-constructor config gate (bypassing from_json) ══════════
+
+#[test]
+fn model_from_weights_rejects_zero_layers_before_weights() {
+  // `Qwen3Model::from_weights` is public and `Qwen3Config`'s fields are public,
+  // so a caller can mutate a parsed (valid) config to `num_hidden_layers == 0`
+  // and call the constructor directly. Without an up-front `validate` this would
+  // load a norm-only decoder skipping every per-layer required weight; with it,
+  // the config is rejected with a typed `OutOfRange` BEFORE any weight is
+  // consulted. The empty weight map proves the rejection precedes the first
+  // `take_shaped` (otherwise the missing embedding table would surface a
+  // `MissingKey` instead).
+  let mut cfg = tiny_config(true);
+  cfg.num_hidden_layers = 0;
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  assert!(matches!(
+    Qwen3Model::from_weights(&cfg, &mut weights),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn model_from_weights_rejects_zero_head_counts_before_weights() {
+  // A zero attention- or kv-head count derives zero-width projections that would
+  // otherwise fail later in `reshape` / SDPA; the config gate rejects each with a
+  // typed `OutOfRange` at load, ahead of consulting any weight (empty map).
+  for mutate in [
+    (|c: &mut Qwen3Config| c.num_attention_heads = 0) as fn(&mut Qwen3Config),
+    (|c: &mut Qwen3Config| c.num_key_value_heads = 0) as fn(&mut Qwen3Config),
+  ] {
+    let mut cfg = tiny_config(true);
+    mutate(&mut cfg);
+    let mut weights: HashMap<String, Array> = HashMap::new();
+    assert!(matches!(
+      Qwen3Model::from_weights(&cfg, &mut weights),
+      Err(Error::OutOfRange(_))
+    ));
+  }
+}
+
+#[test]
+fn model_from_weights_accepts_valid_config() {
+  // The gate does not reject a valid config: a well-formed tiny config with a
+  // matching weight map still builds the head-less decoder.
+  let w = tiny_weights(true);
+  let mut map = tiny_weight_map(&w);
+  assert!(Qwen3Model::from_weights(&tiny_config(true), &mut map).is_ok());
 }
 
 #[test]

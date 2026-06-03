@@ -33,7 +33,9 @@ mod text;
 use std::collections::HashMap;
 
 #[cfg(feature = "qwen3-asr-aligner")]
-pub use aligner::{AlignWord, ForcedAligner, PreTokenizedTranscript, RawTranscript};
+pub use aligner::{
+  AlignWord, ForcedAligner, JpKoSegmenter, PreTokenizedTranscript, RawAlignOptions, RawTranscript,
+};
 #[cfg(feature = "qwen3-asr-aligner")]
 pub use aligner_config::ForcedAlignerConfig;
 pub use audio::AudioEncoder;

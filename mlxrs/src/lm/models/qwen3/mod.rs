@@ -58,8 +58,12 @@ use linear::Linear;
 use smol_str::format_smolstr;
 
 use crate::{
+  Dtype,
   array::Array,
-  error::{Error, LengthMismatchPayload, MissingKeyPayload, Result},
+  error::{
+    Error, LayerKeyedPayload, LengthMismatchPayload, MissingKeyPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload,
+  },
   lm::{
     cache::{KvCache, MaskMode, StandardKvCache},
     model::Model as LmModel,
@@ -227,9 +231,23 @@ impl Qwen3Model {
   /// Embed `tokens` (`(B, L)` integer ids) to `(B, L, hidden)` via the token
   /// embedding table — the row-gather front of the decoder, exposed so a
   /// caller can splice input features into chosen positions of the embeddings
-  /// before running [`forward_hidden`](Self::forward_hidden). No implicit eval —
-  /// the returned [`Array`] is lazy.
+  /// before running [`forward_hidden`](Self::forward_hidden). No implicit eval of
+  /// a *lazy graph* — the returned [`Array`] is lazy; reading the (data-backed)
+  /// `tokens` to range-check them is an explicit materialization of an input, not
+  /// a hidden eval.
+  ///
+  /// Every id must be a valid embedding row index in `[0, row_count)` (the
+  /// embedding table's leading dimension). MLX `take` (the gather) does **not**
+  /// bound-check its indices — a negative id (read as `id + row_count`, which for
+  /// `id < -row_count` stays negative) or an id `>= row_count` is an
+  /// out-of-bounds embedding-table read, i.e. UB — so each id is range-checked
+  /// here with a typed [`Error::OutOfRange`] before the gather. The values are
+  /// read in their native integer dtype (widened to `i64`, so a `u32`/`i32` id
+  /// tensor is validated without truncation, mirroring the aligner's
+  /// `input_ids` guard).
   pub fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
+    let row_count = self.embed_tokens.shape().first().copied().unwrap_or(0);
+    check_token_ids_in_rows(tokens, row_count, "Qwen3Model::embed_tokens: token id")?;
     take_axis(&self.embed_tokens, tokens, 0)
   }
 
@@ -269,7 +287,34 @@ impl Qwen3Model {
         cache.len(),
       )));
     }
-    let n = h.shape()[1];
+    // `forward_hidden` is public (and reachable from `Qwen3::forward_embeddings`,
+    // whose `supports_input_embeddings` is `true`), so a caller can hand in an
+    // arbitrary-rank `Array`. Require rank-3 `[batch, seq, hidden]` and validate
+    // the hidden width against the token-embedding table BEFORE reading
+    // `shape[1]`: a rank-0 / rank-1 input would otherwise panic on the `shape[1]`
+    // index, and a rank-2 (or wrong-width rank-3) input would proceed with a
+    // misinterpreted shape into a downstream matmul.
+    let shape = h.shape();
+    if shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Qwen3Model::forward: hidden states must be rank-3 [batch, seq, hidden]",
+        shape.len() as u32,
+        shape,
+      )));
+    }
+    // The token-embedding table is `(vocab, hidden)`, so its axis-1 is the width
+    // every attention/MLP projection expects; reject a mismatched hidden axis
+    // before the layers index it.
+    if let Some(hidden) = self.embed_tokens.shape().get(1).copied()
+      && shape[2] != hidden
+    {
+      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "Qwen3Model::forward: hidden-states width vs token-embedding width",
+        vec![hidden],
+        vec![shape[2]],
+      )));
+    }
+    let n = shape[1];
 
     // Build the single shared causal mask once from the first layer's cache
     // (mlx-lm `create_attention_mask(h, cache[0])`). An empty model has no
@@ -305,18 +350,74 @@ impl Qwen3Model {
   /// `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight`,
   /// `model.layers.{i}.self_attn.{q,k}_norm.weight`,
   /// `model.layers.{i}.mlp.{gate,up,down}_proj.weight`. A missing required
-  /// weight is an [`Error::MissingKey`]. The caller validates `config` and
-  /// builds the output head that sits on top (the LM vocab head in
-  /// [`Qwen3::from_weights`]).
+  /// weight is an [`Error::MissingKey`]. `config` is [`validate`]d first (it is
+  /// public and its fields are public, so this constructor cannot trust a caller
+  /// to have done so); the caller builds the output head that sits on top (the LM
+  /// vocab head in [`Qwen3::from_weights`]).
+  ///
+  /// [`validate`]: Qwen3Config::validate
+  ///
+  /// Every loaded tensor is shape-checked against the config-derived expectation
+  /// (the same arithmetic the forward realizes) on load, so a
+  /// malformed decoder checkpoint — a wrong-rank or wrong-width projection /
+  /// norm — is rejected here with a typed [`Error::LayerKeyed`] rather than
+  /// deferring to an opaque MLX `matmul` / `reshape` / `RMSNorm` failure (or, for
+  /// a broadcastable mismatch, silently running a different graph). This mirrors
+  /// the Qwen3-ASR text decoder
+  /// (`crate::audio::stt::models::qwen3_asr`), which validates every decoder
+  /// weight the same way.
   pub fn from_weights(
     config: &Qwen3Config,
     weights: &mut HashMap<String, Array>,
   ) -> Result<Qwen3Model> {
+    // Validate the (public-field) config BEFORE deriving any head count or
+    // projection width from it, or reserving/iterating `num_hidden_layers`. This
+    // constructor is public and the fields are public, so a caller can hand in a
+    // structurally invalid config (e.g. `num_hidden_layers == 0`, a zero
+    // attention- or kv-head count, a non-divisible GQA grouping) even after the
+    // parsed config was valid. Without this gate `num_hidden_layers == 0` would
+    // load a norm-only decoder skipping every required per-layer weight, and a
+    // zero head count would derive zero-width projections that fail later in
+    // `reshape` / SDPA rather than at load. `validate` rejects every such value
+    // with a typed error here, so the downstream shape derivation below operates
+    // only on a validated config.
+    config.validate()?;
     let eps = config.rms_norm_eps;
     let head_dim = config.head_dim;
 
-    let embed_tokens = take_weight(weights, "model.embed_tokens.weight")?;
-    let norm = RMSNorm::new(take_weight(weights, "model.norm.weight")?, eps);
+    // Config-derived expected projection widths (the same arithmetic the forward
+    // realizes), so every loaded tensor can be shape-checked against them.
+    // `validate()` (run just above) bounds `num_attention_heads * head_dim`
+    // within the i32 width cap; the kv product is no larger, so neither
+    // `saturating_mul` can overflow i32.
+    let hidden = config.hidden_size;
+    let inter = config.intermediate_size;
+    let q_out = config.num_attention_heads.saturating_mul(head_dim);
+    let kv_out = config.num_key_value_heads.saturating_mul(head_dim);
+
+    // Validate the embedding table's shape on load: it must be `(vocab_size,
+    // hidden_size)` from `config`. The embedding `take` gather indexes its
+    // leading dimension with caller token ids and does not bound-check, so a
+    // checkpoint whose table has fewer rows than `config.vocab_size` would let an
+    // id in `[rows, vocab_size)` — which `embed_tokens` admits against
+    // `config.vocab_size` — reach the gather out of bounds (UB). Checking the
+    // full shape here also pins axis-1 to `hidden_size`, the width
+    // `forward_hidden` validates input embeddings against.
+    let embed_tokens = take_shaped(
+      weights,
+      "model.embed_tokens.weight",
+      "embed_tokens weight (vocab_size, hidden_size)",
+      &[config.vocab_size, hidden],
+    )?;
+    let norm = RMSNorm::new(
+      take_shaped(
+        weights,
+        "model.norm.weight",
+        "final norm weight (hidden_size)",
+        &[hidden],
+      )?,
+      eps,
+    );
 
     // `num_hidden_layers` is bounded by `MAX_CONFIG_CARDINALITY` in `validate`,
     // but reserve fallibly so even a within-cap heavyweight per-layer `Vec` the
@@ -337,36 +438,109 @@ impl Qwen3Model {
         n_kv_heads: config.num_key_value_heads,
         head_dim,
         scale: (head_dim as f32).powf(-0.5),
-        q_proj: Linear::new(take_weight(weights, &format!("{q}.q_proj.weight"))?, None),
-        k_proj: Linear::new(take_weight(weights, &format!("{q}.k_proj.weight"))?, None),
-        v_proj: Linear::new(take_weight(weights, &format!("{q}.v_proj.weight"))?, None),
-        o_proj: Linear::new(take_weight(weights, &format!("{q}.o_proj.weight"))?, None),
-        q_norm: RMSNorm::new(take_weight(weights, &format!("{q}.q_norm.weight"))?, eps),
-        k_norm: RMSNorm::new(take_weight(weights, &format!("{q}.k_norm.weight"))?, eps),
+        q_proj: Linear::new(
+          take_shaped(
+            weights,
+            &format!("{q}.q_proj.weight"),
+            "q_proj weight (n_heads * head_dim, hidden_size)",
+            &[q_out, hidden],
+          )?,
+          None,
+        ),
+        k_proj: Linear::new(
+          take_shaped(
+            weights,
+            &format!("{q}.k_proj.weight"),
+            "k_proj weight (n_kv_heads * head_dim, hidden_size)",
+            &[kv_out, hidden],
+          )?,
+          None,
+        ),
+        v_proj: Linear::new(
+          take_shaped(
+            weights,
+            &format!("{q}.v_proj.weight"),
+            "v_proj weight (n_kv_heads * head_dim, hidden_size)",
+            &[kv_out, hidden],
+          )?,
+          None,
+        ),
+        o_proj: Linear::new(
+          take_shaped(
+            weights,
+            &format!("{q}.o_proj.weight"),
+            "o_proj weight (hidden_size, n_heads * head_dim)",
+            &[hidden, q_out],
+          )?,
+          None,
+        ),
+        q_norm: RMSNorm::new(
+          take_shaped(
+            weights,
+            &format!("{q}.q_norm.weight"),
+            "q_norm weight (head_dim)",
+            &[head_dim],
+          )?,
+          eps,
+        ),
+        k_norm: RMSNorm::new(
+          take_shaped(
+            weights,
+            &format!("{q}.k_norm.weight"),
+            "k_norm weight (head_dim)",
+            &[head_dim],
+          )?,
+          eps,
+        ),
         rope: Rope::new(head_dim, false, config.rope_theta, 1.0),
       };
 
       let mlp = Mlp {
         gate_proj: Linear::new(
-          take_weight(weights, &format!("{p}.mlp.gate_proj.weight"))?,
+          take_shaped(
+            weights,
+            &format!("{p}.mlp.gate_proj.weight"),
+            "mlp gate_proj weight (intermediate_size, hidden_size)",
+            &[inter, hidden],
+          )?,
           None,
         ),
         up_proj: Linear::new(
-          take_weight(weights, &format!("{p}.mlp.up_proj.weight"))?,
+          take_shaped(
+            weights,
+            &format!("{p}.mlp.up_proj.weight"),
+            "mlp up_proj weight (intermediate_size, hidden_size)",
+            &[inter, hidden],
+          )?,
           None,
         ),
         down_proj: Linear::new(
-          take_weight(weights, &format!("{p}.mlp.down_proj.weight"))?,
+          take_shaped(
+            weights,
+            &format!("{p}.mlp.down_proj.weight"),
+            "mlp down_proj weight (hidden_size, intermediate_size)",
+            &[hidden, inter],
+          )?,
           None,
         ),
       };
 
       let input_layernorm = RMSNorm::new(
-        take_weight(weights, &format!("{p}.input_layernorm.weight"))?,
+        take_shaped(
+          weights,
+          &format!("{p}.input_layernorm.weight"),
+          "input_layernorm weight (hidden_size)",
+          &[hidden],
+        )?,
         eps,
       );
       let post_attention_layernorm = RMSNorm::new(
-        take_weight(weights, &format!("{p}.post_attention_layernorm.weight"))?,
+        take_shaped(
+          weights,
+          &format!("{p}.post_attention_layernorm.weight"),
+          "post_attention_layernorm weight (hidden_size)",
+          &[hidden],
+        )?,
         eps,
       );
 
@@ -487,6 +661,82 @@ fn take_weight(weights: &mut HashMap<String, Array>, name: &str) -> Result<Array
   })
 }
 
+/// Assert a tensor's shape equals `expected` (rank + every dim) before it is
+/// stored, so a checkpoint whose weight disagrees with the config-derived
+/// expectation is rejected here rather than running a different graph (or
+/// admitting an out-of-bounds embedding gather). On mismatch returns
+/// [`Error::ShapePairMismatch`] wrapped in [`Error::LayerKeyed`] naming `key`,
+/// mirroring how the Qwen3-ASR text loader reports a malformed decoder weight.
+fn expect_shape(
+  tensor: &Array,
+  key: &str,
+  descriptor: &'static str,
+  expected: &[i32],
+) -> Result<()> {
+  let actual = tensor.shape();
+  let matches = actual.len() == expected.len()
+    && actual
+      .iter()
+      .zip(expected.iter())
+      .all(|(&a, &e)| e >= 0 && a as i64 == i64::from(e));
+  if !matches {
+    let expected_usize: Vec<usize> = expected.iter().map(|&e| e.max(0) as usize).collect();
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      key.to_string(),
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        expected_usize,
+        actual,
+      )),
+    )));
+  }
+  Ok(())
+}
+
+/// [`take_weight`] then assert the tensor's shape — the fused fetch-and-check
+/// used for the embedding table, mirroring the Qwen3-ASR text loader's
+/// `take_shaped`.
+fn take_shaped(
+  weights: &mut HashMap<String, Array>,
+  key: &str,
+  descriptor: &'static str,
+  expected: &[i32],
+) -> Result<Array> {
+  let tensor = take_weight(weights, key)?;
+  expect_shape(&tensor, key, descriptor, expected)?;
+  Ok(tensor)
+}
+
+/// Reject any token id in `tokens` outside `[0, row_count)` — the valid
+/// embedding-row range (the table's leading dimension).
+///
+/// MLX `take` (the `embed_tokens` gather) does not bound-check its indices, so a
+/// negative id (read as `id + row_count`, and for `id < -row_count` still
+/// negative) or an id `>= row_count` is an out-of-bounds embedding-table read
+/// (UB). This fails fast with a typed [`Error::OutOfRange`] before the gather.
+///
+/// The ids are read in their native integer dtype, widened to `i64` so the value
+/// is captured without truncation for any integer id tensor (`i32` here, `u32`
+/// in other model paths), then compared in `i64` (a negative `row_count`, which
+/// cannot occur for a validated config, still admits nothing). Reading the
+/// data-backed `tokens` is an explicit materialization of an input, not a hidden
+/// eval of a lazy graph.
+fn check_token_ids_in_rows(tokens: &Array, row_count: usize, context: &'static str) -> Result<()> {
+  let mut widened = tokens.astype(Dtype::I64)?;
+  let ids: Vec<i64> = widened.to_vec::<i64>()?;
+  let rows = row_count as i64;
+  for &id in &ids {
+    if id < 0 || id >= rows {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        context,
+        "token id must be in [0, embedding-table rows)",
+        format_smolstr!("id={id}, rows={row_count}"),
+      )));
+    }
+  }
+  Ok(())
+}
+
 impl Qwen3 {
   /// `mlx-lm`'s `Model.sanitize` (`qwen3.py:185-188`): when
   /// `tie_word_embeddings` is set, drop a stray `lm_head.weight` (the tied head
@@ -522,12 +772,22 @@ impl Qwen3 {
     let model = Qwen3Model::from_weights(&config, &mut weights)?;
 
     // The vocab head: tied reuses the embedding table; untied reads
-    // `lm_head.weight` from the remaining map.
+    // `lm_head.weight` from the remaining map. The untied weight is shape-checked
+    // on load to `(vocab_size, hidden_size)` — the same pin the embedding table
+    // gets — so `forward` produces the `(B, S, vocab_size)` logits the `Model`
+    // contract promises. A wrong row count would emit token ids outside the
+    // configured vocab; a wrong hidden width would defer the failure into the
+    // `Linear` matmul rather than report a typed load-time error here.
     let lm_head = if config.tie_word_embeddings {
       LmHead::Tied
     } else {
       LmHead::Untied(Linear::new(
-        take_weight(&mut weights, "lm_head.weight")?,
+        take_shaped(
+          &mut weights,
+          "lm_head.weight",
+          "lm_head weight (vocab_size, hidden_size)",
+          &[config.vocab_size, config.hidden_size],
+        )?,
         None,
       ))
     };

@@ -1069,11 +1069,15 @@ fn align_pretokenized_multi_window_produces_one_span_per_word() {
 
 // ════════════════════════════ word splitting ════════════════════════════
 
+/// No pluggable Japanese/Korean segmenter — the default for the inline-language
+/// `split_words` tests (only the Japanese/Korean branch consults it).
+const NO_SEG: Option<&dyn JpKoSegmenter> = None;
+
 #[test]
 fn split_words_space_lang_splits_on_whitespace_and_cleans() {
   // English / default branch: whitespace split, punctuation dropped by
   // clean_token, apostrophes kept.
-  let got = split_words("Hello, world! it's", "English").unwrap();
+  let got = split_words("Hello, world! it's", "English", NO_SEG).unwrap();
   assert_eq!(got, vec!["Hello", "world", "it's"]);
 }
 
@@ -1083,7 +1087,7 @@ fn split_words_chinese_uses_space_lang_path() {
   // space-separated path. A single whitespace segment is cleaned then has each
   // CJK ideograph broken out, with a Latin run kept whole: "ab你好c" → ["ab",
   // "你", "好", "c"].
-  let got = split_words("ab你好c", "Chinese").unwrap();
+  let got = split_words("ab你好c", "Chinese", NO_SEG).unwrap();
   assert_eq!(got, vec!["ab", "你", "好", "c"]);
 }
 
@@ -1093,7 +1097,7 @@ fn split_words_chinese_cleans_segment_before_splitting_cjk() {
   // each whitespace segment (dropping the hyphen) before breaking out CJK, so
   // "COVID-19" stays joined as "COVID19" while "你好" splits per character.
   // Reference: tokenize_space_lang → clean_token + split_segment_with_chinese.
-  let got = split_words("COVID-19 你好", "Chinese").unwrap();
+  let got = split_words("COVID-19 你好", "Chinese", NO_SEG).unwrap();
   assert_eq!(got, vec!["COVID19", "你", "好"]);
 }
 
@@ -1101,37 +1105,42 @@ fn split_words_chinese_cleans_segment_before_splitting_cjk() {
 fn split_words_space_lang_breaks_out_embedded_cjk() {
   // A whitespace segment containing CJK is split so each ideograph is its own
   // token (split_segment_with_chinese), even on the space-separated path.
-  let got = split_words("hi你 there", "English").unwrap();
+  let got = split_words("hi你 there", "English", NO_SEG).unwrap();
   assert_eq!(got, vec!["hi", "你", "there"]);
 }
 
 #[test]
 fn split_words_case_insensitive_language() {
   // The language is matched case-insensitively (reference `language.lower()`).
-  assert_eq!(split_words("你", "CHINESE").unwrap(), vec!["你"]);
+  assert_eq!(split_words("你", "CHINESE", NO_SEG).unwrap(), vec!["你"]);
 }
 
 #[test]
 fn split_words_all_punctuation_is_empty() {
   // Every character is dropped by clean_token, leaving no tokens.
-  assert!(split_words("!!! ---  ???", "English").unwrap().is_empty());
+  assert!(
+    split_words("!!! ---  ???", "English", NO_SEG)
+      .unwrap()
+      .is_empty()
+  );
 }
 
 #[test]
 fn split_words_empty_transcript_is_empty() {
   // An empty transcript yields no words.
-  assert!(split_words("", "English").unwrap().is_empty());
-  assert!(split_words("", "Chinese").unwrap().is_empty());
+  assert!(split_words("", "English", NO_SEG).unwrap().is_empty());
+  assert!(split_words("", "Chinese", NO_SEG).unwrap().is_empty());
 }
 
 #[test]
-fn split_words_japanese_korean_are_typed_errors() {
-  // Japanese/Korean need external morphological segmenters this port does not
-  // bundle: a typed Tokenizer error rather than a wrong split. The message must
-  // direct the caller to the pre-tokenized path (honest scope, not a claim of
-  // full-language raw-text faithfulness).
+fn split_words_japanese_korean_without_segmenter_are_typed_errors() {
+  // With no pluggable segmenter supplied, Japanese/Korean raw splitting is a
+  // typed Tokenizer error rather than a wrong split. The message must direct the
+  // caller to BOTH the pluggable segmenter hook AND the pre-tokenized path
+  // (honest scope, not a claim of full-language raw-text faithfulness).
   for (text, lang) in [("こんにちは", "Japanese"), ("안녕하세요", "Korean")] {
-    let err = split_words(text, lang).expect_err("JP/KO raw split must be a typed error");
+    let err =
+      split_words(text, lang, NO_SEG).expect_err("JP/KO raw split without a segmenter must error");
     let Error::Tokenizer(msg) = err else {
       panic!("expected Error::Tokenizer for {lang}, got {err:?}");
     };
@@ -1144,7 +1153,168 @@ fn split_words_japanese_korean_are_typed_errors() {
       msg.contains("PreTokenizedTranscript"),
       "{lang} error must name PreTokenizedTranscript: {msg}"
     );
+    assert!(
+      msg.contains("RawAlignOptions::with_segmenter"),
+      "{lang} error must point to the pluggable segmenter hook in the align options: {msg}"
+    );
   }
+}
+
+/// A mock [`JpKoSegmenter`] for the tests: it splits on a chosen delimiter
+/// (whitespace by default) into word units, recording the `language` it was
+/// called with so a test can confirm the dispatch reached it. A faithful stand
+/// -in for an external `nagisa` / `soynlp` segmenter — the aligner only needs
+/// the ordered word labels back.
+struct MockJpKoSegmenter;
+
+impl JpKoSegmenter for MockJpKoSegmenter {
+  fn segment(&self, text: &str, language: &str) -> Result<Vec<String>> {
+    // Only Japanese/Korean should ever reach the segmenter.
+    assert!(
+      language == "japanese" || language == "korean",
+      "segmenter called with unexpected language {language:?}"
+    );
+    // Split into one unit per non-space character — a deterministic stand-in for
+    // a real morphological segmenter (each CJK character becomes a word unit).
+    Ok(
+      text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_string())
+        .collect(),
+    )
+  }
+}
+
+#[test]
+fn split_words_japanese_korean_with_segmenter_splits_through_it() {
+  // With a pluggable segmenter attached, Japanese/Korean raw splitting routes
+  // through it (one unit per character here) instead of erroring.
+  let seg = MockJpKoSegmenter;
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let ja = split_words("こんにちは", "Japanese", seg_ref).unwrap();
+  assert_eq!(ja, vec!["こ", "ん", "に", "ち", "は"]);
+  let ko = split_words("안녕", "Korean", seg_ref).unwrap();
+  assert_eq!(ko, vec!["안", "녕"]);
+}
+
+#[test]
+fn split_words_segmenter_not_consulted_for_other_languages() {
+  // The segmenter is only for Japanese/Korean; English still routes through the
+  // inline space-lang path even when a segmenter is attached (the mock would
+  // panic on a non-JP/KO language, so reaching the inline path is the assertion).
+  let seg = MockJpKoSegmenter;
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let got = split_words("hello world", "English", seg_ref).unwrap();
+  assert_eq!(got, vec!["hello", "world"]);
+}
+
+/// A [`JpKoSegmenter`] that returns a fixed, caller-supplied unit list, ignoring
+/// the input text — a stand-in for a degraded/buggy external segmenter so the
+/// validation of its output can be exercised directly.
+struct FixedUnitsSegmenter(Vec<String>);
+
+impl JpKoSegmenter for FixedUnitsSegmenter {
+  fn segment(&self, _text: &str, _language: &str) -> Result<Vec<String>> {
+    Ok(self.0.clone())
+  }
+}
+
+#[test]
+fn split_words_segmenter_empty_units_for_nonempty_text_is_typed_error() {
+  // A degraded segmenter returning only empty / whitespace-only units for a
+  // non-empty Japanese/Korean transcript must surface as a typed Tokenizer error
+  // (nothing alignable) — never a successful blank-span alignment.
+  let seg = FixedUnitsSegmenter(vec![String::new(), "   ".to_string(), "\t".to_string()]);
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let err = split_words("こんにちは", "Japanese", seg_ref)
+    .expect_err("blank-only segmenter output for non-empty text must be a typed error");
+  assert!(
+    matches!(err, Error::Tokenizer(_)),
+    "expected Error::Tokenizer, got {err:?}"
+  );
+}
+
+#[test]
+fn split_words_segmenter_unit_with_reserved_marker_is_typed_error() {
+  // A unit equal to / containing a reserved audio or timestamp marker would
+  // inject a special token into the tokenizer input; reject it as a typed error.
+  // Cover each marker literal assemble_input_text relies on.
+  for marker in [
+    "<|audio_start|>",
+    "<|audio_pad|>",
+    "<|audio_end|>",
+    "<timestamp>",
+  ] {
+    // A unit that *contains* the marker (with a real-looking prefix) is rejected,
+    // not just an exact-equal unit.
+    let seg = FixedUnitsSegmenter(vec!["안".to_string(), format!("녕{marker}")]);
+    let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+    let err = split_words("안녕", "Korean", seg_ref)
+      .expect_err("a unit containing a reserved marker must be a typed error");
+    assert!(
+      matches!(err, Error::Tokenizer(_)),
+      "expected Error::Tokenizer for marker {marker:?}, got {err:?}"
+    );
+  }
+}
+
+#[test]
+fn split_words_segmenter_valid_units_align_unchanged() {
+  // A well-behaved segmenter's units pass through validation unchanged (the
+  // normal-case regression: trimming a unit with no surrounding whitespace and
+  // dropping no non-empty unit leaves the list as-is).
+  let seg = FixedUnitsSegmenter(vec!["안".to_string(), "녕".to_string()]);
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let got = split_words("안녕", "Korean", seg_ref).unwrap();
+  assert_eq!(got, vec!["안", "녕"]);
+}
+
+#[test]
+fn split_words_segmenter_mixed_units_drop_empties_keep_valid() {
+  // A mix of valid and empty/whitespace-only units drops the empties (mirroring
+  // the built-in clean path) and keeps the valid words trimmed, in order.
+  let seg = FixedUnitsSegmenter(vec![
+    " 안 ".to_string(),
+    String::new(),
+    "녕".to_string(),
+    "   ".to_string(),
+    "하세요".to_string(),
+  ]);
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let got = split_words("안녕하세요", "Korean", seg_ref).unwrap();
+  assert_eq!(got, vec!["안", "녕", "하세요"]);
+}
+
+#[test]
+fn split_words_segmenter_non_alignable_only_units_are_typed_error() {
+  // A degraded segmenter returning units with no alignable character — a
+  // zero-width space (U+200B, General_Category Cf) and a punctuation-only unit
+  // (the CJK full stop U+3002, Po) — for a non-empty transcript must surface as
+  // a typed Tokenizer error: these clean to empty in the built-in path, so they
+  // are dropped here too and the no-alignable-units guard fires, never a
+  // successful blank / non-alignable span (issue #322).
+  let seg = FixedUnitsSegmenter(vec!["\u{200B}".to_string(), "\u{3002}".to_string()]);
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let err = split_words("こんにちは。", "Japanese", seg_ref)
+    .expect_err("non-alignable-only segmenter output for non-empty text must be a typed error");
+  assert!(
+    matches!(err, Error::Tokenizer(_)),
+    "expected Error::Tokenizer, got {err:?}"
+  );
+}
+
+#[test]
+fn split_words_segmenter_punctuation_plus_real_char_keeps_unit() {
+  // A unit that is punctuation PLUS a real CJK character is kept (it has an
+  // alignable character): the keep/drop predicate only gates emptiness, so the
+  // trimmed original — punctuation included — survives as the label, exactly as
+  // the built-in path keeps a segment with at least one kept character. The CJK
+  // full stop (U+3002) attached to a real ideograph keeps the whole unit.
+  let seg = FixedUnitsSegmenter(vec!["안".to_string(), "녕\u{3002}".to_string()]);
+  let seg_ref: Option<&dyn JpKoSegmenter> = Some(&seg);
+  let got = split_words("안녕。", "Korean", seg_ref).unwrap();
+  assert_eq!(got, vec!["안", "녕\u{3002}"]);
 }
 
 #[test]
@@ -1201,7 +1371,7 @@ fn split_words_drops_combining_marks_in_segment() {
   // Through the public split path: a whitespace segment of a base letter plus a
   // combining mark yields just the base letter, and a Latin word with a
   // combining accent keeps only its base letters.
-  let got = split_words("\u{0628}\u{064E} cafe\u{0301}", "English").unwrap();
+  let got = split_words("\u{0628}\u{064E} cafe\u{0301}", "English", NO_SEG).unwrap();
   assert_eq!(got, vec!["\u{0628}", "cafe"]);
 }
 
@@ -1292,7 +1462,7 @@ fn align_raw_text_tokenizes_internally_and_produces_spans() {
   let a = tiny_aligner_with_tokenizer("raw-spans");
   let feats = filled(&[1, 8, 8], 0.1);
   let input = RawTranscript::english("hello world");
-  let opts = AlignOptions::new();
+  let opts = RawAlignOptions::new();
   let align = a.align(&feats, input, &opts).unwrap();
   // The result language defaults to the transcript language when opts is unset.
   assert_eq!(align.language(), Some("English"));
@@ -1313,7 +1483,7 @@ fn align_raw_text_opts_language_overrides_result_label() {
   let a = tiny_aligner_with_tokenizer("raw-override");
   let feats = filled(&[1, 8, 8], 0.1);
   let input = RawTranscript::new("hello world", "English");
-  let opts = AlignOptions::new().with_language("en-US");
+  let opts = RawAlignOptions::new().with_language("en-US");
   let align = a.align(&feats, input, &opts).unwrap();
   assert_eq!(align.language(), Some("en-US"));
   assert_eq!(align.spans().len(), 2);
@@ -1326,23 +1496,116 @@ fn align_raw_text_without_tokenizer_is_typed_error() {
   let a = tiny_aligner(); // from_weights → no tokenizer
   let feats = filled(&[1, 8, 8], 0.1);
   let input = RawTranscript::english("hello world");
-  let err = ForcedAlignerTrait::<RawTranscript>::align(&a, &feats, input, &AlignOptions::new())
+  let err = ForcedAlignerTrait::<RawTranscript>::align(&a, &feats, input, &RawAlignOptions::new())
     .expect_err("raw-text align without a tokenizer must error");
   assert!(matches!(err, Error::Tokenizer(_)), "got {err:?}");
 }
 
+/// [`RawAlignOptions`] carrying the [`MockJpKoSegmenter`] (one word unit per
+/// non-space character) — the segmenter now flows through the per-align options,
+/// not a stored aligner field (issue #322).
+fn opts_with_segmenter() -> RawAlignOptions {
+  RawAlignOptions::new().with_segmenter(Box::new(MockJpKoSegmenter))
+}
+
+#[test]
+fn raw_align_options_carries_language_and_segmenter() {
+  // The segmenter is now a typed part of the align contract (RawAlignOptions),
+  // not a bolted-on aligner field: default options carry neither a language nor
+  // a segmenter, `with_language` projects through the shared AlignOptions, and
+  // `with_segmenter` attaches the owned hook the raw-text path reads.
+  let bare = RawAlignOptions::new();
+  assert_eq!(bare.language(), None);
+  assert!(bare.segmenter().is_none(), "default carries no segmenter");
+
+  let labelled = RawAlignOptions::new().with_language("ja");
+  assert_eq!(labelled.language(), Some("ja"));
+  assert!(
+    labelled.segmenter().is_none(),
+    "a language label alone adds no segmenter"
+  );
+
+  let full = opts_with_segmenter().with_language("ko");
+  assert_eq!(full.language(), Some("ko"));
+  assert!(
+    full.segmenter().is_some(),
+    "with_segmenter attaches the owned hook"
+  );
+
+  // The in-place setters chain and mutate through &mut.
+  let mut m = RawAlignOptions::new();
+  m.set_language("en")
+    .set_segmenter(Box::new(MockJpKoSegmenter));
+  assert_eq!(m.language(), Some("en"));
+  assert!(m.segmenter().is_some());
+}
+
+#[test]
+fn align_raw_text_japanese_through_segmenter_in_opts_produces_spans() {
+  // The pluggable-hook path (issue #322): a Japanese raw transcript splits
+  // through the JpKoSegmenter supplied IN the RawAlignOptions (one span per
+  // character here) and aligns end to end to per-word spans — no caller-supplied
+  // tokenization, no error. The segmenter is sourced from opts, not the struct.
+  let a = tiny_aligner_with_tokenizer("jp-spans");
+  let feats = filled(&[1, 8, 8], 0.1);
+  let input = RawTranscript::new("こん", "Japanese");
+  let align = a.align(&feats, input, &opts_with_segmenter()).unwrap();
+  // Result language defaults to the transcript language.
+  assert_eq!(align.language(), Some("Japanese"));
+  let spans = align.spans();
+  assert_eq!(spans.len(), 2, "one span per segmented character");
+  assert_eq!(spans[0].text(), "こ");
+  assert_eq!(spans[1].text(), "ん");
+  for s in spans {
+    assert!(s.start_time().is_finite() && s.end_time().is_finite());
+    assert!(s.start_time() <= s.end_time());
+  }
+}
+
+#[test]
+fn align_raw_text_korean_through_segmenter_in_opts_produces_spans() {
+  // The symmetric Korean case through the same opts-supplied pluggable hook.
+  let a = tiny_aligner_with_tokenizer("ko-spans");
+  let feats = filled(&[1, 8, 8], 0.1);
+  let input = RawTranscript::new("안녕", "Korean");
+  let align = a.align(&feats, input, &opts_with_segmenter()).unwrap();
+  assert_eq!(align.language(), Some("Korean"));
+  let spans = align.spans();
+  assert_eq!(spans.len(), 2);
+  assert_eq!(spans[0].text(), "안");
+  assert_eq!(spans[1].text(), "녕");
+}
+
+#[test]
+fn align_raw_text_japanese_korean_without_segmenter_in_opts_is_typed_error() {
+  // With no segmenter supplied in the RawAlignOptions, a Japanese/Korean
+  // RawTranscript still returns the typed Tokenizer error through the full align
+  // path (the issue #322 behavior, now sourced from opts rather than a stored
+  // field — `RawAlignOptions::new()` carries no segmenter).
+  let a = tiny_aligner_with_tokenizer("jp-ko-no-seg");
+  let feats = filled(&[1, 8, 8], 0.1);
+  for lang in ["Japanese", "Korean"] {
+    let input = RawTranscript::new("こん", lang);
+    let err =
+      ForcedAlignerTrait::<RawTranscript>::align(&a, &feats, input, &RawAlignOptions::new())
+        .expect_err("JP/KO align without a segmenter in opts must error");
+    assert!(matches!(err, Error::Tokenizer(_)), "got {err:?} for {lang}");
+  }
+}
+
 #[test]
 fn raw_transcript_aligner_is_object_safe() {
-  // `Box<dyn ForcedAligner<RawTranscript>>` must be constructible and usable —
-  // the generic-over-input trait stays object-safe for a chosen input type.
+  // `Box<dyn ForcedAligner<RawTranscript, Options = RawAlignOptions>>` must be
+  // constructible and usable — the generic-over-input trait stays object-safe
+  // for a chosen input type once the associated Options is named at the dyn site.
   let a = tiny_aligner_with_tokenizer("obj-safe");
-  let boxed: Box<dyn ForcedAlignerTrait<RawTranscript>> = Box::new(a);
+  let boxed: Box<dyn ForcedAlignerTrait<RawTranscript, Options = RawAlignOptions>> = Box::new(a);
   let feats = filled(&[1, 8, 8], 0.1);
   let align = boxed
     .align(
       &feats,
       RawTranscript::english("hello world"),
-      &AlignOptions::new(),
+      &RawAlignOptions::new(),
     )
     .unwrap();
   assert_eq!(align.spans().len(), 2);
@@ -1352,9 +1615,11 @@ fn raw_transcript_aligner_is_object_safe() {
 #[test]
 fn pretokenized_transcript_aligner_is_object_safe() {
   // The pre-tokenized input is likewise reachable object-safely (no tokenizer
-  // required on this path).
+  // required on this path), naming its `Options = AlignOptions` at the dyn site.
   let a = tiny_aligner();
-  let boxed: Box<dyn for<'b> ForcedAlignerTrait<PreTokenizedTranscript<'b>>> = Box::new(a);
+  let boxed: Box<
+    dyn for<'b> ForcedAlignerTrait<PreTokenizedTranscript<'b>, Options = AlignOptions>,
+  > = Box::new(a);
   let feats = filled(&[1, 8, 8], 0.1);
   let transcript = [AlignWord::new("x", vec![10]), AlignWord::new("y", vec![11])];
   let align = boxed
