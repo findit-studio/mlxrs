@@ -30,6 +30,9 @@
 //! - [`decoding`] — the full [`decoding::DecodingTask`] (greedy decode +
 //!   the three logit filters + temperature fallback + the 30-second seek loop
 //!   + language detection).
+//! - [`timing`] — word-level timestamps via cross-attention DTW
+//!   ([`timing::find_alignment`] / [`timing::add_word_timestamps`]) +
+//!   the hallucination-anomaly heuristic.
 
 pub mod audio;
 pub mod config;
@@ -38,4 +41,5 @@ pub mod decoding;
 pub(crate) mod encoder;
 pub(crate) mod layers;
 pub mod model;
+pub mod timing;
 pub mod tokenizer;

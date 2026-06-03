@@ -278,3 +278,35 @@ fn languages_table_matches_reference() {
   assert_eq!(LANGUAGES[0], ("en", "english"));
   assert_eq!(LANGUAGES[99], ("yue", "cantonese"));
 }
+
+#[test]
+fn split_to_word_tokens_merges_spaceless_subwords_and_splits_specials() {
+  // The fixture's per-token decode yields no leading space, so consecutive
+  // plain tokens merge into one word (`_split_tokens_on_spaces`: a subword that
+  // is not special / leading-space / punctuation / first merges into the
+  // previous word). A special token (`>= eot`) always starts its own word.
+  let tok = fixture("split_words");
+  let w = HFTokenizerWrapper::new(&tok, true, 99, Some("en"), Task::Transcribe).unwrap();
+  let (words, word_tokens) = w.split_to_word_tokens(&[0, 1, 2]).unwrap();
+  assert_eq!(
+    words,
+    vec!["helloworld".to_string(), "<|endoftext|>".to_string()]
+  );
+  assert_eq!(word_tokens, vec![vec![0u32, 1], vec![2]]);
+  // The word_tokens partition the input exactly (no token dropped / duplicated).
+  let flat: Vec<u32> = word_tokens.into_iter().flatten().collect();
+  assert_eq!(flat, vec![0, 1, 2]);
+}
+
+#[test]
+fn split_to_word_tokens_eot_starts_new_word() {
+  // A plain token followed by a special (`>= eot`) token: the plain token is the
+  // first word, and the special starts its own word (`special = tokens[0] >=
+  // eot`). The partition is preserved exactly.
+  let tok = fixture("split_eot");
+  let w = HFTokenizerWrapper::new(&tok, true, 99, Some("en"), Task::Transcribe).unwrap();
+  let (words, word_tokens) = w.split_to_word_tokens(&[0, 2]).unwrap();
+  assert_eq!(word_tokens, vec![vec![0u32], vec![2]]);
+  assert_eq!(words.len(), 2);
+  assert_eq!(words[1], "<|endoftext|>");
+}

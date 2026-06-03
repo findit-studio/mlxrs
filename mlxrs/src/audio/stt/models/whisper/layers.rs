@@ -395,9 +395,8 @@ impl MultiHeadAttention {
   /// Identical to [`Self::forward`] except it returns the third `qk` tensor
   /// `(B, H, T_q, T_kv)` (the per-head attention weights over the keys),
   /// mirroring the reference's `return self.out(wv), (k, v), qk`. The cross-
-  /// attention `qk` is the input the later word-timestamp DTW alignment
-  /// consumes; this method only extracts and exposes it (the alignment itself
-  /// is a later phase).
+  /// attention `qk` is the input the word-timestamp DTW alignment consumes
+  /// (`super::timing::find_alignment`); this method extracts and exposes it.
   ///
   /// # Errors
   /// Propagates the projection / reshape / transpose / matmul / softmax errors.

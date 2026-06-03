@@ -116,6 +116,7 @@ fn build_decoder(
     blocks,
     layer_norm(n_state),
     n_ctx,
+    n_vocab,
     Dtype::F32,
   )
   .unwrap();
@@ -135,8 +136,9 @@ fn decoder_embedding_positional_logits_oracle() {
   let blocks = vec![transparent_decoder_block(n_state, n_head)];
   let (dec, tok_w, pe) = build_decoder(n_vocab, n_state, n_ctx, blocks);
 
-  // tokens (B=1, T=3).
-  let tokens = Array::from_slice::<i32>(&[2, 0, 4], &[1, 3]).unwrap();
+  // tokens (B=1, T=3) — passed as a `&[u32]` slice; the decoder builds the
+  // `(1, T)` array internally.
+  let tokens = [2u32, 0, 4];
   // encoder states (B=1, T_kv=2, n_state).
   let xa = arr(
     &[0.3, -0.1, 0.5, 0.2, 0.7, -0.4, 0.1, 0.9],
@@ -153,8 +155,10 @@ fn decoder_embedding_positional_logits_oracle() {
 
   // Independent reference: token_embedding(tokens) + positional_embedding[0:3],
   // through a transparent block (x unchanged), final ln, weight-tied logits.
+  // The reference embedding gathers from the `(1, T)` token array built here.
+  let tokens_arr = Array::from_slice::<u32>(&tokens, &[1, 3]).unwrap();
   let emb = Embedding::new(tok_w);
-  let token_emb = emb.forward(&tokens).unwrap();
+  let token_emb = emb.forward(&tokens_arr).unwrap();
   let pe_slice = slice(&pe, &[0, 0], &[3, n_state as i32], &[1, 1]).unwrap();
   let summed = token_emb.add(&pe_slice).unwrap();
   let normed = layer_norm(n_state).forward(&summed).unwrap();
@@ -188,7 +192,7 @@ fn decoder_positional_slice_uses_cache_offset() {
   let cache: DecoderKvCache = vec![(Some((ck, cv)), None)];
 
   // One new token at absolute position `offset`.
-  let tokens = Array::from_slice::<i32>(&[3], &[1, 1]).unwrap();
+  let tokens = [3u32];
   let xa = arr(&[0.1, 0.2, 0.3, 0.4], &[1, 1, n_state as i32]);
 
   let (logits, new_cache) = dec.forward(&tokens, &xa, Some(&cache)).unwrap();
@@ -203,8 +207,9 @@ fn decoder_positional_slice_uses_cache_offset() {
   );
 
   // Oracle: hidden = ln(token_embedding(token) + positional_embedding[5:6]).
+  let tokens_arr = Array::from_slice::<u32>(&tokens, &[1, 1]).unwrap();
   let emb = Embedding::new(tok_w);
-  let token_emb = emb.forward(&tokens).unwrap();
+  let token_emb = emb.forward(&tokens_arr).unwrap();
   let pe_slice = slice(
     &pe,
     &[offset as i32, 0],
@@ -235,7 +240,7 @@ fn decoder_cross_attention_depends_on_encoder_states() {
   let blocks = vec![identity_decoder_block(n_state, n_head)];
   let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
 
-  let tokens = Array::from_slice::<i32>(&[1, 2], &[1, 2]).unwrap();
+  let tokens = [1u32, 2];
   let xa1 = arr(
     &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
     &[1, 2, n_state as i32],
@@ -277,7 +282,7 @@ fn decoder_block_count_and_cache_shape() {
   let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
   assert_eq!(dec.num_blocks(), 3);
 
-  let tokens = Array::from_slice::<i32>(&[0, 1], &[1, 2]).unwrap();
+  let tokens = [0u32, 1];
   let xa = arr(&[0.1, 0.2, 0.3, 0.4], &[1, 1, n_state as i32]);
   let (_, cache) = dec.forward(&tokens, &xa, None).unwrap();
   assert_eq!(cache.len(), 3, "one cache entry per block");
@@ -321,8 +326,9 @@ fn decoder_rejects_position_past_n_ctx() {
   let n_ctx = 4usize;
   let blocks = vec![transparent_decoder_block(n_state, 2)];
   let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
-  // A 5-token prompt exceeds n_ctx = 4 at offset 0.
-  let tokens = Array::from_slice::<i32>(&[0, 1, 2, 3, 0], &[1, 5]).unwrap();
+  // A 5-token prompt exceeds n_ctx = 4 at offset 0 (all ids < n_vocab, so the
+  // context bound — not the value-range guard — is the rejection).
+  let tokens = [0u32, 1, 2, 3, 0];
   let xa = arr(&[0.1, 0.2, 0.3, 0.4], &[1, 1, n_state as i32]);
   let err = dec
     .forward(&tokens, &xa, None)
@@ -352,14 +358,14 @@ fn decoder_context_checked_before_embedding_at_offset() {
   let cache: DecoderKvCache = vec![(Some((ck, cv)), None)];
 
   // A 2-token window at offset 3 → end 5 > n_ctx 4: rejected before the gather.
-  let two = Array::from_slice::<i32>(&[0, 1], &[1, 2]).unwrap();
+  let two = [0u32, 1];
   let err = dec
     .forward(&two, &xa, Some(&cache))
     .expect_err("offset + T past n_text_ctx must be rejected");
   assert!(matches!(err, Error::OutOfRange(_)), "got {err:?}");
 
   // A single token at offset 3 → end 4 == n_ctx: accepted.
-  let one = Array::from_slice::<i32>(&[0], &[1, 1]).unwrap();
+  let one = [0u32];
   assert!(dec.forward(&one, &xa, Some(&cache)).is_ok());
 }
 
@@ -384,7 +390,7 @@ fn decoder_forward_with_cross_qk_returns_per_layer_weights() {
   // tokens (B=1, T=3); encoder states (B=1, T_kv=2, n_state).
   let t = 3usize;
   let t_kv = 2usize;
-  let tokens = Array::from_slice::<i32>(&[2, 0, 4], &[1, t as i32]).unwrap();
+  let tokens = [2u32, 0, 4];
   let xa = arr(
     &[0.3, -0.1, 0.5, 0.2, 0.7, -0.4, 0.1, 0.9],
     &[1, t_kv as i32, n_state as i32],
@@ -416,5 +422,89 @@ fn decoder_forward_with_cross_qk_returns_per_layer_weights() {
   assert_eq!(
     a, b,
     "forward_with_cross_qk logits must equal forward logits"
+  );
+}
+
+/// The decoder is the single lowest crate-visible gather chokepoint: calling
+/// `forward` / `forward_with_cross_qk` DIRECTLY (bypassing `WhisperModel`) with
+/// a token id `== n_vocab` or `> n_vocab` is rejected with a typed `OutOfRange`
+/// — NOT a panic or an out-of-bounds row gather in the `(n_vocab, n_text_state)`
+/// token-embedding table — while a fully in-range slice still forwards (logits
+/// shape on both methods, cross-qk shape on the cross-qk variant).
+///
+/// Because the entry now takes `&[u32]`, the signed / negative / float and the
+/// non-`(1, T)` rank/shape classes are COMPILE-TIME impossible (a `&[u32]` slice
+/// cannot carry a negative, fractional, or wrong-rank token), so only the
+/// value-range (`id < n_vocab`) class needs a runtime test — it is the sole
+/// remaining gather hazard the structural fix closes at the root.
+#[test]
+fn decoder_forward_rejects_out_of_range_token_id() {
+  let n_vocab = 5usize;
+  let n_state = 4usize;
+  let n_head = 2usize;
+  let n_ctx = 8usize;
+  let make = || {
+    let blocks = vec![identity_decoder_block(n_state, n_head)];
+    let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
+    dec
+  };
+  let xa = arr(
+    &[0.3, -0.1, 0.5, 0.2, 0.7, -0.4, 0.1, 0.9],
+    &[1, 2, n_state as i32],
+  );
+
+  // `id == n_vocab` (the first out-of-range row): rejected on both entries.
+  let dec = make();
+  let at_bound = [0u32, n_vocab as u32, 1];
+  let err = dec
+    .forward(&at_bound, &xa, None)
+    .expect_err("id == n_vocab must be rejected, not gathered out of bounds");
+  assert!(matches!(err, Error::OutOfRange(_)), "forward: got {err:?}");
+  let err = dec
+    .forward_with_cross_qk(&at_bound, &xa, None)
+    .expect_err("id == n_vocab must be rejected on the cross-qk entry too");
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "forward_with_cross_qk: got {err:?}"
+  );
+
+  // `id > n_vocab` (far past the table): same typed rejection on both entries.
+  let past = [1u32, (n_vocab + 7) as u32];
+  let err = dec
+    .forward(&past, &xa, None)
+    .expect_err("id > n_vocab must be rejected");
+  assert!(matches!(err, Error::OutOfRange(_)), "forward: got {err:?}");
+  let err = dec
+    .forward_with_cross_qk(&past, &xa, None)
+    .expect_err("id > n_vocab must be rejected on the cross-qk entry too");
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "forward_with_cross_qk: got {err:?}"
+  );
+
+  // A fully in-range slice (every id `< n_vocab`) still forwards: the logits are
+  // `(1, T, n_vocab)` on both methods, and the cross-qk variant additionally
+  // returns one `(1, n_head, T, T_kv)` weight tensor per block.
+  let valid = [4u32, 0, 2]; // T = 3, all ids in 0..n_vocab
+  let t = valid.len();
+  let t_kv = 2usize;
+  let (logits, _cache) = dec
+    .forward(&valid, &xa, None)
+    .expect("an in-range token slice must forward");
+  assert_eq!(logits.shape(), vec![1, t, n_vocab], "forward logits shape");
+  let (logits, _cache, cross_qk) = dec
+    .forward_with_cross_qk(&valid, &xa, None)
+    .expect("an in-range token slice must forward on the cross-qk entry");
+  assert_eq!(
+    logits.shape(),
+    vec![1, t, n_vocab],
+    "forward_with_cross_qk logits shape"
+  );
+  assert_eq!(cross_qk.len(), 1, "one cross-qk per decoder block");
+  let qk = cross_qk[0].as_ref().expect("block 0 cross-qk must be Some");
+  assert_eq!(
+    qk.shape(),
+    vec![1, n_head, t, t_kv],
+    "cross-qk shape (B, H, T, T_kv)"
   );
 }

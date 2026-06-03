@@ -650,3 +650,236 @@ fn build_accepts_layer_count_at_cap() {
   let at_cap = 1usize << 12;
   assert!(ModelDimensions::new(80, 1500, 8, 2, at_cap, 51865, 448, 8, 2, at_cap).is_ok());
 }
+
+// ───────────────────────── alignment heads ────────────────────────────────
+
+#[test]
+fn default_alignment_heads_is_last_half_of_layers() {
+  // 4 decoder layers, 6 heads → the last 2 layers (indices 2, 3) × 6 heads, in
+  // (layer, head) row-major order. Mirrors `all_heads[n_text_layer // 2 :]`.
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  let heads = dims.default_alignment_heads();
+  let mut want = Vec::new();
+  for l in 2..4usize {
+    for h in 0..6usize {
+      want.push((l, h));
+    }
+  }
+  assert_eq!(heads, want);
+}
+
+#[test]
+fn default_alignment_heads_odd_layer_count_uses_floor_div() {
+  // 5 layers → `5 // 2 = 2` → layers 2,3,4. 1 layer → `1 // 2 = 0` → layer 0.
+  let dims5 = ModelDimensions::new(80, 1500, 8, 2, 5, 51865, 448, 8, 2, 5).unwrap();
+  let h5 = dims5.default_alignment_heads();
+  assert_eq!(h5.first(), Some(&(2usize, 0usize)));
+  assert_eq!(h5.last(), Some(&(4usize, 1usize)));
+
+  let dims1 = ModelDimensions::new(80, 1500, 8, 2, 1, 51865, 448, 8, 2, 1).unwrap();
+  let h1 = dims1.default_alignment_heads();
+  assert_eq!(h1, vec![(0, 0), (0, 1)]);
+}
+
+#[test]
+fn alignment_heads_from_generation_config_parses_pairs() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  let cfg = serde_json::json!({ "alignment_heads": [[2, 1], [3, 4], [3, 5]] });
+  let heads = AlignmentHeads::from_generation_config(&cfg, &dims)
+    .unwrap()
+    .unwrap();
+  assert_eq!(heads.heads(), &[(2, 1), (3, 4), (3, 5)]);
+}
+
+#[test]
+fn alignment_heads_absent_key_is_none() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  let cfg = serde_json::json!({ "other": 1 });
+  assert!(
+    AlignmentHeads::from_generation_config(&cfg, &dims)
+      .unwrap()
+      .is_none()
+  );
+}
+
+#[test]
+fn alignment_heads_out_of_grid_is_out_of_range() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // layer 4 is out of [0, 3]; head 6 is out of [0, 5].
+  let bad_layer = serde_json::json!({ "alignment_heads": [[4, 0]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&bad_layer, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+  let bad_head = serde_json::json!({ "alignment_heads": [[0, 6]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&bad_head, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_malformed_is_parse_error() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // Not a list.
+  let not_list = serde_json::json!({ "alignment_heads": 7 });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&not_list, &dims),
+    Err(Error::Parse(_))
+  ));
+  // Wrong arity.
+  let triple = serde_json::json!({ "alignment_heads": [[0, 1, 2]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&triple, &dims),
+    Err(Error::Parse(_))
+  ));
+  // Negative entry.
+  let neg = serde_json::json!({ "alignment_heads": [[-1, 0]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&neg, &dims),
+    Err(Error::Parse(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_huge_index_is_out_of_range() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // A layer index above `i32::MAX`: a prior `as i32` cast would have wrapped it
+  // into an in-range `i32` and accepted it. Validated as `usize`, it is out of
+  // the `[0, 4)` grid and rejected.
+  let huge = i64::from(i32::MAX) + 1;
+  let bad = serde_json::json!({ "alignment_heads": [[huge, 0]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&bad, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_duplicate_pair_is_out_of_range() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // A repeated in-grid pair is rejected (the reference's heads are a set).
+  let dup = serde_json::json!({ "alignment_heads": [[2, 1], [3, 4], [2, 1]] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&dup, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_longer_than_grid_is_rejected() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // The grid is `n_text_layer * n_text_head == 4 * 6 == 24` distinct heads. A
+  // list of 25 entries cannot be all-in-grid AND all-distinct, so it is
+  // rejected (here it exhausts the grid then repeats a pair → OutOfRange).
+  let mut list = Vec::new();
+  for l in 0..4 {
+    for h in 0..6 {
+      list.push(serde_json::json!([l, h]));
+    }
+  }
+  // One more, forced to repeat an already-seen pair.
+  list.push(serde_json::json!([0, 0]));
+  let cfg = serde_json::json!({ "alignment_heads": list });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&cfg, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_over_grid_rejected_before_parse_loop() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // The grid is `n_text_layer * n_text_head == 4 * 6 == 24`. A list with MORE
+  // than `grid` entries is rejected by the up-front length check BEFORE the
+  // parse loop pushes anything, so `parsed` never grows past the fallibly
+  // reserved grid capacity (the over-push panic/OOM path is unreachable). The
+  // entries here are deliberately out-of-grid pairs that the parse loop would
+  // otherwise have to walk — the length precheck fires first.
+  let grid = 4 * 6;
+  let list: Vec<_> = (0..=grid).map(|_| serde_json::json!([999, 999])).collect();
+  assert_eq!(list.len(), grid + 1);
+  let cfg = serde_json::json!({ "alignment_heads": list });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&cfg, &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_empty_list_is_empty_input() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // An explicit empty `alignment_heads` has no DTW analogue (the reference's
+  // default is the last-half of the layers), so it is rejected, not installed.
+  let cfg = serde_json::json!({ "alignment_heads": [] });
+  assert!(matches!(
+    AlignmentHeads::from_generation_config(&cfg, &dims),
+    Err(Error::EmptyInput(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_full_grid_list_parses_without_quadratic_blowup() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // The full `4 * 6 == 24`-head grid, all distinct: a valid in-grid list of the
+  // maximum length. Dedup is O(1) per pair via the seen bitset (no O(n^2)
+  // `contains` scan), so this parses cleanly.
+  let mut list = Vec::new();
+  let mut want = Vec::new();
+  for l in 0..4usize {
+    for h in 0..6usize {
+      list.push(serde_json::json!([l, h]));
+      want.push((l, h));
+    }
+  }
+  let cfg = serde_json::json!({ "alignment_heads": list });
+  let heads = AlignmentHeads::from_generation_config(&cfg, &dims)
+    .unwrap()
+    .unwrap();
+  assert_eq!(heads.heads(), want.as_slice());
+}
+
+#[test]
+fn alignment_heads_try_new_valid_list_succeeds() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // A distinct, in-grid list builds successfully through the public validating
+  // constructor and round-trips unchanged.
+  let heads = AlignmentHeads::try_new(vec![(2, 1), (3, 4), (3, 5)], &dims).unwrap();
+  assert_eq!(heads.heads(), &[(2, 1), (3, 4), (3, 5)]);
+}
+
+#[test]
+fn alignment_heads_try_new_duplicate_is_out_of_range() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // A repeated in-grid pair is rejected by the shared validation (the O(1)
+  // bitset dedup), same as the JSON path.
+  assert!(matches!(
+    AlignmentHeads::try_new(vec![(2, 1), (3, 4), (2, 1)], &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_try_new_out_of_grid_is_out_of_range() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // layer 4 is out of [0, 3]; head 6 is out of [0, 5].
+  assert!(matches!(
+    AlignmentHeads::try_new(vec![(4, 0)], &dims),
+    Err(Error::OutOfRange(_))
+  ));
+  assert!(matches!(
+    AlignmentHeads::try_new(vec![(0, 6)], &dims),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn alignment_heads_try_new_empty_is_empty_input() {
+  let dims = ModelDimensions::new(80, 1500, 384, 6, 4, 51865, 448, 384, 6, 4).unwrap();
+  // The public constructor rejects an empty head set — no public path can
+  // install empty alignment heads on a model.
+  assert!(matches!(
+    AlignmentHeads::try_new(Vec::new(), &dims),
+    Err(Error::EmptyInput(_))
+  ));
+}

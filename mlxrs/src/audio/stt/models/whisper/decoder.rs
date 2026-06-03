@@ -59,12 +59,23 @@ pub(crate) struct TextDecoder {
   /// Precomputed additive causal mask `(n_text_ctx, n_text_ctx)`, sliced to the
   /// query length inside each block's self-attention.
   mask: Array,
+  /// The vocabulary size — the `(n_vocab, n_text_state)` token-embedding row
+  /// count (`ModelDimensions::n_vocab`). Every token id the decoder forwards
+  /// must be `< n_vocab`, or the token-embedding gather (a row gather along the
+  /// vocab axis) would index out of bounds. Validated against the
+  /// caller-supplied `&[u32]` slice at the single [`Self::run`] chokepoint
+  /// BEFORE the `(1, T)` token array is built, so no crate-visible path reaches
+  /// the gather with an out-of-range id.
+  n_vocab: usize,
 }
 
 impl TextDecoder {
   /// Construct from the loaded sub-modules. `n_ctx` (= `n_text_ctx`, 448) sizes
   /// the precomputed causal mask; the mask is built in `dtype` (the model
   /// dtype) so the `qk + mask` add inside attention stays in that dtype.
+  /// `n_vocab` is the token-embedding row count, used to value-check every
+  /// caller-supplied token id `< n_vocab` before the embedding gather (see
+  /// [`Self::run`]).
   ///
   /// # Errors
   /// Propagates the causal-mask construction op errors.
@@ -74,6 +85,7 @@ impl TextDecoder {
     blocks: Vec<ResidualAttentionBlock>,
     ln: LayerNorm,
     n_ctx: usize,
+    n_vocab: usize,
     dtype: crate::Dtype,
   ) -> Result<Self> {
     let mask = create_additive_causal_mask(n_ctx, dtype)?;
@@ -83,6 +95,7 @@ impl TextDecoder {
       blocks,
       ln,
       mask,
+      n_vocab,
     })
   }
 
@@ -117,24 +130,31 @@ impl TextDecoder {
   /// Run the decoder. Faithful port of `TextDecoder.__call__`
   /// (`whisper.py:464-486`).
   ///
-  /// - `tokens`: the text token ids `(B, T)`.
+  /// - `tokens`: the text token ids for the new (uncached) window, as a host
+  ///   `&[u32]` slice — the decoder builds the `(1, T)` `u32` decoder-input
+  ///   array internally, so the rank/batch (always `(1, T)`) and dtype (always
+  ///   `u32`, never signed / float) classes are true by construction; only the
+  ///   value-range (`id < n_vocab`) remains a runtime check, done once on the
+  ///   slice. This is the lowest crate-visible decoder entry, so the gather is
+  ///   structurally safe for every caller.
   /// - `xa`: the encoder states `(B, n_audio_ctx, n_audio_state)`.
   /// - `kv_cache`: the incoming per-block cache; `None` on the first step.
   ///
-  /// Returns `(logits, updated_cache)` — the vocabulary logits `(B, T,
+  /// Returns `(logits, updated_cache)` — the vocabulary logits `(1, T,
   /// n_vocab)` and the per-block cache to thread into the next decode step. The
   /// reference's third `cross_qk` return is dropped on this path;
   /// [`Self::forward_with_cross_qk`] is the variant that surfaces it.
   ///
   /// # Errors
-  /// - [`Error::OutOfRange`] if the positional slice `offset + T` exceeds the
-  ///   positional table or `i32::MAX`;
+  /// - [`Error::OutOfRange`] if `tokens` is empty, an id is `>= n_vocab`, the
+  ///   positional slice `offset + T` exceeds the positional table, or a
+  ///   dimension overflows `i32`;
   /// - [`Error::AllocFailure`] if the fresh per-block cache vector cannot be
   ///   reserved;
   /// - propagates the embedding / block / LayerNorm / logit op errors.
   pub(crate) fn forward(
     &self,
-    tokens: &Array,
+    tokens: &[u32],
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
@@ -153,11 +173,15 @@ impl TextDecoder {
   /// later word-timestamp DTW consumes; this method only extracts and exposes
   /// them.
   ///
+  /// `tokens` is the new-window `&[u32]` slice (the `(1, T)` `u32` array is
+  /// built internally, ids value-checked `< n_vocab`), exactly as
+  /// [`Self::forward`].
+  ///
   /// # Errors
   /// Same as [`Self::forward`].
   pub(crate) fn forward_with_cross_qk(
     &self,
-    tokens: &Array,
+    tokens: &[u32],
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
@@ -169,27 +193,76 @@ impl TextDecoder {
   /// cross-attention `qk` is retained (it is dropped when `false`, so the
   /// normal decode path keeps the weights' lifetime to a single block).
   ///
+  /// This is the SINGLE lowest crate-visible chokepoint every decoder gather
+  /// path funnels through: it takes the new-window token ids as a host `&[u32]`
+  /// slice, value-checks every id `< n_vocab` and builds the `(1, T)` `u32`
+  /// decoder-input array internally, so the rank/batch and dtype classes are
+  /// impossible by construction and only the value-range class is a runtime
+  /// check — done once on host data before the embedding gather, so no
+  /// out-of-range id (which would index out of bounds in the `(n_vocab,
+  /// n_text_state)` token-embedding row gather) can reach the gather from any
+  /// caller, current or future.
+  ///
   /// # Errors
   /// See [`Self::forward`].
   fn run(
     &self,
-    tokens: &Array,
+    tokens: &[u32],
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
     collect_cross_qk: bool,
   ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
     let offset = Self::cache_offset(kv_cache);
-    let seq_len = *tokens.shape().last().unwrap_or(&0);
+    let seq_len = tokens.len();
 
-    // Bound the decode context BEFORE the token-embedding gather: a direct
-    // caller can pass a prefix longer than the validated `n_text_ctx`, and the
-    // gather would otherwise materialize `(1, T, n_text_state)` before the
-    // positional slice's bound check fires. Reject `offset + seq_len >
-    // n_text_ctx` here, so no allocation precedes the typed error.
+    // `T > 0`: an empty window has no tokens to forward (and would build a
+    // degenerate `(1, 0)` array). Checked on the slice before any allocation.
+    if seq_len == 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: token window length",
+        "must be non-empty",
+        format_smolstr!("len={seq_len}"),
+      )));
+    }
+
+    // Value-range guard — the ONLY token class that remains a runtime check:
+    // taking `&[u32]` already makes the dtype (always `u32`, never signed /
+    // float) and the `(1, T)` shape true by construction, so an id `>= n_vocab`
+    // (which would index out of bounds in the `(n_vocab, n_text_state)`
+    // token-embedding row gather) is the sole remaining hazard. Checked here on
+    // the host slice — once, no per-step device sync — BEFORE the `(1, T)` array
+    // is built and BEFORE the gather, so no crate-visible decoder path reaches
+    // the embedding gather with an out-of-range id, for any caller.
+    if let Some(&id) = tokens.iter().find(|&&id| id as usize >= self.n_vocab) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: token id",
+        "must be < n_vocab (the token-embedding rows)",
+        format_smolstr!("id={id}, n_vocab={}", self.n_vocab),
+      )));
+    }
+
+    // Bound the decode context BEFORE the token-embedding gather: a caller can
+    // pass a prefix longer than the validated `n_text_ctx`, and the gather would
+    // otherwise materialize `(1, T, n_text_state)` before the positional slice's
+    // bound check fires. Reject `offset + seq_len > n_text_ctx` here, so no
+    // allocation precedes the typed error.
     self.check_context(offset, seq_len)?;
 
+    // Build the `(1, T)` `u32` decoder-input array from the validated slice —
+    // the rank/batch and dtype are fixed by construction. The `i32` `T`
+    // conversion is the dimension the embedding gather / positional slice will
+    // perform; guard it here, matching the positional-slice `i32` guards.
+    let t = i32::try_from(seq_len).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: token window length",
+        "must fit in i32",
+        format_smolstr!("{seq_len}"),
+      ))
+    })?;
+    let tokens = Array::from_slice::<u32>(tokens, &[1, t])?;
+
     // `x = token_embedding(tokens) + positional_embedding[offset:offset+T]`.
-    let token_emb = self.token_embedding.forward(tokens)?;
+    let token_emb = self.token_embedding.forward(&tokens)?;
     let pe_slice = self.positional_slice(offset, seq_len)?;
     let mut x = token_emb.add(&pe_slice)?;
 

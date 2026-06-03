@@ -595,6 +595,140 @@ fn decode_step_with_cross_qk_exposes_per_layer_weights() {
   );
 }
 
+/// `forward_with_cross_qk` (the cacheless full-sequence alignment entry the
+/// word-timestamp DTW drives) takes the tokens as a `&[u32]` slice and passes it
+/// straight to the decoder, which builds the `(1, T)` `u32` decoder-input array
+/// internally at the single gather chokepoint (`TextDecoder::run`), mirroring
+/// the incremental `decode_step_with_cross_qk` contract. The `&[u32]` type makes
+/// two whole defect classes IMPOSSIBLE by construction — there is no rank/batch
+/// to mis-shape (the array is always `(1, T)`) and no dtype to mis-set (always
+/// `u32`), so the prior rank-1 / batched-`(2, T)` / signed-`i32` / float token
+/// cases simply cannot be expressed and need no runtime test. The two genuine
+/// semantic guards remain and are typed errors (NOT panics): `1 <= T <=
+/// max_context` and every id `< n_vocab` (an out-of-range id would gather out of
+/// bounds in the decoder token embedding). A valid in-range slice is accepted
+/// and returns the full logits + one cross-qk per decoder layer.
+#[test]
+fn forward_with_cross_qk_validates_caller_tokens() {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let mel = tiny_mel();
+  let max_context = model.max_context();
+  let n_vocab = model.dims().n_vocab();
+
+  // empty slice (`T == 0`) — no tokens to align, rejected with a typed OutOfRange.
+  let err = model.forward_with_cross_qk(&mel, &[]).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for an empty token slice, got {err:?}"
+  );
+
+  // over-context (`max_context + 1`) — exceeds the decoder positional table,
+  // rejected with a typed OutOfRange BEFORE encoding. Ids stay in range so the
+  // length bound (not the value range) is what fires.
+  let over: Vec<u32> = (0..(max_context as u32 + 1))
+    .map(|i| i % n_vocab as u32)
+    .collect();
+  let err = model.forward_with_cross_qk(&mel, &over).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for an over-context token slice, got {err:?}"
+  );
+
+  // id == n_vocab — the first out-of-bounds embedding row, rejected with a typed
+  // OutOfRange (it would gather past the `(n_vocab, n_text_state)` table).
+  let at_vocab = [0u32, 1, n_vocab as u32];
+  let err = model.forward_with_cross_qk(&mel, &at_vocab).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id == n_vocab, got {err:?}"
+  );
+
+  // id > n_vocab — further out of bounds, same typed OutOfRange.
+  let over_vocab = [0u32, n_vocab as u32 + 7, 2];
+  let err = model.forward_with_cross_qk(&mel, &over_vocab).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id > n_vocab, got {err:?}"
+  );
+
+  // valid in-range `[u32; T]` with `T <= max_context` and every id `< n_vocab` —
+  // accepted, returns the full `(1, T, V)` logits + one cross-qk per decoder
+  // layer shaped `(1, H, T, n_audio_ctx)` (mirroring the incremental assertions).
+  let t = max_context; // exactly at the context bound is in range.
+  let valid: Vec<u32> = (0..t as u32).map(|i| i % n_vocab as u32).collect();
+  let (logits, cross_qk) = model.forward_with_cross_qk(&mel, &valid).unwrap();
+  assert_eq!(logits.shape(), vec![1, t, TINY.n_vocab]);
+  assert_eq!(cross_qk.len(), 1, "one cross-qk per decoder layer");
+  let qk = cross_qk[0]
+    .as_ref()
+    .expect("decoder block cross-qk must be Some");
+  assert_eq!(
+    qk.shape(),
+    vec![1, TINY.n_head, t, TINY.n_audio_ctx],
+    "cross-qk shape (B, H, T, n_audio_ctx)"
+  );
+}
+
+/// `forward_with_cross_qk` validates the cheap host-side `tokens` BEFORE the
+/// expensive `encode(mel)` — the fail-fast ordering boundary. Proven decisively
+/// by feeding an **invalid mel** (a non-`N_FRAMES` frame count `encode` rejects
+/// with `ShapePairMismatch`) together with an invalid-token slice: if the token
+/// validation runs first, the call fails with the token `OutOfRange`; if `encode`
+/// ran first, it would fail with the encoder's `ShapePairMismatch`. The positive
+/// control (the SAME bad mel with a valid token slice) confirms that mel really
+/// is encode-rejectable, so the token-error cases genuinely demonstrate the token
+/// check preempts the encoder rather than the mel merely being accepted.
+#[test]
+fn forward_with_cross_qk_validates_tokens_before_encode() {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let max_context = model.max_context();
+  let n_vocab = model.dims().n_vocab();
+
+  // A mel `encode` rejects: the config pins `n_audio_ctx = N_FRAMES / 2`, so any
+  // frame count other than N_FRAMES is a `ShapePairMismatch` from `encode`. This
+  // is the observable "encoder would be the source of the error" sentinel.
+  let bad_mel = Array::ones::<f32>(&(N_FRAMES + 8, TINY.n_mels)).unwrap();
+
+  // Positive control: the bad mel WITH a valid token slice errors with the
+  // encoder's ShapePairMismatch — establishing the mel is genuinely
+  // encode-rejectable, so a token OutOfRange below could only come from the token
+  // check firing FIRST (not from the mel being silently accepted).
+  let valid_tokens: Vec<u32> = (0..3u32).map(|i| i % n_vocab as u32).collect();
+  let err = model
+    .forward_with_cross_qk(&bad_mel, &valid_tokens)
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::ShapePairMismatch(_)),
+    "control: a bad mel with valid tokens must surface the encoder ShapePairMismatch, got {err:?}"
+  );
+
+  // empty tokens + bad mel → the token OutOfRange wins (token check precedes
+  // encode), NOT the encoder ShapePairMismatch.
+  let err = model.forward_with_cross_qk(&bad_mel, &[]).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "empty tokens must fail-fast as OutOfRange before the encoder runs, got {err:?}"
+  );
+
+  // over-context tokens (ids in range) + bad mel → the length OutOfRange wins.
+  let over: Vec<u32> = (0..(max_context as u32 + 1))
+    .map(|i| i % n_vocab as u32)
+    .collect();
+  let err = model.forward_with_cross_qk(&bad_mel, &over).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "over-context tokens must fail-fast as OutOfRange before the encoder runs, got {err:?}"
+  );
+
+  // id >= n_vocab + bad mel → the value-range OutOfRange wins.
+  let bad_id = [0u32, n_vocab as u32, 1];
+  let err = model.forward_with_cross_qk(&bad_mel, &bad_id).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "an id >= n_vocab must fail-fast as OutOfRange before the encoder runs, got {err:?}"
+  );
+}
+
 #[test]
 fn decode_step_rejects_tokens_shorter_than_cache() {
   // The driver always extends `tokens`; a prefix shorter than the cache (no
@@ -792,6 +926,46 @@ fn decode_step_rejects_prefix_longer_than_max_context() {
   assert!(model.decode_step(&mut cache2, &enc, &at_bound).is_ok());
 }
 
+/// The incremental decode path (`decode_step` / `decode_step_with_cross_qk`)
+/// shares the `id < n_vocab` value guard with the full-sequence
+/// `forward_with_cross_qk`: a caller-owned token id `>= n_vocab` would index out
+/// of bounds in the decoder token-embedding gather, so it is rejected with a
+/// typed `OutOfRange` BEFORE the gather rather than reaching backend
+/// out-of-bounds indexing. An in-range prefix is accepted.
+#[test]
+fn decode_step_rejects_token_id_at_or_above_n_vocab() {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let enc = model.encode(&tiny_mel()).unwrap();
+  let n_vocab = model.dims().n_vocab();
+
+  // id == n_vocab — the first out-of-bounds embedding row.
+  let mut cache = model.new_cache();
+  let at_vocab = [0u32, n_vocab as u32];
+  let err = model.decode_step(&mut cache, &enc, &at_vocab).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id == n_vocab, got {err:?}"
+  );
+
+  // The cross-qk incremental entry shares `prepare_decode_tail` (and the
+  // decoder's gather-root `id < n_vocab` check), so it rejects the same
+  // out-of-range id.
+  let mut cache_qk = model.new_cache();
+  let over_vocab = [1u32, n_vocab as u32 + 3];
+  let err = model
+    .decode_step_with_cross_qk(&mut cache_qk, &enc, &over_vocab)
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id > n_vocab on the cross-qk path, got {err:?}"
+  );
+
+  // An in-range prefix is accepted (the guard does not reject valid ids).
+  let mut cache_ok = model.new_cache();
+  let in_range = [0u32, (n_vocab as u32).saturating_sub(1)];
+  assert!(model.decode_step(&mut cache_ok, &enc, &in_range).is_ok());
+}
+
 /// `decode_step` validates the encoder-states extent BEFORE building the
 /// token array or entering the decoder. An `enc` whose audio context exceeds
 /// `n_audio_ctx` is rejected with a typed `ShapePairMismatch` — so the
@@ -875,7 +1049,7 @@ fn decode_step_same_encoder_states_reuses_cache_across_steps() {
 #[test]
 fn decode_tokens_rejects_oversized_and_batched_enc() {
   let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
-  let tok = Array::from_slice::<u32>(&[0u32], &[1, 1]).unwrap();
+  let tok = [0u32];
 
   // Oversized audio context.
   let oversized = Array::ones::<f32>(&(1usize, TINY.n_audio_ctx + 8, TINY.n_state)).unwrap();
@@ -896,6 +1070,49 @@ fn decode_tokens_rejects_oversized_and_batched_enc() {
   // A correctly-shaped single segment is accepted.
   let good = model.encode(&tiny_mel()).unwrap();
   assert!(model.decode_tokens(&tok, &good, None).is_ok());
+}
+
+/// The crate-private decode chokepoint (`decode_tokens`) takes a `&[u32]` and
+/// builds the `(1, T)` `u32` decoder-input array internally, so the rank/batch
+/// and dtype classes are structural — every caller (the decoding task's
+/// prefill / step and `detect_language`) funnels through here. The single
+/// remaining semantic guard is the value range: an id `>= n_vocab` would index
+/// out of bounds in the `(n_vocab, n_text_state)` token-embedding gather, so it
+/// is rejected with a typed `OutOfRange` BEFORE the gather, sharing the
+/// `validate_token_ids` value check with the incremental and full-sequence
+/// paths. An empty slice (no tokens to decode) is likewise an `OutOfRange`.
+#[test]
+fn decode_tokens_rejects_out_of_vocab_token_id() {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let enc = model.encode(&tiny_mel()).unwrap();
+  let n_vocab = model.dims().n_vocab();
+
+  // id == n_vocab — the first out-of-bounds embedding row.
+  let at_vocab = [0u32, n_vocab as u32];
+  let err = model.decode_tokens(&at_vocab, &enc, None).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id == n_vocab, got {err:?}"
+  );
+
+  // id > n_vocab.
+  let over_vocab = [1u32, n_vocab as u32 + 5];
+  let err = model.decode_tokens(&over_vocab, &enc, None).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for a token id > n_vocab, got {err:?}"
+  );
+
+  // An empty slice has no tokens to decode.
+  let err = model.decode_tokens(&[], &enc, None).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfRange(_)),
+    "expected OutOfRange for an empty token slice, got {err:?}"
+  );
+
+  // An in-range slice is accepted (the guard does not reject valid ids).
+  let in_range = [0u32, (n_vocab as u32).saturating_sub(1)];
+  assert!(model.decode_tokens(&in_range, &enc, None).is_ok());
 }
 
 /// The encoder batch guard surfaces through the model's `encode`: an already-3-D
@@ -960,6 +1177,80 @@ fn with_eot_token_overrides_eot() {
     .unwrap()
     .with_eot_token(2);
   assert_eq!(model.eot(), 2);
+}
+
+#[test]
+fn with_alignment_heads_installs_validated_override() {
+  // The grid for `dims()` is `n_text_layer * n_text_head == 1 * 2 == 2`, so
+  // `(0, 0)` and `(0, 1)` are the only valid heads. Building the override
+  // through the public validating constructor (against this model's dims) and
+  // installing it replaces the last-half default; the install-time dims recheck
+  // passes because the heads carry this model's grid.
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let heads = AlignmentHeads::try_new(vec![(0, 0), (0, 1)], model.dims()).unwrap();
+  let model = model.with_alignment_heads(heads).unwrap();
+  assert_eq!(model.alignment_heads().heads(), &[(0, 0), (0, 1)]);
+}
+
+#[test]
+fn with_alignment_heads_rejects_heads_validated_for_another_model() {
+  // An `AlignmentHeads` carries the `(n_text_layer, n_text_head)` grid it was
+  // validated against. Building one against a LARGER model's dims and trying to
+  // install it on this SMALLER model is rejected by the install-time dims
+  // recheck with a typed `OutOfRange` — the out-of-grid head `(3, 3)` never
+  // reaches the DTW gather.
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let default_heads = model.alignment_heads().heads().to_vec();
+
+  // A larger decoder grid: 6 layers x 4 heads. `(3, 3)` is in-grid here but out
+  // of this model's `1 x 2` grid.
+  let larger = ModelDimensions::new(80, 1500, 384, 4, 6, 51865, 448, 384, 4, 6).unwrap();
+  let foreign = AlignmentHeads::try_new(vec![(3, 3), (4, 0)], &larger).unwrap();
+  assert_eq!(foreign.n_layer(), 6);
+  assert_eq!(foreign.n_head(), 4);
+
+  // The install consumes `model`; the dims mismatch is rejected, so the foreign
+  // set is never stored.
+  assert!(matches!(
+    model.with_alignment_heads(foreign),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // A freshly built model of the same dims keeps the last-half default — the
+  // rejected foreign set could not have been installed on it.
+  let fresh = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  assert_eq!(fresh.alignment_heads().heads(), default_heads.as_slice());
+}
+
+#[test]
+fn alignment_heads_override_cannot_install_invalid_heads() {
+  // `with_alignment_heads` takes an already-validated `AlignmentHeads`, and the
+  // only public constructor (`try_new`) validates against the model's dims —
+  // the unchecked `AlignmentHeads::new` is crate-private. So a duplicate, an
+  // out-of-grid, or an empty head set is rejected at construction and never
+  // reaches `with_alignment_heads` (and so never the DTW gather). The model's
+  // alignment heads stay at the last-half default.
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F32).unwrap();
+  let default_heads = model.alignment_heads().heads().to_vec();
+
+  // Duplicate pair.
+  assert!(matches!(
+    AlignmentHeads::try_new(vec![(0, 0), (0, 0)], model.dims()),
+    Err(Error::OutOfRange(_))
+  ));
+  // Out-of-grid head (n_text_head == 2, so head 2 is out of [0, 1]).
+  assert!(matches!(
+    AlignmentHeads::try_new(vec![(0, 2)], model.dims()),
+    Err(Error::OutOfRange(_))
+  ));
+  // Empty set.
+  assert!(matches!(
+    AlignmentHeads::try_new(Vec::new(), model.dims()),
+    Err(Error::EmptyInput(_))
+  ));
+
+  // None of the rejected sets could be installed: the default is intact.
+  assert_eq!(model.alignment_heads().heads(), default_heads.as_slice());
 }
 
 #[test]
