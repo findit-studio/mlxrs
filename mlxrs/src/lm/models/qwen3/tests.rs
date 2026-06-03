@@ -229,10 +229,10 @@ fn attention_matches_independent_gqa_oracle() {
     n_kv_heads: n_kv_heads as i32,
     head_dim: head_dim as i32,
     scale: (head_dim as f32).powf(-0.5),
-    q_proj: Linear::new(mat_to_array(&w.q_proj), None),
-    k_proj: Linear::new(mat_to_array(&w.k_proj), None),
-    v_proj: Linear::new(mat_to_array(&w.v_proj), None),
-    o_proj: Linear::new(mat_to_array(&w.o_proj), None),
+    q_proj: Linear::dense(mat_to_array(&w.q_proj)),
+    k_proj: Linear::dense(mat_to_array(&w.k_proj)),
+    v_proj: Linear::dense(mat_to_array(&w.v_proj)),
+    o_proj: Linear::dense(mat_to_array(&w.o_proj)),
     q_norm: RMSNorm::new(vec_to_array(&w.q_norm), eps as f32),
     k_norm: RMSNorm::new(vec_to_array(&w.k_norm), eps as f32),
     rope: Rope::new(head_dim as i32, false, rope_base as f32, 1.0),
@@ -1114,7 +1114,7 @@ fn model_from_weights_rejects_zero_layers_before_weights() {
   cfg.num_hidden_layers = 0;
   let mut weights: HashMap<String, Array> = HashMap::new();
   assert!(matches!(
-    Qwen3Model::from_weights(&cfg, &mut weights),
+    Qwen3Model::from_weights(&cfg, &mut weights, None),
     Err(Error::OutOfRange(_))
   ));
 }
@@ -1132,7 +1132,7 @@ fn model_from_weights_rejects_zero_head_counts_before_weights() {
     mutate(&mut cfg);
     let mut weights: HashMap<String, Array> = HashMap::new();
     assert!(matches!(
-      Qwen3Model::from_weights(&cfg, &mut weights),
+      Qwen3Model::from_weights(&cfg, &mut weights, None),
       Err(Error::OutOfRange(_))
     ));
   }
@@ -1144,7 +1144,7 @@ fn model_from_weights_accepts_valid_config() {
   // matching weight map still builds the head-less decoder.
   let w = tiny_weights(true);
   let mut map = tiny_weight_map(&w);
-  assert!(Qwen3Model::from_weights(&tiny_config(true), &mut map).is_ok());
+  assert!(Qwen3Model::from_weights(&tiny_config(true), &mut map, None).is_ok());
 }
 
 #[test]
@@ -1153,4 +1153,899 @@ fn from_json_rejects_malformed_json() {
     Qwen3Config::from_json("{not json"),
     Err(Error::Parse(_))
   ));
+}
+
+// ════════════════════════════ quantized load ════════════════════════════
+//
+// A small synthetic 8-bit affine-quantized Qwen3 checkpoint, built by running
+// the dense weights through the real `ops::quantized::quantize` op (exactly how
+// an mlx-community quantized Qwen3 bundle stores a quantized `nn.Linear` /
+// `nn.Embedding`), then asserting it loads through `Qwen3::from_weights` and
+// forwards to the right shape. Mirrors the Whisper / EmbeddingGemma
+// quantized-load tests.
+//
+// The dims are chosen so every quantized weight's last axis (the `in`
+// dimension) is a whole number of affine groups (`group_size = 32`), which
+// mlx's affine `quantize` requires: every projection / the embedding / the
+// untied head contracts over 32 or 64.
+
+/// Affine group size for the synthetic quantized checkpoint (divides every
+/// quantized weight's last axis: 32, 64).
+const QGROUP: i32 = 32;
+/// Bit depth for the synthetic quantized checkpoint.
+const QBITS: i32 = 8;
+
+const Q_HIDDEN: i32 = 32;
+const Q_HEADS: i32 = 2;
+const Q_KV_HEADS: i32 = 1;
+const Q_HEAD_DIM: i32 = 16; // Q_HEADS * Q_HEAD_DIM = 32 = Q_HIDDEN
+const Q_INTER: i32 = 64; // multiple of QGROUP
+const Q_VOCAB: i32 = 64;
+
+/// A tiny `Qwen3Config` (with a `quantization` block) whose every quantized
+/// weight's last axis is a multiple of `QGROUP`. `tie` selects the tied embedding
+/// head vs a dedicated `lm_head`.
+fn quant_config(tie: bool) -> Qwen3Config {
+  let json = format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+    "tie_word_embeddings": {tie},
+    "quantization": {{ "group_size": {QGROUP}, "bits": {QBITS} }}}}"#
+  );
+  let cfg = Qwen3Config::from_json(&json).unwrap();
+  cfg.validate().unwrap();
+  cfg
+}
+
+/// A deterministic `(rows, cols)` f32 weight with small distinct values.
+fn qmat(rows: i32, cols: i32, off: f32) -> Array {
+  let (r, c) = (rows as usize, cols as usize);
+  let data: Vec<f32> = (0..r * c)
+    .map(|n| ((n % 13) as f32) * 0.01 - 0.05 + off)
+    .collect();
+  Array::from_slice::<f32>(&data, &(r, c)).unwrap()
+}
+
+/// A deterministic `(n,)` f32 vector (RMSNorm weights stay dense).
+fn qvec(n: i32) -> Array {
+  let data: Vec<f32> = (0..n as usize)
+    .map(|i| 1.0 + ((i % 5) as f32) * 0.01)
+    .collect();
+  Array::from_slice::<f32>(&data, &(n as usize,)).unwrap()
+}
+
+/// Build the dense `quant_config`-sized weight map (sanitized layout) of the f32
+/// originals — the DENSE checkpoint, before any quantization. `tie` adds a
+/// dense `lm_head.weight` when untied.
+fn dense_quant_sized_map(tie: bool) -> HashMap<String, Array> {
+  let mut w = HashMap::new();
+  w.insert(
+    "model.embed_tokens.weight".to_string(),
+    qmat(Q_VOCAB, Q_HIDDEN, 0.0),
+  );
+  w.insert("model.norm.weight".to_string(), qvec(Q_HIDDEN));
+  let p = "model.layers.0";
+  let q_out = Q_HEADS * Q_HEAD_DIM; // 32
+  let kv_out = Q_KV_HEADS * Q_HEAD_DIM; // 16
+  w.insert(
+    format!("{p}.self_attn.q_proj.weight"),
+    qmat(q_out, Q_HIDDEN, 0.01),
+  );
+  w.insert(
+    format!("{p}.self_attn.k_proj.weight"),
+    qmat(kv_out, Q_HIDDEN, 0.02),
+  );
+  w.insert(
+    format!("{p}.self_attn.v_proj.weight"),
+    qmat(kv_out, Q_HIDDEN, 0.03),
+  );
+  w.insert(
+    format!("{p}.self_attn.o_proj.weight"),
+    qmat(Q_HIDDEN, q_out, 0.04),
+  );
+  w.insert(format!("{p}.self_attn.q_norm.weight"), qvec(Q_HEAD_DIM));
+  w.insert(format!("{p}.self_attn.k_norm.weight"), qvec(Q_HEAD_DIM));
+  w.insert(
+    format!("{p}.mlp.gate_proj.weight"),
+    qmat(Q_INTER, Q_HIDDEN, 0.05),
+  );
+  w.insert(
+    format!("{p}.mlp.up_proj.weight"),
+    qmat(Q_INTER, Q_HIDDEN, 0.06),
+  );
+  w.insert(
+    format!("{p}.mlp.down_proj.weight"),
+    qmat(Q_HIDDEN, Q_INTER, 0.07),
+  );
+  w.insert(format!("{p}.input_layernorm.weight"), qvec(Q_HIDDEN));
+  w.insert(
+    format!("{p}.post_attention_layernorm.weight"),
+    qvec(Q_HIDDEN),
+  );
+  if !tie {
+    w.insert("lm_head.weight".to_string(), qmat(Q_VOCAB, Q_HIDDEN, 0.08));
+  }
+  w
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`), mirroring how an mlx-community
+/// quantized checkpoint stores a quantized `nn.Linear` / `nn.Embedding`.
+fn quantize_weight_in_place(w: &mut HashMap<String, Array>, prefix: &str) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .expect("dense weight present");
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QGROUP, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// The list of quantizable layer prefixes (every `nn.Linear` + the embedding;
+/// the untied `lm_head` when present). RMSNorm weights stay dense.
+fn quant_prefixes(tie: bool) -> Vec<String> {
+  let p = "model.layers.0";
+  let mut prefixes = vec![
+    "model.embed_tokens".to_string(),
+    format!("{p}.self_attn.q_proj"),
+    format!("{p}.self_attn.k_proj"),
+    format!("{p}.self_attn.v_proj"),
+    format!("{p}.self_attn.o_proj"),
+    format!("{p}.mlp.gate_proj"),
+    format!("{p}.mlp.up_proj"),
+    format!("{p}.mlp.down_proj"),
+  ];
+  if !tie {
+    prefixes.push("lm_head".to_string());
+  }
+  prefixes
+}
+
+/// The dense map with every `nn.Linear` projection, the token embedding, and
+/// (untied) the `lm_head` quantized to the 8-bit affine triple — mirroring an
+/// mlx-community quantized Qwen3 checkpoint.
+fn quant_weights(tie: bool) -> HashMap<String, Array> {
+  let mut w = dense_quant_sized_map(tie);
+  for prefix in quant_prefixes(tie) {
+    quantize_weight_in_place(&mut w, &prefix);
+  }
+  w
+}
+
+#[test]
+fn quantized_checkpoint_loads_and_builds_quantized_layers() {
+  // With a quantization config and a checkpoint whose Linear/Embedding weights
+  // carry `.scales`/`.biases`, the model builds quantized layers throughout. A
+  // packed `uint32` weight of a DIFFERENT shape than the dense `(out, in)` would
+  // otherwise be rejected by the dense shape gate, so a successful load is itself
+  // proof the quantized path ran — but assert the introspection too.
+  let model = Qwen3::from_weights(quant_config(true), quant_weights(true)).expect("load");
+  assert!(
+    model.model().embedding_is_quantized(),
+    "the token embedding must load quantized"
+  );
+  assert!(
+    model.model().all_projections_quantized(),
+    "every attention + MLP projection must load quantized"
+  );
+}
+
+#[test]
+fn quantized_untied_lm_head_loads_quantized() {
+  // An untied quantized checkpoint loads the dedicated `lm_head` through the
+  // quantized path too (its `lm_head.scales` sibling is the signal).
+  let model = Qwen3::from_weights(quant_config(false), quant_weights(false)).expect("load");
+  assert!(
+    model.model().embedding_is_quantized(),
+    "the token embedding must load quantized"
+  );
+  assert!(
+    model.model().all_projections_quantized(),
+    "every attention + MLP projection must load quantized"
+  );
+  assert!(
+    model.untied_lm_head_is_quantized(),
+    "the untied lm_head must load quantized"
+  );
+}
+
+#[test]
+fn quantized_checkpoint_forwards_to_expected_logits_shape() {
+  // The full quantized forward executes (the quantized attention/MLP
+  // `quantized_matmul`, the quantized token-embedding gather + dequantize, and
+  // the tied quantized `as_linear` head) and returns finite `[B, L, vocab]`
+  // logits.
+  let model = Qwen3::from_weights(quant_config(true), quant_weights(true)).expect("load");
+  let tokens = Array::from_slice::<i32>(&[1, 7, 30], &(1usize, 3usize)).unwrap();
+  let mut cache = model.make_cache();
+  let mut logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, Q_VOCAB as usize]);
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "quantized forward produced non-finite logits"
+  );
+}
+
+#[test]
+fn quantized_forward_matches_dequantized_dense_oracle() {
+  // Independent oracle: dequantize every triple back to a dense weight via the
+  // real `ops::quantized::dequantize` op, build a DENSE Qwen3 from those weights,
+  // and run it. The quantized model's logits must match the dense-from-
+  // dequantized-weights logits — the only difference is the round-trip quant
+  // error, which `dequantize(quantize(w))` reproduces exactly on both sides, so
+  // the two are bit-for-bit equal here (both consume the same dequantized
+  // weight). This confirms the quantized `quantized_matmul` / gather path is the
+  // faithful counterpart of the dense matmul, not an unrelated graph.
+  let qmap = quant_weights(true);
+
+  // Build the dense oracle map: dequantize each quantized triple, keep the dense
+  // (RMSNorm) weights verbatim.
+  let prefixes = quant_prefixes(true);
+  let mut dense: HashMap<String, Array> = HashMap::new();
+  for (key, arr) in &qmap {
+    // Skip the `.scales` / `.biases` siblings; reconstruct from the `.weight`.
+    if key.ends_with(".scales") || key.ends_with(".biases") {
+      continue;
+    }
+    let prefix = key.strip_suffix(".weight");
+    let is_quant = prefix.is_some_and(|p| prefixes.iter().any(|qp| qp == p));
+    if is_quant {
+      let p = prefix.unwrap();
+      let scales = qmap.get(&format!("{p}.scales")).unwrap();
+      let biases = qmap.get(&format!("{p}.biases")).unwrap();
+      let deq = crate::ops::quantized::dequantize(
+        arr,
+        scales,
+        Some(biases),
+        QGROUP,
+        QBITS,
+        "affine",
+        None,
+        None,
+      )
+      .unwrap();
+      dense.insert(key.clone(), deq);
+    } else {
+      dense.insert(key.clone(), arr.try_clone().unwrap());
+    }
+  }
+
+  // Dense model: a config WITHOUT the quantization block, dense weights.
+  let dense_cfg = Qwen3Config::from_json(&format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": true}}"#
+  ))
+  .unwrap();
+  let dense_model = Qwen3::from_weights(dense_cfg, dense).expect("dense load");
+  let quant_model = Qwen3::from_weights(quant_config(true), qmap).expect("quant load");
+
+  let tokens = Array::from_slice::<i32>(&[2, 11, 40], &(1usize, 3usize)).unwrap();
+  let mut dc = dense_model.make_cache();
+  let mut qc = quant_model.make_cache();
+  let mut dense_logits = dense_model.forward(&tokens, &mut dc).unwrap();
+  let mut quant_logits = quant_model.forward(&tokens, &mut qc).unwrap();
+  assert_eq!(quant_logits.shape(), dense_logits.shape());
+
+  let want = dense_logits.to_vec::<f32>().unwrap();
+  let got = quant_logits.to_vec::<f32>().unwrap();
+  // Tolerance for the dequantize/quantized_matmul accumulation-order difference
+  // (the quantized kernel and the dense matmul accumulate in a different order on
+  // identical dequantized values), scaled to the logit magnitude.
+  let scale = want.iter().fold(0.0_f32, |m, v| m.max(v.abs())).max(1.0);
+  for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+    assert!(
+      (g - w).abs() <= 2e-3 * scale,
+      "index {i}: quant {g} vs dense-from-dequant {w} (|Δ|={})",
+      (g - w).abs()
+    );
+  }
+}
+
+/// The quantized Qwen3 forward must preserve the activation dtype: a `bf16`/`f16`
+/// activation must yield `bf16`/`f16` logits, never a silent promotion to `f32`.
+/// The quantized `quantized_matmul` / dequantize gather follow the activation
+/// dtype, so this is the quantized-path counterpart of the dense
+/// `forward_preserves_*` guards. The scales/biases are kept f32 (mlx quantizes
+/// from an f32 master here); the activation enters bf16/f16 via the embedding
+/// dequantize → the `scales` dtype drives it, so quantize the dense weights from
+/// a `dtype`-cast master so the dequantize yields `dtype`.
+fn assert_quantized_forward_preserves_dtype(dtype: crate::Dtype) {
+  // Build the dense master in `dtype`, then quantize: mlx's `quantize` writes
+  // `scales` in the input dtype, so the embedding dequantize + every
+  // `quantized_matmul` produce `dtype` activations.
+  let mut w: HashMap<String, Array> = dense_quant_sized_map(true)
+    .into_iter()
+    .map(|(k, v)| (k, v.astype(dtype).expect("cast master")))
+    .collect();
+  for prefix in quant_prefixes(true) {
+    quantize_weight_in_place(&mut w, &prefix);
+  }
+  let model = Qwen3::from_weights(quant_config(true), w).expect("load");
+  let tokens = Array::from_slice::<i32>(&[1, 7], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dtype,
+    "quantized Qwen3 forward upcast {dtype:?} → {:?}",
+    logits.dtype().unwrap()
+  );
+  let vals = logits
+    .astype(crate::Dtype::F32)
+    .unwrap()
+    .to_vec::<f32>()
+    .unwrap();
+  assert!(vals.iter().all(|v| v.is_finite()), "non-finite: {vals:?}");
+}
+
+#[test]
+fn quantized_forward_preserves_bf16() {
+  assert_quantized_forward_preserves_dtype(crate::Dtype::BF16);
+}
+
+#[test]
+fn quantized_forward_preserves_f16() {
+  assert_quantized_forward_preserves_dtype(crate::Dtype::F16);
+}
+
+#[test]
+fn dense_checkpoint_loads_dense_even_with_quant_config() {
+  // A dense checkpoint (no `.scales` siblings) loads DENSE even when the config
+  // carries a `quantization` block — the `.scales` sibling, not the config, is
+  // the load-bearing per-layer signal (the `class_predicate` gate).
+  let model = Qwen3::from_weights(quant_config(true), dense_quant_sized_map(true)).expect("load");
+  assert!(
+    !model.model().embedding_is_quantized(),
+    "a dense embedding must NOT load quantized just because the config has a quant block"
+  );
+  assert!(
+    !model.model().all_projections_quantized(),
+    "dense projections must NOT load quantized without `.scales` siblings"
+  );
+  // And it still forwards.
+  let tokens = Array::from_slice::<i32>(&[3, 9], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, Q_VOCAB as usize]);
+}
+
+#[test]
+fn quantized_scales_without_config_is_rejected() {
+  // A checkpoint that carries `.scales` siblings but a config with NO
+  // quantization block does NOT silently mis-load: the `.scales` sibling ALONE
+  // is the load-bearing "this layer is quantized" signal (the shared
+  // `.scales`-presence discriminator), so the layer takes the quantized branch
+  // and — finding no scheme to interpret the packed weight — fails fast with a
+  // typed `InvariantViolation` (a mixed / malformed checkpoint), NEVER a silent
+  // dense reinterpret of the packed `uint32` weight. The first consumed
+  // quantized weight (the token embedding) fires it.
+  let model = Qwen3::from_weights(tiny_quant_sized_dense_config(), quant_weights(true));
+  assert!(matches!(model, Err(Error::InvariantViolation(_))));
+}
+
+/// Insert a stale `<prefix>.scales` next to an otherwise-dense, correctly-shaped
+/// `<prefix>.weight` in `w`. The `.scales` shape is irrelevant: the
+/// `.scales`-presence gate enters the quantized branch and (with no resolvable
+/// scheme) errors BEFORE any `.scales` shape check, so a tiny placeholder
+/// suffices. Used to prove a DENSE-shaped weight carrying a stale `.scales` is
+/// rejected rather than silently loaded dense (the dense shape gate would have
+/// admitted the dense-shaped weight, masking the stale quant metadata).
+fn add_stale_scales(w: &mut HashMap<String, Array>, prefix: &str) {
+  assert!(
+    w.contains_key(&format!("{prefix}.weight")),
+    "{prefix}.weight must be a dense, correctly-shaped weight"
+  );
+  w.insert(format!("{prefix}.scales"), qvec(QGROUP));
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_projection_is_invariant_violation() {
+  // A DENSE-shaped `q_proj.weight` (the dense shape gate would accept it) that
+  // ALSO carries a stale `q_proj.scales`, under a config with NO quantization
+  // block, must NOT silently load dense (ignoring the quant metadata): the
+  // `.scales` presence alone routes it to the quantized branch, which — finding
+  // no scheme — fails with a typed `InvariantViolation`. The embedding is left
+  // clean dense so the projection (not the embedding) is the layer that fires.
+  let mut w = dense_quant_sized_map(true);
+  add_stale_scales(&mut w, "model.layers.0.self_attn.q_proj");
+  let model = Qwen3::from_weights(tiny_quant_sized_dense_config(), w);
+  assert!(matches!(model, Err(Error::InvariantViolation(_))));
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_embedding_is_invariant_violation() {
+  // The token embedding: a dense-shaped `model.embed_tokens.weight` carrying a
+  // stale `model.embed_tokens.scales`, no quant config — the same
+  // `.scales`-presence gate rejects it with `InvariantViolation` rather than
+  // silently gathering against the dense-reinterpreted table.
+  let mut w = dense_quant_sized_map(true);
+  add_stale_scales(&mut w, "model.embed_tokens");
+  let model = Qwen3::from_weights(tiny_quant_sized_dense_config(), w);
+  assert!(matches!(model, Err(Error::InvariantViolation(_))));
+}
+
+#[test]
+fn dense_shaped_weight_with_stale_scales_untied_lm_head_is_invariant_violation() {
+  // The untied `lm_head`: a dense-shaped `lm_head.weight` carrying a stale
+  // `lm_head.scales`, no quant config. The embedding + every projection are
+  // clean dense, so loading reaches the (last-consumed) untied head, whose
+  // `.scales` presence routes it to the quantized branch → `InvariantViolation`,
+  // not a silent dense head.
+  let mut w = dense_quant_sized_map(false);
+  add_stale_scales(&mut w, "lm_head");
+  let model = Qwen3::from_weights(tiny_quant_sized_dense_config_untied(), w);
+  assert!(matches!(model, Err(Error::InvariantViolation(_))));
+}
+
+#[test]
+fn quantized_scales_with_skip_override_is_invariant_violation() {
+  // A config WITH a quantization block but an explicit per-layer `false` (Skip)
+  // for a layer that nonetheless carries `.scales` cannot resolve scheme
+  // parameters for it — a typed InvariantViolation, never a guessed scheme nor a
+  // silent dense reinterpret of the packed weight. Mark the token embedding
+  // `Skip`; it is the first consumed quantized layer.
+  let json = format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": true,
+    "quantization": {{ "group_size": {QGROUP}, "bits": {QBITS},
+      "model.embed_tokens": false }}}}"#
+  );
+  let cfg = Qwen3Config::from_json(&json).unwrap();
+  let model = Qwen3::from_weights(cfg, quant_weights(true));
+  assert!(matches!(model, Err(Error::InvariantViolation(_))));
+}
+
+/// The `quant_config` dims WITHOUT a quantization block — used to prove a
+/// `.scales`-bearing checkpoint with no config quant block is rejected.
+fn tiny_quant_sized_dense_config() -> Qwen3Config {
+  Qwen3Config::from_json(&format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": true}}"#
+  ))
+  .unwrap()
+}
+
+/// The `tiny_quant_sized_dense_config` dims but UNTIED (a dedicated `lm_head`),
+/// still WITHOUT a quantization block — used to prove a stale-`.scales` untied
+/// head is rejected with no config quant block.
+fn tiny_quant_sized_dense_config_untied() -> Qwen3Config {
+  Qwen3Config::from_json(&format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": false}}"#
+  ))
+  .unwrap()
+}
+
+#[test]
+fn config_quantization_parses_block_and_defaults_none() {
+  // The `quantization` block deserializes to a PerLayerQuantization; absent block
+  // is None.
+  let plq = quant_config(true).quantization().unwrap().expect("Some");
+  let q = plq
+    .quantization_for("model.layers.0.self_attn.q_proj")
+    .unwrap();
+  assert_eq!(q.group_size, QGROUP);
+  assert_eq!(q.bits, QBITS);
+  // A config with no quantization block → None.
+  assert!(
+    Qwen3Config::from_json("{}")
+      .unwrap()
+      .quantization()
+      .unwrap()
+      .is_none()
+  );
+  // A null block → None.
+  assert!(
+    Qwen3Config::from_json(r#"{"quantization": null}"#)
+      .unwrap()
+      .quantization()
+      .unwrap()
+      .is_none()
+  );
+}
+
+/// A `quant_config`-sized config carrying a `quantization` block that is NOT a
+/// valid `PerLayerQuantization` — `quant_block_json` is spliced in verbatim.
+/// `from_json` parses it (the block is retained as an opaque JSON value and
+/// `validate` never inspects it), but [`Qwen3Config::quantization`] would fail
+/// to deserialize it: a malformed / foreign / partial block becomes fatal ONLY
+/// if the scheme is actually resolved. `tie` selects the tied vs untied head.
+fn dense_config_with_quant_block(tie: bool, quant_block_json: &str) -> Qwen3Config {
+  Qwen3Config::from_json(&format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": {tie},
+    "quantization": {quant_block_json}}}"#
+  ))
+  .unwrap()
+}
+
+#[test]
+fn dense_checkpoint_with_malformed_quant_block_loads_dense() {
+  // The completing-finding case: a DENSE checkpoint (no `.scales` on any layer)
+  // whose config carries a stale / foreign / partial `quantization` block that
+  // is NOT a valid mlx `PerLayerQuantization`. The block becoming fatal would
+  // contradict the `.scales`-presence discriminator (unused quant metadata must
+  // not break a dense load), so `from_weights` must load DENSE and forward —
+  // the scheme is never resolved because no layer is quantized.
+  //
+  // A `{ "quant_method": "gptq", "version": 2 }`-style block has no
+  // `group_size`, so it is the kind that WOULD be fatal if parsed — assert that
+  // directly first, so this test stays honest if the parser ever loosens.
+  let malformed = r#"{ "quant_method": "gptq", "version": 2, "bits": 4 }"#;
+  let probe = dense_config_with_quant_block(true, malformed);
+  assert!(
+    matches!(probe.quantization(), Err(Error::Parse(_))),
+    "the malformed block must be fatal WHEN the scheme is resolved (control)"
+  );
+
+  // Dense weights (no `.scales`) + this malformed block → loads DENSE, no parse.
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(true, malformed),
+    dense_quant_sized_map(true),
+  )
+  .expect("dense checkpoint must load despite the unused malformed quant block");
+  assert!(
+    !model.model().embedding_is_quantized(),
+    "no `.scales` ⇒ dense embedding"
+  );
+  assert!(
+    !model.model().all_projections_quantized(),
+    "no `.scales` ⇒ dense projections"
+  );
+  // And the dense forward runs to the expected logits shape.
+  let tokens = Array::from_slice::<i32>(&[4, 12], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, Q_VOCAB as usize]);
+}
+
+#[test]
+fn dense_untied_checkpoint_with_partial_quant_block_loads_dense() {
+  // The untied-head counterpart: an incomplete block (only `bits`, no required
+  // `group_size`) on an UNTIED dense checkpoint (dedicated `lm_head.weight`, no
+  // `.scales` anywhere). The dedicated head + every projection load dense; the
+  // partial block is never parsed.
+  let partial = r#"{ "bits": 8 }"#;
+  let probe = dense_config_with_quant_block(false, partial);
+  assert!(
+    matches!(probe.quantization(), Err(Error::Parse(_))),
+    "a block missing `group_size` must be fatal WHEN resolved (control)"
+  );
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(false, partial),
+    dense_quant_sized_map(false),
+  )
+  .expect("dense untied checkpoint must load despite the unused partial quant block");
+  assert!(!model.model().all_projections_quantized());
+  assert!(
+    !model.untied_lm_head_is_quantized(),
+    "the dedicated dense `lm_head` must NOT load quantized"
+  );
+  let tokens = Array::from_slice::<i32>(&[5, 20], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, Q_VOCAB as usize]);
+}
+
+#[test]
+fn malformed_quant_block_with_present_scales_still_errors() {
+  // The symmetry guard: when a relevant `.scales` IS present, the scheme is
+  // still required, so a malformed block remains fatal — the pre-scan gates the
+  // parse, it never SUPPRESSES it. A dense-shaped `q_proj.weight` carrying a
+  // stale `q_proj.scales`, under a config with a malformed quant block, surfaces
+  // the block's parse failure (the `.scales` pre-scan finds the sibling and
+  // resolves the scheme, which fails) rather than silently loading dense.
+  let mut w = dense_quant_sized_map(true);
+  add_stale_scales(&mut w, "model.layers.0.self_attn.q_proj");
+  let cfg = dense_config_with_quant_block(true, r#"{ "quant_method": "gptq" }"#);
+  assert!(matches!(Qwen3::from_weights(cfg, w), Err(Error::Parse(_))));
+}
+
+#[test]
+fn stale_scales_on_never_quantized_layer_does_not_resolve_scheme() {
+  // A `.scales` sibling on a layer the model NEVER loads quantized (the final
+  // `model.norm`, which loads dense via `take_shaped`) is NOT a relevant scale:
+  // the pre-scan must ignore it, so a dense checkpoint with a malformed quant
+  // block still loads DENSE. This pins the leaf-name boundary of the pre-scan —
+  // only the projections / embedding / `lm_head` carry a load-bearing `.scales`.
+  let mut w = dense_quant_sized_map(true);
+  w.insert("model.norm.scales".to_string(), qvec(QGROUP));
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(true, r#"{ "quant_method": "awq" }"#),
+    w,
+  )
+  .expect("an irrelevant `.scales` on `model.norm` must not resolve the scheme");
+  assert!(!model.model().all_projections_quantized());
+}
+
+// ════════════ exact, config-aware `.scales` pre-scan ════════════
+//
+// The pre-scan probes the EXACT `<prefix>.scales` keys the `Linear` / `Embedding`
+// loaders consume under the validated config — not a suffix / `ends_with` match.
+// A foreign key, an out-of-range layer index, or a tied `lm_head.scales` is then
+// IGNORED, so a dense checkpoint carrying one (plus a malformed/unused quant
+// block) still loads DENSE; only a scale on a layer the loaders actually consume
+// resolves the scheme.
+
+#[test]
+fn foreign_scales_key_is_ignored_dense_load() {
+  // A `.scales` whose prefix merely ENDS WITH a quantizable leaf (`foreign.q_proj`)
+  // is NOT a key any loader consults: the exact-key pre-scan ignores it, so a
+  // dense checkpoint with an unused malformed quant block still loads DENSE.
+  let mut w = dense_quant_sized_map(true);
+  w.insert("foreign.q_proj.scales".to_string(), qvec(QGROUP));
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(true, r#"{ "quant_method": "gptq" }"#),
+    w,
+  )
+  .expect("a foreign `.scales` key must not resolve the scheme — dense load");
+  assert!(
+    !model.model().embedding_is_quantized() && !model.model().all_projections_quantized(),
+    "no consumed `.scales` ⇒ fully dense"
+  );
+  let tokens = Array::from_slice::<i32>(&[2, 8], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  assert_eq!(
+    model.forward(&tokens, &mut cache).unwrap().shape(),
+    vec![1, 2, Q_VOCAB as usize]
+  );
+}
+
+#[test]
+fn out_of_range_layer_scales_key_is_ignored_dense_load() {
+  // An in-shape `.scales` on a layer index BEYOND `num_hidden_layers` (which is 1
+  // here, so layer 99 is never built) is not consumed by any loader: the
+  // config-aware pre-scan iterates only `0..num_hidden_layers`, so a dense
+  // checkpoint with an unused malformed quant block still loads DENSE.
+  let mut w = dense_quant_sized_map(true);
+  w.insert(
+    "model.layers.99.self_attn.q_proj.scales".to_string(),
+    qvec(QGROUP),
+  );
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(true, r#"{ "quant_method": "gptq" }"#),
+    w,
+  )
+  .expect("an out-of-range layer `.scales` must not resolve the scheme — dense load");
+  assert!(!model.model().all_projections_quantized());
+  let tokens = Array::from_slice::<i32>(&[3, 11], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  assert_eq!(
+    model.forward(&tokens, &mut cache).unwrap().shape(),
+    vec![1, 2, Q_VOCAB as usize]
+  );
+}
+
+#[test]
+fn tied_lm_head_scales_is_ignored_dense_load() {
+  // A TIED model reuses the embedding table as the head and never consumes
+  // `lm_head.scales`; the pre-scan gates `lm_head` on `!tie_word_embeddings`, so
+  // a stale `lm_head.scales` on a tied dense checkpoint (plus a malformed unused
+  // block) is IGNORED and the checkpoint loads DENSE.
+  let mut w = dense_quant_sized_map(true);
+  w.insert("lm_head.scales".to_string(), qvec(QGROUP));
+  let model = Qwen3::from_weights(
+    dense_config_with_quant_block(true, r#"{ "quant_method": "gptq" }"#),
+    w,
+  )
+  .expect("a tied `lm_head.scales` must not resolve the scheme — dense load");
+  assert!(
+    !model.model().embedding_is_quantized() && !model.model().all_projections_quantized(),
+    "tied dense head ⇒ fully dense"
+  );
+  let tokens = Array::from_slice::<i32>(&[6, 21], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  assert_eq!(
+    model.forward(&tokens, &mut cache).unwrap().shape(),
+    vec![1, 2, Q_VOCAB as usize]
+  );
+}
+
+#[test]
+fn real_consumed_scales_still_resolves_scheme_and_errors() {
+  // The symmetry guard for the exact pre-scan: a `.scales` on a layer the
+  // loaders DO consume (`model.layers.0.self_attn.q_proj`, layer 0 is in range)
+  // is relevant, so the scheme IS resolved — a malformed quant block then remains
+  // fatal (the R4 InvariantViolation/Parse contract stays green), proving the
+  // exact match did not regress the real-scale detection.
+  let mut w = dense_quant_sized_map(true);
+  add_stale_scales(&mut w, "model.layers.0.self_attn.q_proj");
+  // No config quant block ⇒ no scheme resolves ⇒ typed InvariantViolation.
+  assert!(matches!(
+    Qwen3::from_weights(tiny_quant_sized_dense_config(), w),
+    Err(Error::InvariantViolation(_))
+  ));
+}
+
+#[test]
+fn untied_lm_head_scales_is_relevant_and_resolves_scheme() {
+  // The untied counterpart to the tied-ignore test: an UNTIED model DOES consume
+  // `lm_head.scales`, so the pre-scan must treat it as relevant. A stale
+  // `lm_head.scales` on an otherwise-dense untied checkpoint with no resolvable
+  // scheme is therefore a typed InvariantViolation, not a silent dense head.
+  let mut w = dense_quant_sized_map(false);
+  add_stale_scales(&mut w, "lm_head");
+  assert!(matches!(
+    Qwen3::from_weights(tiny_quant_sized_dense_config_untied(), w),
+    Err(Error::InvariantViolation(_))
+  ));
+}
+
+// ════════════ `quantization` / `quantization_config` two-field precedence ════════════
+//
+// A mlx-saved quantized config mirrors `quantization` into `quantization_config`
+// (`utils.py:914-915`, reproduced by mlxrs `save_config`), so a round-tripped
+// config carries BOTH keys. The two separate `#[serde(default)]` fields parse
+// either or both without a serde duplicate-field error, and `quantization()`
+// resolves precedence (canonical `quantization` first, else the mirror).
+
+/// A `quant_config`-sized config carrying BOTH a `quantization` and a
+/// `quantization_config` block — each spliced verbatim — mirroring a
+/// mlxrs-saved (round-tripped) quantized Qwen3 `config.json`.
+fn config_with_both_quant_keys(
+  tie: bool,
+  quantization_json: &str,
+  quantization_config_json: &str,
+) -> Qwen3Config {
+  Qwen3Config::from_json(&format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": {tie},
+    "quantization": {quantization_json},
+    "quantization_config": {quantization_config_json}}}"#
+  ))
+  .unwrap()
+}
+
+#[test]
+fn config_with_both_quant_keys_parses_without_duplicate_field_error() {
+  // The core round-trip fix: a config carrying BOTH keys must deserialize (the
+  // single aliased field would reject it as a serde duplicate-field error). Both
+  // fields are populated and the chosen block resolves.
+  let cfg = config_with_both_quant_keys(
+    true,
+    &format!(r#"{{ "group_size": {QGROUP}, "bits": {QBITS} }}"#),
+    &format!(r#"{{ "group_size": {QGROUP}, "bits": {QBITS} }}"#),
+  );
+  assert!(cfg.quantization.is_some(), "`quantization` field populated");
+  assert!(
+    cfg.quantization_config.is_some(),
+    "`quantization_config` field populated"
+  );
+  let plq = cfg.quantization().unwrap().expect("a block resolves");
+  let q = plq
+    .quantization_for("model.layers.0.self_attn.q_proj")
+    .unwrap();
+  assert_eq!((q.group_size, q.bits), (QGROUP, QBITS));
+}
+
+#[test]
+fn both_keys_precedence_prefers_quantization_block() {
+  // Precedence: when both keys are present, the canonical `quantization` block
+  // wins (mlx-lm mirrors `quantization_config` INTO `quantization`). Give the two
+  // blocks DISTINCT bit depths and confirm the resolved scheme is `quantization`'s.
+  let cfg = config_with_both_quant_keys(
+    true,
+    r#"{ "group_size": 32, "bits": 8 }"#,
+    r#"{ "group_size": 64, "bits": 4 }"#,
+  );
+  let q = cfg
+    .quantization()
+    .unwrap()
+    .expect("resolves")
+    .quantization_for("model.embed_tokens")
+    .unwrap();
+  assert_eq!(
+    (q.group_size, q.bits),
+    (32, 8),
+    "the canonical `quantization` block must take precedence over `quantization_config`"
+  );
+}
+
+#[test]
+fn quantization_config_mirror_is_fallback_when_quantization_absent() {
+  // Fallback: a config with `quantization` absent + a `quantization_config`
+  // mirror present resolves the mirror (HF model-tree interop), so a
+  // quantization_config-only checkpoint config is not silently treated as dense.
+  let json = format!(
+    r#"{{"hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM},
+    "num_attention_heads": {Q_HEADS}, "num_key_value_heads": {Q_KV_HEADS},
+    "num_hidden_layers": 1, "intermediate_size": {Q_INTER}, "vocab_size": {Q_VOCAB},
+    "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": true,
+    "quantization_config": {{ "group_size": 64, "bits": 4 }}}}"#
+  );
+  let cfg = Qwen3Config::from_json(&json).unwrap();
+  let q = cfg
+    .quantization()
+    .unwrap()
+    .expect("the mirror resolves")
+    .quantization_for("model.embed_tokens")
+    .unwrap();
+  assert_eq!((q.group_size, q.bits), (64, 4));
+}
+
+#[test]
+fn quantization_null_falls_back_to_quantization_config_mirror() {
+  // A config carrying `quantization: null` (present but null) alongside a real
+  // `quantization_config` mirror still resolves the mirror — the null canonical
+  // block is treated as absent for precedence.
+  let cfg = config_with_both_quant_keys(
+    true,
+    "null",
+    &format!(r#"{{ "group_size": {QGROUP}, "bits": {QBITS} }}"#),
+  );
+  let q = cfg
+    .quantization()
+    .unwrap()
+    .expect("the mirror resolves when `quantization` is null")
+    .quantization_for("model.embed_tokens")
+    .unwrap();
+  assert_eq!((q.group_size, q.bits), (QGROUP, QBITS));
+}
+
+#[test]
+fn both_keys_quantized_round_trip_loads_quantized() {
+  // A genuinely quantized round-trip: a both-keys config (the mlxrs-saved layout)
+  // + a `.scales`-bearing checkpoint loads QUANTIZED throughout — the two-field
+  // parse does not break the real quantized path, and the resolved scheme drives
+  // every layer.
+  let cfg = config_with_both_quant_keys(
+    true,
+    &format!(r#"{{ "group_size": {QGROUP}, "bits": {QBITS} }}"#),
+    &format!(r#"{{ "group_size": {QGROUP}, "bits": {QBITS} }}"#),
+  );
+  let model = Qwen3::from_weights(cfg, quant_weights(true)).expect("quantized load");
+  assert!(
+    model.model().embedding_is_quantized() && model.model().all_projections_quantized(),
+    "a both-keys quantized checkpoint must load quantized throughout"
+  );
+}
+
+#[test]
+fn both_keys_malformed_dense_checkpoint_loads_dense() {
+  // The gated-pre-scan × two-field combination: a DENSE checkpoint (no consumed
+  // `.scales`) whose both-keys config carries a malformed block under BOTH keys
+  // still loads DENSE — the config parses (no duplicate-field error) and the
+  // unused malformed scheme is never resolved.
+  let model = Qwen3::from_weights(
+    config_with_both_quant_keys(
+      true,
+      r#"{ "quant_method": "gptq", "version": 2 }"#,
+      r#"{ "quant_method": "gptq", "version": 2 }"#,
+    ),
+    dense_quant_sized_map(true),
+  )
+  .expect("a dense both-keys-malformed checkpoint must load dense");
+  assert!(
+    !model.model().embedding_is_quantized() && !model.model().all_projections_quantized(),
+    "no consumed `.scales` ⇒ fully dense despite the both-keys malformed block"
+  );
+  let tokens = Array::from_slice::<i32>(&[7, 19], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  assert_eq!(
+    model.forward(&tokens, &mut cache).unwrap().shape(),
+    vec![1, 2, Q_VOCAB as usize]
+  );
 }

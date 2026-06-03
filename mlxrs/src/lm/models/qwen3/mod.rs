@@ -54,15 +54,15 @@ mod linear;
 use std::collections::HashMap;
 
 pub use config::Qwen3Config;
-use linear::Linear;
+use linear::{Embedding, Linear, SCALES_SUFFIX, take_shaped};
 use smol_str::format_smolstr;
 
 use crate::{
   Dtype,
   array::Array,
   error::{
-    Error, LayerKeyedPayload, LengthMismatchPayload, MissingKeyPayload, OutOfRangePayload,
-    RankMismatchPayload, Result, ShapePairMismatchPayload,
+    Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result,
+    ShapePairMismatchPayload,
   },
   lm::{
     cache::{KvCache, MaskMode, StandardKvCache},
@@ -73,13 +73,10 @@ use crate::{
       norm::RMSNorm,
       rope::Rope,
     },
+    quant::PerLayerQuantization,
   },
   model_validation::reserve_or_error,
-  ops::{
-    indexing::take_axis,
-    linalg_basic::matmul,
-    shape::{reshape, swapaxes, transpose_axes},
-  },
+  ops::shape::{reshape, transpose_axes},
 };
 
 // ───────────────────────── attention ─────────────────────────
@@ -220,9 +217,14 @@ impl TransformerBlock {
 /// (`crate::audio::stt::models::qwen3_asr`) rather than this dense decoder.
 #[derive(Debug)]
 pub struct Qwen3Model {
-  /// `(vocab, hidden)` token-embedding table; also the tied output head when
-  /// reused by [`Qwen3`].
-  embed_tokens: Array,
+  /// `(vocab, hidden)` token-embedding table (quantize-aware); also the tied
+  /// output head when reused by [`Qwen3`] (via [`Embedding::as_linear`]).
+  embed_tokens: Embedding,
+  /// The hidden width (`config.hidden_size`), carried explicitly so the input
+  /// embeddings' width can be validated against it. The quantized embedding's
+  /// packed weight has axis-1 `hidden * bits / 32` (not `hidden`), so the width
+  /// cannot be recovered from the embedding table on a quantized checkpoint.
+  hidden_size: i32,
   layers: Vec<TransformerBlock>,
   norm: RMSNorm,
 }
@@ -246,9 +248,9 @@ impl Qwen3Model {
   /// tensor is validated without truncation, mirroring the aligner's
   /// `input_ids` guard).
   pub fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
-    let row_count = self.embed_tokens.shape().first().copied().unwrap_or(0);
+    let row_count = self.embed_tokens.row_count();
     check_token_ids_in_rows(tokens, row_count, "Qwen3Model::embed_tokens: token id")?;
-    take_axis(&self.embed_tokens, tokens, 0)
+    self.embed_tokens.forward(tokens)
   }
 
   /// The number of decoder layers — also the per-layer cache cardinality
@@ -256,6 +258,30 @@ impl Qwen3Model {
   #[inline(always)]
   pub fn num_layers(&self) -> usize {
     self.layers.len()
+  }
+
+  /// `true` if the token embedding loaded from a quantized checkpoint
+  /// (test-only introspection for the quantized-load test).
+  #[cfg(test)]
+  pub(crate) fn embedding_is_quantized(&self) -> bool {
+    self.embed_tokens.is_quantized()
+  }
+
+  /// `true` if every decoder attention + MLP projection loaded quantized
+  /// (test-only introspection).
+  #[cfg(test)]
+  pub(crate) fn all_projections_quantized(&self) -> bool {
+    self.layers.iter().all(|l| {
+      let a = &l.self_attn;
+      let m = &l.mlp;
+      a.q_proj.is_quantized()
+        && a.k_proj.is_quantized()
+        && a.v_proj.is_quantized()
+        && a.o_proj.is_quantized()
+        && m.gate_proj.is_quantized()
+        && m.up_proj.is_quantized()
+        && m.down_proj.is_quantized()
+    })
   }
 
   /// Build the homogeneous per-layer cache: a [`StandardKvCache`] for every
@@ -302,14 +328,15 @@ impl Qwen3Model {
         shape,
       )));
     }
-    // The token-embedding table is `(vocab, hidden)`, so its axis-1 is the width
-    // every attention/MLP projection expects; reject a mismatched hidden axis
-    // before the layers index it.
-    if let Some(hidden) = self.embed_tokens.shape().get(1).copied()
-      && shape[2] != hidden
-    {
+    // The hidden width (`config.hidden_size`) is the width every attention/MLP
+    // projection expects; reject a mismatched hidden axis before the layers index
+    // it. Carried explicitly (not read off the embedding table) because a
+    // quantized embedding's packed weight has axis-1 `hidden * bits / 32`.
+    // `hidden_size` is a `validate`d positive `i32`, so the `usize` cast is exact.
+    let hidden = self.hidden_size as usize;
+    if shape[2] != hidden {
       return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
-        "Qwen3Model::forward: hidden-states width vs token-embedding width",
+        "Qwen3Model::forward: hidden-states width vs model hidden width",
         vec![hidden],
         vec![shape[2]],
       )));
@@ -366,9 +393,22 @@ impl Qwen3Model {
   /// the Qwen3-ASR text decoder
   /// (`crate::audio::stt::models::qwen3_asr`), which validates every decoder
   /// weight the same way.
+  ///
+  /// A **quantized** checkpoint loads through the same path: each projection /
+  /// the token embedding is built quantized via the shared
+  /// [`crate::nn::MaybeQuantizedLinear`] / a quantized table when the checkpoint
+  /// carries that layer's `.scales` sibling ALONE (the per-layer auto-detect
+  /// Whisper / EmbeddingGemma use), with the per-layer `(group_size, bits,
+  /// mode)` resolved from `quant`. The quantized path pins the packed triple's
+  /// logical shape to the same config-derived extents the dense path checks.
+  /// `quant` is `None` for a dense checkpoint; a dense checkpoint (no `.scales`)
+  /// loads dense even if `quant` is `Some`, but a layer that DOES carry
+  /// `.scales` with no resolvable scheme is a typed `Error::InvariantViolation`,
+  /// never reinterpreted as dense.
   pub fn from_weights(
     config: &Qwen3Config,
     weights: &mut HashMap<String, Array>,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Qwen3Model> {
     // Validate the (public-field) config BEFORE deriving any head count or
     // projection width from it, or reserving/iterating `num_hidden_layers`. This
@@ -395,19 +435,22 @@ impl Qwen3Model {
     let q_out = config.num_attention_heads.saturating_mul(head_dim);
     let kv_out = config.num_key_value_heads.saturating_mul(head_dim);
 
-    // Validate the embedding table's shape on load: it must be `(vocab_size,
-    // hidden_size)` from `config`. The embedding `take` gather indexes its
-    // leading dimension with caller token ids and does not bound-check, so a
-    // checkpoint whose table has fewer rows than `config.vocab_size` would let an
-    // id in `[rows, vocab_size)` — which `embed_tokens` admits against
-    // `config.vocab_size` — reach the gather out of bounds (UB). Checking the
-    // full shape here also pins axis-1 to `hidden_size`, the width
-    // `forward_hidden` validates input embeddings against.
-    let embed_tokens = take_shaped(
+    // Validate the embedding table's shape on load: its logical shape must be
+    // `(vocab_size, hidden_size)` from `config`. The embedding `take` gather
+    // indexes its leading dimension with caller token ids and does not
+    // bound-check, so a checkpoint whose table has fewer rows than
+    // `config.vocab_size` would let an id in `[rows, vocab_size)` — which
+    // `embed_tokens` admits against `config.vocab_size` — reach the gather out of
+    // bounds (UB). On the quantized path the packed weight's logical `(vocab,
+    // hidden)` is pinned identically. `model.embed_tokens` quantizes alongside
+    // the projections (mlx-lm's `class_predicate` covers `nn.Embedding`).
+    let embed_tokens = Embedding::from_weights(
       weights,
-      "model.embed_tokens.weight",
+      "model.embed_tokens",
+      config.vocab_size,
+      hidden,
       "embed_tokens weight (vocab_size, hidden_size)",
-      &[config.vocab_size, hidden],
+      quant,
     )?;
     let norm = RMSNorm::new(
       take_shaped(
@@ -438,42 +481,38 @@ impl Qwen3Model {
         n_kv_heads: config.num_key_value_heads,
         head_dim,
         scale: (head_dim as f32).powf(-0.5),
-        q_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{q}.q_proj.weight"),
-            "q_proj weight (n_heads * head_dim, hidden_size)",
-            &[q_out, hidden],
-          )?,
-          None,
-        ),
-        k_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{q}.k_proj.weight"),
-            "k_proj weight (n_kv_heads * head_dim, hidden_size)",
-            &[kv_out, hidden],
-          )?,
-          None,
-        ),
-        v_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{q}.v_proj.weight"),
-            "v_proj weight (n_kv_heads * head_dim, hidden_size)",
-            &[kv_out, hidden],
-          )?,
-          None,
-        ),
-        o_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{q}.o_proj.weight"),
-            "o_proj weight (hidden_size, n_heads * head_dim)",
-            &[hidden, q_out],
-          )?,
-          None,
-        ),
+        q_proj: Linear::from_weights(
+          weights,
+          &format!("{q}.q_proj"),
+          q_out,
+          hidden,
+          "q_proj weight (n_heads * head_dim, hidden_size)",
+          quant,
+        )?,
+        k_proj: Linear::from_weights(
+          weights,
+          &format!("{q}.k_proj"),
+          kv_out,
+          hidden,
+          "k_proj weight (n_kv_heads * head_dim, hidden_size)",
+          quant,
+        )?,
+        v_proj: Linear::from_weights(
+          weights,
+          &format!("{q}.v_proj"),
+          kv_out,
+          hidden,
+          "v_proj weight (n_kv_heads * head_dim, hidden_size)",
+          quant,
+        )?,
+        o_proj: Linear::from_weights(
+          weights,
+          &format!("{q}.o_proj"),
+          hidden,
+          q_out,
+          "o_proj weight (hidden_size, n_heads * head_dim)",
+          quant,
+        )?,
         q_norm: RMSNorm::new(
           take_shaped(
             weights,
@@ -496,33 +535,30 @@ impl Qwen3Model {
       };
 
       let mlp = Mlp {
-        gate_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{p}.mlp.gate_proj.weight"),
-            "mlp gate_proj weight (intermediate_size, hidden_size)",
-            &[inter, hidden],
-          )?,
-          None,
-        ),
-        up_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{p}.mlp.up_proj.weight"),
-            "mlp up_proj weight (intermediate_size, hidden_size)",
-            &[inter, hidden],
-          )?,
-          None,
-        ),
-        down_proj: Linear::new(
-          take_shaped(
-            weights,
-            &format!("{p}.mlp.down_proj.weight"),
-            "mlp down_proj weight (hidden_size, intermediate_size)",
-            &[hidden, inter],
-          )?,
-          None,
-        ),
+        gate_proj: Linear::from_weights(
+          weights,
+          &format!("{p}.mlp.gate_proj"),
+          inter,
+          hidden,
+          "mlp gate_proj weight (intermediate_size, hidden_size)",
+          quant,
+        )?,
+        up_proj: Linear::from_weights(
+          weights,
+          &format!("{p}.mlp.up_proj"),
+          inter,
+          hidden,
+          "mlp up_proj weight (intermediate_size, hidden_size)",
+          quant,
+        )?,
+        down_proj: Linear::from_weights(
+          weights,
+          &format!("{p}.mlp.down_proj"),
+          hidden,
+          inter,
+          "mlp down_proj weight (hidden_size, intermediate_size)",
+          quant,
+        )?,
       };
 
       let input_layernorm = RMSNorm::new(
@@ -554,6 +590,7 @@ impl Qwen3Model {
 
     Ok(Qwen3Model {
       embed_tokens,
+      hidden_size: hidden,
       layers,
       norm,
     })
@@ -607,16 +644,25 @@ impl Qwen3 {
     &self.model
   }
 
+  /// `true` if the untied `lm_head` loaded quantized. `false` for the tied head
+  /// (its quantization is the embedding's — see
+  /// [`Qwen3Model::embedding_is_quantized`]). Test-only introspection.
+  #[cfg(test)]
+  pub(crate) fn untied_lm_head_is_quantized(&self) -> bool {
+    match &self.lm_head {
+      LmHead::Untied(head) => head.is_quantized(),
+      LmHead::Tied => false,
+    }
+  }
+
   /// Project final hidden states to vocab logits via the configured head.
   ///
   /// Tied (`qwen3.py:180-181`): `embed_tokens.as_linear(out)` = `out @
-  /// embed_tokens.T`. Untied: the dedicated `lm_head` linear.
+  /// embed_tokens.T` (dense) or `quantized_matmul` (quantized embedding).
+  /// Untied: the dedicated `lm_head` linear.
   fn project_logits(&self, hidden: &Array) -> Result<Array> {
     match &self.lm_head {
-      LmHead::Tied => {
-        let wt = swapaxes(&self.model.embed_tokens, -1, -2)?;
-        matmul(hidden, &wt)
-      }
+      LmHead::Tied => self.model.embed_tokens.as_linear(hidden),
       LmHead::Untied(head) => head.forward(hidden),
     }
   }
@@ -650,63 +696,6 @@ impl LmModel for Qwen3 {
 
 // ───────────────────────── weight loading ─────────────────────────
 
-/// Pull a required weight out of the map by `name`, erroring with the key on
-/// absence (mlx's `model.update(tree_unflatten(weights))` would raise).
-fn take_weight(weights: &mut HashMap<String, Array>, name: &str) -> Result<Array> {
-  weights.remove(name).ok_or_else(|| {
-    Error::MissingKey(MissingKeyPayload::new(
-      "Qwen3 weight map",
-      format_smolstr!("{name}"),
-    ))
-  })
-}
-
-/// Assert a tensor's shape equals `expected` (rank + every dim) before it is
-/// stored, so a checkpoint whose weight disagrees with the config-derived
-/// expectation is rejected here rather than running a different graph (or
-/// admitting an out-of-bounds embedding gather). On mismatch returns
-/// [`Error::ShapePairMismatch`] wrapped in [`Error::LayerKeyed`] naming `key`,
-/// mirroring how the Qwen3-ASR text loader reports a malformed decoder weight.
-fn expect_shape(
-  tensor: &Array,
-  key: &str,
-  descriptor: &'static str,
-  expected: &[i32],
-) -> Result<()> {
-  let actual = tensor.shape();
-  let matches = actual.len() == expected.len()
-    && actual
-      .iter()
-      .zip(expected.iter())
-      .all(|(&a, &e)| e >= 0 && a as i64 == i64::from(e));
-  if !matches {
-    let expected_usize: Vec<usize> = expected.iter().map(|&e| e.max(0) as usize).collect();
-    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
-      key.to_string(),
-      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
-        descriptor,
-        expected_usize,
-        actual,
-      )),
-    )));
-  }
-  Ok(())
-}
-
-/// [`take_weight`] then assert the tensor's shape — the fused fetch-and-check
-/// used for the embedding table, mirroring the Qwen3-ASR text loader's
-/// `take_shaped`.
-fn take_shaped(
-  weights: &mut HashMap<String, Array>,
-  key: &str,
-  descriptor: &'static str,
-  expected: &[i32],
-) -> Result<Array> {
-  let tensor = take_weight(weights, key)?;
-  expect_shape(&tensor, key, descriptor, expected)?;
-  Ok(tensor)
-}
-
 /// Reject any token id in `tokens` outside `[0, row_count)` — the valid
 /// embedding-row range (the table's leading dimension).
 ///
@@ -737,6 +726,75 @@ fn check_token_ids_in_rows(tokens: &Array, row_count: usize, context: &'static s
   Ok(())
 }
 
+/// `true` if `weights` carries a `<prefix>.scales` sibling for some layer the
+/// Qwen3 loaders **actually consume** under this exact `config` — i.e. the
+/// checkpoint is (at least partly) a quantized one.
+///
+/// This is the load-time half of the `.scales`-presence discriminator the
+/// per-layer [`Linear::from_weights`] / [`Embedding::from_weights`] use: those
+/// gate on the exact `<prefix>.scales` key for one layer; this pre-scans the
+/// whole map once for the same signal across every layer the loaders consume, so
+/// [`Qwen3::from_weights`] resolves the quantization scheme
+/// ([`Qwen3Config::quantization`]) ONLY when a scale actually needs
+/// interpreting. A dense checkpoint (no relevant `.scales`) then loads through
+/// the unchanged dense path regardless of any stale / foreign / partial
+/// quantization block the config may still carry — the scheme is irrelevant when
+/// no consumed layer is quantized.
+///
+/// The match is **exact and config-aware** (it runs after [`config.validate`]):
+/// the relevant keys are precisely the `<prefix>.scales` siblings the
+/// [`Linear`] / [`Embedding`] loaders build a `scales_key` for, with the SAME
+/// `<prefix>` strings —
+///
+/// - `model.embed_tokens.scales` (the token embedding);
+/// - for each `i` in `0..config.num_hidden_layers` (the actual loaded layer
+///   count): the attention `model.layers.{i}.self_attn.{q,k,v,o}_proj.scales`
+///   and the MLP `model.layers.{i}.mlp.{gate,up,down}_proj.scales`;
+/// - `lm_head.scales` ONLY when the head is untied
+///   (`config.tie_word_embeddings == false`), mirroring exactly how
+///   [`Qwen3::from_weights`] decides tied-vs-untied: a tied head reuses the
+///   embedding table and never consumes `lm_head.scales`, so a stale one is
+///   ignored.
+///
+/// Building the loaders' exact `<prefix>.scales` strings and probing
+/// `weights.contains_key` (not a suffix / `ends_with` match) means a foreign key
+/// (`foreign.q_proj.scales`), an out-of-range layer index
+/// (`model.layers.{N}.…` for `N >= num_hidden_layers`), a never-quantized
+/// layer's stale `.scales` (`model.norm.scales`), or a tied `lm_head.scales` is
+/// correctly IGNORED — exactly the keys no loader ever consults. Reads only the
+/// map's keys (cheap string lookups); no `Array` is touched.
+///
+/// [`config.validate`]: Qwen3Config::validate
+fn has_relevant_scales(config: &Qwen3Config, weights: &HashMap<String, Array>) -> bool {
+  // Probe the exact `<prefix>.scales` key the matching loader would build, with
+  // the SAME `<prefix>` format the `Linear` / `Embedding` loaders use.
+  let has_scales = |prefix: &str| weights.contains_key(&format!("{prefix}{SCALES_SUFFIX}"));
+
+  // The token embedding.
+  if has_scales("model.embed_tokens") {
+    return true;
+  }
+  // The untied vocab head consumes `lm_head.scales`; a tied head reuses the
+  // embedding table and never does (mirror `from_weights`' tied/untied split).
+  if !config.tie_word_embeddings && has_scales("lm_head") {
+    return true;
+  }
+  // Every per-layer projection, for the ACTUAL loaded layer count — an
+  // out-of-range index `N >= num_hidden_layers` is never built, so its `.scales`
+  // is irrelevant. `num_hidden_layers` is a `validate`d positive `i32`.
+  (0..config.num_hidden_layers).any(|i| {
+    let q = format!("model.layers.{i}.self_attn");
+    let m = format!("model.layers.{i}.mlp");
+    has_scales(&format!("{q}.q_proj"))
+      || has_scales(&format!("{q}.k_proj"))
+      || has_scales(&format!("{q}.v_proj"))
+      || has_scales(&format!("{q}.o_proj"))
+      || has_scales(&format!("{m}.gate_proj"))
+      || has_scales(&format!("{m}.up_proj"))
+      || has_scales(&format!("{m}.down_proj"))
+  })
+}
+
 impl Qwen3 {
   /// `mlx-lm`'s `Model.sanitize` (`qwen3.py:185-188`): when
   /// `tie_word_embeddings` is set, drop a stray `lm_head.weight` (the tied head
@@ -765,31 +823,63 @@ impl Qwen3 {
   /// Callers should run [`sanitize`](Qwen3::sanitize) first (it drops a stray
   /// tied `lm_head.weight`); `from_weights` itself only consumes the keys the
   /// configured head needs.
+  ///
+  /// A **quantized** checkpoint (e.g. a 4-bit / 8-bit `mlx-community` Qwen3)
+  /// loads through the same path: the per-layer scheme parameters are resolved
+  /// from the config's `quantization` block (via
+  /// [`Qwen3Config::quantization`]) and each `nn.Linear` / the token embedding
+  /// is built quantized via the shared [`crate::nn::MaybeQuantizedLinear`] when
+  /// the checkpoint carries that layer's `.scales` sibling (the per-layer
+  /// auto-detect Whisper / EmbeddingGemma use). The scheme is resolved ONLY when
+  /// a relevant `.scales` is present (a one-pass pre-scan over the weight keys,
+  /// the load-time half of that same discriminator), so a **dense** checkpoint (no
+  /// `.scales`) loads dense regardless of any stale / foreign / partial
+  /// `quantization` block the config may still carry — the scheme is only needed
+  /// to interpret a scale that is actually present. The non-quant
+  /// [`Qwen3Config::validate`] always runs first.
   pub fn from_weights(config: Qwen3Config, mut weights: HashMap<String, Array>) -> Result<Qwen3> {
     config.validate()?;
 
-    // The head-less decoder (drains the `model.*` keys).
-    let model = Qwen3Model::from_weights(&config, &mut weights)?;
+    // Resolve the per-layer quantization scheme ONLY when the checkpoint
+    // actually carries a `.scales` sibling for some layer the model loads (the
+    // `.scales`-presence discriminator the per-layer `Linear` / `Embedding`
+    // loaders use, hoisted to the whole map). When no layer is quantized the
+    // scheme is irrelevant, so a DENSE checkpoint loads through the unchanged
+    // dense path regardless of any stale / foreign / partial `quantization`
+    // block the config may still carry — only a present `.scales` makes an
+    // unresolvable scheme fatal (the per-layer typed `InvariantViolation`). The
+    // non-quant config validation above always runs. The result is threaded to
+    // the decoder + the untied head, which pick quantized-vs-dense per layer by
+    // the same `.scales` sibling.
+    let quant = if has_relevant_scales(&config, &weights) {
+      config.quantization()?
+    } else {
+      None
+    };
 
-    // The vocab head: tied reuses the embedding table; untied reads
-    // `lm_head.weight` from the remaining map. The untied weight is shape-checked
-    // on load to `(vocab_size, hidden_size)` — the same pin the embedding table
-    // gets — so `forward` produces the `(B, S, vocab_size)` logits the `Model`
-    // contract promises. A wrong row count would emit token ids outside the
-    // configured vocab; a wrong hidden width would defer the failure into the
-    // `Linear` matmul rather than report a typed load-time error here.
+    // The head-less decoder (drains the `model.*` keys).
+    let model = Qwen3Model::from_weights(&config, &mut weights, quant.as_ref())?;
+
+    // The vocab head: tied reuses the embedding table (via
+    // `Embedding::as_linear`); untied reads `lm_head.weight` from the remaining
+    // map. The untied weight is shape-checked on load to `(vocab_size,
+    // hidden_size)` — the same pin the embedding table gets — so `forward`
+    // produces the `(B, S, vocab_size)` logits the `Model` contract promises. A
+    // wrong row count would emit token ids outside the configured vocab; a wrong
+    // hidden width would defer the failure into the matmul rather than report a
+    // typed load-time error here. The untied head auto-detects dense-vs-quantized
+    // from its `lm_head.scales` sibling like every other projection.
     let lm_head = if config.tie_word_embeddings {
       LmHead::Tied
     } else {
-      LmHead::Untied(Linear::new(
-        take_shaped(
-          &mut weights,
-          "lm_head.weight",
-          "lm_head weight (vocab_size, hidden_size)",
-          &[config.vocab_size, config.hidden_size],
-        )?,
-        None,
-      ))
+      LmHead::Untied(Linear::from_weights(
+        &mut weights,
+        "lm_head",
+        config.vocab_size,
+        config.hidden_size,
+        "lm_head weight (vocab_size, hidden_size)",
+        quant.as_ref(),
+      )?)
     };
 
     Ok(Qwen3 {
