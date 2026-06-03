@@ -425,6 +425,58 @@ fn from_weights_builds_and_encodes() {
   assert_eq!(enc.shape(), vec![1, TINY.n_audio_ctx, TINY.n_state]);
 }
 
+/// An f16 checkpoint-shaped weight set loads with f16 params and the encoder
+/// forward stays f16 end-to-end — the conv front-end, the sinusoid positional
+/// add (the sinusoid is cast to the model dtype, `whisper.py:422`), the attention
+/// (the scalar scale is cast to the activation dtype), and `ln_post` all preserve
+/// the dtype, with NO hidden promotion to f32. (`from_weights` casts every
+/// consumed weight to the model dtype; the mel is supplied in that dtype, as the
+/// reference casts the mel to `self.dtype` before the encoder,
+/// `whisper.py:783`/`:1029-1031`.) Built from a synthetic small config + tensors
+/// — no real checkpoint needed.
+#[test]
+fn f16_checkpoint_encode_stays_f16() {
+  checkpoint_encode_stays_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn bf16_checkpoint_encode_stays_bf16() {
+  checkpoint_encode_stays_dtype(Dtype::BF16);
+}
+
+fn checkpoint_encode_stays_dtype(dtype: Dtype) {
+  // The f32 `tiny_weights()` are cast to `dtype` by `from_weights` (every
+  // consumed tensor is materialized in the model dtype).
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), dtype).unwrap();
+  assert_eq!(model.dtype(), dtype);
+  // The encoder's stored sinusoid is in the model dtype (so `x + pos` cannot
+  // promote the post-conv activations).
+  assert_eq!(
+    model.encoder.positional_embedding_ref().dtype().unwrap(),
+    dtype,
+    "the encoder sinusoid must be stored in the model dtype"
+  );
+  // The decoder's causal mask is in the model dtype (so `qk + mask` is
+  // dtype-consistent).
+  assert_eq!(
+    model.decoder.mask_ref().dtype().unwrap(),
+    dtype,
+    "the decoder causal mask must be built in the model dtype"
+  );
+  // Supply the mel in the model dtype (as the reference casts it to `self.dtype`
+  // before the encoder). The full encoder forward must stay in that dtype.
+  let mel = tiny_mel().astype(dtype).unwrap();
+  let enc = model.encode(&mel).unwrap();
+  assert_eq!(enc.shape(), vec![1, TINY.n_audio_ctx, TINY.n_state]);
+  assert_eq!(
+    enc.dtype().unwrap(),
+    dtype,
+    "the encoder output must stay in the checkpoint dtype end-to-end \
+     (no full-graph promotion to f32 by the sinusoid add or the attention scale)"
+  );
+}
+
 #[test]
 fn multi_layer_build_reserves_and_fills_every_block() {
   // The encoder / decoder block vectors and the decoder KV cache are reserved

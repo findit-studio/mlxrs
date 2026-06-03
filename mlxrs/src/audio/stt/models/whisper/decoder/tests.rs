@@ -508,3 +508,170 @@ fn decoder_forward_rejects_out_of_range_token_id() {
     "cross-qk shape (B, H, T, T_kv)"
   );
 }
+
+// ---- fp16 / bf16 activation-dtype preservation ----------------------
+//
+// The decoder embeds tokens + the learned positional table (both checkpoint
+// tensors, cast to the model dtype at load) and adds the precomputed causal mask
+// inside attention. The reference builds the mask cast to the model dtype
+// (`self._mask = create_additive_causal_mask(n_ctx).astype(dtype)`,
+// `whisper.py:460-462`); the port mirrors this (`create_additive_causal_mask(n,
+// dtype)`). With the attention-scale fix (the scalar scale is cast to the
+// activation dtype), a full f16/bf16 decoder forward stays in that dtype through
+// the position add, the self-/cross-attention, and the weight-tied logits. The
+// decoder's `forward` returns logits in the activation dtype — the f32 logit
+// cast lives at the model layer (`Inference.logits`'s `.astype(mx.float32)`), not
+// in the decoder — so this is the right level to pin activation-dtype
+// preservation. These tests assert the mask dtype and a dtype-preserving forward.
+
+/// An identity `(n, n)` projection (no bias) in `dtype`.
+fn identity_linear_dtype(n: usize, dtype: Dtype) -> Linear {
+  let mut w = vec![0.0_f32; n * n];
+  for i in 0..n {
+    w[i * n + i] = 1.0;
+  }
+  Linear::new(arr(&w, &[n as i32, n as i32]).astype(dtype).unwrap(), None)
+}
+
+/// A zero `(out, in)` projection in `dtype`.
+fn zero_linear_dtype(out: usize, inp: usize, dtype: Dtype) -> Linear {
+  Linear::new(
+    Array::zeros::<f32>(&[out as i32, inp as i32])
+      .unwrap()
+      .astype(dtype)
+      .unwrap(),
+    None,
+  )
+}
+
+/// A unit LayerNorm (`ones`/`zeros` affine) in `dtype`.
+fn layer_norm_dtype(n: usize, dtype: Dtype) -> LayerNorm {
+  LayerNorm::new(
+    Some(Array::ones::<f32>(&(n,)).unwrap().astype(dtype).unwrap()),
+    Some(Array::zeros::<f32>(&(n,)).unwrap().astype(dtype).unwrap()),
+    1e-5,
+  )
+}
+
+/// A cross-attention decoder block (identity attention, zero MLP) in `dtype`.
+fn identity_decoder_block_dtype(
+  n_state: usize,
+  n_head: usize,
+  dtype: Dtype,
+) -> ResidualAttentionBlock {
+  let self_attn = MultiHeadAttention::new(
+    n_head,
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+  );
+  let cross_attn = MultiHeadAttention::new(
+    n_head,
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+  );
+  ResidualAttentionBlock::new(
+    self_attn,
+    layer_norm_dtype(n_state, dtype),
+    Some((cross_attn, layer_norm_dtype(n_state, dtype))),
+    zero_linear_dtype(4 * n_state, n_state, dtype),
+    zero_linear_dtype(n_state, 4 * n_state, dtype),
+    layer_norm_dtype(n_state, dtype),
+  )
+}
+
+/// Build a decoder whose every weight is in `dtype` (mirroring an f16/bf16
+/// checkpoint, whose token embedding, positional table, and block weights are
+/// all cast to the model dtype at load), constructing the causal mask in `dtype`.
+fn build_decoder_dtype(
+  n_vocab: usize,
+  n_state: usize,
+  n_ctx: usize,
+  blocks: Vec<ResidualAttentionBlock>,
+  dtype: Dtype,
+) -> TextDecoder {
+  let tok_buf: Vec<f32> = (0..n_vocab * n_state).map(|i| 0.1 * i as f32).collect();
+  let tok_w = arr(&tok_buf, &[n_vocab as i32, n_state as i32])
+    .astype(dtype)
+    .unwrap();
+  let pe_buf: Vec<f32> = (0..n_ctx * n_state)
+    .map(|i| -0.05 * i as f32 + 0.2)
+    .collect();
+  let pe = arr(&pe_buf, &[n_ctx as i32, n_state as i32])
+    .astype(dtype)
+    .unwrap();
+  TextDecoder::new(
+    Embedding::new(tok_w),
+    pe,
+    blocks,
+    layer_norm_dtype(n_state, dtype),
+    n_ctx,
+    n_vocab,
+    dtype,
+  )
+  .unwrap()
+}
+
+/// The causal mask is built in the model dtype (f16), so the `qk + mask` add
+/// inside attention is dtype-consistent and does not promote to f32.
+#[test]
+fn decoder_mask_is_model_dtype_f16() {
+  decoder_mask_is_model_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn decoder_mask_is_model_dtype_bf16() {
+  decoder_mask_is_model_dtype(Dtype::BF16);
+}
+
+fn decoder_mask_is_model_dtype(dtype: Dtype) {
+  let dec = build_decoder_dtype(4, 4, 4, Vec::new(), dtype);
+  assert_eq!(
+    dec.mask_ref().dtype().unwrap(),
+    dtype,
+    "the causal mask must be built in the model dtype \
+     (whisper.py:460-462 `create_additive_causal_mask(n_ctx).astype(dtype)`)"
+  );
+}
+
+/// A full f16 decoder forward (token+positional embed → self/cross attention →
+/// final norm → weight-tied logits) preserves the activation dtype: f16 in → f16
+/// logits, no hidden promotion to f32 by the position add, the attention scale,
+/// or the masked scores. (The model layer casts logits to f32 afterwards; the
+/// decoder itself stays in the activation dtype.)
+#[test]
+fn decoder_forward_preserves_f16() {
+  decoder_forward_preserves_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn decoder_forward_preserves_bf16() {
+  decoder_forward_preserves_dtype(Dtype::BF16);
+}
+
+fn decoder_forward_preserves_dtype(dtype: Dtype) {
+  let n_vocab = 6usize;
+  let n_state = 4usize;
+  let n_head = 2usize;
+  let n_ctx = 8usize;
+  let blocks = vec![identity_decoder_block_dtype(n_state, n_head, dtype)];
+  let dec = build_decoder_dtype(n_vocab, n_state, n_ctx, blocks, dtype);
+  let tokens: Vec<u32> = vec![1, 3, 0];
+  // Encoder states `(1, T_kv, n_state)` in the activation dtype.
+  let xa = arr(&[0.5, -0.5, 1.0, -1.0, 0.2, 0.4, -0.2, -0.4], &[1, 2, 4])
+    .astype(dtype)
+    .unwrap();
+  let (logits, _cache) = dec.forward(&tokens, &xa, None).unwrap();
+  assert_eq!(logits.shape(), vec![1, tokens.len(), n_vocab]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dtype,
+    "decoder logits must stay in the activation dtype before the model-layer \
+     f32 cast (no promotion through the position add / attention scale / mask)"
+  );
+}

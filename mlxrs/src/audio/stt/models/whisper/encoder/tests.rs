@@ -1,5 +1,8 @@
 use super::*;
-use crate::audio::stt::models::whisper::layers::{Linear, MultiHeadAttention};
+use crate::{
+  Dtype,
+  audio::stt::models::whisper::layers::{Linear, MultiHeadAttention},
+};
 
 fn to_vec(a: &Array) -> Vec<f32> {
   a.try_clone().unwrap().to_vec::<f32>().unwrap()
@@ -98,6 +101,7 @@ fn encoder_downsamples_3000_to_1500() {
     n_state,
     Vec::new(), // no blocks
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   // (3000, n_mels) mel.
@@ -123,6 +127,7 @@ fn encoder_positional_embedding_is_sinusoids() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   let pe = enc.positional_embedding_ref();
@@ -176,6 +181,7 @@ fn encoder_zero_block_matches_reference_wiring() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
 
@@ -238,6 +244,7 @@ fn encoder_rejects_wrong_frame_count() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   let mel = Array::zeros::<f32>(&[100i32, n_mels as i32]).unwrap();
@@ -267,6 +274,7 @@ fn encoder_rejects_oversized_frame_count_before_conv() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   let mel = Array::zeros::<f32>(&[4096i32, n_mels as i32]).unwrap();
@@ -298,6 +306,7 @@ fn encoder_rejects_oversized_batch_before_conv() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   // (B=4, frames=8, n_mels) — valid frame axis, oversized batch.
@@ -334,6 +343,7 @@ fn encoder_rejects_wrong_mel_channel_width() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   // (frames = 8, mels = 7): valid frame axis, WRONG channel width (expected 4).
@@ -367,6 +377,7 @@ fn encoder_rejects_wrong_mel_channel_width_batched() {
     n_state,
     Vec::new(),
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   let wrong = Array::zeros::<f32>(&[1i32, 8, 9]).unwrap();
@@ -400,10 +411,177 @@ fn encoder_with_blocks_preserves_shape() {
     n_state,
     blocks,
     layer_norm(n_state),
+    Dtype::F32,
   )
   .unwrap();
   let mel_buf: Vec<f32> = (0..frames * n_mels).map(|i| 0.1 * i as f32).collect();
   let mel = arr(&mel_buf, &[frames as i32, n_mels as i32]);
   let out = enc.forward(&mel).unwrap();
   assert_eq!(out.shape(), vec![1, n_ctx, n_state]);
+}
+
+// ---- fp16 / bf16 activation-dtype preservation ----------------------
+//
+// The encoder adds the precomputed `sinusoids(n_ctx, n_state)` positional
+// embedding to the post-conv activations (`x + positional_embedding`,
+// `whisper.py:431`). The reference stores that table cast to the model dtype
+// (`self._positional_embedding = sinusoids(...).astype(dtype)`,
+// `whisper.py:422`). The port mirrors this — `AudioEncoder::new` casts the
+// (f32-built) sinusoid to the `dtype` argument — so an f16/bf16 checkpoint's
+// activations are not promoted to f32 by the positional add. These tests pin
+// that the stored table is in the model dtype, and that a full f16/bf16 forward
+// (conv front-end → sinusoid add → attention → ln_post) yields the same dtype.
+
+/// A center-tap-identity conv (the [`center_tap_identity_conv`] layout) whose
+/// weight + bias are in `dtype`, so an `x` of that dtype convolves without
+/// promotion (a real checkpoint casts every conv weight to the model dtype).
+fn center_tap_identity_conv_dtype(c_out: usize, c_in: usize, dtype: Dtype) -> (Array, Array) {
+  let (w, b) = center_tap_identity_conv(c_out, c_in);
+  (w.astype(dtype).unwrap(), b.astype(dtype).unwrap())
+}
+
+/// A self-attention-only encoder block (the [`identity_encoder_block`] wiring)
+/// whose every weight is in `dtype`.
+fn identity_encoder_block_dtype(
+  n_state: usize,
+  n_head: usize,
+  dtype: Dtype,
+) -> ResidualAttentionBlock {
+  let id = || {
+    let mut w = vec![0.0_f32; n_state * n_state];
+    for i in 0..n_state {
+      w[i * n_state + i] = 1.0;
+    }
+    Linear::new(
+      arr(&w, &[n_state as i32, n_state as i32])
+        .astype(dtype)
+        .unwrap(),
+      None,
+    )
+  };
+  let mha = MultiHeadAttention::new(n_head, id(), id(), id(), id());
+  let ln = || {
+    LayerNorm::new(
+      Some(
+        Array::ones::<f32>(&(n_state,))
+          .unwrap()
+          .astype(dtype)
+          .unwrap(),
+      ),
+      Some(
+        Array::zeros::<f32>(&(n_state,))
+          .unwrap()
+          .astype(dtype)
+          .unwrap(),
+      ),
+      1e-5,
+    )
+  };
+  let mlp1 = Linear::new(
+    Array::zeros::<f32>(&[(4 * n_state) as i32, n_state as i32])
+      .unwrap()
+      .astype(dtype)
+      .unwrap(),
+    None,
+  );
+  let mlp2 = Linear::new(
+    Array::zeros::<f32>(&[n_state as i32, (4 * n_state) as i32])
+      .unwrap()
+      .astype(dtype)
+      .unwrap(),
+    None,
+  );
+  ResidualAttentionBlock::new(mha, ln(), None, mlp1, mlp2, ln())
+}
+
+/// The stored positional embedding is cast to the model dtype (f16), so the
+/// `x + positional_embedding` add cannot promote an f16 activation to f32.
+#[test]
+fn encoder_positional_embedding_is_model_dtype_f16() {
+  encoder_positional_embedding_is_model_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn encoder_positional_embedding_is_model_dtype_bf16() {
+  encoder_positional_embedding_is_model_dtype(Dtype::BF16);
+}
+
+fn encoder_positional_embedding_is_model_dtype(dtype: Dtype) {
+  let n_ctx = 6usize;
+  let n_state = 4usize;
+  let (c1w, c1b) = center_tap_identity_conv_dtype(n_state, n_state, dtype);
+  let (c2w, c2b) = center_tap_identity_conv_dtype(n_state, n_state, dtype);
+  let enc = AudioEncoder::new(
+    c1w,
+    c1b,
+    c2w,
+    c2b,
+    n_ctx,
+    n_state,
+    Vec::new(),
+    layer_norm(n_state),
+    dtype,
+  )
+  .unwrap();
+  assert_eq!(
+    enc.positional_embedding_ref().dtype().unwrap(),
+    dtype,
+    "the sinusoid positional embedding must be stored in the model dtype \
+     (whisper.py:422 `sinusoids(...).astype(dtype)`)"
+  );
+}
+
+/// A full f16 encoder forward (conv → gelu → conv → gelu → + sinusoid → block →
+/// ln_post) preserves the activation dtype end-to-end: f16 mel → f16 output, no
+/// hidden promotion to f32 by the positional add or the attention scale.
+#[test]
+fn encoder_forward_preserves_f16() {
+  encoder_forward_preserves_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn encoder_forward_preserves_bf16() {
+  encoder_forward_preserves_dtype(Dtype::BF16);
+}
+
+fn encoder_forward_preserves_dtype(dtype: Dtype) {
+  let n_mels = 4usize;
+  let n_state = 4usize;
+  let n_head = 2usize;
+  let frames = 8usize;
+  let n_ctx = 4usize;
+  let (c1w, c1b) = center_tap_identity_conv_dtype(n_state, n_mels, dtype);
+  let (c2w, c2b) = center_tap_identity_conv_dtype(n_state, n_state, dtype);
+  let blocks = vec![identity_encoder_block_dtype(n_state, n_head, dtype)];
+  let ln = LayerNorm::new(
+    Some(
+      Array::ones::<f32>(&(n_state,))
+        .unwrap()
+        .astype(dtype)
+        .unwrap(),
+    ),
+    Some(
+      Array::zeros::<f32>(&(n_state,))
+        .unwrap()
+        .astype(dtype)
+        .unwrap(),
+    ),
+    1e-5,
+  );
+  let enc = AudioEncoder::new(c1w, c1b, c2w, c2b, n_ctx, n_state, blocks, ln, dtype).unwrap();
+  let mel_buf: Vec<f32> = (0..frames * n_mels)
+    .map(|i| 0.1 * (i as f32).sin())
+    .collect();
+  let mel = arr(&mel_buf, &[frames as i32, n_mels as i32])
+    .astype(dtype)
+    .unwrap();
+  let out = enc.forward(&mel).unwrap();
+  assert_eq!(out.shape(), vec![1, n_ctx, n_state]);
+  assert_eq!(
+    out.dtype().unwrap(),
+    dtype,
+    "encoder output must stay in the activation dtype (no promotion to f32)"
+  );
 }
