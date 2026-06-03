@@ -98,6 +98,35 @@ pub struct Qwen3Config {
   /// rejected by [`validate`](Qwen3Config::validate).
   #[serde(default)]
   pub rope_scaling: Option<serde_json::Value>,
+  /// Optional quantization config (opaque JSON). A quantized Qwen3 checkpoint
+  /// (e.g. a 4-bit / 8-bit `mlx-community` Qwen3) carries a `quantization` block
+  /// and packed `.weight` / `.scales` / `.biases` weight triples; the loader
+  /// resolves the per-layer scheme parameters from this block (via
+  /// [`quantization`](Self::quantization)) and builds each `nn.Linear` /
+  /// `nn.Embedding` quantized through the shared
+  /// [`crate::nn::MaybeQuantizedLinear`] when the checkpoint carries the layer's
+  /// `.scales` sibling. The raw value is retained verbatim (not interpreted
+  /// here) so the loader can deserialize it into a
+  /// [`crate::lm::quant::PerLayerQuantization`]. A dense checkpoint has no — or a
+  /// `null` — block.
+  ///
+  /// `quantization` and [`quantization_config`](Self::quantization_config) are
+  /// kept as **two separate** optional fields rather than one aliased field: a
+  /// mlx-saved quantized checkpoint mirrors `quantization` into
+  /// `quantization_config` (`mlx-lm utils.py:914-915`, which mlxrs's own
+  /// `save_config` reproduces), so a round-tripped config carries **both** keys.
+  /// A single `#[serde(alias = "quantization_config")]` field would reject such
+  /// a config as a serde duplicate-field error; two fields deserialize either or
+  /// both keys, and [`quantization`](Self::quantization) resolves precedence.
+  #[serde(default)]
+  pub quantization: Option<serde_json::Value>,
+  /// The HF model-tree `quantization_config` mirror of
+  /// [`quantization`](Self::quantization) (`mlx-lm utils.py:914-915`). Carried as
+  /// its own field so a round-tripped config holding **both** keys parses without
+  /// a serde duplicate-field error; [`quantization`](Self::quantization) prefers
+  /// the canonical `quantization` block and falls back to this mirror.
+  #[serde(default)]
+  pub quantization_config: Option<serde_json::Value>,
 }
 
 fn default_model_type() -> String {
@@ -156,6 +185,8 @@ impl Default for Qwen3Config {
       head_dim: default_head_dim(),
       tie_word_embeddings: default_tie_word_embeddings(),
       rope_scaling: None,
+      quantization: None,
+      quantization_config: None,
     }
   }
 }
@@ -180,6 +211,54 @@ impl Qwen3Config {
     })?;
     cfg.validate()?;
     Ok(cfg)
+  }
+
+  /// The parsed per-layer quantization config, or `None` for a dense checkpoint
+  /// (no — or a `null` — quantization block).
+  ///
+  /// Resolves the block by precedence — the canonical
+  /// [`quantization`](Self::quantization) when it is present and non-null, else
+  /// the [`quantization_config`](Self::quantization_config) mirror — then
+  /// deserializes the chosen block into a
+  /// [`crate::lm::quant::PerLayerQuantization`] (the swift-faithful schema the
+  /// loader keys on to resolve each layer's `(group_size, bits, mode)`).
+  /// `quantization` is canonical because mlx-lm mirrors `quantization_config`
+  /// *into* `quantization` (`utils.py:914-915`); preferring it matches a config
+  /// that carries both keys (e.g. a mlxrs-saved round-trip).
+  /// [`Qwen3::from_weights`](crate::lm::models::qwen3::Qwen3::from_weights)
+  /// threads the result to the decoder + the untied head, which build a quantized
+  /// layer (via [`crate::nn::MaybeQuantizedLinear`]) whenever the checkpoint
+  /// carries that layer's `.scales` sibling (the same per-layer auto-detect
+  /// Whisper uses).
+  ///
+  /// # Errors
+  /// [`Error::Parse`] if the resolved, non-null block is not a valid
+  /// `PerLayerQuantization` (e.g. it is missing the required `group_size` /
+  /// `bits`, or a per-layer value is neither `false` nor a quantization object).
+  pub fn quantization(&self) -> Result<Option<crate::lm::quant::PerLayerQuantization>> {
+    // Precedence: the canonical `quantization` block when present and non-null,
+    // else the `quantization_config` mirror. A present-but-`null` `quantization`
+    // is treated as absent so a config carrying `quantization: null` alongside a
+    // real `quantization_config` mirror still resolves the mirror.
+    let block = match self.quantization.as_ref() {
+      Some(v) if !v.is_null() => Some(v),
+      _ => self.quantization_config.as_ref().filter(|v| !v.is_null()),
+    };
+    match block {
+      // Neither block present (or both `null`) — the dense path.
+      None => Ok(None),
+      Some(v) => {
+        let plq = serde_json::from_value::<crate::lm::quant::PerLayerQuantization>(v.clone())
+          .map_err(|e| {
+            Error::Parse(ParsePayload::new(
+              "Qwen3Config::quantization",
+              "`quantization` block",
+              e,
+            ))
+          })?;
+        Ok(Some(plq))
+      }
+    }
   }
 
   /// Reject a structurally invalid configuration before it can panic the
