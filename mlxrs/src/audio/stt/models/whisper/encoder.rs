@@ -18,7 +18,7 @@
 //! Output is `(1, n_ctx, n_audio_state)` (`(1, 1500, n_state)`).
 
 use crate::{
-  Array, Result,
+  Array, Dtype, Result,
   error::{Error, ShapePairMismatchPayload},
   lm::nn::{activations::gelu, norm::LayerNorm},
   ops::conv::conv1d,
@@ -90,11 +90,15 @@ impl AudioEncoder {
   ///
   /// `positional_embedding` is computed eagerly via [`sinusoids`] (the
   /// reference precomputes it in `__init__` and never learns it), so it is
-  /// **not** a checkpoint tensor.
+  /// **not** a checkpoint tensor. It is cast to the model `dtype` (the reference
+  /// `self._positional_embedding = sinusoids(n_ctx, n_state).astype(dtype)`,
+  /// `whisper.py:422`), so adding it to the post-conv activations in
+  /// [`Self::forward`] does not promote an f16/bf16 checkpoint's activations to
+  /// f32. The cast is a no-op for an f32 model.
   ///
   /// # Errors
   /// Propagates the [`sinusoids`] op error (`n_state` must be even and `>= 2`,
-  /// `n_ctx > 0`).
+  /// `n_ctx > 0`) and the dtype cast.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     conv1_weight: Array,
@@ -105,8 +109,13 @@ impl AudioEncoder {
     n_state: usize,
     blocks: Vec<ResidualAttentionBlock>,
     ln_post: LayerNorm,
+    dtype: Dtype,
   ) -> Result<Self> {
-    let positional_embedding = sinusoids(n_ctx, n_state, MAX_TIMESCALE)?;
+    // `sinusoids(...).astype(dtype)` (`whisper.py:422`): the table is computed in
+    // f32 (the reference builds it in f32 inside `sinusoids`) and then cast to the
+    // model dtype, so the `x + positional_embedding` add in `forward` stays in the
+    // activation dtype. A no-op cast when `dtype == F32`.
+    let positional_embedding = sinusoids(n_ctx, n_state, MAX_TIMESCALE)?.astype(dtype)?;
     Ok(Self {
       // conv1: stride 1, pad 1 (keeps the time axis).
       conv1: Conv1dLayer::new(conv1_weight, conv1_bias, 1, 1),

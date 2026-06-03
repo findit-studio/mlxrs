@@ -481,8 +481,19 @@ impl MultiHeadAttention {
     let n_head = self.n_head as i32;
     let head_dim = (n_state / self.n_head) as i32;
     // scale = (n_state // n_head) ** -0.25, applied to BOTH q and k.
+    //
+    // The reference multiplies by a Python `float` (`q * scale`, `k * scale`,
+    // `whisper.py:364-365`), a *weak* scalar that adopts the activation dtype and
+    // never promotes — so an f16/bf16 checkpoint keeps q/k in that dtype through
+    // the `q @ kᵀ` score path. A bare `Array::full::<f32>` is a *strong* f32
+    // operand instead, which MLX type-promotion would upgrade f16/bf16 q/k to f32
+    // against, inflating the whole score graph (and the KV cache) to f32 and
+    // breaking checkpoint parity. Cast the scale to the activation dtype
+    // (`q.dtype()`) first, reproducing the weak-scalar semantics; q and k are
+    // projected from the same-dtype attention input, so q's dtype is the shared
+    // activation dtype. A no-op cast when the activations are already f32.
     let scale = (n_state as f64 / self.n_head as f64).powf(-0.25) as f32;
-    let scale_arr = Array::full::<f32>(&[0i32; 0], scale)?;
+    let scale_arr = Array::full::<f32>(&[0i32; 0], scale)?.astype(q.dtype()?)?;
 
     // q: (B, T_q, n_state) -> (B, T_q, H, D) -> (B, H, T_q, D), then * scale.
     let k_ctx = k.shape()[1] as i32;

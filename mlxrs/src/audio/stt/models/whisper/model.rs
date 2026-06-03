@@ -1892,6 +1892,7 @@ impl Builder<'_> {
       dims.n_audio_state(),
       blocks,
       ln_post,
+      self.dtype,
     )
   }
 

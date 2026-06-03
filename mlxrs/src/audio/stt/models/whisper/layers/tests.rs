@@ -924,3 +924,146 @@ fn decoder_block_runs_cross_attention() {
   assert!(self_kv.is_some());
   assert!(cross_kv.is_some(), "decoder block must produce cross KV");
 }
+
+// ---- fp16 / bf16 activation-dtype preservation ----------------------
+//
+// The Whisper attention applies the `head_dim ** -0.25` scale to BOTH q and k
+// by multiplying with a scalar (`MultiHeadAttention::attention_scores`). The
+// reference does `q * scale` with a Python `float` — a *weak* scalar that keeps
+// q/k in the activation dtype (`whisper.py:364-365`). A strong f32 scalar array
+// would instead promote an f16/bf16 q/k to f32 via MLX type-promotion, inflating
+// the whole `q @ kᵀ` score graph to f32 and breaking checkpoint parity. These
+// tests pin that the scaled-QK + masked-scores + attention output stay in the
+// activation dtype for f16 and bf16, and that the f32 path is unchanged.
+
+/// An identity `(n, n)` projection (no bias) whose weight is in `dtype`, so an
+/// `x` of that dtype flows through the projection without promotion (mirroring a
+/// real checkpoint whose every weight is cast to the model dtype at load).
+fn identity_linear_dtype(n: usize, dtype: Dtype) -> Linear {
+  let mut w = vec![0.0_f32; n * n];
+  for i in 0..n {
+    w[i * n + i] = 1.0;
+  }
+  let w = arr(&w, &[n as i32, n as i32]).astype(dtype).unwrap();
+  Linear::new(w, None)
+}
+
+/// An all-identity-projection MHA whose weights are in `dtype`.
+fn identity_mha_dtype(n_head: usize, n_state: usize, dtype: Dtype) -> MultiHeadAttention {
+  MultiHeadAttention::new(
+    n_head,
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+    identity_linear_dtype(n_state, dtype),
+  )
+}
+
+/// `forward` (the no-qk core normal decode reaches) preserves the activation
+/// dtype: an f16 input through an f16-weighted attention yields f16 output and
+/// f16 cached (k, v) — no hidden promotion to f32 in the scaled `q @ kᵀ` path.
+#[test]
+fn mha_forward_preserves_f16() {
+  mha_forward_preserves_dtype(Dtype::F16);
+}
+
+/// Same as [`mha_forward_preserves_f16`] for bf16.
+#[test]
+fn mha_forward_preserves_bf16() {
+  mha_forward_preserves_dtype(Dtype::BF16);
+}
+
+fn mha_forward_preserves_dtype(dtype: Dtype) {
+  let n_state = 4usize;
+  let mha = identity_mha_dtype(2, n_state, dtype);
+  // (B=1, T=3, n_state=4) activations in the target dtype.
+  let x = arr(
+    &[
+      0.1, 0.2, 0.3, 0.4, // t0
+      1.0, -1.0, 0.5, -0.5, // t1
+      -0.3, 0.7, -0.2, 0.9, // t2
+    ],
+    &[1, 3, 4],
+  )
+  .astype(dtype)
+  .unwrap();
+  let (out, (k, v)) = mha.forward(&x, None, None, None).unwrap();
+  assert_eq!(
+    out.dtype().unwrap(),
+    dtype,
+    "attention output must stay in the activation dtype (no promotion to f32)"
+  );
+  assert_eq!(
+    k.dtype().unwrap(),
+    dtype,
+    "cached k must stay in activation dtype"
+  );
+  assert_eq!(
+    v.dtype().unwrap(),
+    dtype,
+    "cached v must stay in activation dtype"
+  );
+}
+
+/// The SCALED, MASKED pre-softmax scores `qk` (the reference's second
+/// `qkv_attention` return) stay in the activation dtype — this is the exact
+/// tensor the f32 scalar promotion would have lifted to f32. `forward_with_qk`
+/// surfaces it; assert it is f16 (and the masked-score add did not promote it).
+#[test]
+fn mha_scaled_masked_scores_stay_f16() {
+  mha_scaled_masked_scores_stay_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn mha_scaled_masked_scores_stay_bf16() {
+  mha_scaled_masked_scores_stay_dtype(Dtype::BF16);
+}
+
+fn mha_scaled_masked_scores_stay_dtype(dtype: Dtype) {
+  let n_state = 4usize;
+  let mha = identity_mha_dtype(2, n_state, dtype);
+  let x = arr(
+    &[
+      0.1, 0.2, 0.3, 0.4, // t0
+      1.0, -1.0, 0.5, -0.5, // t1
+    ],
+    &[1, 2, 4],
+  )
+  .astype(dtype)
+  .unwrap();
+  // An additive causal mask in the SAME dtype (as the decoder builds it), so the
+  // `qk + mask` add is dtype-consistent and must not promote.
+  let mask = arr(&[0.0, f32::NEG_INFINITY, 0.0, 0.0], &[2, 2])
+    .astype(dtype)
+    .unwrap();
+  let (out, _kv, qk) = mha.forward_with_qk(&x, None, Some(&mask), None).unwrap();
+  assert_eq!(
+    qk.dtype().unwrap(),
+    dtype,
+    "scaled+masked pre-softmax scores must stay in the activation dtype \
+     (the scalar scale must not promote q/k to f32)"
+  );
+  assert_eq!(
+    out.dtype().unwrap(),
+    dtype,
+    "attention output must stay in dtype"
+  );
+}
+
+/// The f32 path is UNCHANGED by the scale cast: with f32 activations the cast
+/// `scale_arr.astype(q.dtype())` is a no-op, so the output is still f32 and
+/// bit-identical to the pre-change reference equation. The numeric equality to
+/// the hand-built reference is already pinned by
+/// [`mha_matches_reference_qkv_equation`]; this asserts the dtype is preserved
+/// (no accidental down/upcast for f32).
+#[test]
+fn mha_f32_path_dtype_unchanged() {
+  let n_state = 4usize;
+  let mha = identity_mha_dtype(2, n_state, Dtype::F32);
+  let x = arr(&[0.1, 0.2, 0.3, 0.4, 1.0, -1.0, 0.5, -0.5], &[1, 2, 4]);
+  assert_eq!(x.dtype().unwrap(), Dtype::F32);
+  let (out, _kv, qk) = mha.forward_with_qk(&x, None, None, None).unwrap();
+  assert_eq!(out.dtype().unwrap(), Dtype::F32, "f32 output unchanged");
+  assert_eq!(qk.dtype().unwrap(), Dtype::F32, "f32 scores unchanged");
+}
