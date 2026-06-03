@@ -949,6 +949,69 @@ fn forward_rejects_wrong_cardinality_cache() {
 }
 
 #[test]
+fn forward_embeddings_rejects_low_rank_without_panic() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model();
+  let mut cache = model.make_cache();
+
+  // Rank-0 scalar: must be a typed RankMismatch, NOT a panic on shape[1].
+  // An empty `[i32; 0]` shape ⇒ a rank-0 (single-element) array.
+  let r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r0, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-0 embeddings → RankMismatch"
+  );
+
+  // Rank-1 `[hidden]`: still RankMismatch (would index shape[1] out of bounds).
+  let r1 = Array::from_slice::<f32>(&[0.0_f32; 4], &(4usize,)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r1, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-1 embeddings → RankMismatch"
+  );
+
+  // Rank-2 `[seq, hidden]` (the common "forgot the batch axis" mistake):
+  // RankMismatch (the LM wants rank-3 `[batch, seq, hidden]`).
+  let r2 = Array::from_slice::<f32>(&[0.0_f32; 8], &(2usize, 4usize)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r2, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-2 embeddings → RankMismatch"
+  );
+}
+
+#[test]
+fn forward_embeddings_rejects_wrong_hidden_width() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model(); // hidden_size = 4
+  let mut cache = model.make_cache();
+
+  // Rank-3 but the hidden width is 8 ≠ config.hidden_size (4): a typed
+  // LengthMismatch naming the hidden-width contract.
+  let wrong = Array::from_slice::<f32>(&[0.0_f32; 16], &(1usize, 2usize, 8usize)).unwrap();
+  match model.forward_embeddings(&wrong, &mut cache) {
+    Err(Error::LengthMismatch(p)) => {
+      assert_eq!(p.expected(), 4, "expected = config.hidden_size");
+      assert_eq!(p.actual(), 8, "actual = supplied hidden width");
+    }
+    other => panic!("expected LengthMismatch(hidden width), got {other:?}"),
+  }
+
+  // The matching rank-3 `[1, 2, 4]` runs (the guard only rejects mismatches) →
+  // `[1, 2, vocab=8]` logits.
+  let ok = Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 2usize, 4usize)).unwrap();
+  let logits = model.forward_embeddings(&ok, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
 fn adjusted_ff_dim_matches_reference_formula() {
   // block_ff_dim=6656, multiple_of=256, multiplier=1.0, adjust=true:
   //   int(2*6656/3)=4437; int(1.0*4437)=4437;
@@ -1044,4 +1107,306 @@ fn conv_bias_false_no_bias_loads() {
   // The complement of the collision case: conv_bias=false + no bias tensors is
   // the normal biasless path and loads cleanly.
   assert!(Lfm2::from_weights(tiny_all_conv_config(false), tiny_all_conv_weights(false)).is_ok());
+}
+
+// ───────────────────── quantized-checkpoint loading ─────────────────────
+//
+// No local 8-bit LFM2 checkpoint is available, so the quantized load path is
+// covered by a SYNTHETIC quantized checkpoint: a tiny hybrid (one attention +
+// one short-conv layer) whose every quantizable weight's last axis is a whole
+// multiple of the affine `group_size` (mlx requires `group_size ∈ {32, 64,
+// 128}`, `mlx/ops.cpp:4740`), with every `nn.Linear` weight and the token
+// embedding replaced by the real `ops::quantized::quantize` `(weight, scales,
+// biases)` triple — the exact on-disk layout an mlx-community 8-bit checkpoint
+// (e.g. `LiquidAI/LFM2.5-VL-450M-MLX-8bit`) ships. The depthwise `nn.Conv1d`
+// weight stays dense (MLX quantizes `nn.Linear` / `nn.Embedding` only). The
+// model must then construct (quantized Linears + quantized Embedding) and run a
+// forward through BOTH layer kinds to finite logits.
+
+/// A valid mlx affine group size (`mlx/ops.cpp:4740`).
+const QGROUP: i32 = 64;
+/// 8-bit affine — the mlx-community 8-bit scheme.
+const QBITS: i32 = 8;
+
+/// The tiny hybrid quantized-fixture config: `hidden = vocab-divisor = QGROUP`
+/// so every quantizable weight's last axis (`hidden`, `ff`) is a whole number
+/// of groups; layer 0 is attention (`full_attn_idxs = [0]`), layer 1 is conv.
+/// `block_auto_adjust_ff_dim = false` pins `ff = block_ff_dim = 2*QGROUP`,
+/// itself a multiple of `QGROUP`.
+fn quant_hybrid_config() -> TextConfig {
+  let hidden = QGROUP; // 64
+  let ff = 2 * QGROUP; // 128
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false}}"#
+  );
+  TextConfig::from_json(&json).unwrap()
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` 8-bit affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`), mirroring how an mlx-community
+/// quantized checkpoint stores a quantized `Linear` / `Embedding`.
+fn quantize_weight_in_place(w: &mut std::collections::HashMap<String, Array>, prefix: &str) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .unwrap_or_else(|| panic!("dense weight present for {prefix}"));
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QGROUP, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Build the dense hybrid weight map for [`quant_hybrid_config`]: layer 0 is an
+/// attention layer (QK-norm + q/k/v/out_proj), layer 1 is a conv layer (dense
+/// depthwise conv weight + in_proj/out_proj). All bias-free (`conv_bias=false`).
+fn quant_hybrid_dense_weights() -> std::collections::HashMap<String, Array> {
+  use std::collections::HashMap;
+  let hidden = QGROUP as usize; // 64
+  let ff = 2 * QGROUP as usize; // 128
+  let vocab = 128usize;
+  let k = 3usize;
+
+  // A deterministic `(rows, cols)` weight with tiny distinct entries.
+  let mat = |rows: usize, cols: usize| -> Array {
+    let data: Vec<f32> = (0..rows * cols)
+      .map(|i| ((i % 17) as f32) * 0.01 - 0.08)
+      .collect();
+    Array::from_slice::<f32>(&data, &(rows, cols)).unwrap()
+  };
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+
+  let mut w: HashMap<String, Array> = HashMap::new();
+  w.insert("model.embed_tokens.weight".to_string(), mat(vocab, hidden));
+  w.insert("model.embedding_norm.weight".to_string(), vecn(hidden));
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    w.insert(format!("{p}.operator_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.ffn_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.feed_forward.w1.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w3.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w2.weight"), mat(hidden, ff));
+  }
+  // Layer 0: attention (head_dim = hidden/2 = 32, even).
+  let q = "model.layers.0.self_attn";
+  let head_dim = hidden / 2; // 32
+  w.insert(format!("{q}.q_layernorm.weight"), vecn(head_dim));
+  w.insert(format!("{q}.k_layernorm.weight"), vecn(head_dim));
+  w.insert(format!("{q}.q_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.k_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.v_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.out_proj.weight"), mat(hidden, hidden));
+  // Layer 1: conv (dense depthwise weight in MLX (C, K, 1) layout) + projections.
+  let c = "model.layers.1.conv";
+  let conv_flat: Vec<f32> = (0..hidden * k).map(|i| (i as f32) * 0.01).collect();
+  w.insert(
+    format!("{c}.conv.weight"),
+    Array::from_slice::<f32>(&conv_flat, &(hidden, k, 1usize)).unwrap(),
+  );
+  w.insert(format!("{c}.in_proj.weight"), mat(3 * hidden, hidden));
+  w.insert(format!("{c}.out_proj.weight"), mat(hidden, hidden));
+  w
+}
+
+/// The dense hybrid weights with every `nn.Linear` and the token embedding
+/// quantized to the 8-bit affine triple. The depthwise conv weight stays dense
+/// (`mlx_lm/utils.py` `class_predicate` quantizes `nn.Linear` / `nn.Embedding`
+/// only, never `nn.Conv1d`).
+fn quant_hybrid_weights() -> std::collections::HashMap<String, Array> {
+  let mut w = quant_hybrid_dense_weights();
+  // Token embedding (tied logit head).
+  quantize_weight_in_place(&mut w, "model.embed_tokens");
+  // Per-layer MLP projections (both layers).
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    for proj in ["w1", "w3", "w2"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.feed_forward.{proj}"));
+    }
+  }
+  // Layer 0 attention projections.
+  for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+    quantize_weight_in_place(&mut w, &format!("model.layers.0.self_attn.{proj}"));
+  }
+  // Layer 1 conv projections (the two `nn.Linear`s — NOT the conv weight).
+  for proj in ["in_proj", "out_proj"] {
+    quantize_weight_in_place(&mut w, &format!("model.layers.1.conv.{proj}"));
+  }
+  w
+}
+
+/// The parsed global 8-bit affine quantization config for the synthetic
+/// checkpoint (the analogue of the `config.json` `quantization` block).
+fn quant_config() -> PerLayerQuantization {
+  PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(QGROUP, QBITS))
+}
+
+#[test]
+fn from_weights_quantized_builds_quantized_layers_and_keeps_conv_dense() {
+  use crate::lm::model::Model as _;
+  // An 8-bit checkpoint whose Linear/Embedding weights carry `.scales`/`.biases`
+  // builds quantized layers (a packed `uint32` weight of a DIFFERENT shape than
+  // the dense `(out, in)` loads through the quantized path), the token embedding
+  // + the tied head are quantized, and the depthwise conv weight STAYS DENSE.
+  let model = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+
+  // The token embedding (and therefore the tied `as_linear` head, which reuses
+  // the same table) is quantized.
+  assert!(
+    model.model.embed_tokens.is_quantized(),
+    "token embedding (tied head) must be quantized"
+  );
+
+  // Layer 0 = attention: all four projections quantized.
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => {
+      assert!(attn.q_proj.is_quantized(), "q_proj quantized");
+      assert!(attn.k_proj.is_quantized(), "k_proj quantized");
+      assert!(attn.v_proj.is_quantized(), "v_proj quantized");
+      assert!(attn.out_proj.is_quantized(), "out_proj quantized");
+    }
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+  // Both layers' MLP projections quantized.
+  for layer in &model.model.layers {
+    assert!(layer.feed_forward.w1.is_quantized(), "w1 quantized");
+    assert!(layer.feed_forward.w3.is_quantized(), "w3 quantized");
+    assert!(layer.feed_forward.w2.is_quantized(), "w2 quantized");
+  }
+  // Layer 1 = conv: the two projections are quantized, but the depthwise conv
+  // weight is DENSE — assert it kept its float dtype (a quantized weight would
+  // be `uint32`).
+  match &model.model.layers[1].mixer {
+    Mixer::Conv(conv) => {
+      assert!(conv.in_proj.is_quantized(), "conv in_proj quantized");
+      assert!(conv.out_proj.is_quantized(), "conv out_proj quantized");
+      assert_eq!(
+        conv.conv_weight.dtype().unwrap(),
+        crate::dtype::Dtype::F32,
+        "depthwise conv weight must stay dense (f32), not be quantized to uint32"
+      );
+    }
+    Mixer::Attention(_) => panic!("layer 1 should be conv"),
+  }
+
+  // And it runs a forward through BOTH the attention and the conv layer to
+  // FINITE logits of the right shape (the quantized `quantized_matmul`s and the
+  // quantized weight-tied logit head all execute through mlx-c).
+  let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let mut cache = model.make_cache();
+  let mut logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  for v in logits.to_vec::<f32>().unwrap() {
+    assert!(
+      v.is_finite(),
+      "quantized forward produced a non-finite logit: {v}"
+    );
+  }
+}
+
+#[test]
+fn from_weights_quantized_dense_checkpoint_byte_identical() {
+  use crate::lm::model::Model as _;
+  // A NON-quantized checkpoint loads identically whether or not a quantization
+  // config is threaded (the `.scales` sibling is the load-bearing signal; a
+  // dense checkpoint has none, so the dense path runs regardless), and
+  // `from_weights == from_weights_quantized(.., None)`. The three load paths
+  // must produce bit-identical logits on the same input.
+  let cfg = || tiny_all_conv_config(false);
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+
+  let run = |model: &Lfm2| -> Vec<f32> {
+    let mut cache = model.make_cache();
+    let mut logits = model.forward(&tokens, &mut cache).unwrap();
+    logits.to_vec::<f32>().unwrap()
+  };
+
+  let plain = Lfm2::from_weights(cfg(), tiny_all_conv_weights(false)).unwrap();
+  let with_none = Lfm2::from_weights_quantized(cfg(), tiny_all_conv_weights(false), None).unwrap();
+  let with_cfg =
+    Lfm2::from_weights_quantized(cfg(), tiny_all_conv_weights(false), Some(&quant_config()))
+      .unwrap();
+  // None of the dense projections are quantized regardless of the threaded cfg.
+  assert!(!plain.model.embed_tokens.is_quantized());
+  assert!(!with_cfg.model.embed_tokens.is_quantized());
+
+  let a = run(&plain);
+  let b = run(&with_none);
+  let c = run(&with_cfg);
+  assert_eq!(
+    a, b,
+    "from_weights vs from_weights_quantized(None) must match exactly"
+  );
+  assert_eq!(
+    a, c,
+    "a dense checkpoint loads identically with a quant config threaded"
+  );
+}
+
+#[test]
+fn from_weights_quantized_scales_without_config_errors() {
+  // Weights say quantized (`.scales` present) but the threaded config resolves
+  // NO scheme params for the layer → a typed InvariantViolation, never a panic
+  // or a silently-wrong load. An empty per-layer config with no global default
+  // makes `quantization_for` return None for the quantized embedding (the first
+  // quantized layer the loader reaches).
+  let empty_cfg = PerLayerQuantization::new(None, std::collections::HashMap::new());
+  let err = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&empty_cfg),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for `.scales` present but no resolved params, got {err:?}"
+  );
+}
+
+#[test]
+fn resolve_quantization_handles_both_keys() {
+  // The LFM2 resolver accepts the mlx-lm `quantization` key AND the HF
+  // `quantization_config` alias some post-quantize artifacts emit; both parse to
+  // the same global scheme. A dense config (neither key) resolves to None.
+  let block = r#"{"group_size": 64, "bits": 8, "mode": "affine"}"#;
+  for key in ["quantization", "quantization_config"] {
+    let json = format!(r#"{{"hidden_size": 64, "{key}": {block}}}"#);
+    let plq = resolve_quantization(&json)
+      .unwrap()
+      .expect("a quantized config resolves");
+    let q = plq
+      .quantization_for("model.embed_tokens")
+      .expect("global default applies");
+    assert_eq!((q.group_size, q.bits), (64, 8));
+  }
+  // No quantization block → dense (None).
+  assert!(
+    resolve_quantization(r#"{"hidden_size": 64}"#)
+      .unwrap()
+      .is_none()
+  );
+  // An explicit `null` block is also dense (None), mirroring the audio fallback.
+  assert!(
+    resolve_quantization(r#"{"quantization": null}"#)
+      .unwrap()
+      .is_none()
+  );
+  // A malformed block (missing required `bits`) is a recoverable typed error.
+  assert!(matches!(
+    resolve_quantization(r#"{"quantization": {"group_size": 64}}"#),
+    Err(Error::Parse(_))
+  ));
 }

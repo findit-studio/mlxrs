@@ -1482,6 +1482,97 @@ pub fn resize_lanczos(
   resize(img, (target_h, target_w), ResizeFilter::Lanczos3)
 }
 
+/// Fallibly extract a [`::image::DynamicImage`]'s interleaved 8-bit RGB bytes
+/// (`width * height * 3`, alpha dropped, RGB-ordered) plus its `(width,
+/// height)` — the recoverable-OOM analogue of `img.to_rgb8().as_raw()`.
+///
+/// `image` 0.25's `DynamicImage::to_rgb8()` allocates a fresh `RgbImage` (and
+/// clones even when the source is already `ImageRgb8`) backed by an
+/// **infallible** `Vec`, so under allocator pressure / a near-cap decoded image
+/// it `abort()`s the process — making a `-> Result` seam dishonest. This
+/// reserves the RGB buffer via `try_reserve_exact` (the crate's fallible
+/// `try_with_capacity` helper) and fills it manually: a borrowed
+/// [`as_rgb8`](::image::DynamicImage::as_rgb8) fast path when the source is
+/// already RGB8 (no per-pixel projection), else a per-pixel `get_pixel`
+/// projection (the same `dynamic_map!` color-space conversion `to_rgb8()`
+/// performs) — never a second source-sized image allocation. Allocator failure
+/// surfaces as [`Error::OutOfMemory`].
+///
+/// Mirrors the [`resize`] source-RGBA materialization (and `image_to_array` /
+/// `pad_to_square`): the same borrow-or-per-pixel + `try_reserve_exact`
+/// discipline, with alpha dropped.
+///
+/// # Errors
+/// - [`Error::ArithmeticOverflow`] if `width * height * 3` overflows `usize`;
+/// - [`Error::CapExceeded`] if the RGB byte count exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`] (the same 512 MiB ceiling [`load_image`] /
+///   [`resize`] enforce — a low-bytes-per-pixel source accepted just under the
+///   decoder cap can expand past it when projected to RGB8);
+/// - [`Error::OutOfMemory`] if the `try_reserve_exact` for the RGB buffer
+///   fails;
+/// - [`Error::LengthMismatch`] if an already-RGB8 source's backing buffer is
+///   shorter than `width * height * 3` (a corrupt container).
+pub fn decode_rgb(img: &::image::DynamicImage) -> Result<(Vec<u8>, u32, u32)> {
+  let width = img.width();
+  let height = img.height();
+  // `width * height * 3` (RGB8 bytes) in usize. Bounded in practice by
+  // `load_image`'s 512 MiB decoder cap, but a `checked_mul` keeps the
+  // reservation honest on a 32-bit `usize` and routes a pathological product to
+  // a recoverable `ArithmeticOverflow` instead of a silent under-allocation.
+  let rgb_bytes = (width as usize)
+    .checked_mul(height as usize)
+    .and_then(|wh| wh.checked_mul(3))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "decode_rgb: RGB bytes (width * height * 3)",
+        "usize",
+        [("width", width as u64), ("height", height as u64)],
+      ))
+    })?;
+  // RGB8 staging cap: a low-bytes-per-pixel source (e.g. `Luma8`, 1 B/px)
+  // accepted just under `load_image`'s 512 MiB ceiling expands 3x when
+  // projected to RGB8, so apply the same `MAX_DECODED_IMAGE_BYTES` gate here
+  // before the reservation. `u64` so the comparison is host-width-independent.
+  if rgb_bytes as u64 > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "decode_rgb: RGB8 staging (Luma8/Rgba8/etc. projected to RGB8)",
+      "MAX_DECODED_IMAGE_BYTES",
+      MAX_DECODED_IMAGE_BYTES,
+      rgb_bytes as u64,
+    )));
+  }
+  let mut buf = crate::error::try_with_capacity::<u8>(rgb_bytes)?;
+  if let Some(rgb) = img.as_rgb8() {
+    // Already RGB8: borrow the backing `&[u8]` and copy exactly `rgb_bytes`
+    // (slice to guard an over-long backing buffer, matching the resize /
+    // `image_to_array` `.get(..)` discipline so the fill cannot grow `buf` past
+    // the `try_reserve_exact` reservation).
+    let raw = rgb.as_raw().get(..rgb_bytes).ok_or_else(|| {
+      Error::LengthMismatch(LengthMismatchPayload::new(
+        "decode_rgb: rgb backing buffer bytes vs width*height*3",
+        rgb_bytes,
+        rgb.as_raw().len(),
+      ))
+    })?;
+    buf.extend_from_slice(raw);
+  } else {
+    // Non-RGB8 source (Luma8 / Rgba8 / Rgb16 / Rgb32F / …): per-pixel
+    // `DynamicImage::get_pixel(x, y).to_rgb()` projection (alpha dropped). NO
+    // intermediate source-sized image allocation.
+    for y in 0..height {
+      for x in 0..width {
+        buf.extend_from_slice(&dynamic_image_rgb_pixel(img, x, y));
+      }
+    }
+  }
+  debug_assert_eq!(
+    buf.len(),
+    rgb_bytes,
+    "decode_rgb fill length must equal width * height * 3",
+  );
+  Ok((buf, width, height))
+}
+
 /// Center crop `img` to `(target_h, target_w)`.
 ///
 /// Mirrors swift
@@ -2521,6 +2612,74 @@ pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
       expand_dims_axes(&chw, &[0])
     }
   }
+}
+
+// ═══════════════════════════ SigLIP2 NaFlex sizing ══════════════════════════
+
+/// Tolerance for the [`patch_grid`] binary-search termination. Mirrors the
+/// `siglip2-naflex` crate's `SCALE_EPS` (= the upstream `transformers` value).
+/// **Do not loosen**: it is what keeps `s` clearly below the boundary where
+/// `ceil()` flips, the difference between emitting upstream-equivalent grids vs
+/// silently drifting by one patch in the longer axis on edge inputs.
+const NAFLEX_SCALE_EPS: f64 = 1e-5;
+
+/// Upper search bound on the uniform scale. Mirrors the oracle's
+/// `scale_max = 100.0`.
+const NAFLEX_SCALE_MAX: f64 = 100.0;
+
+/// Find the largest uniform scale `s` such that, after rounding each axis up to
+/// a multiple of `patch_size`, the patch grid `H_p x W_p` fits within
+/// `max_num_patches`. Returns `(H_p, W_p)` with both `>= 1`.
+///
+/// The SigLIP2 NaFlex *smart-resize* target-grid formula — a port of upstream
+/// `transformers`'
+/// `image_processing_siglip2_fast.get_image_size_for_max_num_patches` (validated
+/// against PyTorch by the user's published `siglip2-naflex` crate): binary-search
+/// `s ∈ [SCALE_EPS/10, SCALE_MAX]`, terminating at `hi - lo < SCALE_EPS`. Shared
+/// (it lives in the model-agnostic `vlm::image` layer) by every model whose
+/// processor defers to the SigLIP2 slow image processor — the
+/// [`siglip2-naflex`](crate::embeddings::siglip2_naflex) dual-tower embeddings
+/// and the [`lfm2-vl`](crate::vlm::models::lfm2_vl) native-resolution processor.
+///
+/// `patch_size` and `max_num_patches` must be `> 0` (the caller validates this
+/// from the config); `width` / `height` must be `> 0`. The returned product is
+/// **not** guaranteed `<= max_num_patches` for adversarial `u32` inputs whose
+/// entire feasible scale range falls below the `SCALE_EPS/10` search floor (e.g.
+/// `width` near `u32::MAX` at `height = 1`) — every caller re-checks the budget
+/// post-hoc and rejects such inputs with [`crate::Error::CapExceeded`].
+pub fn patch_grid(height: u32, width: u32, patch_size: u32, max_num_patches: u32) -> (u32, u32) {
+  let h = f64::from(height);
+  let w = f64::from(width);
+  let p = f64::from(patch_size);
+  let m = f64::from(max_num_patches);
+
+  // Round `scale * original` up to a multiple of `P`, then floor at `P` so the
+  // smallest target is one full patch (matches upstream).
+  fn scaled_pixel_size(scale: f64, original: f64, patch: f64) -> f64 {
+    let scaled = scale * original;
+    let scaled = (scaled / patch).ceil() * patch;
+    scaled.max(patch)
+  }
+
+  let mut scale_min: f64 = NAFLEX_SCALE_EPS / 10.0;
+  let mut scale_max: f64 = NAFLEX_SCALE_MAX;
+  while (scale_max - scale_min) >= NAFLEX_SCALE_EPS {
+    let scale = 0.5 * (scale_min + scale_max);
+    let target_h = scaled_pixel_size(scale, h, p);
+    let target_w = scaled_pixel_size(scale, w, p);
+    let num_patches = (target_h * target_w) / (p * p);
+    if num_patches <= m {
+      scale_min = scale;
+    } else {
+      scale_max = scale;
+    }
+  }
+
+  let target_h = scaled_pixel_size(scale_min, h, p);
+  let target_w = scaled_pixel_size(scale_min, w, p);
+  let h_p = ((target_h / p) as u32).max(1);
+  let w_p = ((target_w / p) as u32).max(1);
+  (h_p, w_p)
 }
 
 /// Private regression tests for [`apply_orientation_fallible`] and

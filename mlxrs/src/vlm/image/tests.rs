@@ -316,3 +316,85 @@ fn rotate_buf_rotate90_tiny_luma_permutes_into_swapped_extent() {
     "Rotate90 of a single row stacks the pixels"
   );
 }
+
+// -- decode_rgb: fallible RGB extraction (no abort) ------------------
+//
+// `decode_rgb` is the recoverable-OOM replacement for `to_rgb8().as_raw()`:
+// a borrowed `as_rgb8()` fast path when the source is already RGB8, else a
+// per-pixel `dynamic_image_rgb_pixel` projection, both `try_reserve_exact`-
+// backed. These pin the two extraction paths (RGB8 borrow + non-RGB8
+// projection) produce the correct interleaved RGB bytes, and that the
+// signature is fallible (`-> Result`).
+
+#[test]
+fn decode_rgb_rgb8_source_extracts_exact_bytes() {
+  // An already-RGB8 image takes the borrowed `as_rgb8()` fast path: the
+  // returned bytes are exactly the source's interleaved RGB, in order.
+  let mut buf = ::image::RgbImage::new(2, 2);
+  buf.put_pixel(0, 0, ::image::Rgb([10, 20, 30]));
+  buf.put_pixel(1, 0, ::image::Rgb([40, 50, 60]));
+  buf.put_pixel(0, 1, ::image::Rgb([70, 80, 90]));
+  buf.put_pixel(1, 1, ::image::Rgb([100, 110, 120]));
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+
+  let (rgb, w, h) = decode_rgb(&img).expect("RGB8 decode_rgb succeeds");
+  assert_eq!((w, h), (2, 2));
+  assert_eq!(rgb.len(), 2 * 2 * 3, "width * height * 3 RGB bytes");
+  assert_eq!(
+    rgb,
+    vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+    "RGB8 fast path copies the interleaved bytes in row-major order"
+  );
+}
+
+#[test]
+fn decode_rgb_non_rgb8_source_projects_per_pixel() {
+  // A Luma8 (greyscale) image is NOT RGB8, so it takes the per-pixel
+  // projection path: each grey value broadcasts to (L, L, L) (the same
+  // `to_rgb8()` conversion), alpha (here none) dropped.
+  let mut buf = ::image::GrayImage::new(2, 1);
+  buf.put_pixel(0, 0, ::image::Luma([42]));
+  buf.put_pixel(1, 0, ::image::Luma([200]));
+  let img = ::image::DynamicImage::ImageLuma8(buf);
+  assert!(
+    img.as_rgb8().is_none(),
+    "Luma8 is not RGB8 (per-pixel path)"
+  );
+
+  let (rgb, w, h) = decode_rgb(&img).expect("Luma8 decode_rgb succeeds");
+  assert_eq!((w, h), (2, 1));
+  assert_eq!(
+    rgb,
+    vec![42, 42, 42, 200, 200, 200],
+    "greyscale broadcasts each Luma value to R=G=B"
+  );
+}
+
+#[test]
+fn decode_rgb_rgba8_source_drops_alpha() {
+  // An RGBA8 image is not RGB8 either; the per-pixel projection keeps R/G/B
+  // and drops the alpha channel.
+  let mut buf = ::image::RgbaImage::new(1, 2);
+  buf.put_pixel(0, 0, ::image::Rgba([11, 22, 33, 255]));
+  buf.put_pixel(0, 1, ::image::Rgba([44, 55, 66, 128]));
+  let img = ::image::DynamicImage::ImageRgba8(buf);
+
+  let (rgb, w, h) = decode_rgb(&img).expect("RGBA8 decode_rgb succeeds");
+  assert_eq!((w, h), (1, 2));
+  assert_eq!(
+    rgb,
+    vec![11, 22, 33, 44, 55, 66],
+    "RGBA8 projection drops the alpha byte"
+  );
+}
+
+#[test]
+fn decode_rgb_signature_is_fallible() {
+  // The function returns a `Result` (the no-abort contract): a valid image
+  // yields `Ok`, and the bound type is `Result<_, Error>` (so a future
+  // allocator / cap failure is recoverable, not an abort). Asserting the
+  // type explicitly pins the fallible signature.
+  let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(1, 1));
+  let res: Result<(Vec<u8>, u32, u32)> = decode_rgb(&img);
+  assert!(res.is_ok(), "a 1x1 RGB image decodes successfully");
+}

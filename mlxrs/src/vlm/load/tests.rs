@@ -17,6 +17,7 @@ use crate::{
   vlm::{
     generate::{VlmGenConfig, vlm_generate},
     image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+    model::{FixedGridProcessor, ProcessedImage},
     prompt::MarkerPolicy,
   },
 };
@@ -143,7 +144,7 @@ impl crate::vlm::model::Model for MockVlmModel {
     Array::from_slice::<f32>(&vec![0.0_f32; b * t * 8], &(b, t, 8usize))
   }
 
-  fn encode_image(&self, _image: &Array) -> Result<Array> {
+  fn encode_image(&self, _image: &ProcessedImage) -> Result<Array> {
     // [1, 8] zero features — single placeholder per image into the
     // hidden_size = 8 space.
     Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 8usize))
@@ -449,10 +450,13 @@ fn loaded_model_drives_vlm_generate_end_to_end() {
     MarkerPolicy::Required,
   );
   let prompt = [0_u32, 1, 2];
-  // mlx-vlm `generate(model, processor, …)` — the image-processor config is
-  // supplied separately; the loaded processor carries the parsed config.
+  // mlx-vlm `generate(model, processor, …)` — the image processor is supplied
+  // separately; the loaded processor carries the parsed config. No images
+  // here (zero-image passthrough), so the processor is unused — wrap the
+  // loaded config in a fixed-grid processor for the explicit argument.
   let img_cfg = ctx.processor().image_processor_config();
-  let steps = vlm_generate(ctx.model(), &img_cfg, &prompt, &[], Vec::new(), cfg)
+  let proc = FixedGridProcessor::new(img_cfg, 3);
+  let steps = vlm_generate(ctx.model(), &proc, &prompt, &[], Vec::new(), cfg)
     .expect("vlm_generate constructs against the loaded trait-object model");
 
   let tokens: Vec<u32> = steps
@@ -544,12 +548,12 @@ fn loaded_processor_config_drives_image_preprocessing_not_model_default() {
       // hidden_size = 8, matching `encode_image`'s D below.
       Array::from_slice::<f32>(&vec![0.0_f32; b * t * 8], &(b, t, 8usize))
     }
-    fn encode_image(&self, image: &Array) -> Result<Array> {
-      // Record the preprocessed image shape — this is the observable
-      // proof of which `ImageProcessorConfig` drove `preprocess`.
-      *self.seen_image_shape.lock().unwrap() = Some(image.shape());
-      // `[num_tokens_per_image = 1, D = 8]` features (one row per image,
-      // satisfying `vlm_generate`'s `[num_tokens_per_image, D]` check).
+    fn encode_image(&self, image: &ProcessedImage) -> Result<Array> {
+      // Record the preprocessed pixel tensor shape — this is the observable
+      // proof of which `ImageProcessorConfig` drove the fixed-grid processor.
+      *self.seen_image_shape.lock().unwrap() = Some(image.pixels().shape());
+      // `[num_tokens = 1, D = 8]` features (one row per image, satisfying
+      // `vlm_generate`'s `[image.num_tokens(), D]` check).
       Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 8usize))
     }
   }
@@ -622,9 +626,13 @@ fn loaded_processor_config_drives_image_preprocessing_not_model_default() {
     MarkerPolicy::Required,
   );
   let prompt = [0_u32, 99, 1]; // one marker → one image
+  // Wrap the LOADED processor config in the fixed-grid processor so
+  // `preprocess` runs at the loaded 48×48 (NOT the model's trait-default
+  // 224×224) — the observable proof the loaded config drives preprocessing.
+  let proc = FixedGridProcessor::new(loaded_img_cfg, 1);
   let steps = vlm_generate(
     ctx.model(),
-    &loaded_img_cfg,
+    &proc,
     &prompt,
     std::slice::from_ref(&img_path),
     Vec::new(),

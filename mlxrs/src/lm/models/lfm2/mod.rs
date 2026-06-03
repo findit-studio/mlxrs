@@ -48,7 +48,8 @@ use crate::{
   dtype::Dtype,
   error::{
     ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
-    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
+    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload,
+    RankMismatchPayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -59,20 +60,21 @@ use crate::{
       norm::RMSNorm,
       rope::Rope,
     },
+    quant::PerLayerQuantization,
   },
   ops::{
     self,
     conv::conv1d,
-    indexing::{take_along_axis, take_axis},
+    indexing::take_along_axis,
     logical::select,
     misc::astype,
-    shape::{
-      concatenate, expand_dims_axes, pad, reshape, split_sections, swapaxes, transpose_axes,
-    },
+    shape::{concatenate, expand_dims_axes, pad, reshape, split_sections, transpose_axes},
   },
 };
-use linear::Linear;
+use linear::{Embedding, Linear};
 use smol_str::format_smolstr;
+
+pub use linear::resolve_quantization;
 
 use crate::model_validation::{
   checked_add, checked_mul, require_cardinality, require_divisible, require_even, require_in_range,
@@ -669,16 +671,25 @@ impl Attention {
     let values = self.v_proj.forward(x)?;
 
     // Per-head reshape `(B, L, n_heads, head_dim)`, q/k RMSNorm over the last
-    // axis, then transpose to `(B, n_heads, L, head_dim)`.
-    let queries = reshape(&queries, &[b, l, self.n_heads, -1])?;
+    // axis, then transpose to `(B, n_heads, L, head_dim)`. The reference
+    // `reshape(B, L, n_heads, -1)` infers the trailing per-head dim; mlxrs's
+    // `reshape` validates dims before FFI and does not accept the `-1`
+    // inference sentinel, so the head dim is computed explicitly as
+    // `proj_width / heads` (an exact division — `validate` pins
+    // `hidden % num_attention_heads == 0`, and q/k/v are
+    // `heads * head_dim` wide).
+    let q_head_dim = head_dim_for(&queries, self.n_heads)?;
+    let queries = reshape(&queries, &[b, l, self.n_heads, q_head_dim])?;
     let queries = self.q_layernorm.forward(&queries)?;
     let queries = transpose_axes(&queries, &[0, 2, 1, 3])?;
 
-    let keys = reshape(&keys, &[b, l, self.n_kv_heads, -1])?;
+    let k_head_dim = head_dim_for(&keys, self.n_kv_heads)?;
+    let keys = reshape(&keys, &[b, l, self.n_kv_heads, k_head_dim])?;
     let keys = self.k_layernorm.forward(&keys)?;
     let keys = transpose_axes(&keys, &[0, 2, 1, 3])?;
 
-    let values = reshape(&values, &[b, l, self.n_kv_heads, -1])?;
+    let v_head_dim = head_dim_for(&values, self.n_kv_heads)?;
+    let values = reshape(&values, &[b, l, self.n_kv_heads, v_head_dim])?;
     let values = transpose_axes(&values, &[0, 2, 1, 3])?;
 
     // RoPE at the cache offset, then append+fetch the running K/V.
@@ -689,9 +700,13 @@ impl Attention {
 
     let attn_mask = mask_mode_to_mask(mask);
     let output = scaled_dot_product_attention(&queries, &keys, &values, self.scale, attn_mask)?;
-    // `(B, n_heads, L, head_dim)` -> `(B, L, n_heads*head_dim)`.
+    // `(B, n_heads, L, head_dim)` -> `(B, L, n_heads*head_dim)`. The merged
+    // width is the SDPA output's `n_heads * head_dim` (its axes 1 and 3),
+    // computed explicitly for the same reason as the per-head reshapes above
+    // (the reference's `reshape(B, L, -1)` infers it).
     let output = transpose_axes(&output, &[0, 2, 1, 3])?;
-    let output = reshape(&output, &[b, l, -1])?;
+    let merged = merged_head_width(&output)?;
+    let output = reshape(&output, &[b, l, merged])?;
     self.out_proj.forward(&output)
   }
 }
@@ -704,6 +719,49 @@ fn mask_mode_to_mask(mode: &MaskMode) -> Mask<'_> {
     MaskMode::Causal => Mask::Causal,
     MaskMode::Array(a) => Mask::Array(a),
   }
+}
+
+/// The per-head dimension of a `(B, L, heads * head_dim)` projection — the
+/// explicit replacement for the reference's `reshape(B, L, heads, -1)`
+/// trailing-axis inference (mlxrs's `reshape` validates dims before FFI and so
+/// cannot take the `-1` sentinel).
+///
+/// `proj` is the `(B, L, width)` output of a q/k/v projection; `heads` is the
+/// matching (query or key/value) head count. Returns `width / heads`, requiring
+/// the division to be exact — a projection width that is not a whole multiple
+/// of `heads` is a malformed checkpoint (its per-head reshape would otherwise
+/// truncate) and is a recoverable typed error here rather than a silently-wrong
+/// shape.
+///
+/// # Errors
+/// [`Error::DivisibilityConstraint`] if `width` is not divisible by `heads`.
+fn head_dim_for(proj: &Array, heads: i32) -> Result<i32> {
+  let shape = proj.shape();
+  let width = shape[shape.len() - 1] as i32;
+  require_divisible("attention projection width", width, "head count", heads)?;
+  Ok(width / heads)
+}
+
+/// The merged `heads * head_dim` width of the `(B, L, heads, head_dim)`
+/// post-attention tensor (after the `(B, heads, L, head_dim) →
+/// (B, L, heads, head_dim)` transpose) — the explicit replacement for the
+/// reference's `reshape(B, L, -1)` inference. Computed as the product of the
+/// last two axes, with a [`checked_mul`] so a corrupt huge shape cannot wrap
+/// the `i32` width.
+///
+/// # Errors
+/// [`Error::ArithmeticOverflow`] if `heads * head_dim` overflows `i32`.
+fn merged_head_width(attended: &Array) -> Result<i32> {
+  let shape = attended.shape();
+  let heads = shape[shape.len() - 2] as i32;
+  let head_dim = shape[shape.len() - 1] as i32;
+  checked_mul(
+    "attention merged head width",
+    "heads",
+    heads,
+    "head_dim",
+    head_dim,
+  )
 }
 
 // ───────────────────────── short conv ─────────────────────────
@@ -988,8 +1046,10 @@ fn layer_cache_err(detail: &'static str) -> Error {
 /// the per-layer mixers with two precomputed masks, and the final RMSNorm.
 #[derive(Debug)]
 struct Lfm2Model {
-  /// `(vocab, hidden)` token-embedding table; also the tied output head.
-  embed_tokens: Array,
+  /// The token-embedding table; also the tied output head
+  /// ([`Embedding::as_linear`]). Quantize-aware: dense for a dense checkpoint,
+  /// quantized (`mlx.nn.QuantizedEmbedding`) for a quantized one.
+  embed_tokens: Embedding,
   layers: Vec<Lfm2DecoderLayer>,
   embedding_norm: RMSNorm,
   /// The attention-layer index set (for the per-layer mixer dispatch and the
@@ -1034,8 +1094,21 @@ impl Lfm2Model {
         cache.len(),
       )));
     }
+    // Rank guard at the indexing site: `h.shape()[1]` (the seq axis) below
+    // would panic on a rank-0/1 `h`. `forward_tokens` always feeds a rank-3
+    // embed output and `Lfm2::forward_embeddings` validates the rank before
+    // delegating here, but guard the index directly so this private decoder
+    // entry can never index out of bounds.
+    let shape = h.shape();
+    if shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Lfm2Model::forward_hidden: hidden states must be rank-3 (batch, seq, hidden)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
     let n_layers = self.layers.len() as i32;
-    let n = h.shape()[1];
+    let n = shape[1];
     let (fa_idx, conv_idx) = self.mask_source_indices(n_layers);
 
     // Build the two masks once (mlx-lm `create_attention_mask` /
@@ -1065,7 +1138,7 @@ impl Lfm2Model {
   /// Embed `tokens` (`(B, L)` integer ids) via the embedding table, then run
   /// the decoder.
   fn forward_tokens(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
-    let h = take_axis(&self.embed_tokens, tokens, 0)?;
+    let h = self.embed_tokens.forward(tokens)?;
     self.forward_hidden(&h, cache)
   }
 }
@@ -1084,11 +1157,12 @@ impl Lfm2 {
     &self.config
   }
 
-  /// `embed_tokens.as_linear(out)` — the tied output head (`lfm2.py:296`):
-  /// `out @ embed_tokens.T`, projecting hidden states back to vocab logits.
+  /// `embed_tokens.as_linear(out)` — the tied output head (`lfm2.py:296`),
+  /// projecting hidden states back to vocab logits through the SAME
+  /// (dense-or-quantized) embedding table the forward gather uses, so the tie
+  /// holds bit-identically under quantization.
   fn as_linear(&self, hidden: &Array) -> Result<Array> {
-    let wt = swapaxes(&self.model.embed_tokens, -1, -2)?;
-    ops::linalg_basic::matmul(hidden, &wt)
+    self.model.embed_tokens.as_linear(hidden)
   }
 
   /// `mlx-lm`'s `Model.sanitize` (`lfm2.py:298-306`): transpose any
@@ -1119,6 +1193,20 @@ impl Lfm2 {
     Ok(())
   }
 
+  /// Gather the token embeddings `embed_tokens(input_ids)` — the LFM2-VL
+  /// `language_model.model.embed_tokens(input_ids)` entry point
+  /// (`mlx-vlm/mlx_vlm/models/lfm2_vl/lfm2_vl.py:124`). `ids` is an integer
+  /// `(B, T)` (or `(T,)`) array; the result is `ids.shape ++ (hidden,)`.
+  ///
+  /// Mirrors `mlx.nn.Embedding.__call__` (dense) /
+  /// `mlx.nn.QuantizedEmbedding.__call__` (quantized) over the SAME table the
+  /// tied logit head ([`Self::forward`]) uses. The VLM wrapper splices image
+  /// features into these embeddings before re-entering the decoder through
+  /// [`crate::lm::model::Model::forward_embeddings`].
+  pub fn embed_tokens(&self, ids: &Array) -> Result<Array> {
+    self.model.embed_tokens.forward(ids)
+  }
+
   /// Build the heterogeneous per-layer cache (`make_cache`, `lfm2.py:312-316`):
   /// a [`StandardKvCache`] (`"KVCache"`) for every attention layer and a
   /// one-slot [`ArraysCache`] for every conv layer, in layer order.
@@ -1147,6 +1235,34 @@ impl LmModel for Lfm2 {
     embeddings: &Array,
     cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
+    // Guard the rank + hidden width BEFORE `forward_hidden` indexes
+    // `embeddings.shape()[1]` (the seq axis) — a rank-0/1 array would
+    // otherwise panic on that index. The VLM splice / a caller supplying
+    // pre-merged embeddings must hand a rank-3 `(batch, seq, hidden)` tensor
+    // whose hidden width matches the LM; surface a typed error, never a panic.
+    let shape = embeddings.shape();
+    if shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Lfm2::forward_embeddings: embeddings must be rank-3 (batch, seq, hidden)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
+    let want = self.config.hidden_size;
+    let got = i32::try_from(shape[2]).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Lfm2::forward_embeddings: embeddings hidden dim",
+        "must fit in i32",
+        format_smolstr!("{}", shape[2]),
+      ))
+    })?;
+    if got != want {
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "Lfm2::forward_embeddings: embeddings hidden width vs config.hidden_size",
+        want as usize,
+        shape[2],
+      )));
+    }
     let hidden = self.model.forward_hidden(embeddings, cache)?;
     self.as_linear(&hidden)
   }
@@ -1183,16 +1299,81 @@ impl Lfm2 {
   /// attention (`self_attn.*`) or conv (`conv.*`) sub-tree. The map is
   /// drained (weights are moved out); a missing required weight is an
   /// [`Error::MissingKey`].
+  ///
+  /// This is the **dense** entry point — exactly
+  /// [`from_weights_quantized`](Lfm2::from_weights_quantized) with
+  /// `quantization = None`. A dense checkpoint loads byte-for-byte identically
+  /// either way (the `<prefix>.scales` sibling is the load-bearing signal; a
+  /// dense checkpoint has none, so the dense path runs regardless of the
+  /// config).
   pub fn from_weights(
     config: TextConfig,
+    weights: std::collections::HashMap<String, Array>,
+  ) -> Result<Lfm2> {
+    Self::from_weights_quantized(config, weights, None)
+  }
+
+  /// Construct an LFM2 model from a parsed [`TextConfig`], a flat weight map,
+  /// and an optional parsed quantization config — the quantization-aware
+  /// analogue of [`from_weights`](Lfm2::from_weights) (which is just this with
+  /// `quantization = None`).
+  ///
+  /// Every `nn.Linear` (attention `q/k/v/out_proj`, MLP `w1/w2/w3`, the
+  /// short-conv `in_proj` / `out_proj`) and the token `nn.Embedding` (the tied
+  /// logit head) is routed through a quantize-aware path that picks the
+  /// quantized variant PER LAYER when the (sanitized) checkpoint carries that
+  /// layer's `<prefix>.scales` sibling AND `quantization` resolves scheme
+  /// parameters for it — the weight-map analogue of mlx-lm's
+  /// `f"{p}.scales" in weights` predicate (`utils.py:349-352`), with the
+  /// `(group_size, bits, mode)` resolved per layer from
+  /// [`PerLayerQuantization::quantization_for`]. The per-layer key is the LFM2
+  /// module path (`model.embed_tokens`, `model.layers.{i}.self_attn.q_proj`,
+  /// …), the same namespace mlx-lm resolves per-layer overrides against.
+  ///
+  /// The depthwise `nn.Conv1d` in each short-conv layer stays **dense**: MLX
+  /// quantizes `nn.Linear` / `nn.Embedding` only, never `nn.Conv1d`
+  /// (`mlx_lm/utils.py` `class_predicate`), so the `conv.conv.weight` (and its
+  /// optional bias) load through the existing dense path — and the
+  /// [`sanitize`](Lfm2::sanitize) `(C, 1, K) → (C, K, 1)` transpose is
+  /// preserved unchanged for it.
+  ///
+  /// A dense projection (no `.scales` sibling) builds exactly as before, so a
+  /// non-quantized checkpoint loads identically whether or not a `quantization`
+  /// config is threaded.
+  ///
+  /// # Errors
+  /// The [`from_weights`](Lfm2::from_weights) errors, plus:
+  /// - [`Error::InvariantViolation`] if a `<prefix>.scales` sibling is present
+  ///   but `quantization` resolved no scheme parameters for that layer (the
+  ///   weights say quantized, the config says dense);
+  /// - propagates [`crate::nn::QuantizedLinear::from_parts`] /
+  ///   [`Embedding::quantized`](crate::lm::models::lfm2) structural validation
+  ///   of the quantized triple.
+  pub fn from_weights_quantized(
+    config: TextConfig,
     mut weights: std::collections::HashMap<String, Array>,
+    quantization: Option<&PerLayerQuantization>,
   ) -> Result<Lfm2> {
     config.validate()?;
     let attn_idxs = config.attention_layer_indices()?;
     let eps = config.norm_eps;
     let head_dim = config.head_dim();
 
-    let embed_tokens = take_weight(&mut weights, "model.embed_tokens.weight")?;
+    // Resolve the per-layer scheme `(group_size, bits, mode)` for a module path
+    // from the parsed config — `None` when the layer is not quantized (an
+    // explicit per-layer `Skip`, or no global default), exactly mlx-swift's
+    // `PerLayerQuantization.quantization(layer:)`.
+    let quant_for = |path: &str| -> Option<(i32, i32, &str)> {
+      quantization
+        .and_then(|q| q.quantization_for(path))
+        .map(|q| (q.group_size, q.bits, q.mode.as_str()))
+    };
+
+    let embed_tokens = Embedding::from_weights(
+      &mut weights,
+      "model.embed_tokens",
+      quant_for("model.embed_tokens"),
+    )?;
     let embedding_norm = RMSNorm::new(
       take_weight(&mut weights, "model.embedding_norm.weight")?,
       eps,
@@ -1221,19 +1402,25 @@ impl Lfm2 {
 
       // The feed-forward width is validated eagerly in `validate` (and again by
       // the loaded weight shapes), so no per-layer recomputation is needed here.
+      // Each `w*` is bias-free (`nn.Linear(..., bias=False)`); the quantize-aware
+      // `Linear::from_weights` picks dense vs quantized by the `.scales` sibling
+      // and consumes no `.bias` when none is present.
       let feed_forward = Mlp {
-        w1: Linear::new(
-          take_weight(&mut weights, &format!("{p}.feed_forward.w1.weight"))?,
-          None,
-        ),
-        w3: Linear::new(
-          take_weight(&mut weights, &format!("{p}.feed_forward.w3.weight"))?,
-          None,
-        ),
-        w2: Linear::new(
-          take_weight(&mut weights, &format!("{p}.feed_forward.w2.weight"))?,
-          None,
-        ),
+        w1: Linear::from_weights(
+          &mut weights,
+          &format!("{p}.feed_forward.w1"),
+          quant_for(&format!("{p}.feed_forward.w1")),
+        )?,
+        w3: Linear::from_weights(
+          &mut weights,
+          &format!("{p}.feed_forward.w3"),
+          quant_for(&format!("{p}.feed_forward.w3")),
+        )?,
+        w2: Linear::from_weights(
+          &mut weights,
+          &format!("{p}.feed_forward.w2"),
+          quant_for(&format!("{p}.feed_forward.w2")),
+        )?,
       };
 
       let mixer = if is_attention_layer(&attn_idxs, i) {
@@ -1250,46 +1437,70 @@ impl Lfm2 {
             take_weight(&mut weights, &format!("{q}.k_layernorm.weight"))?,
             eps,
           ),
-          q_proj: Linear::new(
-            take_weight(&mut weights, &format!("{q}.q_proj.weight"))?,
-            None,
-          ),
-          k_proj: Linear::new(
-            take_weight(&mut weights, &format!("{q}.k_proj.weight"))?,
-            None,
-          ),
-          v_proj: Linear::new(
-            take_weight(&mut weights, &format!("{q}.v_proj.weight"))?,
-            None,
-          ),
-          out_proj: Linear::new(
-            take_weight(&mut weights, &format!("{q}.out_proj.weight"))?,
-            None,
-          ),
+          // The four attention projections are bias-free (`bias=False`,
+          // `lfm2.py:68-71`); quantized iff the layer carries a `.scales`
+          // sibling.
+          q_proj: Linear::from_weights(
+            &mut weights,
+            &format!("{q}.q_proj"),
+            quant_for(&format!("{q}.q_proj")),
+          )?,
+          k_proj: Linear::from_weights(
+            &mut weights,
+            &format!("{q}.k_proj"),
+            quant_for(&format!("{q}.k_proj")),
+          )?,
+          v_proj: Linear::from_weights(
+            &mut weights,
+            &format!("{q}.v_proj"),
+            quant_for(&format!("{q}.v_proj")),
+          )?,
+          out_proj: Linear::from_weights(
+            &mut weights,
+            &format!("{q}.out_proj"),
+            quant_for(&format!("{q}.out_proj")),
+          )?,
           rope: Rope::new(head_dim, false, config.rope_theta, 1.0),
         })
       } else {
         let c = format!("{p}.conv");
+        // The depthwise `nn.Conv1d` weight stays DENSE — MLX quantizes
+        // `nn.Linear` / `nn.Embedding` only, never `nn.Conv1d` — so it loads
+        // through the plain `take_weight` path (the `sanitize` transpose having
+        // already put it in MLX `(C, K, 1)` layout). Only `in_proj` / `out_proj`
+        // (the two `nn.Linear`s) are routed through the quantize-aware path.
         let conv_weight = take_weight(&mut weights, &format!("{c}.conv.weight"))?;
-        let in_weight = take_weight(&mut weights, &format!("{c}.in_proj.weight"))?;
-        let out_weight = take_weight(&mut weights, &format!("{c}.out_proj.weight"))?;
         // `conv_bias` is authoritative (`lfm2.py` builds the conv + its two
         // projections with `bias=config.conv_bias`): when set, all three bias
         // tensors are required; when unset, none may be present (a stray bias
         // key would otherwise be silently applied). `take_if` enforces that
-        // gate per tensor — [`Error::MissingKey`] when required-but-absent,
-        // [`Error::KeyCollision`] when forbidden-but-present.
+        // gate for the dense conv weight's bias — [`Error::MissingKey`] when
+        // required-but-absent, [`Error::KeyCollision`] when forbidden-but-present.
         let conv_bias = take_if(
           &mut weights,
           "conv_bias",
           config.conv_bias,
           &format!("{c}.conv.bias"),
         )?;
+        // The `in_proj` / `out_proj` projections honor `conv_bias` too: when
+        // set, each REQUIRES its dense `.bias`; when unset, a stray projection
+        // bias is a collision. `take_if` enforces that gate and TAKES the bias,
+        // which is then passed explicitly to the quantize-aware
+        // `from_weights_with_bias` (applied on both the dense and quantized
+        // paths), so the dense-bias arity matches the reference whether the
+        // projection is dense or quantized — mirroring the Whisper `linear()`
+        // builder.
         let in_bias = take_if(
           &mut weights,
           "conv_bias",
           config.conv_bias,
           &format!("{c}.in_proj.bias"),
+        )?;
+        let in_proj = Linear::from_weights_with_bias(
+          &mut weights,
+          &format!("{c}.in_proj"),
+          quant_for(&format!("{c}.in_proj")),
+          in_bias,
         )?;
         let out_bias = take_if(
           &mut weights,
@@ -1297,13 +1508,19 @@ impl Lfm2 {
           config.conv_bias,
           &format!("{c}.out_proj.bias"),
         )?;
+        let out_proj = Linear::from_weights_with_bias(
+          &mut weights,
+          &format!("{c}.out_proj"),
+          quant_for(&format!("{c}.out_proj")),
+          out_bias,
+        )?;
         Mixer::Conv(ShortConv {
           hidden_size: config.hidden_size,
           l_cache: config.conv_l_cache,
           conv_weight,
           conv_bias,
-          in_proj: Linear::new(in_weight, in_bias),
-          out_proj: Linear::new(out_weight, out_bias),
+          in_proj,
+          out_proj,
         })
       };
 
