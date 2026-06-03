@@ -134,6 +134,13 @@ fn spatial_shapes(pairs: &[(i32, i32)]) -> Array {
   Array::from_slice::<i32>(&data, &(pairs.len(), 2usize)).unwrap()
 }
 
+/// A `(1, num_patches)` i32 patch attention mask: `1` for the first `active`
+/// rows, `0` for the rest (one image).
+fn patch_mask(active: i32, num_patches: i32) -> Array {
+  let data: Vec<i32> = (0..num_patches).map(|i| (i < active) as i32).collect();
+  Array::from_slice::<i32>(&data, &(1usize, num_patches as usize)).unwrap()
+}
+
 /// No-op quantization resolver (every layer dense).
 fn no_quant(_path: &str) -> Option<(i32, i32, &'static str)> {
   None
@@ -170,7 +177,7 @@ fn vision_forward_full_grid_output_shape_and_finite() {
   let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
   let pv = pixel_values(1);
   let ss = spatial_shapes(&[(2, 2)]);
-  let out = tower.forward(&pv, &ss).unwrap();
+  let out = tower.forward(&pv, &ss, None).unwrap();
   assert_eq!(out.shape(), vec![1, NUM_PATCHES as usize, HIDDEN as usize]);
   assert!(
     eval_to_vec(&out).iter().all(|x| x.is_finite()),
@@ -188,9 +195,111 @@ fn vision_forward_below_budget_grid_resizes_and_pads() {
   let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
   let pv = pixel_values(1);
   let ss = spatial_shapes(&[(1, 3)]);
-  let out = tower.forward(&pv, &ss).unwrap();
+  let out = tower.forward(&pv, &ss, None).unwrap();
   assert_eq!(out.shape(), vec![1, NUM_PATCHES as usize, HIDDEN as usize]);
   assert!(eval_to_vec(&out).iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn vision_padded_mask_matches_unpadded_active_rows() {
+  // The load-bearing native-resolution invariant: with the patch attention
+  // mask, an image whose active grid is smaller than the patch budget
+  // must produce the SAME active-patch encoder outputs as the equivalent
+  // UNPADDED run — the padding (zero rows + first-resized-position) must have NO
+  // effect on the active rows.
+  //
+  // Active grid (2, 1) = 2 active patches out of the 4-patch budget. The padded
+  // run carries 4 rows (2 active + 2 padded) and a mask 1,1,0,0; the unpadded
+  // run carries exactly the 2 active rows (its own 2-patch grid, no padding, no
+  // mask needed). Both use the same spatial_shape (2, 1) so the per-image
+  // position resize for the active rows is identical.
+  let cfg = tiny_vision_config();
+  let mut w = tiny_vision_weights(LAYERS);
+  let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
+
+  let active = 2i32;
+  let (h_p, w_p) = (2i32, 1i32); // 2 * 1 = 2 active patches
+  let pf = PATCH_FEAT as usize;
+  let h = HIDDEN as usize;
+  let ss = spatial_shapes(&[(h_p, w_p)]);
+  let mask = patch_mask(active, NUM_PATCHES);
+
+  // Deterministic active-patch rows shared by every run.
+  let active_data: Vec<f32> = (0..active as usize * pf)
+    .map(|i| ((i % 11) as f32) * 0.01 - 0.05)
+    .collect();
+
+  // Helper: a full-budget pixel_values whose active rows are `active_data` and
+  // whose padded rows are filled with the constant `pad`.
+  let padded_pv = |pad: f32| -> Array {
+    let mut data = active_data.clone();
+    data.extend(std::iter::repeat_n(
+      pad,
+      (NUM_PATCHES - active) as usize * pf,
+    ));
+    Array::from_slice::<f32>(&data, &(1usize, NUM_PATCHES as usize, pf)).unwrap()
+  };
+
+  // Run A: padded + mask, padding = 7.0.
+  let out_a = eval_to_vec(&tower.forward(&padded_pv(7.0), &ss, Some(&mask)).unwrap());
+  // Run B: padded + mask, padding = -3.0 (DIFFERENT padding values).
+  let out_b = eval_to_vec(&tower.forward(&padded_pv(-3.0), &ss, Some(&mask)).unwrap());
+
+  // (1) Non-vacuous: with the mask, the active-row outputs are INDEPENDENT of
+  // the padding row values (run A == run B on the active rows) — a weight-
+  // magnitude-independent proof the mask isolates the active patches from the
+  // padding. Without the mask the padded keys would feed into the active
+  // queries' attention and these would differ.
+  for row in 0..active as usize {
+    for c in 0..h {
+      let a = out_a[row * h + c];
+      let b = out_b[row * h + c];
+      assert!(
+        (a - b).abs() < 1e-5,
+        "active row {row} chan {c}: masked active output must NOT depend on padding \
+         (pad=7 {a} vs pad=-3 {b})"
+      );
+    }
+  }
+
+  // (2) Equivalence: the masked padded active rows equal the UNPADDED run (its
+  // own active-only 2-patch grid; no padding ⇒ no mask) — the padding has no
+  // effect on the active rows.
+  let pv_unpadded = Array::from_slice::<f32>(&active_data, &(1usize, active as usize, pf)).unwrap();
+  let out_unpadded = tower.forward(&pv_unpadded, &ss, None).unwrap();
+  assert_eq!(
+    out_unpadded.shape(),
+    vec![1, active as usize, HIDDEN as usize]
+  );
+  let unpadded_v = eval_to_vec(&out_unpadded);
+  for row in 0..active as usize {
+    for c in 0..h {
+      let pv = out_a[row * h + c];
+      let uv = unpadded_v[row * h + c];
+      assert!(
+        (pv - uv).abs() < 1e-4,
+        "active row {row} chan {c}: padded+mask {pv} vs unpadded {uv} (mask must zero padding's effect)"
+      );
+    }
+  }
+}
+
+#[test]
+fn vision_mask_shape_mismatch_is_typed_error() {
+  // A pixel_attention_mask whose shape disagrees with (N, num_patches) is a
+  // typed RankMismatch, never a panic or a silent SDPA broadcast.
+  let cfg = tiny_vision_config();
+  let mut w = tiny_vision_weights(LAYERS);
+  let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
+  let pv = pixel_values(1); // (1, NUM_PATCHES, PATCH_FEAT)
+  let ss = spatial_shapes(&[(2, 2)]);
+  // Wrong trailing dim: (1, NUM_PATCHES + 1).
+  let bad = patch_mask(2, NUM_PATCHES + 1);
+  let err = tower.forward(&pv, &ss, Some(&bad)).unwrap_err();
+  assert!(
+    matches!(err, crate::error::Error::RankMismatch(_)),
+    "got {err}"
+  );
 }
 
 #[test]
@@ -202,7 +311,7 @@ fn vision_forward_multi_image_batch() {
   let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
   let pv = pixel_values(2);
   let ss = spatial_shapes(&[(2, 2), (1, 3)]);
-  let out = tower.forward(&pv, &ss).unwrap();
+  let out = tower.forward(&pv, &ss, None).unwrap();
   assert_eq!(out.shape(), vec![2, NUM_PATCHES as usize, HIDDEN as usize]);
   assert!(eval_to_vec(&out).iter().all(|x| x.is_finite()));
 }
@@ -217,7 +326,7 @@ fn vision_encoder_truncates_to_feature_layer() {
   let tower = VisionModel::from_weights(&cfg, 1, &mut w, &no_quant).unwrap();
   let pv = pixel_values(1);
   let ss = spatial_shapes(&[(2, 2)]);
-  let out = tower.forward(&pv, &ss).unwrap();
+  let out = tower.forward(&pv, &ss, None).unwrap();
   assert_eq!(out.shape(), vec![1, NUM_PATCHES as usize, HIDDEN as usize]);
 }
 
@@ -390,7 +499,7 @@ fn vision_quantized_layer_loads_and_forwards() {
     .collect();
   let pv = Array::from_slice::<f32>(&data, &(1usize, 4usize, 32usize)).unwrap();
   let ss = spatial_shapes(&[(2, 2)]);
-  let out = tower.forward(&pv, &ss).unwrap();
+  let out = tower.forward(&pv, &ss, None).unwrap();
   assert_eq!(out.shape(), vec![1, 4, 32]);
   assert!(
     eval_to_vec(&out).iter().all(|x| x.is_finite()),

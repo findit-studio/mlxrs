@@ -1482,6 +1482,97 @@ pub fn resize_lanczos(
   resize(img, (target_h, target_w), ResizeFilter::Lanczos3)
 }
 
+/// Fallibly extract a [`::image::DynamicImage`]'s interleaved 8-bit RGB bytes
+/// (`width * height * 3`, alpha dropped, RGB-ordered) plus its `(width,
+/// height)` — the recoverable-OOM analogue of `img.to_rgb8().as_raw()`.
+///
+/// `image` 0.25's `DynamicImage::to_rgb8()` allocates a fresh `RgbImage` (and
+/// clones even when the source is already `ImageRgb8`) backed by an
+/// **infallible** `Vec`, so under allocator pressure / a near-cap decoded image
+/// it `abort()`s the process — making a `-> Result` seam dishonest. This
+/// reserves the RGB buffer via `try_reserve_exact` (the crate's fallible
+/// `try_with_capacity` helper) and fills it manually: a borrowed
+/// [`as_rgb8`](::image::DynamicImage::as_rgb8) fast path when the source is
+/// already RGB8 (no per-pixel projection), else a per-pixel `get_pixel`
+/// projection (the same `dynamic_map!` color-space conversion `to_rgb8()`
+/// performs) — never a second source-sized image allocation. Allocator failure
+/// surfaces as [`Error::OutOfMemory`].
+///
+/// Mirrors the [`resize`] source-RGBA materialization (and `image_to_array` /
+/// `pad_to_square`): the same borrow-or-per-pixel + `try_reserve_exact`
+/// discipline, with alpha dropped.
+///
+/// # Errors
+/// - [`Error::ArithmeticOverflow`] if `width * height * 3` overflows `usize`;
+/// - [`Error::CapExceeded`] if the RGB byte count exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`] (the same 512 MiB ceiling [`load_image`] /
+///   [`resize`] enforce — a low-bytes-per-pixel source accepted just under the
+///   decoder cap can expand past it when projected to RGB8);
+/// - [`Error::OutOfMemory`] if the `try_reserve_exact` for the RGB buffer
+///   fails;
+/// - [`Error::LengthMismatch`] if an already-RGB8 source's backing buffer is
+///   shorter than `width * height * 3` (a corrupt container).
+pub fn decode_rgb(img: &::image::DynamicImage) -> Result<(Vec<u8>, u32, u32)> {
+  let width = img.width();
+  let height = img.height();
+  // `width * height * 3` (RGB8 bytes) in usize. Bounded in practice by
+  // `load_image`'s 512 MiB decoder cap, but a `checked_mul` keeps the
+  // reservation honest on a 32-bit `usize` and routes a pathological product to
+  // a recoverable `ArithmeticOverflow` instead of a silent under-allocation.
+  let rgb_bytes = (width as usize)
+    .checked_mul(height as usize)
+    .and_then(|wh| wh.checked_mul(3))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "decode_rgb: RGB bytes (width * height * 3)",
+        "usize",
+        [("width", width as u64), ("height", height as u64)],
+      ))
+    })?;
+  // RGB8 staging cap: a low-bytes-per-pixel source (e.g. `Luma8`, 1 B/px)
+  // accepted just under `load_image`'s 512 MiB ceiling expands 3x when
+  // projected to RGB8, so apply the same `MAX_DECODED_IMAGE_BYTES` gate here
+  // before the reservation. `u64` so the comparison is host-width-independent.
+  if rgb_bytes as u64 > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "decode_rgb: RGB8 staging (Luma8/Rgba8/etc. projected to RGB8)",
+      "MAX_DECODED_IMAGE_BYTES",
+      MAX_DECODED_IMAGE_BYTES,
+      rgb_bytes as u64,
+    )));
+  }
+  let mut buf = crate::error::try_with_capacity::<u8>(rgb_bytes)?;
+  if let Some(rgb) = img.as_rgb8() {
+    // Already RGB8: borrow the backing `&[u8]` and copy exactly `rgb_bytes`
+    // (slice to guard an over-long backing buffer, matching the resize /
+    // `image_to_array` `.get(..)` discipline so the fill cannot grow `buf` past
+    // the `try_reserve_exact` reservation).
+    let raw = rgb.as_raw().get(..rgb_bytes).ok_or_else(|| {
+      Error::LengthMismatch(LengthMismatchPayload::new(
+        "decode_rgb: rgb backing buffer bytes vs width*height*3",
+        rgb_bytes,
+        rgb.as_raw().len(),
+      ))
+    })?;
+    buf.extend_from_slice(raw);
+  } else {
+    // Non-RGB8 source (Luma8 / Rgba8 / Rgb16 / Rgb32F / …): per-pixel
+    // `DynamicImage::get_pixel(x, y).to_rgb()` projection (alpha dropped). NO
+    // intermediate source-sized image allocation.
+    for y in 0..height {
+      for x in 0..width {
+        buf.extend_from_slice(&dynamic_image_rgb_pixel(img, x, y));
+      }
+    }
+  }
+  debug_assert_eq!(
+    buf.len(),
+    rgb_bytes,
+    "decode_rgb fill length must equal width * height * 3",
+  );
+  Ok((buf, width, height))
+}
+
 /// Center crop `img` to `(target_h, target_w)`.
 ///
 /// Mirrors swift

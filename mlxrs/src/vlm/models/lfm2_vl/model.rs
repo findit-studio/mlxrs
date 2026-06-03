@@ -277,11 +277,17 @@ impl Lfm2Vl {
   pub fn encode_image_inputs(&self, inputs: &Lfm2VlImageInputs) -> Result<Array> {
     let (h_p, w_p) = inputs.grid();
     // Add the leading per-image batch axis the vision tower expects:
-    // pixel_values (1, num_patches, patch_feat), spatial_shapes (1, 2).
+    // pixel_values (1, num_patches, patch_feat), spatial_shapes (1, 2),
+    // pixel_attention_mask (1, num_patches).
     let pv = expand_dims_axes(&inputs.pixel_values, &[0])?;
     let ss = expand_dims_axes(&inputs.spatial_shapes, &[0])?;
-    // `vision_tower(pixel_values, spatial_shapes)` → (1, num_patches, hidden).
-    let hidden_states = self.vision_tower.forward(&pv, &ss)?;
+    let pam = expand_dims_axes(&inputs.pixel_attention_mask, &[0])?;
+    // `vision_tower(pixel_values, spatial_shapes, pixel_attention_mask)` →
+    // (1, num_patches, hidden). The native patch attention mask excludes the
+    // padded patch rows from every encoder layer's attention, so the active
+    // rows sliced below are uncontaminated by the padding (the HF LFM2-VL
+    // reference threads `pixel_attention_mask` into the vision tower).
+    let hidden_states = self.vision_tower.forward(&pv, &ss, Some(&pam))?;
     // Slice the active `H_p * W_p` patch rows (the reference's
     // `feature[: img_feature_lengths[i], :]`). The grid is the authoritative
     // active count (`pixel_attention_mask.sum() == H_p * W_p`).
@@ -604,11 +610,15 @@ impl ImageProcessor for Lfm2VlImageProcessor {
   /// [`crate::Error`]s.
   fn process(&self, image: &::image::DynamicImage) -> Result<ProcessedImage> {
     // The SigLIP2 slow processor operates on the decoded RGB image
-    // (`np.array(image.convert("RGB"))`). `to_rgb8()` yields an interleaved
-    // `width * height * 3` RGB buffer (alpha dropped, RGB-ordered).
-    let rgb = image.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    let inputs = preprocess_image(rgb.as_raw(), width, height, &self.cfg)?;
+    // (`np.array(image.convert("RGB"))`) — an interleaved `width * height * 3`
+    // RGB buffer (alpha dropped, RGB-ordered). Use the FALLIBLE
+    // [`crate::vlm::image::decode_rgb`] (a borrowed `as_rgb8` fast path, else a
+    // per-pixel projection, both `try_reserve_exact`-backed) rather than
+    // `to_rgb8()`, whose infallible global allocation can `abort()` under
+    // memory pressure / a near-cap decoded image — surfacing allocator failure
+    // as a typed [`Error::OutOfMemory`] through this seam's `Result`.
+    let (rgb, width, height) = crate::vlm::image::decode_rgb(image)?;
+    let inputs = preprocess_image(&rgb, width, height, &self.cfg)?;
     let (h_p, w_p) = inputs.grid();
     let num_tokens = num_image_tokens_from_patch_grid(h_p, w_p, self.downsample_factor)? as usize;
     let Lfm2VlImageInputs {

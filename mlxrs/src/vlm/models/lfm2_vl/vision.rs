@@ -161,8 +161,9 @@ impl Attention {
     })
   }
 
-  /// `(B, L, C) -> (B, L, C)` bidirectional attention (`mask = None`).
-  fn forward(&self, x: &Array) -> Result<Array> {
+  /// `(B, L, C) -> (B, L, C)` bidirectional attention with the given key
+  /// `mask` (the native patch key-padding mask, or [`Mask::None`]).
+  fn forward(&self, x: &Array, mask: Mask<'_>) -> Result<Array> {
     let shape = x.shape();
     let bsz = dim_i32(&shape, 0, "lfm2_vl vision Attention: batch")?;
     let seq = dim_i32(&shape, 1, "lfm2_vl vision Attention: seq")?;
@@ -175,7 +176,7 @@ impl Attention {
     let k = self.split_heads(&k, bsz, seq)?;
     let v = self.split_heads(&v, bsz, seq)?;
 
-    let attn = scaled_dot_product_attention(&q, &k, &v, self.scale, Mask::None)?;
+    let attn = scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
     // (B, n_heads, L, head_dim) -> (B, L, n_heads*head_dim).
     let attn = ops::shape::transpose_axes(&attn, &[0, 2, 1, 3])?;
     let embed_dim = checked_mul(
@@ -260,9 +261,11 @@ impl EncoderLayer {
     })
   }
 
-  /// `h = x + attn(ln1(x)); out = h + mlp(ln2(h))`.
-  fn forward(&self, x: &Array) -> Result<Array> {
-    let r = self.self_attn.forward(&self.layer_norm1.forward(x)?)?;
+  /// `h = x + attn(ln1(x), mask); out = h + mlp(ln2(h))`.
+  fn forward(&self, x: &Array, mask: Mask<'_>) -> Result<Array> {
+    let r = self
+      .self_attn
+      .forward(&self.layer_norm1.forward(x)?, mask)?;
     let h = x.add(&r)?;
     let r = self.mlp.forward(&self.layer_norm2.forward(&h)?)?;
     h.add(&r)
@@ -400,18 +403,42 @@ impl VisionModel {
   ///   processor's flattened patches; `N` is the per-call image/batch dim).
   /// - `spatial_shapes` — `(N, 2)` i32 `[H_patch, W_patch]` per image (the
   ///   active patch grid each image's position embedding is resized to).
+  /// - `pixel_attention_mask` — optional `(N, num_patches)` i32 (`1` for an
+  ///   active patch, `0` for a padded one). When `Some`, an additive key mask
+  ///   excludes the padded patches from every encoder layer's attention (so
+  ///   active patches cannot attend to the padded zero rows); when `None`, the
+  ///   tower runs full bidirectional attention over all `num_patches` rows.
+  ///
+  /// ## Why the mask is load-bearing
+  ///
+  /// The processor pads every image to `num_patches`, so an image whose active
+  /// grid `H_p * W_p` is smaller than the patch budget carries padded zero
+  /// rows (with the first-resized-position positional embedding). Without the
+  /// mask those padded keys attend and are attended to, contaminating every
+  /// active patch's representation before the active-row slice — the HF
+  /// LFM2-VL reference threads `pixel_attention_mask` into the vision tower
+  /// (`modeling_lfm2_vl.py`) for exactly this reason. The mask construction
+  /// mirrors the SigLIP2 NaFlex vision tower's
+  /// [`crate::embeddings::siglip2_naflex`] additive padded-key mask (real →
+  /// `0.0`, padded → `-inf`, broadcast over heads + query positions by SDPA).
   ///
   /// Returns the post-LayerNorm hidden states `(N, num_patches, hidden)`
   /// (`vision.py`'s `last_hidden_state`).
   ///
   /// # Errors
   /// - [`Error::RankMismatch`] if `pixel_values` is not rank-3, or
-  ///   `spatial_shapes` is not exactly `(N, 2)` (so a per-image-count or
+  ///   `spatial_shapes` is not exactly `(N, 2)`, or `pixel_attention_mask`
+  ///   (when `Some`) is not exactly `(N, num_patches)` (so a per-image-count or
   ///   trailing-axis mismatch is rejected here, not by a downstream broadcast);
   /// - [`Error::OutOfRange`] if an image's active grid `H_p * W_p` exceeds the
   ///   patch budget;
   /// - propagates the embed / interp / attention op errors.
-  pub fn forward(&self, pixel_values: &Array, spatial_shapes: &Array) -> Result<Array> {
+  pub fn forward(
+    &self,
+    pixel_values: &Array,
+    spatial_shapes: &Array,
+    pixel_attention_mask: Option<&Array>,
+  ) -> Result<Array> {
     let pv_shape = pixel_values.shape();
     if pv_shape.len() != 3 {
       return Err(Error::RankMismatch(RankMismatchPayload::new(
@@ -439,8 +466,21 @@ impl VisionModel {
     let pos = self.resize_positional_embeddings(spatial_shapes, n, num_patches)?;
     let mut h = patch_embeds.add(&pos)?;
 
+    // Build the additive key-padding mask from `pixel_attention_mask` (shape
+    // validated against the verified `(n, num_patches)` here, so a mismatched
+    // mask is a typed error, not a silent SDPA broadcast). Held in an
+    // `Option<Array>` so the `Mask` borrow below outlives every layer's use.
+    let attn_mask = match pixel_attention_mask {
+      Some(m) => Some(build_attention_mask(m, n, num_patches)?),
+      None => None,
+    };
+    let mask = match &attn_mask {
+      Some(m) => Mask::Array(m),
+      None => Mask::None,
+    };
+
     for layer in &self.layers {
-      h = layer.forward(&h)?;
+      h = layer.forward(&h, mask)?;
     }
     self.post_layernorm.forward(&h)
   }
@@ -531,6 +571,42 @@ impl VisionModel {
 }
 
 // ───────────────────────── builders / helpers ─────────────────────────
+
+/// Build an additive attention key-mask `(N, 1, 1, num_patches)` from the
+/// `(N, num_patches)` `pixel_attention_mask` (`1` active, `0` padded): active →
+/// `0.0`, padded → `-inf`, so SDPA's softmax zeroes the padded keys for every
+/// active query (the padded patches contribute nothing).
+///
+/// Reuses the SigLIP2 NaFlex padded-key mask construction
+/// ([`crate::embeddings::siglip2_naflex`]'s `build_attention_mask`):
+/// `select(mask_bool, 0.0, -inf)`, reshaped to broadcast over `(B, heads, L_q,
+/// L_kv)`. Generalized to the LFM2-VL batched `(N, num_patches)` mask (SigLIP2's
+/// is a single-image `(num_patches,)`), so the broadcast leading axis is `N`
+/// rather than `1`.
+///
+/// The mask shape is validated against the `(n, num_patches)` the caller
+/// already verified from `pixel_values`, so a mismatched mask is a typed
+/// [`Error::RankMismatch`] (no panic, no silent downstream broadcast).
+#[cfg(feature = "lfm2-vl")]
+fn build_attention_mask(pixel_attention_mask: &Array, n: usize, num_patches: i32) -> Result<Array> {
+  let shape = pixel_attention_mask.shape();
+  if shape.as_slice() != [n, num_patches as usize] {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "lfm2_vl vision: pixel_attention_mask must be (N, num_patches) matching pixel_values",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  // (N, num_patches) i32 → bool (nonzero = active), then
+  // select(active, 0.0, -inf): active keeps 0, padded gets -inf.
+  let mask_bool = ops::misc::astype(pixel_attention_mask, Dtype::Bool)?;
+  let zeros = Array::zeros::<f32>(&(n, num_patches as usize))?;
+  let neg_inf = Array::full::<f32>(&(n, num_patches as usize), f32::NEG_INFINITY)?;
+  let additive = ops::logical::select(&mask_bool, &zeros, &neg_inf)?;
+  // (N, num_patches) → (N, 1, 1, num_patches) to broadcast over
+  // (B, heads, L_q, L_kv).
+  ops::shape::reshape(&additive, &[n as i32, 1, 1, num_patches])
+}
 
 /// Build a `LayerNorm` from `{prefix}.weight` + `{prefix}.bias` with the given
 /// `eps`. Both affine params are required (SigLIP2 LayerNorms are full-affine).
