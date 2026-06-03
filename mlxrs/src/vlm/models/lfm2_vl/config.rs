@@ -126,6 +126,15 @@ fn default_vision_layer_norm_eps() -> f64 {
 #[cfg(feature = "lfm2-vl")]
 const VISION_MODEL_TYPES: &[&str] = &["lfm2_vl", "siglip2_vision_model"];
 
+/// The top-level architecture ids the LFM2.5-VL [`ModelConfig`] accepts.
+/// `config.py`'s default is `"lfm2-vl"` (hyphen, `config.py:75`), but the
+/// released mlx-community checkpoints (e.g. `mlx-community/LFM2.5-VL-450M-6bit` /
+/// `-8bit`) ship `model_type: "lfm2_vl"` (underscore). Both are accepted so a
+/// checkpoint with either spelling loads (the `VisionConfig` already accepts the
+/// underscore via [`VISION_MODEL_TYPES`]).
+#[cfg(feature = "lfm2-vl")]
+const MODEL_TYPES: &[&str] = &["lfm2-vl", "lfm2_vl"];
+
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 impl VisionConfig {
@@ -246,7 +255,9 @@ pub struct ModelConfig {
   pub text_config: TextConfig,
   /// Vision-tower config (`vision_config`).
   pub vision_config: VisionConfig,
-  /// Top-level architecture id (`"lfm2-vl"`).
+  /// Top-level architecture id. `config.py`'s default is `"lfm2-vl"`, but the
+  /// released mlx-community checkpoints ship `"lfm2_vl"` (underscore); both are
+  /// accepted by [`validate`](ModelConfig::validate) (see [`MODEL_TYPES`]).
   #[serde(default = "default_model_type")]
   model_type: String,
   /// Pixel-unshuffle downsample factor applied to the vision grid before the
@@ -394,17 +405,19 @@ impl ModelConfig {
   /// Reject a structurally invalid model config with a typed error before any
   /// tensor is built.
   ///
-  /// Pins the top-level `model_type` to `"lfm2-vl"`; requires the projector /
-  /// patch-merge dimensions (`downsample_factor`, `projector_hidden_size`,
-  /// `max_num_patches`, `tile_size`) strictly positive and `image_token_index`
-  /// / `eos_token_id` non-negative; validates that `vision_feature_layer`
-  /// resolves to an in-range kept-layer count; and validates both tower configs
-  /// (see [`TextConfig::validate`] / [`VisionConfig::validate`]).
+  /// Pins the top-level `model_type` to [`MODEL_TYPES`] (`"lfm2-vl"` /
+  /// `"lfm2_vl"` — mlx-community checkpoints ship the underscore form); requires
+  /// the projector / patch-merge dimensions (`downsample_factor`,
+  /// `projector_hidden_size`, `max_num_patches`, `tile_size`) strictly positive
+  /// and `image_token_index` / `eos_token_id` non-negative; validates that
+  /// `vision_feature_layer` resolves to an in-range kept-layer count; and
+  /// validates both tower configs (see [`TextConfig::validate`] /
+  /// [`VisionConfig::validate`]).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::ModelConfig: model_type",
       self.model_type.as_str(),
-      &["lfm2-vl"],
+      MODEL_TYPES,
     )?;
     for (name, value) in [
       (

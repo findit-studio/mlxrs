@@ -171,6 +171,32 @@ fn model_config_rejects_wrong_model_type() {
 }
 
 #[test]
+fn model_config_accepts_both_model_type_spellings() {
+  // `config.py`'s default is `"lfm2-vl"` (hyphen, `config.py:75`), but the
+  // released mlx-community checkpoints (e.g. `mlx-community/LFM2.5-VL-450M-6bit`
+  // / `-8bit`) ship `model_type: "lfm2_vl"` (underscore). Both must validate so
+  // either checkpoint spelling loads; a bogus value still errors.
+  let underscore = r#"{"text_config": {}, "vision_config": {}, "model_type": "lfm2_vl"}"#;
+  let cfg = ModelConfig::from_json(underscore).unwrap();
+  cfg
+    .validate()
+    .expect("underscore model_type lfm2_vl must validate (mlx-community checkpoints)");
+  assert_eq!(cfg.model_type(), "lfm2_vl");
+
+  let hyphen = r#"{"text_config": {}, "vision_config": {}, "model_type": "lfm2-vl"}"#;
+  let cfg = ModelConfig::from_json(hyphen).unwrap();
+  cfg
+    .validate()
+    .expect("hyphen model_type lfm2-vl must still validate (config.py default)");
+  assert_eq!(cfg.model_type(), "lfm2-vl");
+
+  let bogus = r#"{"text_config": {}, "vision_config": {}, "model_type": "lfm2vl"}"#;
+  let cfg = ModelConfig::from_json(bogus).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::UnknownEnumValue(_)), "got {err}");
+}
+
+#[test]
 fn model_config_rejects_negative_image_token_index() {
   let json = r#"{"text_config": {}, "vision_config": {}, "image_token_index": -1}"#;
   let cfg = ModelConfig::from_json(json).unwrap();
