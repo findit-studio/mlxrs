@@ -27,6 +27,8 @@
 
 use std::collections::HashMap;
 
+use smol_str::SmolStr;
+
 use crate::{
   array::Array,
   audio::stt::model::{
@@ -62,6 +64,32 @@ const AUDIO_END_MARKER: &str = "<|audio_end|>";
 /// tokenized sequence carries two `timestamp_token_id` positions per word.
 const TIMESTAMP_MARKER: &str = "<timestamp>";
 
+/// A pluggable Japanese/Korean word segmenter for the [`RawTranscript`] align
+/// path.
+///
+/// The reference aligner (`ForceAlignProcessor.encode_timestamp`) delegates
+/// Japanese and Korean word splitting to **optional external** morphological
+/// segmenters (`nagisa` for Japanese, `soynlp` for Korean) that this port does
+/// not bundle. To stay faithful for those languages without vendoring those
+/// dependencies, a caller can supply their own segmenter through this trait and
+/// pass it in the [`RawTranscript`] align options via
+/// [`RawAlignOptions::with_segmenter`]. When supplied, the raw-text path calls
+/// it for a Japanese or Korean transcript and then continues through the normal
+/// assemble + encode path; when absent, a Japanese/Korean [`RawTranscript`]
+/// returns a typed [`Error::Tokenizer`] pointing at this hook and the
+/// pre-tokenized path (issue #322).
+///
+/// The returned `Vec<String>` is the ordered word units (one display label per
+/// aligned span); a failing segmentation should surface as a typed [`Error`]
+/// (e.g. an [`Error::Tokenizer`]) rather than a panic.
+#[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
+pub trait JpKoSegmenter {
+  /// Segment `text` (in `language`, which is `"japanese"` or `"korean"`,
+  /// lowercased) into its ordered word units. Returns a typed [`Error`] on a
+  /// segmentation failure.
+  fn segment(&self, text: &str, language: &str) -> Result<Vec<String>>;
+}
+
 /// The **primary** forced-alignment input: a raw transcript `text` plus the
 /// `language` it is in.
 ///
@@ -77,27 +105,30 @@ const TIMESTAMP_MARKER: &str = "<timestamp>";
 /// This raw-text path is reference-faithful for the languages the reference
 /// segments **inline**: whitespace-segmented languages and CJK-per-character
 /// languages (Chinese included) split on whitespace with embedded CJK broken out
-/// per character. It is **not** faithful for Japanese and Korean, which the
-/// reference delegates to **optional external** morphological segmenters
-/// (`nagisa` / `soynlp`) this port does not bundle; a Japanese or Korean
-/// [`RawTranscript`] raises a typed [`Error::Tokenizer`] pointing to the
-/// pre-tokenized path. Align Japanese/Korean transcripts via
-/// [`PreTokenizedTranscript`], where the caller supplies the tokenization (the
-/// scope decision is tracked in issue #322).
+/// per character. Japanese and Korean — which the reference delegates to
+/// **optional external** morphological segmenters (`nagisa` / `soynlp`) this
+/// port does not bundle — are supported in **two** ways: supply a pluggable
+/// [`JpKoSegmenter`] in the align options (via
+/// [`RawAlignOptions::with_segmenter`]), in which case a Japanese/Korean
+/// [`RawTranscript`] segments through it and then runs the normal path; or, with
+/// no segmenter supplied, align them via [`PreTokenizedTranscript`] (the caller
+/// supplies the tokenization). Without either, a Japanese/Korean
+/// [`RawTranscript`] returns a typed [`Error::Tokenizer`] pointing at both
+/// options (issue #322).
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTranscript {
   /// The transcript text to align.
-  text: String,
+  text: SmolStr,
   /// The transcript language (selects the word splitter; matched
   /// case-insensitively).
-  language: String,
+  language: SmolStr,
 }
 
 impl RawTranscript {
   /// Construct a [`RawTranscript`] from its text and language.
   #[inline]
-  pub fn new(text: impl Into<String>, language: impl Into<String>) -> Self {
+  pub fn new(text: impl Into<SmolStr>, language: impl Into<SmolStr>) -> Self {
     Self {
       text: text.into(),
       language: language.into(),
@@ -107,7 +138,7 @@ impl RawTranscript {
   /// Construct an English [`RawTranscript`] (the reference's default language),
   /// using whitespace word splitting.
   #[inline]
-  pub fn english(text: impl Into<String>) -> Self {
+  pub fn english(text: impl Into<SmolStr>) -> Self {
     Self::new(text, "English")
   }
 
@@ -121,6 +152,108 @@ impl RawTranscript {
   #[inline(always)]
   pub fn language(&self) -> &str {
     &self.language
+  }
+}
+
+/// The [`RawTranscript`] align options: the result-language label plus the
+/// optional Japanese/Korean word-segmentation strategy.
+///
+/// This is the [`Options`](ForcedAlignerTrait::Options) type for the
+/// [`RawTranscript`] align path. It composes the shared [`AlignOptions`] (the
+/// result `language` label carried through to [`ForcedAlignment::language`])
+/// with an **owned** [`JpKoSegmenter`]: the reference's optional `nagisa` /
+/// `soynlp` morphological splitting for Japanese and Korean, which this port
+/// does not bundle and a caller supplies here. When a segmenter is set, a
+/// Japanese or Korean [`RawTranscript`] splits through it and then runs the
+/// normal assemble + encode path; when absent, such a transcript returns a
+/// typed [`Error::Tokenizer`] pointing at this hook and the pre-tokenized path.
+/// Other languages never consult it (issue #322).
+///
+/// The segmenter is owned (a `Box<dyn JpKoSegmenter>`) rather than borrowed: a
+/// borrowed `&dyn` would force a lifetime on the associated
+/// [`Options`](ForcedAlignerTrait::Options) type (a generic associated type),
+/// which would make [`ForcedAligner`](ForcedAlignerTrait) no longer object-safe
+/// and break the `Box<dyn ForcedAligner<…>>` use the trait preserves. Owning
+/// the box keeps the options a plain `'static` type.
+#[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
+pub struct RawAlignOptions {
+  /// The shared result-language label (projected through [`Self::language`]).
+  base: AlignOptions,
+  /// The optional caller-supplied Japanese/Korean word segmenter (issue #322).
+  segmenter: Option<Box<dyn JpKoSegmenter>>,
+}
+
+// `dyn JpKoSegmenter` is not `Debug`, so the derive cannot apply; report the
+// segmenter's presence (not its contents) and forward the language label.
+impl std::fmt::Debug for RawAlignOptions {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("RawAlignOptions")
+      .field("base", &self.base)
+      .field("segmenter", &self.segmenter.is_some())
+      .finish()
+  }
+}
+
+#[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
+impl Default for RawAlignOptions {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+#[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
+impl RawAlignOptions {
+  /// A new options bundle with no language label and no segmenter.
+  #[inline(always)]
+  pub const fn new() -> Self {
+    Self {
+      base: AlignOptions::new(),
+      segmenter: None,
+    }
+  }
+
+  /// The configured result-language label, or `None` (projected from the shared
+  /// [`AlignOptions`]).
+  #[inline(always)]
+  pub fn language(&self) -> Option<&str> {
+    self.base.language()
+  }
+
+  /// Set the result-language label.
+  #[inline(always)]
+  pub fn set_language(&mut self, language: impl Into<SmolStr>) -> &mut Self {
+    self.base.set_language(language);
+    self
+  }
+
+  /// Return `self` with the result-language label set.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_language(mut self, language: impl Into<SmolStr>) -> Self {
+    self.base.set_language(language);
+    self
+  }
+
+  /// The attached Japanese/Korean word segmenter, or `None`.
+  #[inline(always)]
+  pub fn segmenter(&self) -> Option<&dyn JpKoSegmenter> {
+    self.segmenter.as_deref()
+  }
+
+  /// Set the Japanese/Korean word segmenter.
+  #[inline(always)]
+  pub fn set_segmenter(&mut self, segmenter: Box<dyn JpKoSegmenter>) -> &mut Self {
+    self.segmenter = Some(segmenter);
+    self
+  }
+
+  /// Return `self` with the Japanese/Korean word segmenter set.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_segmenter(mut self, segmenter: Box<dyn JpKoSegmenter>) -> Self {
+    self.segmenter = Some(segmenter);
+    self
   }
 }
 
@@ -138,7 +271,7 @@ impl RawTranscript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlignWord {
   /// The word's display text — copied verbatim into the output span's text.
-  text: String,
+  text: SmolStr,
   /// The word's decoder token ids (the caller's subword tokenization).
   token_ids: Vec<i32>,
 }
@@ -146,7 +279,7 @@ pub struct AlignWord {
 impl AlignWord {
   /// Construct an [`AlignWord`] from its display text and token ids.
   #[inline(always)]
-  pub fn new(text: impl Into<String>, token_ids: Vec<i32>) -> Self {
+  pub fn new(text: impl Into<SmolStr>, token_ids: Vec<i32>) -> Self {
     Self {
       text: text.into(),
       token_ids,
@@ -211,7 +344,10 @@ impl<'a> From<&'a [AlignWord]> for PreTokenizedTranscript<'a> {
 /// already-tokenized word sequence, which needs no tokenizer). A tokenizer is
 /// supplied via [`from_weights_with_tokenizer`](Self::from_weights_with_tokenizer)
 /// or [`with_tokenizer`](Self::with_tokenizer) and is required only for the
-/// [`RawTranscript`] path.
+/// [`RawTranscript`] path. For Japanese/Korean [`RawTranscript`]s an optional
+/// pluggable [`JpKoSegmenter`] supplies the reference's morphological word
+/// splitting; it is passed per-align in the [`RawTranscript`] options via
+/// [`RawAlignOptions::with_segmenter`], not stored on the aligner (issue #322).
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
 pub struct ForcedAligner {
   config: ForcedAlignerConfig,
@@ -590,7 +726,7 @@ impl ForcedAligner {
     input_ids: &Array,
     logits: &Array,
     transcript: &[AlignWord],
-    language: Option<String>,
+    language: Option<SmolStr>,
   ) -> Result<ForcedAlignment> {
     let times = self.decode_marker_times(input_ids, logits, transcript.len())?;
     let mut spans: Vec<AlignedSpan> = Vec::new();
@@ -922,13 +1058,16 @@ impl ForcedAligner {
   /// [`with_tokenizer`](Self::with_tokenizer)), else a typed
   /// [`Error::Tokenizer`].
   ///
-  /// `result_language` labels the returned [`ForcedAlignment`].
+  /// `segmenter` is the optional Japanese/Korean word segmenter from the
+  /// [`RawAlignOptions`]; `result_language` labels the returned
+  /// [`ForcedAlignment`].
   fn align_raw_text(
     &self,
     audio: &Array,
     text: &str,
     language: &str,
-    result_language: Option<String>,
+    segmenter: Option<&dyn JpKoSegmenter>,
+    result_language: Option<SmolStr>,
   ) -> Result<ForcedAlignment> {
     let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
       Error::tokenizer(
@@ -942,8 +1081,10 @@ impl ForcedAligner {
 
     // Split the transcript into words and assemble the marker string, then
     // tokenize the whole string with the model tokenizer (the reference encodes
-    // the assembled string in one pass with add_special_tokens=False).
-    let word_list = split_words(text, language)?;
+    // the assembled string in one pass with add_special_tokens=False). A
+    // Japanese/Korean transcript splits through the supplied JpKoSegmenter when
+    // one is given; otherwise split_words returns the typed pointer error.
+    let word_list = split_words(text, language, segmenter)?;
     let input_text = assemble_input_text(&word_list, num_audio_tokens)?;
     let ids_u32 = tokenizer.encode(&input_text, false)?;
 
@@ -974,6 +1115,8 @@ impl ForcedAligner {
 
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
 impl ForcedAlignerTrait<RawTranscript> for ForcedAligner {
+  type Options = RawAlignOptions;
+
   /// Localize each word of a raw [`RawTranscript`] in `audio` (the precomputed
   /// mel features `(1, n_mels, time)` of a single unpadded utterance), splitting
   /// + tokenizing the transcript internally.
@@ -984,27 +1127,37 @@ impl ForcedAlignerTrait<RawTranscript> for ForcedAligner {
   /// tokenization. It is reference-faithful for whitespace-segmented and
   /// CJK-per-character languages (Chinese included); Japanese and Korean — which
   /// the reference delegates to optional external segmenters this port does not
-  /// bundle — return a typed [`Error::Tokenizer`] and must instead use the
-  /// pre-tokenized path ([`PreTokenizedTranscript`]); see issue #322. The result
-  /// language label is the transcript's language unless
-  /// [`AlignOptions::language`] overrides it. Requires an attached tokenizer,
-  /// else a typed [`Error::Tokenizer`].
+  /// bundle — are split through a [`JpKoSegmenter`] supplied in
+  /// [`RawAlignOptions::with_segmenter`] when one is given, and otherwise must
+  /// use the pre-tokenized path ([`PreTokenizedTranscript`]) — without either, a
+  /// Japanese/Korean transcript returns a typed [`Error::Tokenizer`] pointing at
+  /// both (issue #322). The result language label is the transcript's language
+  /// unless [`RawAlignOptions::language`] overrides it. Requires an attached
+  /// tokenizer, else a typed [`Error::Tokenizer`].
   fn align(
     &self,
     audio: &Array,
     input: RawTranscript,
-    opts: &AlignOptions,
+    opts: &RawAlignOptions,
   ) -> Result<ForcedAlignment> {
     let result_language = opts
       .language()
-      .map(str::to_string)
-      .or_else(|| Some(input.language().to_string()));
-    self.align_raw_text(audio, input.text(), input.language(), result_language)
+      .map(SmolStr::new)
+      .or_else(|| Some(SmolStr::new(input.language())));
+    self.align_raw_text(
+      audio,
+      input.text(),
+      input.language(),
+      opts.segmenter(),
+      result_language,
+    )
   }
 }
 
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
 impl ForcedAlignerTrait<PreTokenizedTranscript<'_>> for ForcedAligner {
+  type Options = AlignOptions;
+
   /// Localize each word of an already-tokenized [`PreTokenizedTranscript`] in
   /// `audio` (the precomputed mel features `(1, n_mels, time)` of a single
   /// unpadded utterance).
@@ -1015,7 +1168,8 @@ impl ForcedAlignerTrait<PreTokenizedTranscript<'_>> for ForcedAligner {
   /// nothing — the utterance is unpadded), and decodes the per-word spans. The
   /// audio token count is derived from the length formula directly (no extra
   /// encode); only the forward encodes the audio, lazily until the hidden states
-  /// are read in the decode. This path needs no tokenizer.
+  /// are read in the decode. This path needs no tokenizer, and its options are
+  /// the minimal shared [`AlignOptions`] (the result-language label only).
   fn align(
     &self,
     audio: &Array,
@@ -1031,7 +1185,7 @@ impl ForcedAlignerTrait<PreTokenizedTranscript<'_>> for ForcedAligner {
       &input_ids,
       &logits,
       transcript,
-      opts.language().map(str::to_string),
+      opts.language().map(SmolStr::new),
     )
   }
 }
@@ -1137,27 +1291,113 @@ fn splice_index_overflow(what: &'static str, value: usize) -> Error {
 ///
 /// Japanese and Korean are the exception: the reference delegates them to
 /// **optional external** morphological segmenters (`nagisa` / `soynlp`) imported
-/// lazily, which this port does not bundle. They therefore return a typed
-/// [`Error::Tokenizer`] (rather than silently mis-splitting — the reference
-/// itself raises `ImportError` when the dependency is absent) directing the
-/// caller to the pre-tokenized path ([`PreTokenizedTranscript`]), where the
-/// caller supplies the Japanese/Korean tokenization. Bundling those segmenters
-/// vs. a pluggable hook vs. pre-tokenized-only is the open scope decision in
-/// issue #322; this raw path is therefore **not** reference-faithful for every
-/// language.
-fn split_words(text: &str, language: &str) -> Result<Vec<String>> {
+/// lazily, which this port does not bundle. They are supported here through a
+/// pluggable [`JpKoSegmenter`]: when `segmenter` is `Some`, a Japanese or Korean
+/// transcript is split through it (and then continues the normal path); when it
+/// is `None`, such a transcript returns a typed [`Error::Tokenizer`] (rather
+/// than silently mis-splitting — the reference itself raises `ImportError` when
+/// the dependency is absent) directing the caller to attach a segmenter or use
+/// the pre-tokenized path ([`PreTokenizedTranscript`]). Other languages never
+/// consult `segmenter` (issue #322).
+fn split_words(
+  text: &str,
+  language: &str,
+  segmenter: Option<&dyn JpKoSegmenter>,
+) -> Result<Vec<String>> {
   let lang = language.to_ascii_lowercase();
   match lang.as_str() {
-    "japanese" | "korean" => Err(Error::tokenizer(
-      "ForcedAligner: raw-text alignment for Japanese and Korean requires an external \
-       morphological word segmenter (nagisa for Japanese, soynlp for Korean) that this \
-       port does not bundle; align Japanese/Korean transcripts via the pre-tokenized path \
-       — ForcedAligner over a PreTokenizedTranscript, where the caller supplies the \
-       per-word tokenization (see issue #322)",
-    )),
+    "japanese" | "korean" => match segmenter {
+      // The caller supplied the reference's optional morphological segmenter:
+      // split through it, normalize/validate its units, then continue the normal
+      // assemble + encode path.
+      Some(seg) => validate_segmenter_units(seg.segment(text, &lang)?, text),
+      None => Err(Error::tokenizer(
+        "ForcedAligner: raw-text alignment for Japanese and Korean requires a word \
+         segmenter (the reference's optional nagisa for Japanese / soynlp for Korean) that \
+         this port does not bundle; supply one in the align options via \
+         RawAlignOptions::with_segmenter, or align Japanese/Korean transcripts via the \
+         pre-tokenized path — ForcedAligner over a PreTokenizedTranscript, where the caller \
+         supplies the per-word tokenization (see issue #322)",
+      )),
+    },
     // Every other language (Chinese included) — the reference's default branch.
     _ => Ok(tokenize_space_lang(text)),
   }
+}
+
+/// Normalize and validate the word units returned by an external
+/// [`JpKoSegmenter`] before they reach [`assemble_input_text`].
+///
+/// A pluggable segmenter is caller-supplied (and may be a thin wrapper over an
+/// external `nagisa` / `soynlp` process), so its output is untrusted hook
+/// output, not a result this port computed. The built-in
+/// [`tokenize_space_lang`] path cleans each segment through [`clean_token`] and
+/// drops the ones left empty before assembly; this mirrors that emptiness rule
+/// for the segmenter path and adds the soundness guard that the built-in path
+/// gets for free (its tokens come from the transcript, never from the marker
+/// vocabulary):
+///
+/// * A unit is kept only when it has at least one alignable character under the
+///   same [`is_kept_char`] predicate the built-in splitter cleans with (Unicode
+///   General_Category Letter / Number, plus the apostrophe). A unit with no
+///   alignable character — whitespace-only, a zero-width / control codepoint, or
+///   a punctuation-only unit such as the CJK full stop — would clean to empty in
+///   the built-in path and is dropped here too, so a degraded segmenter cannot
+///   inject a blank or non-alignable span. The kept unit's label is the trimmed
+///   original text (only the keep/drop decision consults the predicate; the
+///   alignment uses the original characters).
+/// * After dropping the non-alignable units, if `text` was non-empty yet **no**
+///   units remain, this is a typed [`Error::Tokenizer`] (the "nothing alignable"
+///   condition) rather than a silently blank alignment.
+/// * A unit that contains any reserved marker literal
+///   ([`AUDIO_START_MARKER`] / [`AUDIO_PAD_MARKER`] / [`AUDIO_END_MARKER`] /
+///   [`TIMESTAMP_MARKER`], which [`assemble_input_text`] lays around the words)
+///   is rejected as a typed [`Error::Tokenizer`]: such a unit would inject a
+///   special token into the tokenizer input and corrupt the alignment. A
+///   legitimate Japanese/Korean word never contains these `<|…|>` / `<…>`
+///   markers, so this rejects only malformed output (issue #322).
+fn validate_segmenter_units(units: Vec<String>, text: &str) -> Result<Vec<String>> {
+  const RESERVED_MARKERS: [&str; 4] = [
+    AUDIO_START_MARKER,
+    AUDIO_PAD_MARKER,
+    AUDIO_END_MARKER,
+    TIMESTAMP_MARKER,
+  ];
+
+  let mut kept: Vec<String> = Vec::new();
+  for unit in units {
+    if let Some(marker) = RESERVED_MARKERS
+      .iter()
+      .find(|marker| unit.contains(**marker))
+    {
+      return Err(Error::tokenizer(format!(
+        "ForcedAligner: the attached Japanese/Korean segmenter returned a word unit containing \
+         the reserved marker {marker:?}, which would inject a special token into the tokenizer \
+         input and corrupt the alignment; a real word never contains the aligner's audio/\
+         timestamp markers, so reject the segmenter output (see issue #322)"
+      )));
+    }
+    let trimmed = unit.trim();
+    // Keep a unit only when it has at least one alignable character under the
+    // same predicate the built-in splitter cleans with: a unit with none (a
+    // zero-width / control codepoint, or a punctuation-only unit such as the CJK
+    // full stop) cleans to empty in the built-in path and must drop here too, so
+    // a non-alignable span never survives into the kept set. The kept label is
+    // the trimmed original text — the alignment uses the original characters.
+    if trimmed.chars().any(is_kept_char) {
+      kept.push(trimmed.to_string());
+    }
+  }
+
+  if kept.is_empty() && !text.trim().is_empty() {
+    return Err(Error::tokenizer(
+      "ForcedAligner: the attached Japanese/Korean segmenter returned no alignable word units \
+       for a non-empty transcript; there is nothing to align (check the segmenter, or align via \
+       the pre-tokenized path — see issue #322)",
+    ));
+  }
+
+  Ok(kept)
 }
 
 /// Assemble the aligner's input string for the tokenizer: the audio-span markers

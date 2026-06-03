@@ -33,6 +33,8 @@
 //! these traits. This module is the shared contract every per-model decoder
 //! conforms to.
 
+use smol_str::SmolStr;
+
 use crate::{array::Array, audio::dsp, error::Result};
 
 /// The universal speech-to-text contract: audio waveform in, text out.
@@ -533,44 +535,63 @@ impl Transcription {
 ///
 /// Like [`crate::embeddings::Embed`] this is generic over its `Input` (rather
 /// than carrying an associated input type), so a model implements it once per
-/// transcript representation it accepts and `Box<dyn ForcedAligner<Input>>` /
-/// `&dyn ForcedAligner<Input>` stay object-safe for a chosen `Input`. The
-/// `Input` is **model-defined**: a model that owns its tokenization accepts a
-/// raw transcript (its `align` splits + tokenizes internally); a model fed
+/// transcript representation it accepts and `Box<dyn ForcedAligner<Input,
+/// Options = T>>` / `&dyn ForcedAligner<Input, Options = T>` stay object-safe
+/// for a chosen `Input` and align-time options `T`. The `Input` is
+/// **model-defined**: a model that owns its tokenization accepts a raw
+/// transcript (its `align` splits + tokenizes internally); a model fed
 /// already-tokenized words accepts that pre-tokenized form. The shared contract
 /// here fixes only `audio` in and [`ForcedAlignment`] out, with no assumption
 /// about how the transcript is represented or tokenized.
+///
+/// Each impl declares, via the associated [`Self::Options`] type, the align-time
+/// options its input needs — the minimal shared [`AlignOptions`] (a result
+/// language label) for a pre-tokenized input, or a richer per-input bundle (e.g.
+/// one also carrying a word-segmentation strategy) for a raw-text input.
+/// Object-safety is preserved by naming the associated type at the `dyn` site
+/// (`dyn ForcedAligner<Input, Options = T>`).
 ///
 /// The per-unit spans ([`AlignedSpan`]) are the whispery `Word { text, range }`
 /// equivalent: a `text` plus its `[start_time, end_time]` bounds in seconds —
 /// exactly the representation an IoU comparison against another aligner
 /// consumes.
 pub trait ForcedAligner<Input> {
+  /// The align-time options this input needs. The minimal shared
+  /// [`AlignOptions`] when the input carries everything else (a pre-tokenized
+  /// word sequence); a richer per-input bundle when the align step needs more
+  /// (e.g. a raw-text input whose options also carry a word-segmentation
+  /// strategy).
+  type Options;
+
   /// Localize each unit of the `input` transcript in `audio` under `opts`,
   /// returning one [`AlignedSpan`] per unit in transcript order.
   ///
   /// `audio` is the model's encoder input (for the Qwen3 aligner, the
   /// precomputed log-mel features `(batch, n_mels, time)`); `input` is the
   /// model-defined transcript representation (raw text + language, or an
-  /// already-tokenized word sequence). A model that owns its tokenization does
-  /// the word splitting + subword encoding inside this method.
-  fn align(&self, audio: &Array, input: Input, opts: &AlignOptions) -> Result<ForcedAlignment>;
+  /// already-tokenized word sequence); `opts` is the impl's [`Self::Options`].
+  /// A model that owns its tokenization does the word splitting + subword
+  /// encoding inside this method.
+  fn align(&self, audio: &Array, input: Input, opts: &Self::Options) -> Result<ForcedAlignment>;
 }
 
-/// Options controlling a [`ForcedAligner::align`] run.
+/// The minimal shared [`ForcedAligner::align`] options: just the result
+/// `language` label.
 ///
-/// The alignment algorithm is deterministic (an argmax over the timestamp
-/// head), so unlike [`TranscribeOptions`] there are no sampling knobs; the only
-/// field is the `language` label carried through to
-/// [`ForcedAlignment::language`]. It is purely a result label here — how the
-/// transcript is split into aligned units is the model's `align` concern (for a
-/// raw-text input the model splits + tokenizes per its own input type), not a
-/// knob on these shared options.
+/// This is the [`Options`](ForcedAligner::Options) type for an input that
+/// carries everything else itself — a pre-tokenized word sequence. The
+/// alignment algorithm is deterministic (an argmax over the timestamp head), so
+/// unlike [`TranscribeOptions`] there are no sampling knobs; the only field is
+/// the `language` label carried through to [`ForcedAlignment::language`]. It is
+/// purely a result label here — how the transcript is split into aligned units
+/// is the model's `align` concern. A raw-text input whose options must also
+/// carry a word-segmentation strategy uses a richer per-input options type that
+/// composes this one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlignOptions {
   /// The transcript language label, carried through to the result. `None`
   /// leaves the result's language unset.
-  language: Option<String>,
+  language: Option<SmolStr>,
 }
 
 impl AlignOptions {
@@ -588,7 +609,7 @@ impl AlignOptions {
 
   /// Set the language label.
   #[inline(always)]
-  pub fn set_language(&mut self, language: impl Into<String>) -> &mut Self {
+  pub fn set_language(&mut self, language: impl Into<SmolStr>) -> &mut Self {
     self.language = Some(language.into());
     self
   }
@@ -596,7 +617,7 @@ impl AlignOptions {
   /// Return `self` with the language label set.
   #[must_use]
   #[inline(always)]
-  pub fn with_language(mut self, language: impl Into<String>) -> Self {
+  pub fn with_language(mut self, language: impl Into<SmolStr>) -> Self {
     self.language = Some(language.into());
     self
   }
@@ -607,7 +628,7 @@ impl AlignOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlignedSpan {
   /// The aligned unit's display text (the word / character the span localizes).
-  text: String,
+  text: SmolStr,
   /// Start time in seconds.
   start_time: f64,
   /// End time in seconds.
@@ -618,7 +639,7 @@ impl AlignedSpan {
   /// Construct a span from its text and `[start_time, end_time]` bounds
   /// (seconds).
   #[inline(always)]
-  pub fn new(text: impl Into<String>, start_time: f64, end_time: f64) -> Self {
+  pub fn new(text: impl Into<SmolStr>, start_time: f64, end_time: f64) -> Self {
     Self {
       text: text.into(),
       start_time,
@@ -652,13 +673,13 @@ pub struct ForcedAlignment {
   /// One span per transcript word, in transcript order.
   spans: Vec<AlignedSpan>,
   /// The language label from [`AlignOptions::language`], or `None`.
-  language: Option<String>,
+  language: Option<SmolStr>,
 }
 
 impl ForcedAlignment {
   /// Construct an alignment from its spans and language label.
   #[inline(always)]
-  pub fn new(spans: Vec<AlignedSpan>, language: Option<String>) -> Self {
+  pub fn new(spans: Vec<AlignedSpan>, language: Option<SmolStr>) -> Self {
     Self { spans, language }
   }
 

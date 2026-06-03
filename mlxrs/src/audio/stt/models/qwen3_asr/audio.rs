@@ -445,16 +445,115 @@ impl AudioEncoder {
 
   /// Full forward over a precomputed mel spectrogram with a caller-supplied
   /// additive attention `mask` (e.g. the ragged block-diagonal mask the
-  /// reference builds for windowed inference). The mask must broadcast to the
-  /// SDPA score shape `(batch, num_heads, time', time')`. See the
-  /// module documentation block-attention notes.
+  /// reference builds for windowed inference).
   ///
-  /// The **caller owns the mask shape**: it is forwarded to SDPA as-is (faithful
-  /// to mlx-audio, which broadcasts the caller mask into the score tensor), so a
-  /// mask that does not broadcast to `(batch, num_heads, time', time')` is a
-  /// caller-contract violation rather than a guarded error here (issue #326).
+  /// The mask's **trailing two axes must be exactly `(T, T)`**, where `T =
+  /// time_after_conv(time)` is the post-CNN sequence length, and any leading
+  /// batch/head axes must be either the explicit `(batch, num_heads)` or a
+  /// broadcast singleton `1` — i.e. the mask must address the full
+  /// query×key score grid `(batch, num_heads, T, T)`. SDPA broadcasts any
+  /// rank-`<=4` mask, so a malformed-but-broadcastable shape like `(T, 1)` or
+  /// `(1, T)` would *silently* apply the wrong additive bias (a query- or
+  /// key-axis collapsed to a single time step, broadcast across all of `T`);
+  /// this method **rejects** such a mask with a typed [`Error::RankMismatch`]
+  /// (rank `> 4`) or [`Error::ShapePairMismatch`] (a non-conforming axis)
+  /// rather than running plausible-but-wrong attention. This is stricter than
+  /// mlx-audio, which forwards the caller mask to the kernel and lets it
+  /// broadcast (issue #326).
+  ///
+  /// The check is an O(1) host-side comparison of `mask.shape()` against the
+  /// config-derived `(batch, num_heads, T, T)` — no array is evaluated and no
+  /// GPU op runs (its cost is a shape comparison, not a kernel). See the module
+  /// documentation block-attention notes.
   pub fn forward_with_mask(&self, input_features: &Array, mask: &Array) -> Result<Array> {
+    self.validate_caller_mask(input_features, mask)?;
     self.forward_inner(input_features, Mask::Array(mask))
+  }
+
+  /// Validate a caller-supplied [`forward_with_mask`](Self::forward_with_mask)
+  /// attention mask against the SDPA score grid `(batch, num_heads, T, T)`
+  /// before it reaches the kernel.
+  ///
+  /// `T = time_after_conv(time)` is the post-CNN sequence length (the plain
+  /// forward's full three-fold stride-2 downsample of the mel `time` axis), and
+  /// `batch` / `num_heads` come from the input and config; all are read
+  /// host-side, so this is an O(1) shape comparison with no eval and no GPU op.
+  /// The contract (see [`forward_with_mask`](Self::forward_with_mask)):
+  ///
+  /// - the mask rank must be `<= 4` (SDPA broadcasts at most a rank-4 mask) —
+  ///   else [`Error::RankMismatch`];
+  /// - the trailing two axes (query, key) must be exactly `(T, T)` — a
+  ///   singleton `T` on either axis (e.g. `(T, 1)` / `(1, T)`) would broadcast
+  ///   a single time step's bias across the whole axis, so it is rejected;
+  /// - each leading axis (batch, then head) must be either its explicit dim
+  ///   (`batch` / `num_heads`) or a broadcast singleton `1`;
+  ///
+  /// any non-conforming axis is an [`Error::ShapePairMismatch`] reporting the
+  /// expected `(batch, num_heads, T, T)` grid against the mask's actual shape.
+  fn validate_caller_mask(&self, input_features: &Array, mask: &Array) -> Result<()> {
+    // `encode_features` (run by `forward_inner` next) requires a rank-3
+    // `[batch, num_mel_bins, time]` mel; pin that here so the post-CNN length
+    // is well-defined before the mask is checked against it.
+    let feat_shape = input_features.shape();
+    if feat_shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "AudioEncoder::forward_with_mask: input_features must be rank-3 [batch, num_mel_bins, time]",
+        feat_shape.len() as u32,
+        feat_shape,
+      )));
+    }
+    let batch = i64::try_from(feat_shape[0]).unwrap_or(i64::MAX);
+    let time = i64::try_from(feat_shape[2]).unwrap_or(i64::MAX);
+    let t = AudioEncoderConfig::time_after_conv(time);
+    let heads = i64::from(self.config.encoder_attention_heads);
+
+    let mask_shape = mask.shape();
+    if mask_shape.len() > 4 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "AudioEncoder::forward_with_mask: attention mask must be rank <= 4 (broadcast to (batch, num_heads, T, T))",
+        mask_shape.len() as u32,
+        mask_shape,
+      )));
+    }
+    // The expected SDPA score grid, for the diagnostic on any mismatch.
+    let want: Vec<usize> = [batch, heads, t, t]
+      .iter()
+      .map(|&d| usize::try_from(d.max(0)).unwrap_or(usize::MAX))
+      .collect();
+    let mask_mismatch = || {
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "AudioEncoder::forward_with_mask: attention mask vs (batch, num_heads, T, T) score grid",
+        want.clone(),
+        mask_shape.clone(),
+      ))
+    };
+
+    // Trailing two axes (query, key) must be EXACTLY (T, T) — never a singleton
+    // T that would broadcast one time step's bias across the whole axis.
+    let rank = mask_shape.len();
+    if rank < 2 {
+      return Err(mask_mismatch());
+    }
+    let t_usize = usize::try_from(t.max(0)).unwrap_or(usize::MAX);
+    if mask_shape[rank - 1] != t_usize || mask_shape[rank - 2] != t_usize {
+      return Err(mask_mismatch());
+    }
+    // Each leading axis (batch, then head, from the right) must be its explicit
+    // dim or a broadcast singleton 1. `expected_leading[0]` is the head axis
+    // (closest to the trailing pair), `[1]` the batch axis.
+    let batch_usize = usize::try_from(batch.max(0)).unwrap_or(usize::MAX);
+    let heads_usize = usize::try_from(heads.max(0)).unwrap_or(usize::MAX);
+    let expected_leading = [heads_usize, batch_usize];
+    for (offset, &expected) in expected_leading.iter().enumerate() {
+      // Axis index counting back from just before the trailing (T, T) pair.
+      if rank >= 3 + offset {
+        let dim = mask_shape[rank - 3 - offset];
+        if dim != 1 && dim != expected {
+          return Err(mask_mismatch());
+        }
+      }
+    }
+    Ok(())
   }
 
   /// The reference's `_get_feat_extract_output_lengths` closed form for

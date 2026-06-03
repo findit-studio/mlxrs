@@ -492,6 +492,119 @@ fn from_weights_rejects_missing_key() {
   assert!(matches!(err, Error::MissingKey(_)), "got {err:?}");
 }
 
+// ════════════════════════════ forward_with_mask validation ══════════════════
+
+#[test]
+fn forward_with_mask_accepts_full_grid_mask() {
+  // The canonical shape: a `(batch, num_heads, T, T)` additive mask over the
+  // post-CNN score grid is accepted and runs the masked forward. tiny_config:
+  // n_window=2, num_mel_bins=8, heads=2. mel time=16 → T = time_after_conv(16)
+  // = 2; batch=1, heads=2 → mask (1, 2, 2, 2).
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32;
+  assert_eq!(t, 2);
+  let mask = filled(&[1, 2, t, t], 0.0);
+  let out = enc.forward_with_mask(&mel, &mask).unwrap();
+  // (B=1, T'=2, output_dim=6) — the masked forward produced the same shape as
+  // the plain forward (the mask is all-zeros here, so it is a no-op bias).
+  assert_eq!(out.shape(), vec![1, 2, 6]);
+}
+
+#[test]
+fn forward_with_mask_accepts_bare_t_by_t_and_singleton_leading() {
+  // A bare `(T, T)` mask (both leading axes absent), a `(1, T, T)` (singleton
+  // head), a `(heads, T, T)`, and a `(1, 1, T, T)` are each accepted — every
+  // leading axis is either the explicit dim or a broadcast singleton 1.
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  for shape in [
+    vec![t, t],
+    vec![1, t, t],
+    vec![2, t, t], // heads == 2
+    vec![1, 1, t, t],
+    vec![1, 2, t, t],
+  ] {
+    let mask = filled(&shape, 0.0);
+    let out = enc
+      .forward_with_mask(&mel, &mask)
+      .unwrap_or_else(|e| panic!("mask shape {shape:?} must be accepted, got {e:?}"));
+    assert_eq!(out.shape(), vec![1, t as usize, 6], "shape {shape:?}");
+  }
+}
+
+#[test]
+fn forward_with_mask_rejects_query_axis_singleton() {
+  // A `(T, 1)` mask broadcasts a single key-step's bias across the whole key
+  // axis — a malformed-but-broadcastable shape SDPA would silently accept. It
+  // must be a typed ShapePairMismatch (trailing axes are not exactly (T, T)).
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  let mask = filled(&[t, 1], 0.0);
+  let err = enc
+    .forward_with_mask(&mel, &mask)
+    .expect_err("(T, 1) mask must be rejected");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn forward_with_mask_rejects_key_axis_singleton() {
+  // The symmetric `(1, T)` case: the query axis collapsed to one step. Rejected
+  // as a ShapePairMismatch rather than silently broadcast.
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  let mask = filled(&[1, t], 0.0);
+  let err = enc
+    .forward_with_mask(&mel, &mask)
+    .expect_err("(1, T) mask must be rejected");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn forward_with_mask_rejects_wrong_t() {
+  // A `(T+1, T+1)` mask addresses a different sequence length than the post-CNN
+  // grid — rejected (the trailing axes do not equal the actual T).
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  let mask = filled(&[t + 1, t + 1], 0.0);
+  let err = enc
+    .forward_with_mask(&mel, &mask)
+    .expect_err("wrong-T mask must be rejected");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn forward_with_mask_rejects_wrong_leading_axis() {
+  // A head axis that is neither 1 nor `num_heads` (here 3 vs heads=2) cannot
+  // address the score grid — rejected as a ShapePairMismatch.
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  let mask = filled(&[3, t, t], 0.0);
+  let err = enc
+    .forward_with_mask(&mel, &mask)
+    .expect_err("a non-singleton, non-heads leading axis must be rejected");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn forward_with_mask_rejects_rank_above_four() {
+  // SDPA broadcasts at most a rank-4 mask; a rank-5 mask is a typed
+  // RankMismatch (caught host-side before the kernel).
+  let enc = tiny_encoder();
+  let mel = filled(&[1, 8, 16], 0.3);
+  let t = AudioEncoderConfig::time_after_conv(16) as i32; // 2
+  let mask = filled(&[1, 1, 1, t, t], 0.0);
+  let err = enc
+    .forward_with_mask(&mel, &mask)
+    .expect_err("a rank-5 mask must be rejected");
+  assert!(matches!(err, Error::RankMismatch(_)), "got {err:?}");
+}
+
 // ════════════════════════════ feature-length / single-window ════════════════
 
 /// Independent port of the reference `_get_feat_extract_output_lengths` for the
