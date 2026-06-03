@@ -73,7 +73,7 @@ use crate::{
       projector::{
         Lfm2VlMultiModalProjector, PixelUnshuffleBlock, merge_input_ids_with_image_features,
       },
-      vision::VisionModel,
+      vision::{VisionModel, validate_active_grid},
     },
   },
 };
@@ -275,7 +275,12 @@ impl Lfm2Vl {
   /// Propagates the vision / reshape / unshuffle / projector op errors; an
   /// active grid larger than the patch budget surfaces from the vision tower.
   pub fn encode_image_inputs(&self, inputs: &Lfm2VlImageInputs) -> Result<Array> {
-    let (h_p, w_p) = inputs.grid();
+    // The active grid `(H_p, W_p)` is read from `inputs.spatial_shapes` (the
+    // single source of truth) via `grid()` — there is no separate host-int grid
+    // field, so the value driving the active-row slice + the PixelUnshuffle
+    // reshape below is the SAME one the vision tower derives its attention mask +
+    // position resize from. A mask/slice disagreement is unrepresentable.
+    let (h_p, w_p) = inputs.grid()?;
     // Add the leading per-image batch axis the vision tower expects:
     // pixel_values (1, num_patches, patch_feat), spatial_shapes (1, 2),
     // pixel_attention_mask (1, num_patches).
@@ -299,13 +304,12 @@ impl Lfm2Vl {
     let hs_shape = hidden_states.shape();
     let num_patches = dim_i32(&hs_shape, 1, "lfm2_vl encode_image: num_patches")?;
     let hidden = dim_i32(&hs_shape, 2, "lfm2_vl encode_image: hidden")?;
-    let active = crate::model_validation::checked_mul(
-      "lfm2_vl encode_image: active patches (H_p * W_p)",
-      "H_p",
-      h_p,
-      "W_p",
-      w_p,
-    )?;
+    // The SINGLE active-grid validation point (shared with the vision tower's
+    // mask + position resize): positive dims + `H_p * W_p <= num_patches`,
+    // returning the active patch count. Reusing it (over an inline multiply)
+    // guarantees the slice bound matches the tower's masked active prefix, and
+    // rejects an out-of-budget grid before the slice indexes out of bounds.
+    let active = validate_active_grid(h_p, w_p, num_patches)?;
     // (1, num_patches, hidden) → (num_patches, hidden) → [: active, :]. mlxrs's
     // `reshape` validates dims (no `-1` inference), so the explicit dims are
     // computed from the hidden-state shape.
@@ -449,16 +453,20 @@ impl VlmModel for Lfm2Vl {
   /// [`image.native()`](ProcessedImage::native) companions
   /// (`spatial_shape = [H_p, W_p]`, `patch_mask`), reconstructs the per-image
   /// [`Lfm2VlImageInputs`] triple, and runs the inherent
-  /// [`Lfm2Vl::encode_image_inputs`] body (`lfm2_vl.py:141-153`). The grid
-  /// `(H_p, W_p)` host integers are read from the small `(2,)` `spatial_shape`
-  /// companion (a 2-element materialization).
+  /// [`Lfm2Vl::encode_image_inputs`] body (`lfm2_vl.py:141-153`). The active
+  /// grid `(H_p, W_p)` is carried solely by the `spatial_shape` companion (the
+  /// single source of truth); [`encode_image_inputs`](Lfm2Vl::encode_image_inputs)
+  /// reads + validates it from there, so no separate grid is threaded.
   ///
   /// # Errors
   /// - [`Error::InvariantViolation`] if `image.native()` is `None` (a
   ///   native-resolution model requires the NaFlex companions; a fixed-grid
   ///   [`ProcessedImage`] is rejected here, never a panic);
-  /// - [`Error::RankMismatch`] / [`Error::OutOfRange`] if the `spatial_shape`
-  ///   companion is not a `(2,)` array of `[H_p, W_p]`;
+  /// - [`Error::RankMismatch`] if the `spatial_shape` companion is not a `(2,)`
+  ///   array of `[H_p, W_p]`, and [`Error::OutOfRange`] if its active grid
+  ///   `H_p * W_p` exceeds the patch budget — both surfaced from
+  ///   [`encode_image_inputs`](Lfm2Vl::encode_image_inputs) (the grid read +
+  ///   the shared active-grid validation);
   /// - propagates the vision / reshape / unshuffle / projector op errors.
   fn encode_image(&self, image: &ProcessedImage) -> Result<Array> {
     let native = image.native().ok_or_else(|| {
@@ -468,29 +476,15 @@ impl VlmModel for Lfm2Vl {
          ProcessedImage carries none (a fixed-grid input) — use the Lfm2VlImageProcessor",
       ))
     })?;
-    // Read the patch grid `(H_p, W_p)` host integers from the `(2,)`
-    // spatial_shape companion. `try_clone` shares the device buffer (no copy);
-    // `to_vec` on the owned clone is the only (2-element) materialization.
-    let spatial = native.spatial_shape();
-    let ss_shape = spatial.shape();
-    if ss_shape.as_slice() != [2] {
-      return Err(Error::RankMismatch(RankMismatchPayload::new(
-        "lfm2_vl encode_image: spatial_shape companion must be a (2,) [H_p, W_p] array",
-        ss_shape.len() as u32,
-        ss_shape,
-      )));
-    }
-    let mut ss_owned = spatial.try_clone()?;
-    let grid = ss_owned.to_vec::<i32>()?;
-    let (h_p, w_p) = (grid[0], grid[1]);
     // Reconstruct the NaFlex triple for the inherent per-image body. The
-    // pixel/patch tensor + mask are shared (refcount-only `try_clone`).
+    // pixel/patch tensor + mask + spatial_shape are shared (refcount-only
+    // `try_clone`). The active grid is read from `spatial_shape` alone by
+    // `encode_image_inputs` (which validates the `(2,)` shape), so there is no
+    // separate grid to thread — a disagreeing grid cannot be constructed.
     let inputs = Lfm2VlImageInputs::from_parts(
       image.pixels().try_clone()?,
       native.patch_mask().try_clone()?,
-      spatial.try_clone()?,
-      h_p,
-      w_p,
+      native.spatial_shape().try_clone()?,
     );
     self.encode_image_inputs(&inputs)
   }
@@ -624,13 +618,16 @@ impl ImageProcessor for Lfm2VlImageProcessor {
     // as a typed [`Error::OutOfMemory`] through this seam's `Result`.
     let (rgb, width, height) = crate::vlm::image::decode_rgb(image)?;
     let inputs = preprocess_image(&rgb, width, height, &self.cfg)?;
-    let (h_p, w_p) = inputs.grid();
+    // The grid `(H_p, W_p)` is read from the produced `spatial_shapes` (the
+    // single source of truth) — the same value the vision tower + the active-row
+    // slice consume downstream, so the reported image-token count cannot
+    // disagree with them.
+    let (h_p, w_p) = inputs.grid()?;
     let num_tokens = num_image_tokens_from_patch_grid(h_p, w_p, self.downsample_factor)? as usize;
     let Lfm2VlImageInputs {
       pixel_values,
       pixel_attention_mask,
       spatial_shapes,
-      ..
     } = inputs;
     Ok(ProcessedImage::new(
       pixel_values,

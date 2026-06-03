@@ -210,7 +210,7 @@ fn synth_image(side: i32) -> Lfm2VlImageInputs {
   let pv = mat(num_patches as i32, VPATCH_FEAT);
   let mask = Array::from_slice::<i32>(&vec![1i32; num_patches], &(num_patches,)).unwrap();
   let spatial = Array::from_slice::<i32>(&[side, side], &(2usize,)).unwrap();
-  Lfm2VlImageInputs::from_parts(pv, mask, spatial, side, side)
+  Lfm2VlImageInputs::from_parts(pv, mask, spatial)
 }
 
 /// `(B, T)` i32 token ids.
@@ -256,6 +256,129 @@ fn encode_image_inputs_shape() {
   let mut f = feats.try_clone().unwrap();
   f.eval().unwrap();
   assert!(f.to_vec::<f32>().unwrap().iter().all(|v| v.is_finite()));
+}
+
+// ───────────────── single-sourced active grid (spatial_shapes) ─────────────────
+
+/// A full-budget (`VNUM_PATCHES`-row, all-active) NaFlex input whose declared
+/// active grid is `(h_p, w_p)`. The pixel rows + mask are identical regardless
+/// of `(h_p, w_p)` (every row active), so the ONLY thing that varies the
+/// downstream active-row slice + PixelUnshuffle reshape is `spatial_shapes` —
+/// the single source of truth. (`h_p * w_p` must equal `VNUM_PATCHES` so the
+/// fully-active mask is consistent with the grid.)
+fn full_budget_image(h_p: i32, w_p: i32) -> Lfm2VlImageInputs {
+  let n = VNUM_PATCHES as usize;
+  let pv = mat(VNUM_PATCHES, VPATCH_FEAT);
+  let mask = Array::from_slice::<i32>(&vec![1i32; n], &(n,)).unwrap();
+  let spatial = Array::from_slice::<i32>(&[h_p, w_p], &(2usize,)).unwrap();
+  Lfm2VlImageInputs::from_parts(pv, mask, spatial)
+}
+
+#[test]
+fn grid_is_read_from_spatial_shapes_single_source() {
+  // `grid()` derives the active grid from `spatial_shapes` alone (there is no
+  // separate host-int grid field after the single-source refactor), so it
+  // returns exactly the spatial_shapes contents — the two CANNOT disagree.
+  // (Compile-level: `from_parts` no longer accepts a grid argument, so a
+  // disagreeing grid is unrepresentable; this pins the read at runtime.)
+  let a = Array::from_slice::<i32>(&[2, 1], &(2usize,)).unwrap();
+  let inputs = Lfm2VlImageInputs::from_parts(mat(2, VPATCH_FEAT), ones_mask(2), a);
+  assert_eq!(inputs.grid().unwrap(), (2, 1));
+
+  let b = Array::from_slice::<i32>(&[4, 1], &(2usize,)).unwrap();
+  let inputs_b = Lfm2VlImageInputs::from_parts(mat(4, VPATCH_FEAT), ones_mask(4), b);
+  assert_eq!(inputs_b.grid().unwrap(), (4, 1));
+}
+
+#[test]
+fn grid_rejects_non_2_spatial_shapes() {
+  // A `spatial_shapes` that is not a `(2,)` array is a typed RankMismatch from
+  // `grid()` (never a panic / OOB index), since `grid()` reads `[0]` / `[1]`.
+  let bad = Array::from_slice::<i32>(&[2, 1, 3], &(3usize,)).unwrap();
+  let inputs = Lfm2VlImageInputs::from_parts(mat(3, VPATCH_FEAT), ones_mask(3), bad);
+  assert!(
+    matches!(inputs.grid().unwrap_err(), Error::RankMismatch(_)),
+    "non-(2,) spatial_shapes must be a typed RankMismatch"
+  );
+}
+
+#[test]
+fn encode_image_inputs_slice_and_unshuffle_follow_spatial_shapes() {
+  // The KEY single-source proof for the active-row slice + PixelUnshuffle
+  // reshape: with the SAME (full-budget, all-active) pixel_values + mask, the
+  // projected feature ROW COUNT is determined ENTIRELY by `spatial_shapes` —
+  // because the slice takes `H_p * W_p` rows and the reshape uses `(1, H_p, W_p,
+  // hidden)` before the factor-2 unshuffle.
+  //
+  //   grid (4, 1): slice 4 rows -> reshape (1, 4, 1, h) -> unshuffle pads to
+  //                (1, 4, 2, h) -> fold by 2 -> (1, 2, 1, 4h) -> 2 feature rows.
+  //   grid (2, 2): slice 4 rows -> reshape (1, 2, 2, h) -> unshuffle (1, 1, 1,
+  //                4h) -> 1 feature row.
+  //
+  // The pixel tensor + mask are byte-identical across the two; ONLY
+  // spatial_shapes differs. If anything but spatial_shapes drove the slice /
+  // reshape, the row counts could not both be grid-consistent.
+  let model = dense_model();
+
+  let feats_4x1 = model.encode_image_inputs(&full_budget_image(4, 1)).unwrap();
+  assert_eq!(
+    feats_4x1.shape(),
+    vec![2, THIDDEN as usize],
+    "grid (4,1): ceil(4/2)*ceil(1/2) = 2 feature rows (slice+reshape follow spatial_shapes)"
+  );
+
+  let feats_2x2 = model.encode_image_inputs(&full_budget_image(2, 2)).unwrap();
+  assert_eq!(
+    feats_2x2.shape(),
+    vec![1, THIDDEN as usize],
+    "grid (2,2): ceil(2/2)*ceil(2/2) = 1 feature row — same pixels, different spatial_shapes"
+  );
+
+  // Both finite (no all-masked NaN, no OOB slice).
+  for f in [feats_4x1, feats_2x2] {
+    let mut f = f.try_clone().unwrap();
+    f.eval().unwrap();
+    assert!(f.to_vec::<f32>().unwrap().iter().all(|v| v.is_finite()));
+  }
+}
+
+#[test]
+fn encode_image_inputs_below_budget_grid_slices_active_rows() {
+  // A below-budget active grid (2, 1) = 2 active patches out of the 4-patch
+  // budget: the slice takes exactly the 2 active rows (driven by spatial_shapes
+  // = (2,1)), reshapes to (1, 2, 1, hidden), unshuffles by 2 to (1, 1, 1, 4h),
+  // and projects to ceil(2/2)*ceil(1/2) = 1 feature row. The 2 padded patch rows
+  // (masked in the vision tower) never reach the projector.
+  let model = dense_model();
+  let img = full_budget_image_with_padding(2, 1);
+  let feats = model.encode_image_inputs(&img).unwrap();
+  assert_eq!(
+    feats.shape(),
+    vec![1, THIDDEN as usize],
+    "grid (2,1) -> exactly 2 active rows sliced -> 1 projected feature row"
+  );
+  let mut f = feats.try_clone().unwrap();
+  f.eval().unwrap();
+  assert!(f.to_vec::<f32>().unwrap().iter().all(|v| v.is_finite()));
+}
+
+/// A full-budget (`VNUM_PATCHES`-row) input whose mask marks only the first
+/// `h_p * w_p` rows active (the rest padding), with `spatial_shapes = (h_p,
+/// w_p)`. Exercises the below-budget active-row slice (the active count < the
+/// patch budget).
+fn full_budget_image_with_padding(h_p: i32, w_p: i32) -> Lfm2VlImageInputs {
+  let n = VNUM_PATCHES as usize;
+  let active = (h_p * w_p) as usize;
+  let pv = mat(VNUM_PATCHES, VPATCH_FEAT);
+  let mask_data: Vec<i32> = (0..n).map(|i| (i < active) as i32).collect();
+  let mask = Array::from_slice::<i32>(&mask_data, &(n,)).unwrap();
+  let spatial = Array::from_slice::<i32>(&[h_p, w_p], &(2usize,)).unwrap();
+  Lfm2VlImageInputs::from_parts(pv, mask, spatial)
+}
+
+/// An all-active `(n,)` i32 mask.
+fn ones_mask(n: i32) -> Array {
+  Array::from_slice::<i32>(&vec![1i32; n as usize], &(n as usize,)).unwrap()
 }
 
 // ───────────────────────── end-to-end forward ─────────────────────────
@@ -720,7 +843,7 @@ fn quantized_path_loads_and_forwards() {
   let pv = mat(num_patches as i32, patch_feat);
   let mask = Array::from_slice::<i32>(&vec![1i32; num_patches], &(num_patches,)).unwrap();
   let spatial = Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap();
-  let img = Lfm2VlImageInputs::from_parts(pv, mask, spatial, 2, 2);
+  let img = Lfm2VlImageInputs::from_parts(pv, mask, spatial);
   // 2x2 grid, factor 2 -> (2/2)^2 = 1 projected feature row.
   let input_ids = ids(&[1, IMG, 2], 1, 3);
   let mut cache = model.make_cache();

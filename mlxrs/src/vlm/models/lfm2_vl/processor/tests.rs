@@ -97,7 +97,7 @@ fn preprocess_shapes_and_full_mask() {
   assert_eq!(out.pixel_attention_mask.shape(), vec![16]);
   assert_eq!(out.spatial_shapes.shape(), vec![2]);
   // 8x8 at patch 2, budget 16 -> (4, 4) (fills the budget exactly).
-  assert_eq!(out.grid(), (4, 4));
+  assert_eq!(out.grid().unwrap(), (4, 4));
   assert_eq!(to_vec_i32(&out.spatial_shapes), vec![4, 4]);
   // All 16 patch rows are active (no padding when the grid fills the budget).
   let mask = to_vec_i32(&out.pixel_attention_mask);
@@ -115,7 +115,7 @@ fn preprocess_partial_grid_pads_mask() {
   let (w, h) = (2u32, 4u32);
   let rgb: Vec<u8> = (0..(w * h * 3) as usize).map(|i| (i % 256) as u8).collect();
   let out = preprocess_image(&rgb, w, h, &cfg).unwrap();
-  assert_eq!(out.grid(), (2, 1));
+  assert_eq!(out.grid().unwrap(), (2, 1));
   assert_eq!(to_vec_i32(&out.spatial_shapes), vec![2, 1]);
   let mask = to_vec_i32(&out.pixel_attention_mask);
   assert_eq!(mask, vec![1, 1, 0, 0], "2 active rows, 2 padding rows");
@@ -131,7 +131,7 @@ fn preprocess_normalization_is_applied_and_padding_is_zero() {
   let (w, h) = (2u32, 4u32);
   let rgb = vec![128u8; (w * h * 3) as usize];
   let out = preprocess_image(&rgb, w, h, &cfg).unwrap();
-  assert_eq!(out.grid(), (2, 1));
+  assert_eq!(out.grid().unwrap(), (2, 1));
   let pv = to_vec_f32(&out.pixel_values);
   let expected = 128.0f32 / 127.5 - 1.0; // SigLIP (x/255 - 0.5)/0.5
   // The 2 active patch rows (2 * 12 = 24 floats) carry the normalized value.
@@ -161,7 +161,7 @@ fn preprocess_numeric_oracle_tiny_image() {
   //                     (1,0)=[60,70,80] (1,1)=[90,100,110]
   let rgb: Vec<u8> = vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110];
   let out = preprocess_image(&rgb, w, h, &cfg).unwrap();
-  assert_eq!(out.grid(), (1, 1));
+  assert_eq!(out.grid().unwrap(), (1, 1));
   let pv = to_vec_f32(&out.pixel_values);
   // The single active patch row is the 12-value flatten of the 2x2 patch in
   // (row, col, channel-innermost) order — exactly the input byte order here.

@@ -652,8 +652,14 @@ fn build_attention_mask(shapes: &[(i32, i32)], n: usize, num_patches: i32) -> Re
 /// — `spatial_shapes` is the source of truth for the active grid, so a grid that
 /// disagrees with the patch budget is rejected here, before it drives the
 /// position resize, the active-row slice, or the attention mask.
+///
+/// Shared as the single active-grid validation point: the vision tower's
+/// position resize + attention mask call it, and
+/// [`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs)
+/// calls it for the active-row slice + PixelUnshuffle reshape — all from the
+/// same `spatial_shapes`-derived `(H_p, W_p)`.
 #[cfg(feature = "lfm2-vl")]
-fn validate_active_grid(h_p: i32, w_p: i32, num_patches: i32) -> Result<i32> {
+pub(crate) fn validate_active_grid(h_p: i32, w_p: i32, num_patches: i32) -> Result<i32> {
   require_positive("lfm2_vl vision: H_patch", h_p)?;
   require_positive("lfm2_vl vision: W_patch", w_p)?;
   let active = checked_mul(

@@ -57,11 +57,13 @@
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{
     ArithmeticOverflowPayload, CapExceededPayload, Error, InvariantViolationPayload,
-    LengthMismatchPayload, OutOfRangePayload, Result,
+    LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result,
   },
   model_validation::{Extent, elem_count, require_positive, reserve_or_error},
+  ops,
   vlm::image::{ResizeFilter, patch_grid, resize},
 };
 
@@ -223,6 +225,19 @@ impl Lfm2VlProcessorConfig {
 /// All three are produced lazily (built from host buffers via
 /// [`Array::from_slice`]); no implicit eval. The fixed leading dimension is
 /// `max_num_patches`.
+///
+/// ## Single source of truth for the active grid
+///
+/// [`spatial_shapes`](Self::spatial_shapes) is the **only** carrier of the
+/// active patch grid `(H_p, W_p)`; there is no separate host-int grid field.
+/// The vision tower derives its attention mask and position resize from
+/// `spatial_shapes` in
+/// [`VisionModel::forward`](super::vision::VisionModel::forward), and the
+/// active-row slice and PixelUnshuffle reshape in
+/// [`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs)
+/// read the same `spatial_shapes` via [`grid`](Self::grid). The two therefore
+/// cannot disagree: a mask/slice disagreement is *unrepresentable* because the
+/// type cannot hold two grids.
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 #[derive(Debug)]
@@ -234,46 +249,65 @@ pub struct Lfm2VlImageInputs {
   /// `(max_num_patches,)` i32 — `1` for the first `H_p * W_p` rows, `0` for
   /// padding.
   pub pixel_attention_mask: Array,
-  /// `(2,)` i32 — `[H_p, W_p]`, the patch grid dimensions.
+  /// `(2,)` i32 — `[H_p, W_p]`, the patch grid dimensions. The **single source
+  /// of truth** for the active grid (see the type docs); [`grid`](Self::grid)
+  /// reads `(H_p, W_p)` from here.
   pub spatial_shapes: Array,
-  /// The patch grid height `H_p` (host int; the same value carried lazily as
-  /// `spatial_shapes[0]`). Stashed so [`grid`](Self::grid) needs no eval.
-  grid_h: i32,
-  /// The patch grid width `W_p` (host int; `spatial_shapes[1]`).
-  grid_w: i32,
 }
 
 #[cfg(feature = "lfm2-vl")]
 impl Lfm2VlImageInputs {
   /// Assemble a [`Lfm2VlImageInputs`] from its parts — the `pixel_values`
   /// `(max_num_patches, patch_feat)`, `pixel_attention_mask` `(max_num_patches,)`,
-  /// `spatial_shapes` `(2,)`, and the host patch grid `(H_p, W_p)` (carried so
-  /// [`grid`](Self::grid) needs no eval). Lets a caller that already holds a
+  /// and `spatial_shapes` `(2,)` `[H_p, W_p]`. Lets a caller that already holds a
   /// NaFlex triple (e.g. the cross-model
   /// [`encode_image`](crate::vlm::model::Model::encode_image) reconstructing a
   /// square fully-active grid) build the inputs without re-running
   /// [`preprocess_image`].
+  ///
+  /// The active grid is read from `spatial_shapes` alone (there is no separate
+  /// grid argument), so a caller cannot supply a grid that disagrees with
+  /// `spatial_shapes` — the mask/slice desync class is unrepresentable.
   pub fn from_parts(
     pixel_values: Array,
     pixel_attention_mask: Array,
     spatial_shapes: Array,
-    grid_h: i32,
-    grid_w: i32,
   ) -> Self {
     Self {
       pixel_values,
       pixel_attention_mask,
       spatial_shapes,
-      grid_h,
-      grid_w,
     }
   }
 
-  /// The native patch grid `(H_p, W_p)` of this image (host integers; the same
-  /// values carried lazily in [`spatial_shapes`](Self::spatial_shapes)). Feeds
-  /// [`num_image_tokens_from_patch_grid`] / [`expand_image_tokens`].
-  pub fn grid(&self) -> (i32, i32) {
-    (self.grid_h, self.grid_w)
+  /// The native patch grid `(H_p, W_p)` of this image, read from the `(2,)`
+  /// [`spatial_shapes`](Self::spatial_shapes) companion (the single source of
+  /// truth). Feeds [`num_image_tokens_from_patch_grid`] / [`expand_image_tokens`]
+  /// and the active-row slice + PixelUnshuffle reshape in
+  /// [`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs).
+  ///
+  /// Materializes the tiny `(2,)` array to host integers (a 2-element read; the
+  /// grid geometry is host-side). The eval is on an internal clone — `self` is
+  /// not mutated — so this stays a `&self` read with no observable side effect,
+  /// mirroring the vision tower's `spatial_shapes` host read.
+  ///
+  /// # Errors
+  /// [`Error::RankMismatch`] if `spatial_shapes` is not a `(2,)` array.
+  pub fn grid(&self) -> Result<(i32, i32)> {
+    let shape = self.spatial_shapes.shape();
+    if shape.as_slice() != [2] {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "lfm2_vl Lfm2VlImageInputs::grid: spatial_shapes must be a (2,) [H_p, W_p] array",
+        shape.len() as u32,
+        shape,
+      )));
+    }
+    // Materialize the tiny `(2,)` companion to host ints. `astype` produces a
+    // fresh array; the eval is on that clone, never on `self.spatial_shapes`.
+    let mut s = ops::misc::astype(&self.spatial_shapes, Dtype::I32)?;
+    s.eval()?;
+    let v = s.to_vec::<i32>()?;
+    Ok((v[0], v[1]))
   }
 }
 
@@ -615,8 +649,6 @@ pub fn preprocess_image(
     pixel_values,
     pixel_attention_mask,
     spatial_shapes,
-    grid_h: h_p as i32,
-    grid_w: w_p as i32,
   })
 }
 
