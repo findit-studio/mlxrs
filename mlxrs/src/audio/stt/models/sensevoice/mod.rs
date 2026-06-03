@@ -21,27 +21,33 @@
 //!    LayerNorms, fronted by a `sqrt(output_size)` scale + an additive
 //!    sinusoidal position encoding. Every linear is quantize-aware via the
 //!    shared [`crate::nn::MaybeQuantizedLinear`].
-//! 3. **CTC head + rich-info decode** — the `ctc_lo` projection, the prepended
-//!    query-row assembly, the greedy collapse over the speech frames, and the
-//!    language / emotion / event argmax heads. *(Phase 3 — not yet wired in this
-//!    module.)*
+//! 3. **CTC head + rich-info decode** ([`model`]) — the `ctc_lo` projection, the
+//!    prepended query-row assembly, the greedy collapse over the speech frames,
+//!    and the language / emotion / event argmax heads, decoded through the
+//!    [`tokenizer`] (SentencePiece / `tokens.json`). The
+//!    [`crate::audio::stt::model::CtcModel`] (speech-only `logits`) +
+//!    [`crate::audio::stt::model::Transcribe`] (encoder-once -> rich tags ->
+//!    shared collapse) trait wiring, with the rich tags exposed through the
+//!    model-local [`model::SenseVoiceResult`].
 //!
 //! ## Status
 //!
-//! This module currently provides **Phase 1** (the [`config`] +
-//! [`frontend`] glue + `sanitize`) and **Phase 2** (the SANM/FSMN
-//! [`encoder`]). The CTC head, the query-prefix assembly, the rich-info
-//! extraction, the tokenizer decode, and the
-//! [`crate::audio::stt::model::CtcModel`] / [`crate::audio::stt::model::Transcribe`]
-//! trait wiring (Phase 3), plus the file-loading factory + quant resolution +
-//! shard walk (Phase 4), arrive in later changes. The pieces here are exercised
-//! by shape + closed-form oracle tests (no checkpoint).
+//! This module provides **Phase 1** (the [`config`] + [`frontend`] glue +
+//! `sanitize`), **Phase 2** (the SANM/FSMN [`encoder`]), and **Phase 3** (the
+//! CTC head, the query-prefix assembly, the rich-info extraction, the
+//! [`tokenizer`] decode, and the [`model::SenseVoiceModel`]
+//! [`crate::audio::stt::model::CtcModel`] /
+//! [`crate::audio::stt::model::Transcribe`] wiring). The file-loading factory +
+//! quant resolution + shard walk (Phase 4) arrive in a later change. The pieces
+//! here are exercised by shape + closed-form oracle tests (no checkpoint).
 //!
 //! [sv]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/sensevoice/sensevoice.py
 
 pub mod config;
 pub mod encoder;
 pub mod frontend;
+pub mod model;
+pub mod tokenizer;
 
 pub use config::{Config, EncoderConfig, FrontendConfig, MODEL_TYPE};
 pub use encoder::{
@@ -49,3 +55,5 @@ pub use encoder::{
   SinusoidalPositionEncoder,
 };
 pub use frontend::{apply_cmvn, apply_lfr, compute_fbank, parse_am_mvn, sanitize};
+pub use model::{BLANK_ID, RichInfo, SenseVoiceModel, SenseVoiceResult, build_head};
+pub use tokenizer::SenseVoiceTokenizer;
