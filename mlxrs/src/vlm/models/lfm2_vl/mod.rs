@@ -12,13 +12,16 @@
 //!
 //! ## Phase status
 //!
-//! This phase ports the
+//! This phase adds the
+//! [pixel-unshuffle + multimodal projector + image-feature merge](crate::vlm::models::lfm2_vl::projector)
+//! and the [language adapter](crate::vlm::models::lfm2_vl::language) (the thin
+//! guarded wrapper that forwards merged embeddings through the LFM2 LM), on top
+//! of the previously-ported
 //! [config structs](crate::vlm::models::lfm2_vl::config), the
 //! [vision tower](crate::vlm::models::lfm2_vl::vision), and the pure-MLX bicubic
 //! interpolation primitive
 //! ([`crate::ops::interpolation::bicubic_interpolate`]) the position-embed
-//! resize uses. The pixel-unshuffle projector, the multimodal embed-splice, the
-//! native-resolution processor, and the top-level
+//! resize uses. The native-resolution processor and the top-level
 //! [`crate::vlm::model::Model`] implementation (wiring the LM + vision +
 //! projector together and registering in the VLM factory) come in a later
 //! phase.
@@ -28,11 +31,25 @@
 pub mod config;
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub mod language;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub mod projector;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub mod vision;
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use config::{ModelConfig, TextConfig, VisionConfig};
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub use language::LanguageModel;
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub use projector::{
+  Lfm2VlMultiModalProjector, PixelUnshuffleBlock, merge_input_ids_with_image_features,
+};
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use vision::VisionModel;

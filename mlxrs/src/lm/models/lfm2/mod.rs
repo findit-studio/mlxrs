@@ -1179,6 +1179,20 @@ impl Lfm2 {
     Ok(())
   }
 
+  /// Gather the token embeddings `embed_tokens(input_ids)` — the LFM2-VL
+  /// `language_model.model.embed_tokens(input_ids)` entry point
+  /// (`mlx-vlm/mlx_vlm/models/lfm2_vl/lfm2_vl.py:124`). `ids` is an integer
+  /// `(B, T)` (or `(T,)`) array; the result is `ids.shape ++ (hidden,)`.
+  ///
+  /// Mirrors `mlx.nn.Embedding.__call__` (dense) /
+  /// `mlx.nn.QuantizedEmbedding.__call__` (quantized) over the SAME table the
+  /// tied logit head ([`Self::forward`]) uses. The VLM wrapper splices image
+  /// features into these embeddings before re-entering the decoder through
+  /// [`crate::lm::model::Model::forward_embeddings`].
+  pub fn embed_tokens(&self, ids: &Array) -> Result<Array> {
+    self.model.embed_tokens.forward(ids)
+  }
+
   /// Build the heterogeneous per-layer cache (`make_cache`, `lfm2.py:312-316`):
   /// a [`StandardKvCache`] (`"KVCache"`) for every attention layer and a
   /// one-slot [`ArraysCache`] for every conv layer, in layer order.
