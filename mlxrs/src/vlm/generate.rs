@@ -18,38 +18,45 @@
 //! **Exact per-step order** (faithful to mlx-vlm `generate_step`, lines
 //! 864–963):
 //!
-//! 1. *Assemble + validate prompt FIRST* (deterministic validation must
-//!    precede expensive vision work).
-//!    [`crate::vlm::prompt::insert_image_tokens`] splices
-//!    `num_tokens_per_image` placeholders per image into `text_tokens`
-//!    at the marker run; per-image spans are computed inline as
-//!    `[(base + i*N, base + (i+1)*N)]`. We deliberately invoke the
-//!    splice primitive directly (NOT
+//! 1. *Validate the non-count prompt shape FIRST* (cheap, deterministic;
+//!    precedes any image load). `validate_marker_run` checks marker
+//!    presence (under [`crate::vlm::prompt::MarkerPolicy`]) and the
+//!    image/marker pairing (the first contiguous marker run is exactly
+//!    `image_count` long, no stray markers after it) and returns the
+//!    splice base offset. A template-drift request (missing marker under
+//!    `Required`, wrong run length) errors here BEFORE any image is
+//!    loaded.
+//! 2. *Preprocess each image via the model's [`crate::vlm::model::ImageProcessor`],
+//!    then assemble + encode.* For each path in `images`,
+//!    `vlm::image::load_image(path) → processor.process(&img)` yields a
+//!    [`crate::vlm::model::ProcessedImage`] carrying the model's native
+//!    pixel/patch tensor, any native-resolution companions, and the
+//!    per-image image-token count. The processor is passed explicitly
+//!    (mirroring mlx-vlm `generate(model, processor, …)`): a fixed-grid
+//!    model's default
+//!    [`FixedGridProcessor`](crate::vlm::model::FixedGridProcessor)
+//!    reproduces the historical `preprocess` `[H, W, 3]` result and a
+//!    constant grid count; a native-resolution model returns its own
+//!    processor with a variable per-image count. Then
+//!    `assemble_prompt_with_counts` replaces the marker run with each
+//!    image's `num_tokens` placeholder ids in order (accumulating, NOT a
+//!    uniform stride — a native-res model's per-image widths differ) and
+//!    computes the matching per-image spans, and
+//!    `model.encode_image(&processed_image)` lifts each image into
+//!    `[N_i, D]` vision-encoder embeddings, validated to return EXACTLY
+//!    `[image.num_tokens(), D]` rows (the cross-model splice contract). We
+//!    deliberately build the spans inline (NOT
 //!    [`crate::vlm::prompt::assemble_multimodal_prompt`], which also
-//!    builds an O(T*T) bidirectional-within-image attention mask)
-//!    because the trait's `forward_embeddings(embeds, cache)` signature
-//!    has no way to thread that mask through to a per-model attention
-//!    layer; instead,
-//!    [`crate::vlm::model::Model::forward_embeddings_multimodal`]
-//!    receives chunk-local `image_spans` + a `cache_offset` BY VALUE on
-//!    every prefill chunk so a mask-requiring per-model override builds
-//!    its `[chunk × (past + chunk)]` mask without any `&self` state. A
-//!    malformed prompt (missing marker, marker count mismatch,
-//!    `num_tokens_per_image == 0`) errors here BEFORE any image is
-//!    loaded / preprocessed / encoded.
-//! 2. *Preprocess + encode images.* For each path in `images`,
-//!    `vlm::image::load_image(path) → preprocess(…, image_processor_config)`
-//!    — using the caller-supplied [`crate::vlm::image::ImageProcessorConfig`]
-//!    (the loaded processor's config, mirroring mlx-vlm `generate(model,
-//!    processor, …)`), NOT one re-derived from the model — yields
-//!    `[H, W, 3]` f32; `model.encode_image(image)` lifts each into
-//!    `[N_i, D]` vision-encoder embeddings. Each `encode_image` call
-//!    is validated to return EXACTLY `[num_tokens_per_image, D]` rows
-//!    — a model with variable-per-image counts must pad/truncate
-//!    inside its own `encode_image` to satisfy this cross-model splice
-//!    contract. The per-image slabs are kept SEPARATE (one `[N_i, D]`
-//!    Array per image), NOT pre-concatenated — the prefill gathers only
-//!    the slabs whose span falls in the current chunk (step 4).
+//!    builds an O(T*T) bidirectional-within-image attention mask) because
+//!    the trait's `forward_embeddings(embeds, cache)` signature has no way
+//!    to thread that mask through to a per-model attention layer; instead,
+//!    [`crate::vlm::model::Model::forward_embeddings_multimodal`] receives
+//!    chunk-local `image_spans` + a `cache_offset` BY VALUE on every
+//!    prefill chunk so a mask-requiring per-model override builds its
+//!    `[chunk × (past + chunk)]` mask without any `&self` state. The
+//!    per-image slabs are kept SEPARATE (one `[N_i, D]` Array per image),
+//!    NOT pre-concatenated — the prefill gathers only the slabs whose span
+//!    falls in the current chunk (step 4).
 //! 3. *(no global embed/merge).* Text embedding + image merge are
 //!    NOT done over the full sequence here — they happen INCREMENTALLY
 //!    per chunk in step 4, so peak memory is bounded by `prefill_step_size
@@ -102,8 +109,9 @@ use std::{cell::RefCell, path::PathBuf};
 use crate::{
   array::Array,
   error::{
-    ArithmeticOverflowPayload, EmptyInputPayload, Error, LengthMismatchPayload, OutOfRangePayload,
-    RankMismatchPayload, Result, try_extend_from_slice, try_with_capacity,
+    ArithmeticOverflowPayload, EmptyInputPayload, Error, InvariantViolationPayload,
+    LengthMismatchPayload, MissingFieldPayload, OutOfRangePayload, RankMismatchPayload, Result,
+    try_extend_from_slice, try_with_capacity,
   },
   lm::{
     cache::KvCache,
@@ -114,11 +122,17 @@ use crate::{
   },
   ops,
   vlm::{
-    image::{ImageProcessorConfig, load_image, preprocess},
-    model::Model,
-    prompt::{MarkerPolicy, insert_image_tokens},
+    image::load_image,
+    model::{ImageProcessor, Model, ProcessedImage},
+    prompt::MarkerPolicy,
   },
 };
+
+/// The assembled multimodal prompt + its per-image placeholder spans: the
+/// `(assembled_tokens, image_spans)` pair [`assemble_prompt_with_counts`]
+/// returns. `image_spans[i]` is the half-open `(start, end)` range image `i`'s
+/// placeholder run occupies in `assembled_tokens`.
+type AssembledPrompt = (Vec<u32>, Vec<(usize, usize)>);
 
 /// Multimodal generation config — wraps [`GenConfig`] with the
 /// image-specific knobs the multimodal pipeline needs.
@@ -147,11 +161,16 @@ pub struct VlmGenConfig {
   /// (placeholder). When `None`, defaults to [`Self::image_token_id`]
   /// (the common case).
   image_marker_id: Option<u32>,
-  /// Number of image tokens per image — the per-model
-  /// `num_tokens_per_image` (Qwen-VL variable, LLaVA fixed-grid, etc.).
-  /// MUST match what [`Model::encode_image`] emits (`N_i` per image), or
-  /// the splice will fail the `Σ widths == N_total` contract in
-  /// [`Model::merge_embeddings`].
+  /// The fixed-grid per-image token count fed to the default
+  /// [`Model::image_processor`] (a
+  /// [`FixedGridProcessor`](crate::vlm::model::FixedGridProcessor)) when the
+  /// caller does not pass an explicit processor — the constant grid size a
+  /// CLIP/SigLIP/LLaVA encoder emits per image. A native-resolution model
+  /// (LFM2.5-VL, Qwen3.5-VL) gets its variable per-image counts from its OWN
+  /// [`ImageProcessor`] instead, and this field is unused for that path. The
+  /// per-image counts the prompt is actually built from come from each
+  /// image's [`ProcessedImage::num_tokens`](crate::vlm::model::ProcessedImage::num_tokens),
+  /// and [`Model::encode_image`] must emit exactly that many rows per image.
   num_tokens_per_image: usize,
   /// Marker-vs-prepend policy. See
   /// [`crate::vlm::prompt::MarkerPolicy`].
@@ -236,21 +255,24 @@ impl VlmGenConfig {
 /// dispatches the per-token decode (same per-step order as
 /// [`crate::lm::generate`]) via [`crate::lm::model::Model::forward`].
 ///
-/// **The image-preprocessing config is an explicit parameter, not derived
-/// from the model.** mlx-vlm's `generate` / `generate_step` take the
-/// `processor` separately from the `model` (`generate.py:1183`, `:966` —
-/// `generate(model, processor, …)`): a VLM loaded via
-/// [`crate::vlm::load::load`] returns a [`crate::vlm::load::LoadedVlmContext`]
-/// whose [`processor`](crate::vlm::load::LoadedVlmContext::processor)
-/// carries the parsed `preprocessor_config.json` /
-/// `processor_config.json`. Pass that
-/// processor's [`image_processor_config`](crate::vlm::load::Processor::image_processor_config)
-/// here so real image prompts are preprocessed with the *loaded* config —
-/// `vlm_generate` deliberately does NOT call
-/// [`Model::image_processor_config`] itself (that would silently fall back
-/// to the trait default / a stale baked-in config when a loaded processor
-/// exists). A caller that only has a model and no separate processor can
-/// still pass `&model.image_processor_config()` explicitly.
+/// **The image processor is an explicit parameter, not derived from the
+/// model.** mlx-vlm's `generate` / `generate_step` take the `processor`
+/// separately from the `model` (`generate.py:1183`, `:966` — `generate(model,
+/// processor, …)`). Pass the [`ImageProcessor`] the loaded model carries: a
+/// fixed-grid model's default is
+/// [`model.image_processor(num_tokens)`](Model::image_processor) (a
+/// [`FixedGridProcessor`](crate::vlm::model::FixedGridProcessor) reproducing
+/// the historical [`crate::vlm::image::preprocess`] path), while a
+/// native-resolution model (LFM2.5-VL NaFlex, the future Qwen3.5-VL line)
+/// returns its own model-specific processor whose
+/// [`process`](ImageProcessor::process) builds the variable patch tensor + its
+/// per-image token count. `vlm_generate` runs each raw loaded image through
+/// `processor.process(&img)` to get a [`ProcessedImage`], uses each image's
+/// [`num_tokens`](ProcessedImage::num_tokens) to size that image's placeholder
+/// run in the prompt, and feeds the [`ProcessedImage`] to
+/// [`Model::encode_image`]. Passing the processor explicitly mirrors the
+/// loaded-processor flow and keeps a fixed-grid caller able to specify its
+/// constant count via the default processor.
 ///
 /// Returns `impl Iterator<Item = Result<GenStep>> + 'a` — `impl` keeps the
 /// concrete iterator type unnamed (matching the LM-side
@@ -286,11 +308,11 @@ impl VlmGenConfig {
 ///   on a span/embed/dim contract violation in [`Model::merge_embeddings`].
 /// - `Error::RankMismatch` (wrong ndim) or `Error::LengthMismatch` (wrong
 ///   row count) on a per-image encoder output that is not
-///   `[cfg.num_tokens_per_image, D]` — every image MUST emit exactly
-///   `num_tokens_per_image` feature rows, enforced per-image BEFORE
-///   the slabs are concatenated (the cross-model splice contract; a
-///   model with variable-per-image counts must pad/truncate inside its
-///   own `encode_image`, or override the entry point).
+///   `[image.num_tokens(), D]` — every image MUST emit exactly the feature
+///   rows its [`ProcessedImage::num_tokens`] reports, enforced per-image
+///   BEFORE the slabs are concatenated (the cross-model splice contract; a
+///   variable-per-image model reports each image's own count from its
+///   processor and emits that many rows).
 ///
 /// Surface (as the iterator's first `Err`, exactly like
 /// [`crate::lm::generate::generate_step`]):
@@ -299,7 +321,7 @@ impl VlmGenConfig {
 /// - any per-step forward / sample failure
 pub fn vlm_generate<'a, M: Model + ?Sized>(
   model: &'a M,
-  image_processor_config: &ImageProcessorConfig,
+  processor: &dyn ImageProcessor,
   text_tokens: &[u32],
   images: &[PathBuf],
   cache: Vec<Box<dyn KvCache>>,
@@ -385,82 +407,70 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
 
   // ── MULTIMODAL PATH ──────────────────────────────────────────────────
   //
-  // ORDER: deterministic prompt-shape validation FIRST (marker
-  // presence, num_tokens_per_image, splice overflow), THEN the
-  // expensive vision pipeline. A malformed request — missing marker
-  // under MarkerPolicy::Required, marker-count mismatch,
-  // num_tokens_per_image == 0 — must NOT load/preprocess/encode any
-  // images before erroring; otherwise a service accepting a multi-
-  // image request burns the full vision cost before surfacing the
-  // template-drift error.
+  // ORDER: deterministic non-count prompt-shape validation FIRST (marker
+  // presence under MarkerPolicy::Required, image/marker pairing), THEN the
+  // per-image processor run (whose output carries each image's variable
+  // `num_tokens`), THEN the count-dependent prompt assembly + spans, THEN
+  // the per-image encode. The non-count validation runs before any image
+  // is even loaded so a template-drift request (missing marker, wrong
+  // marker-run length) errors cheaply; the count is per-image and comes
+  // from the processor (native-resolution models produce a variable count
+  // per image), so the placeholder-run sizing necessarily follows
+  // processing.
   let marker_id = cfg.image_marker_id.unwrap_or(cfg.image_token_id);
-  let assembled_tokens = insert_image_tokens(
-    text_tokens,
-    images.len(),
-    marker_id,
-    cfg.image_token_id,
-    cfg.num_tokens_per_image,
-    cfg.marker_policy,
-  )?;
-  // Compute per-image spans directly from the splice base offset and
-  // the per-image `num_tokens_per_image` width — byte-identical to what
-  // [`crate::vlm::prompt::assemble_multimodal_prompt`] computes
-  // internally, but without the trailing mask construction. The base
-  // offset is either the position of the first marker (when present)
-  // or 0 (PrependIfAbsent path). `insert_image_tokens` has already
-  // validated the marker policy + run length, so the same lookup here
-  // is just locating the splice's leading edge.
-  let base: usize = text_tokens
-    .iter()
-    .position(|&t| t == marker_id)
-    .unwrap_or_default();
-  let mut image_spans: Vec<(usize, usize)> = try_with_capacity(images.len())?;
-  for i in 0..images.len() {
-    let start = base + i * cfg.num_tokens_per_image;
-    let end = start + cfg.num_tokens_per_image;
-    image_spans.push((start, end));
-  }
+  let base = validate_marker_run(text_tokens, images.len(), marker_id, cfg.marker_policy)?;
 
-  // Now the expensive vision path. Per-image preprocess + encode. We
-  // deliberately encode one image at a time and concatenate the
-  // resulting `[N_i, D]` slabs along axis 0: some models' `encode_image`
-  // accepts a batch and some don't (the per-model encoder owns the
-  // input layout / batch contract per [`Model::encode_image`]'s doc),
-  // so the cross-model surface stays at "one image at a time" — the
-  // simplest contract that every encoder satisfies. `Vec::with_capacity`
-  // so the per-image push is amortized O(1) without reallocation.
-  //
-  // PER-IMAGE SHAPE VALIDATION: every `encode_image` MUST return exactly
-  // `[cfg.num_tokens_per_image, D]`. The cross-model splice contract is
-  // "one image emits exactly `num_tokens_per_image` features"; a model
-  // with variable-per-image counts (some Qwen-VL configurations) MUST
-  // pad / truncate / repeat inside its own `encode_image` to satisfy this
-  // contract, or override the whole `vlm_generate` entry point with its
-  // own variable-span loop. Without this per-slab check, a model
-  // returning e.g. `[2, D]` for image 1 and `[4, D]` for image 2 with
-  // `num_tokens_per_image = 3` would pass the merge layer's "total
-  // widths == total rows" check (both = 6) but cause silent
-  // marker-to-image misalignment (the first prompt span would consume
-  // 2 rows from image 1 plus 1 row from image 2). Surface as
-  // `Error::LengthMismatch` instead.
-  //
-  // Image preprocessing uses the caller-supplied `image_processor_config`
-  // — NOT `model.image_processor_config()`. mlx-vlm's `generate` /
-  // `generate_step` receive the `processor` separately from the `model`
-  // (`generate.py:1183`, `:966` — `generate(model, processor, …)`); a VLM
-  // loaded via [`crate::vlm::load::load`] carries a `Box<dyn Processor>`
-  // whose [`crate::vlm::load::Processor::image_processor_config`] reflects
-  // the parsed `preprocessor_config.json` / `processor_config.json`. The
-  // generation entry point therefore must NOT silently re-derive the
-  // preprocessing params from the model (which would fall back to the
-  // trait default / a stale baked-in config); the caller passes the
-  // processor's config explicitly. A caller that only has a model can
-  // still pass `&model.image_processor_config()`.
-  let mut image_slabs: Vec<Array> = try_with_capacity(images.len())?;
+  // Per-image preprocess via the model's [`ImageProcessor`]. Each image is
+  // loaded + decoded, then run through `processor.process(&img)` to its
+  // [`ProcessedImage`] — the model's native pixel/patch tensor, optional
+  // native-resolution companions, and the per-image image-token count. A
+  // fixed-grid model's default processor reproduces the historical
+  // `vlm::image::preprocess` result and reports the constant grid count; a
+  // native-resolution model returns its own variable count per image. The
+  // processor is passed explicitly (mlx-vlm's `generate(model, processor,
+  // …)`), so the loaded preprocessor config flows in rather than being
+  // silently re-derived from the model.
+  let mut processed: Vec<ProcessedImage> = try_with_capacity(images.len())?;
   for path in images.iter() {
     let img = load_image(path)?;
-    let pre = preprocess(&img, image_processor_config)?;
-    let encoded = model.encode_image(&pre)?;
+    processed.push(processor.process(&img)?);
+  }
+
+  // Per-image token counts → the count-dependent prompt assembly + spans.
+  // The marker run (one marker per image, validated above) is replaced by
+  // each image's `num_tokens` placeholders in order; spans are the
+  // half-open ranges those placeholder runs occupy. A native-resolution
+  // model's per-image counts differ, so the spans are NOT a uniform stride
+  // — they accumulate each image's own width.
+  let mut counts: Vec<usize> = try_with_capacity(processed.len())?;
+  for p in processed.iter() {
+    counts.push(p.num_tokens());
+  }
+  let (assembled_tokens, image_spans) =
+    assemble_prompt_with_counts(text_tokens, base, marker_id, cfg.image_token_id, &counts)?;
+
+  // Now the per-image encode. We deliberately encode one image at a time
+  // and concatenate the resulting `[N_i, D]` slabs along axis 0: some
+  // models' `encode_image` accepts a batch and some don't (the per-model
+  // encoder owns the input layout / batch contract per
+  // [`Model::encode_image`]'s doc), so the cross-model surface stays at
+  // "one image at a time" — the simplest contract that every encoder
+  // satisfies.
+  //
+  // PER-IMAGE SHAPE VALIDATION: every `encode_image` MUST return exactly
+  // `[image.num_tokens(), D]`. The cross-model splice contract is "one
+  // image emits exactly its reported `num_tokens` features"; a
+  // variable-per-image model reports each image's own count from its
+  // processor and emits that many rows. Without this per-slab check, a
+  // model returning e.g. `[2, D]` for image 1 and `[4, D]` for image 2
+  // whose reported counts are 3 / 3 would pass the merge layer's "total
+  // widths == total rows" check (both = 6) but cause silent
+  // marker-to-image misalignment (the first prompt span would consume 2
+  // rows from image 1 plus 1 row from image 2). Surface as
+  // `Error::LengthMismatch` instead.
+  let mut image_slabs: Vec<Array> = try_with_capacity(processed.len())?;
+  for (p, &want) in processed.iter().zip(counts.iter()) {
+    let encoded = model.encode_image(p)?;
     let enc_shape = encoded.shape();
     let (rows, _d) = match enc_shape.as_slice() {
       [n, d] => (*n, *d),
@@ -472,12 +482,12 @@ pub fn vlm_generate<'a, M: Model + ?Sized>(
         )));
       }
     };
-    if rows != cfg.num_tokens_per_image {
+    if rows != want {
       return Err(Error::LengthMismatch(LengthMismatchPayload::new(
-        "vlm_generate: encode_image feature rows vs cfg.num_tokens_per_image (cross-model splice \
-           contract requires exactly num_tokens_per_image per image — a variable-per-image model \
-           must pad/truncate inside encode_image or override vlm_generate)",
-        cfg.num_tokens_per_image,
+        "vlm_generate: encode_image feature rows vs ProcessedImage::num_tokens (cross-model \
+           splice contract requires exactly the processor-reported per-image token count per \
+           image)",
+        want,
         rows,
       )));
     }
@@ -977,6 +987,188 @@ impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
   }
 }
 
+/// Validate the marker run for the multimodal prompt WITHOUT the per-image
+/// token count, returning the splice base offset (the leading edge where the
+/// image placeholders go).
+///
+/// Mirrors the non-count validation [`crate::vlm::prompt::insert_image_tokens`]
+/// performs — but factored out so the count-dependent assembly can follow the
+/// per-image processor run (a native-resolution model's per-image
+/// `num_tokens` is only known post-processing). Checks:
+/// - the first contiguous run of `marker_id` has length exactly `image_count`
+///   (the chat-template producer emits `marker * image_count`); a mismatch is
+///   [`Error::LengthMismatch`];
+/// - no further `marker_id` occurs after that run
+///   ([`Error::InvariantViolation`] — the splice supports one marker run,
+///   mirroring python `prompt_utils`' `prompt.split("<image>")` 2-chunk
+///   contract);
+/// - when no marker is present, [`MarkerPolicy::Required`] is
+///   [`Error::MissingField`] and [`MarkerPolicy::PrependIfAbsent`] yields
+///   base `0` (prepend).
+///
+/// `image_count` is `> 0` here (the caller's zero-image passthrough handles the
+/// empty case). Returns the base offset: the position of the first marker (when
+/// present) or `0` (the PrependIfAbsent path).
+fn validate_marker_run(
+  text_tokens: &[u32],
+  image_count: usize,
+  marker_id: u32,
+  policy: MarkerPolicy,
+) -> Result<usize> {
+  match text_tokens.iter().position(|&t| t == marker_id) {
+    Some(run_start) => {
+      let run_end = text_tokens[run_start..]
+        .iter()
+        .position(|&t| t != marker_id)
+        .map_or(text_tokens.len(), |off| run_start + off);
+      let run_len = run_end - run_start;
+      // Reject extra markers after the consumed run.
+      if text_tokens[run_end..].contains(&marker_id) {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "vlm_generate: image marker occurrences (after the first contiguous run)",
+          "must be 0 — the splice supports at most one contiguous marker run (mirrors python \
+           prompt_utils' `prompt.split(\"<image>\")` 2-chunk contract)",
+        )));
+      }
+      // Reject contiguous-run length mismatch with `image_count` (the producer
+      // emits exactly `marker * image_count` adjacent markers).
+      if run_len != image_count {
+        return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+          "vlm_generate: contiguous marker run length vs image_count (the chat-template producer \
+             should emit exactly `marker * image_count` adjacent markers; mismatch suggests \
+             caller/template skew)",
+          image_count,
+          run_len,
+        )));
+      }
+      Ok(run_start)
+    }
+    None => {
+      if policy == MarkerPolicy::Required {
+        return Err(Error::MissingField(MissingFieldPayload::new(
+          "vlm_generate (MarkerPolicy::Required, image_count > 0; chat-template / tokenizer drift \
+             detected — pass MarkerPolicy::PrependIfAbsent if the model uses the \
+             PROMPT_WITH_IMAGE_TOKEN-family formatter)",
+          "image_marker_id token in text_tokens",
+        )));
+      }
+      // PrependIfAbsent → the placeholders go at the front.
+      Ok(0)
+    }
+  }
+}
+
+/// Build the assembled prompt + per-image spans from the per-image token
+/// `counts`, replacing the validated marker run (one marker per image) with
+/// each image's `counts[i]` placeholder ids in order.
+///
+/// This is the per-image-count generalization of
+/// [`crate::vlm::prompt::insert_image_tokens`] + the span computation
+/// [`crate::vlm::prompt::assemble_multimodal_prompt`] does internally: a
+/// fixed-grid model passes a uniform `counts` (every entry the constant grid
+/// size) and gets the historical uniform-stride spans; a native-resolution
+/// model passes its variable per-image counts and gets accumulating spans.
+///
+/// `base` is the splice leading edge from [`validate_marker_run`] — the marker
+/// run's start (marker present) or `0` (PrependIfAbsent). When the marker is
+/// present the run spans `base..base + counts.len()` (one marker per image,
+/// already validated); when absent the placeholders are prepended at `base ==
+/// 0`. The placeholder block has total width `Σ counts`; the surrounding text
+/// (before `base` and after the marker run, or the whole text after a
+/// prepend) is copied verbatim.
+///
+/// Returns `(assembled_tokens, image_spans)` where `image_spans[i]` is the
+/// half-open `(start, end)` range image `i`'s `counts[i]` placeholders occupy
+/// in `assembled_tokens`.
+///
+/// # Errors
+/// - [`Error::InvariantViolation`] if any `counts[i] == 0` (an image that
+///   expands to zero placeholders would silently drop — degenerate
+///   model/config state, fail closed, mirroring `insert_image_tokens`);
+/// - [`Error::ArithmeticOverflow`] if the cumulative placeholder total or the
+///   output capacity overflows `usize`;
+/// - [`Error::OutOfMemory`] if the output reservation fails.
+fn assemble_prompt_with_counts(
+  text_tokens: &[u32],
+  base: usize,
+  marker_id: u32,
+  image_token_id: u32,
+  counts: &[usize],
+) -> Result<AssembledPrompt> {
+  // The marker run is present iff the text actually contains the marker; the
+  // base from `validate_marker_run` is the run start in that case, else 0.
+  let marker_present = text_tokens.contains(&marker_id);
+  // The run length is `counts.len()` (one marker per image, validated). With no
+  // marker (PrependIfAbsent) the run length is 0 — the placeholders are a pure
+  // prepend.
+  let run_len = if marker_present { counts.len() } else { 0 };
+
+  // Total placeholder width Σ counts, checked. A zero per-image count would
+  // silently drop that image — reject it.
+  let mut placeholder_total: usize = 0;
+  for (i, &c) in counts.iter().enumerate() {
+    if c == 0 {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "vlm_generate: per-image token count (with image_count > 0)",
+        "must be > 0 — an image expanding to zero placeholders would silently drop; the \
+         processor reported a degenerate count",
+      )));
+    }
+    placeholder_total = placeholder_total.checked_add(c).ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "vlm_generate: cumulative placeholder total (Σ per-image counts)",
+        "usize",
+        [
+          ("placeholder_total", placeholder_total as u64),
+          ("count_i", c as u64),
+          ("i", i as u64),
+        ],
+      ))
+    })?;
+  }
+
+  // Output capacity = text.len() + placeholder_total - run_len (the run is
+  // replaced by the placeholder block). Checked to surface overflow as a
+  // recoverable error.
+  let cap = text_tokens
+    .len()
+    .checked_add(placeholder_total)
+    .and_then(|n| n.checked_sub(run_len))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "vlm_generate: assembled prompt capacity (text_len + placeholder_total - run_len)",
+        "usize",
+        [
+          ("text_len", text_tokens.len() as u64),
+          ("placeholder_total", placeholder_total as u64),
+          ("run_len", run_len as u64),
+        ],
+      ))
+    })?;
+  let mut out: Vec<u32> = try_with_capacity(cap)?;
+  // Leading text (before the splice base). For the prepend path base == 0 so
+  // this is empty.
+  out.extend_from_slice(&text_tokens[..base]);
+  // Placeholder block (Σ counts copies of image_token_id) + per-image spans.
+  let mut spans: Vec<(usize, usize)> = try_with_capacity(counts.len())?;
+  let mut cursor = base;
+  for &c in counts.iter() {
+    let start = cursor;
+    let end = start + c; // `start + c <= base + placeholder_total <= cap`; no overflow.
+    out.extend(std::iter::repeat_n(image_token_id, c));
+    spans.push((start, end));
+    cursor = end;
+  }
+  // Trailing text. With a marker present, skip the consumed run
+  // (`base..base + run_len`); with a prepend, copy the whole text.
+  if marker_present {
+    out.extend_from_slice(&text_tokens[base + run_len..]);
+  } else {
+    out.extend_from_slice(text_tokens);
+  }
+  Ok((out, spans))
+}
+
 /// `logits[:, -1, :]` — slice the final sequence position of a `[B, S, V]`
 /// logits tensor and drop the (now size-1) sequence axis ⇒ `[B, V]`.
 ///
@@ -1128,7 +1320,7 @@ mod tests {
       Array::from_slice::<f32>(&data, &(1_usize, t, self.hidden))
     }
 
-    fn encode_image(&self, _image: &Array) -> Result<Array> {
+    fn encode_image(&self, _image: &ProcessedImage) -> Result<Array> {
       match self.encode {
         EncodeShape::Rank2 { rows, hidden } => {
           let data = vec![1.0_f32; rows * hidden];
@@ -1502,13 +1694,15 @@ mod tests {
       .expect("encode tiny PNG");
 
     let model = VlmMock::new(4, 2).with_encode(EncodeShape::Rank1 { n: 1 });
-    let proc_cfg = ImageProcessorConfig::default();
-    // Prompt: a single marker token (id 7) so insert_image_tokens succeeds
-    // with one image, num_tokens_per_image = 1.
+    // The default fixed-grid processor (num_tokens = 1) preprocesses the real
+    // PNG; the rank-1 encode output then fails the per-image shape check.
+    let proc = model.image_processor(1);
+    // Prompt: a single marker token (id 7) so the marker run validates with
+    // one image, per-image count = 1.
     let cfg = VlmGenConfig::new(
       GenConfig::default().with_max_tokens(4),
       7, // image_token_id == marker_id (single-token marker)
-      1, // num_tokens_per_image
+      1, // num_tokens_per_image (the fixed-grid default count)
       MarkerPolicy::Required,
     );
     let cache = make_prompt_cache(&CacheConfig {
@@ -1517,7 +1711,7 @@ mod tests {
     });
     let res = vlm_generate(
       &model,
-      &proc_cfg,
+      proc.as_ref(),
       &[7u32],
       std::slice::from_ref(&path),
       cache,
@@ -1551,7 +1745,7 @@ mod tests {
   #[test]
   fn vlm_generate_zero_max_tokens_is_empty_no_vision() {
     let model = VlmMock::new(4, 2);
-    let proc_cfg = ImageProcessorConfig::default();
+    let proc = model.image_processor(1);
     let cfg = VlmGenConfig::new(
       GenConfig::default().with_max_tokens(0),
       7,
@@ -1564,7 +1758,7 @@ mod tests {
     });
     // A path that does not exist: if vision work ran, load_image would error.
     let bogus = PathBuf::from("/nonexistent/mlxrs-vlm-no-such-image.png");
-    let mut it = vlm_generate(&model, &proc_cfg, &[7u32], &[bogus], cache, cfg)
+    let mut it = vlm_generate(&model, proc.as_ref(), &[7u32], &[bogus], cache, cfg)
       .expect("max_tokens==0 short-circuits to Ok(empty) before any vision work");
     assert!(it.next().is_none(), "zero-budget run yields nothing");
   }
@@ -1577,7 +1771,7 @@ mod tests {
   #[test]
   fn vlm_generate_invalid_cfg_is_eager_err() {
     let model = VlmMock::new(4, 2);
-    let proc_cfg = ImageProcessorConfig::default();
+    let proc = model.image_processor(1);
     let cfg = VlmGenConfig::new(
       GenConfig::default().with_temp(-1.0),
       7,
@@ -1585,7 +1779,7 @@ mod tests {
       MarkerPolicy::Required,
     );
     let cache: Vec<Box<dyn KvCache>> = Vec::new();
-    let res = vlm_generate(&model, &proc_cfg, &[7u32], &[], cache, cfg);
+    let res = vlm_generate(&model, proc.as_ref(), &[7u32], &[], cache, cfg);
     match res.err().expect("invalid temp must be an eager Err") {
       Error::OutOfRange(p) => assert!(
         p.context().contains("temp"),

@@ -38,7 +38,7 @@ use mlxrs::{
   vlm::{
     generate::{VlmGenConfig, vlm_generate},
     image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
-    model::Model as VlmModel,
+    model::{FixedGridProcessor, ImageProcessor, Model as VlmModel, ProcessedImage},
     prompt::MarkerPolicy,
   },
 };
@@ -234,11 +234,11 @@ impl VlmModel for MockVlmModel {
     Array::from_slice::<f32>(&data, &(b, t, self.hidden_dim))
   }
 
-  fn encode_image(&self, image: &Array) -> mlxrs::Result<Array> {
+  fn encode_image(&self, image: &ProcessedImage) -> mlxrs::Result<Array> {
     if self.fail_encode {
       return Err(Error::Backend("mock encode_image failure".into()));
     }
-    self.encode_calls.borrow_mut().push(image.shape());
+    self.encode_calls.borrow_mut().push(image.pixels().shape());
     // Per-image-token slabs are deterministic & distinguishable: every
     // image emits the same canned [N, D] slab where each row [c, c, c,
     // c] (D=4) carries the row's 1-indexed token offset (so
@@ -278,6 +278,18 @@ impl VlmModel for MockVlmModel {
   fn image_processor_config(&self) -> ImageProcessorConfig {
     self.processor_cfg_override.unwrap_or_default()
   }
+
+  /// The default fixed-grid processor baked with this mock's
+  /// `num_tokens_per_image` (so the per-image count the prompt is built from
+  /// matches what `encode_image` emits) and the mock's
+  /// `image_processor_config` (so the cfg-override test still observes the
+  /// preprocessed shape). The `num_tokens` arg is ignored.
+  fn image_processor(&self, _num_tokens: usize) -> Box<dyn ImageProcessor> {
+    Box::new(FixedGridProcessor::new(
+      self.image_processor_config(),
+      self.num_tokens_per_image,
+    ))
+  }
 }
 
 /// Free-function copy of [`crate::vlm::model::Model::merge_embeddings`]
@@ -302,7 +314,7 @@ fn default_merge(
     fn embed_tokens(&self, _tokens: &Array) -> mlxrs::Result<Array> {
       unreachable!("Shim::embed_tokens never called")
     }
-    fn encode_image(&self, _image: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, _image: &ProcessedImage) -> mlxrs::Result<Array> {
       unreachable!("Shim::encode_image never called")
     }
   }
@@ -348,7 +360,7 @@ fn vlm_generate_pipeline_smoke() {
   let prompt = [1_u32, 2, 99, 3, 4]; // marker run of len 1 → 1 image
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -400,7 +412,7 @@ fn vlm_generate_zero_images_passthrough() {
   let prompt = [1_u32, 2, 3];
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[],
     mock_cache(),
@@ -446,7 +458,7 @@ fn vlm_generate_zero_image_preserves_logprobs() {
   // `None` logprobs and break the documented "VLM always Some" contract.
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[],
     mock_cache(),
@@ -485,7 +497,7 @@ fn vlm_generate_marker_required_missing_errors() {
   let prompt = [1_u32, 2, 3]; // no marker (99)
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -533,8 +545,13 @@ fn vlm_generate_image_tokens_spliced_correctly() {
     fn embed_tokens(&self, t: &Array) -> mlxrs::Result<Array> {
       self.inner.embed_tokens(t)
     }
-    fn encode_image(&self, i: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, i: &ProcessedImage) -> mlxrs::Result<Array> {
       self.inner.encode_image(i)
+    }
+    fn image_processor(&self, n: usize) -> Box<dyn ImageProcessor> {
+      // Delegate to the inner mock so the per-image count baked into the
+      // fixed-grid processor matches the inner mock's `encode_image` output.
+      self.inner.image_processor(n)
     }
     fn merge_embeddings(
       &self,
@@ -559,7 +576,7 @@ fn vlm_generate_image_tokens_spliced_correctly() {
   let prompt = [1_u32, 2, 99, 3, 4];
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -599,7 +616,7 @@ fn vlm_generate_two_images_concat_and_two_spans() {
   let prompt = [1_u32, 2, 99, 99, 3]; // marker run of len 2
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img1, img2],
     mock_cache(),
@@ -644,7 +661,7 @@ fn vlm_generate_uses_image_processor_config_override() {
   let prompt = [1_u32, 99, 2];
   let _ = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -674,7 +691,7 @@ fn vlm_generate_encode_failure_propagates_synchronously() {
   let prompt = [1_u32, 99, 2];
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -702,7 +719,7 @@ fn vlm_generate_forward_failure_yields_err_then_fuses() {
   let prompt = [1_u32, 99, 2];
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -730,7 +747,7 @@ fn vlm_generate_respects_max_tokens() {
   // max_tokens = 7: expect 7 tokens.
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -757,7 +774,7 @@ fn vlm_generate_eos_stops_iteration() {
   cfg.lm_mut().set_eos(vec![4]); // argmax of ramp logits with vocab=5
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -886,7 +903,7 @@ fn vlm_generate_distinct_marker_and_placeholder_ids() {
   .with_image_marker_id(Some(50));
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -921,7 +938,7 @@ fn vlm_generate_advances_cache_across_prefill_and_decode() {
   // calls with token shape [1, 1].
   let it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     cache,
@@ -957,7 +974,7 @@ fn vlm_model_image_processor_config_default_is_imagenet() {
     fn embed_tokens(&self, _t: &Array) -> mlxrs::Result<Array> {
       unreachable!()
     }
-    fn encode_image(&self, _i: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, _i: &ProcessedImage) -> mlxrs::Result<Array> {
       unreachable!()
     }
   }
@@ -998,7 +1015,7 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
     fn embed_tokens(&self, t: &Array) -> mlxrs::Result<Array> {
       self.inner.embed_tokens(t)
     }
-    fn encode_image(&self, _image: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, _image: &ProcessedImage) -> mlxrs::Result<Array> {
       let mut idx = self.next.borrow_mut();
       let counts = self.counts.borrow();
       let n = counts[*idx];
@@ -1011,6 +1028,12 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
         }
       }
       Array::from_slice::<f32>(&data, &(n, d))
+    }
+    fn image_processor(&self, n: usize) -> Box<dyn ImageProcessor> {
+      // Inner mock bakes num_tokens_per_image = 3 into the fixed-grid
+      // processor, so each image reports 3 expected tokens and the encoder's
+      // 2-row first image trips the per-image-count check.
+      self.inner.image_processor(n)
     }
   }
 
@@ -1025,7 +1048,7 @@ fn vlm_generate_rejects_per_image_shape_mismatch() {
   let prompt = [1_u32, 99, 99, 2]; // marker run of len 2 → 2 images
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img1, img2],
     mock_cache(),
@@ -1073,7 +1096,7 @@ fn vlm_generate_first_token_sees_prompt_history_in_logit_bias() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1104,7 +1127,7 @@ fn vlm_generate_marker_missing_errors_before_any_image_work() {
   let prompt = [1_u32, 2, 3]; // no marker (99)
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1136,7 +1159,7 @@ fn vlm_generate_marker_count_mismatch_errors_before_any_image_work() {
   let prompt = [1_u32, 99, 2];
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img1, img2],
     mock_cache(),
@@ -1188,7 +1211,7 @@ fn vlm_generate_span_aware_chunking_never_splits_image_span() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1255,8 +1278,13 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
     fn embed_tokens(&self, t: &Array) -> mlxrs::Result<Array> {
       self.inner.embed_tokens(t)
     }
-    fn encode_image(&self, i: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, i: &ProcessedImage) -> mlxrs::Result<Array> {
       self.inner.encode_image(i)
+    }
+    fn image_processor(&self, n: usize) -> Box<dyn ImageProcessor> {
+      // Delegate to the inner mock so the per-image count baked into the
+      // fixed-grid processor matches the inner mock's `encode_image` output.
+      self.inner.image_processor(n)
     }
     fn forward_embeddings_multimodal(
       &self,
@@ -1290,7 +1318,7 @@ fn vlm_generate_threads_cache_offset_and_chunk_local_spans() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1356,7 +1384,7 @@ fn vlm_generate_single_chunk_when_prefill_step_size_ge_t() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1392,7 +1420,7 @@ fn vlm_generate_max_tokens_zero_does_no_image_work() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1459,8 +1487,13 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
     fn embed_tokens(&self, t: &Array) -> mlxrs::Result<Array> {
       self.inner.embed_tokens(t)
     }
-    fn encode_image(&self, i: &Array) -> mlxrs::Result<Array> {
+    fn encode_image(&self, i: &ProcessedImage) -> mlxrs::Result<Array> {
       self.inner.encode_image(i)
+    }
+    fn image_processor(&self, n: usize) -> Box<dyn ImageProcessor> {
+      // Delegate to the inner mock so the per-image count baked into the
+      // fixed-grid processor matches the inner mock's `encode_image` output.
+      self.inner.image_processor(n)
     }
     fn forward_embeddings_multimodal(
       &self,
@@ -1494,7 +1527,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
 
   let mut it_a = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt_a,
     &[img_a],
     mock_cache(),
@@ -1503,7 +1536,7 @@ fn vlm_generate_threads_per_request_spans_no_cross_iterator_pollution() {
   .expect("iter A constructs");
   let mut it_b = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt_b,
     &[img_b],
     mock_cache(),
@@ -1547,7 +1580,7 @@ fn vlm_generate_forward_embeddings_multimodal_default_dispatches_to_lm() {
   let prompt = [1_u32, 99, 2];
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1593,7 +1626,7 @@ fn vlm_generate_does_not_build_unused_attention_mask() {
   );
   let mut it = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),
@@ -1636,7 +1669,7 @@ fn vlm_generate_rejects_invalid_lm_config_before_image_load() {
   );
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[bogus_img],
     mock_cache(),
@@ -1702,7 +1735,7 @@ fn vlm_generate_rejects_invalid_lm_config_no_images() {
   );
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[],
     mock_cache(),
@@ -1748,7 +1781,7 @@ fn vlm_generate_rejects_invalid_lm_config_under_zero_max_tokens() {
   let img = write_test_image(&dir, "img.png");
   let res = vlm_generate(
     &model,
-    &model.image_processor_config(),
+    model.image_processor(0).as_ref(),
     &prompt,
     &[img],
     mock_cache(),

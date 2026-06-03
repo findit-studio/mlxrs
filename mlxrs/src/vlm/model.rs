@@ -22,8 +22,158 @@ use crate::{
     LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result, try_with_capacity,
   },
   ops,
-  vlm::image::ImageProcessorConfig,
+  vlm::image::{ImageProcessorConfig, preprocess},
 };
+
+/// Turn a raw decoded image into the model's native vision input plus the
+/// number of image-token positions that image expands to.
+///
+/// A loaded preprocessing artifact, mirroring mlx-vlm's per-model
+/// `processing_<model>.py` (the processor object `generate(model, processor,
+/// …)` carries alongside the model). A fixed-grid CLIP/SigLIP/LLaVA model uses
+/// the default [`Model::image_processor`] — a [`FixedGridProcessor`] that runs
+/// the cross-model [`crate::vlm::image::preprocess`] pipeline and reports a
+/// constant per-image grid count. A native-resolution model (LFM2.5-VL NaFlex,
+/// the future Qwen3.5-VL line) returns its own [`ImageProcessor`] whose
+/// [`process`](Self::process) builds the variable patch tensor + its
+/// per-image token count.
+///
+/// Object-safe (the [`process`](Self::process) method takes `&self`, borrows
+/// the decoded image, and returns an owned [`ProcessedImage`]) so a model can
+/// hand back a `Box<dyn ImageProcessor>` and the
+/// [`crate::vlm::generate::vlm_generate`] loop can drive it behind a `&dyn
+/// ImageProcessor`.
+///
+/// **Why the decoded `image::DynamicImage`, not a `[H, W, 3]` [`Array`].** The
+/// raw decoded image is the natural processor input here, exactly as mlx-vlm's
+/// `processing_<model>.py` receives PIL images. The fixed-grid default runs the
+/// cross-model [`crate::vlm::image::preprocess`] pipeline whose resize is the
+/// PIL-bit-exact image-crate kernel (`vlm::resize`) operating on a
+/// `DynamicImage` — so the default processor reproduces the historical
+/// fixed-grid result byte-for-byte by handing the same `DynamicImage` straight
+/// to `preprocess`; an `[H, W, 3]` Array could not be PIL-resized without
+/// diverging. The native-resolution processor likewise reads the decoded
+/// image's interleaved RGB bytes + dimensions for its NaFlex smart-resize. The
+/// resulting model-native tensor IS an [`Array`]
+/// ([`ProcessedImage::pixels`]).
+pub trait ImageProcessor {
+  /// Process one decoded image (the output of
+  /// [`crate::vlm::image::load_image`]) into a [`ProcessedImage`] carrying the
+  /// model's native pixel/patch tensor, any native-resolution companions, and
+  /// the image-token count this image occupies.
+  ///
+  /// # Errors
+  /// Propagates the per-model preprocessing failure (resize / patchify /
+  /// normalize / overflow / allocation) as a typed [`crate::Error`].
+  fn process(&self, image: &::image::DynamicImage) -> Result<ProcessedImage>;
+}
+
+/// One image's preprocessed vision input, as produced by an
+/// [`ImageProcessor`] and consumed by [`Model::encode_image`].
+///
+/// Carries the model's native pixel/patch tensor ([`pixels`](Self::pixels)),
+/// the optional native-resolution companions ([`native`](Self::native), `None`
+/// for a fixed-grid model), and the number of image-token positions this image
+/// expands to ([`num_tokens`](Self::num_tokens) — variable for a
+/// native-resolution model, constant for a fixed grid).
+///
+/// Constructed by the [processor](ImageProcessor); read by the model's
+/// [`encode_image`](Model::encode_image) (`pixels` always; `native` when the
+/// model requires the native-resolution companions) and by
+/// [`crate::vlm::generate::vlm_generate`] (`num_tokens` to size the prompt's
+/// placeholder run for this image).
+#[non_exhaustive]
+pub struct ProcessedImage {
+  /// The model's native pixel/patch tensor: a fixed-grid `[1, H, W, C]`
+  /// preprocessed image for a CLIP/SigLIP-style model, or a native-resolution
+  /// `[1, num_patches, patch_feat]` flattened patch tensor for a NaFlex model.
+  pixels: Array,
+  /// The native-resolution companions (`spatial_shape` + `patch_mask`); `None`
+  /// for a fixed-grid model whose `pixels` is fully self-describing.
+  native: Option<NativeResolution>,
+  /// The number of image-token positions this image expands to (variable for a
+  /// native-resolution model, a constant per-image grid count for a fixed
+  /// grid). [`crate::vlm::generate::vlm_generate`] splices exactly this many
+  /// placeholder ids for this image, and [`Model::encode_image`] must return
+  /// exactly this many feature rows.
+  num_tokens: usize,
+}
+
+impl ProcessedImage {
+  /// Assemble a [`ProcessedImage`] from its parts — the native pixel/patch
+  /// tensor, the optional native-resolution companions (`None` for a
+  /// fixed-grid model), and the per-image token count.
+  #[inline(always)]
+  pub const fn new(pixels: Array, native: Option<NativeResolution>, num_tokens: usize) -> Self {
+    Self {
+      pixels,
+      native,
+      num_tokens,
+    }
+  }
+
+  /// The model's native pixel/patch tensor.
+  #[inline(always)]
+  pub const fn pixels(&self) -> &Array {
+    &self.pixels
+  }
+
+  /// The native-resolution companions, or `None` for a fixed-grid model.
+  #[inline(always)]
+  pub const fn native(&self) -> Option<&NativeResolution> {
+    self.native.as_ref()
+  }
+
+  /// The number of image-token positions this image expands to.
+  #[inline(always)]
+  pub const fn num_tokens(&self) -> usize {
+    self.num_tokens
+  }
+}
+
+/// The native-resolution companions an [`ImageProcessor`] attaches to a
+/// [`ProcessedImage`] for a NaFlex-style model — the `spatial_shape` and
+/// `patch_mask` the vision tower consumes alongside the flattened patch
+/// tensor.
+///
+/// `None` on a fixed-grid [`ProcessedImage`]; `Some` for a native-resolution
+/// model (LFM2.5-VL, the future Qwen3.5-VL line). A model that requires these
+/// reads them in [`Model::encode_image`] via
+/// `image.native().ok_or(...)?` — a missing companion is a typed
+/// [`Error::InvariantViolation`], never a panic.
+#[non_exhaustive]
+pub struct NativeResolution {
+  /// The patch grid dimensions the vision tower reshapes the active rows to —
+  /// e.g. LFM2.5-VL's `(2,)` i32 `[H_p, W_p]` `spatial_shapes`.
+  spatial_shape: Array,
+  /// The per-patch attention mask (`1` for active patch rows, `0` for padding)
+  /// — e.g. LFM2.5-VL's `(max_num_patches,)` i32 `pixel_attention_mask`.
+  patch_mask: Array,
+}
+
+impl NativeResolution {
+  /// Assemble a [`NativeResolution`] from the `spatial_shape` + `patch_mask`
+  /// companions.
+  #[inline(always)]
+  pub const fn new(spatial_shape: Array, patch_mask: Array) -> Self {
+    Self {
+      spatial_shape,
+      patch_mask,
+    }
+  }
+
+  /// The patch grid dimensions (`[H_p, W_p]`).
+  #[inline(always)]
+  pub const fn spatial_shape(&self) -> &Array {
+    &self.spatial_shape
+  }
+
+  /// The per-patch attention mask.
+  #[inline(always)]
+  pub const fn patch_mask(&self) -> &Array {
+    &self.patch_mask
+  }
+}
 
 /// A vision-language model: a [`crate::lm::model::Model`] augmented with
 /// image-embedding inputs.
@@ -55,25 +205,31 @@ pub trait Model: crate::lm::model::Model {
   /// before dispatching through [`crate::lm::model::Model::forward_embeddings`].
   fn embed_tokens(&self, tokens: &Array) -> Result<Array>;
 
-  /// Encode a preprocessed image (post-[`crate::vlm::image::preprocess`])
-  /// into vision-encoder embeddings, shape `[N, D]` where `N` is the
-  /// image-token count this model expects per image (Qwen-VL is variable,
-  /// LLaVA fixed-grid, etc.) and `D` is the LM's hidden dim.
+  /// Encode one preprocessed image (the [`ProcessedImage`] an
+  /// [`ImageProcessor`] produced) into vision-encoder embeddings, shape
+  /// `[N, D]` where `N` is the image-token count this image expands to
+  /// (`image.num_tokens()` — variable for a native-resolution model,
+  /// constant for a fixed grid) and `D` is the LM's hidden dim.
   ///
-  /// Per-model encoders (CLIP / SigLIP / Qwen-VL ViT / etc.) implement
-  /// this. The input layout is the encoder's expected layout — most
-  /// commonly `[1, H, W, 3]` after the per-model post-step from the
-  /// channel-last `[H, W, 3]` that [`crate::vlm::image::preprocess`]
-  /// returns. Per-model code can convert the layout inside its own
-  /// `encode_image` (e.g. `transpose_axes(&[2, 0, 1])` + add batch) so
-  /// the cross-model surface stays layout-agnostic, matching the same
-  /// boundary [`crate::vlm::image`] documents in its `Channel layout`
-  /// conventions section.
+  /// Per-model encoders (CLIP / SigLIP / Qwen-VL ViT / NaFlex ViT / etc.)
+  /// implement this. The model always reads [`image.pixels()`](ProcessedImage::pixels)
+  /// — most commonly `[1, H, W, 3]` for a fixed-grid model, or the flattened
+  /// `[1, num_patches, patch_feat]` patch tensor for a native-resolution one.
+  /// A native-resolution model additionally reads
+  /// [`image.native()`](ProcessedImage::native) for the `spatial_shape` /
+  /// `patch_mask` companions; it requires them via
+  /// `image.native().ok_or(Error::InvariantViolation(...))?` (a typed error,
+  /// never a panic, when a caller hands it a fixed-grid [`ProcessedImage`]).
+  /// Per-model code converts the pixel layout inside its own `encode_image`
+  /// (e.g. `transpose_axes(&[2, 0, 1])` + add batch) so the cross-model
+  /// surface stays layout-agnostic.
   ///
   /// Mirrors `vision_tower(pixel_values.transpose(0, 2, 3, 1), …)` +
   /// `multi_modal_projector(selected_image_feature)` in
-  /// `mlx-vlm/mlx_vlm/models/pixtral/pixtral.py:60-77`.
-  fn encode_image(&self, image: &Array) -> Result<Array>;
+  /// `mlx-vlm/mlx_vlm/models/pixtral/pixtral.py:60-77` (and the per-image
+  /// NaFlex `vision_tower(pixel_values, spatial_shapes)` body in
+  /// `mlx-vlm/mlx_vlm/models/lfm2_vl/lfm2_vl.py:141-153`).
+  fn encode_image(&self, image: &ProcessedImage) -> Result<Array>;
 
   /// Splice `image_embeds` into the LM's `text_embeds` at the positions
   /// identified by `image_spans` (the spans returned by
@@ -184,8 +340,100 @@ pub trait Model: crate::lm::model::Model {
   /// non-standard configs (Qwen-VL uses 448×448 Bilinear, some HF models
   /// override the mean/std, etc.); per-model code returns its own value
   /// loaded from the model's `preprocessor_config.json`.
+  ///
+  /// Still used by the default [`image_processor`](Self::image_processor)
+  /// (the [`FixedGridProcessor`] drives [`crate::vlm::image::preprocess`] off
+  /// this config); a model that overrides `image_processor` with its own
+  /// native-resolution processor may leave this at a nominal value.
   fn image_processor_config(&self) -> ImageProcessorConfig {
     ImageProcessorConfig::default()
+  }
+
+  /// The per-model [`ImageProcessor`] [`crate::vlm::generate::vlm_generate`]
+  /// runs each raw loaded image through to obtain its native vision input +
+  /// per-image token count, mirroring mlx-vlm's per-model
+  /// `processing_<model>.py`.
+  ///
+  /// **Default**: a [`FixedGridProcessor`] that reproduces the historical
+  /// fixed-grid behavior exactly — it runs the cross-model
+  /// [`crate::vlm::image::preprocess`] pipeline (driven by
+  /// [`image_processor_config`](Self::image_processor_config)) to get the
+  /// resized `[1, H, W, C]` (well, `[H, W, C]` — the `Hwc`/`Chw`/`Bchw`
+  /// layout the config selects) and wraps it as a [`ProcessedImage`] with
+  /// `native: None` and a constant per-image token count `num_tokens`. A
+  /// fixed-grid VLM that does not override this gets behavior identical to the
+  /// previous single-`num_tokens_per_image` path.
+  ///
+  /// **Override** for a native-resolution model (LFM2.5-VL NaFlex, the future
+  /// Qwen3.5-VL line) whose per-image patch tensor + token count are computed
+  /// from the source dimensions: return a model-specific `Box<dyn
+  /// ImageProcessor>` whose [`process`](ImageProcessor::process) builds the
+  /// variable patch tensor, attaches the
+  /// [`NativeResolution`] companions, and reports the per-image
+  /// `num_tokens`.
+  ///
+  /// `num_tokens` is the per-image image-token count the default fixed-grid
+  /// processor reports for EVERY image — the constant grid size a
+  /// CLIP/SigLIP/LLaVA encoder emits (e.g. `(image_size / patch_size)^2`,
+  /// the value the previous `VlmGenConfig::num_tokens_per_image` carried).
+  fn image_processor(&self, num_tokens: usize) -> Box<dyn ImageProcessor> {
+    Box::new(FixedGridProcessor::new(
+      self.image_processor_config(),
+      num_tokens,
+    ))
+  }
+}
+
+/// The default fixed-grid [`ImageProcessor`] — runs the cross-model
+/// [`crate::vlm::image::preprocess`] pipeline over a loaded image and reports a
+/// constant per-image grid token count.
+///
+/// This is what [`Model::image_processor`] returns by default, so a fixed-grid
+/// CLIP/SigLIP/LLaVA VLM that does not override `image_processor` gets behavior
+/// identical to the historical single-`num_tokens_per_image`
+/// [`crate::vlm::generate::vlm_generate`] path: each raw `[H, W, 3]` image is
+/// run through [`crate::vlm::image::preprocess`] (driven by the model's
+/// [`ImageProcessorConfig`]) and wrapped as a [`ProcessedImage`] with
+/// `native: None` and the constant [`num_tokens`](Self::num_tokens).
+pub struct FixedGridProcessor {
+  config: ImageProcessorConfig,
+  num_tokens: usize,
+}
+
+impl FixedGridProcessor {
+  /// Build a fixed-grid processor from the model's [`ImageProcessorConfig`]
+  /// (the preprocessing params) and the constant per-image token count.
+  #[inline(always)]
+  pub const fn new(config: ImageProcessorConfig, num_tokens: usize) -> Self {
+    Self { config, num_tokens }
+  }
+
+  /// The preprocessing config driving [`crate::vlm::image::preprocess`].
+  #[inline(always)]
+  pub const fn config(&self) -> &ImageProcessorConfig {
+    &self.config
+  }
+
+  /// The constant per-image grid token count this processor reports.
+  #[inline(always)]
+  pub const fn num_tokens(&self) -> usize {
+    self.num_tokens
+  }
+}
+
+impl ImageProcessor for FixedGridProcessor {
+  /// Run the cross-model [`crate::vlm::image::preprocess`] pipeline over the
+  /// decoded image and wrap the resized tensor as a fixed-grid
+  /// [`ProcessedImage`] (`native: None`, the constant
+  /// [`num_tokens`](Self::num_tokens)).
+  ///
+  /// Byte-identical to the historical [`crate::vlm::generate::vlm_generate`]
+  /// fixed-grid step: `preprocess(&img, self.config())` reproduces the same
+  /// resize / rescale / normalize / layout result the previous code computed
+  /// from the loaded `DynamicImage` and the model's [`ImageProcessorConfig`].
+  fn process(&self, image: &::image::DynamicImage) -> Result<ProcessedImage> {
+    let pixels = preprocess(image, &self.config)?;
+    Ok(ProcessedImage::new(pixels, None, self.num_tokens))
   }
 }
 
@@ -374,4 +622,105 @@ fn default_merge_embeddings(
   let mut refs: Vec<&Array> = try_with_capacity(pieces.len())?;
   refs.extend(pieces.iter());
   ops::shape::concatenate(&refs, 1)
+}
+
+#[cfg(test)]
+mod tests {
+  //! Coverage for the per-model [`ImageProcessor`] seam: the
+  //! [`ProcessedImage`] / [`NativeResolution`] accessors and the default
+  //! [`FixedGridProcessor`] (which must reproduce the historical
+  //! `vlm::image::preprocess` result, report `native = None`, and carry the
+  //! constant fixed-grid count).
+
+  use super::*;
+  use crate::vlm::image::{ImageProcessorConfig, Layout};
+
+  /// `ProcessedImage::new` + accessors round-trip: `pixels` projects to the
+  /// stored tensor, `native` to the optional companions, `num_tokens` to the
+  /// count. The fixed-grid case has `native == None`.
+  #[test]
+  fn processed_image_accessors_fixed_grid() {
+    let pixels = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1_usize, 1, 3)).unwrap();
+    let p = ProcessedImage::new(pixels, None, 7);
+    assert_eq!(p.pixels().shape(), vec![1, 1, 3]);
+    assert!(
+      p.native().is_none(),
+      "fixed-grid carries no native companions"
+    );
+    assert_eq!(p.num_tokens(), 7);
+  }
+
+  /// The native-resolution case: `native()` is `Some`, and the
+  /// [`NativeResolution`] accessors project the `spatial_shape` + `patch_mask`
+  /// arrays.
+  #[test]
+  fn processed_image_accessors_native_resolution() {
+    let pixels = Array::from_slice::<f32>(&[0.0; 6], &(2_usize, 3)).unwrap();
+    let spatial = Array::from_slice::<i32>(&[2, 3], &(2_usize,)).unwrap();
+    let mask = Array::from_slice::<i32>(&[1, 1, 1, 0], &(4_usize,)).unwrap();
+    let native = NativeResolution::new(spatial, mask);
+    assert_eq!(native.spatial_shape().shape(), vec![2]);
+    assert_eq!(native.patch_mask().shape(), vec![4]);
+    let p = ProcessedImage::new(pixels, Some(native), 6);
+    let got = p.native().expect("native present");
+    assert_eq!(got.spatial_shape().shape(), vec![2]);
+    assert_eq!(got.patch_mask().shape(), vec![4]);
+    assert_eq!(p.num_tokens(), 6);
+  }
+
+  /// [`FixedGridProcessor`] accessors expose the config + count it was built
+  /// with.
+  #[test]
+  fn fixed_grid_processor_accessors() {
+    let cfg = ImageProcessorConfig::new().with_size((32, 48));
+    let proc = FixedGridProcessor::new(cfg, 5);
+    assert_eq!(proc.config().size(), (32, 48));
+    assert_eq!(proc.num_tokens(), 5);
+  }
+
+  /// The default [`FixedGridProcessor`] reproduces the historical
+  /// [`crate::vlm::image::preprocess`] result EXACTLY: `process(&img)` equals
+  /// `preprocess(&img, cfg)` element-for-element, carries `native == None`,
+  /// and reports the constant `num_tokens`. This is the contract that keeps a
+  /// fixed-grid VLM's behavior unchanged through the new seam.
+  #[test]
+  fn fixed_grid_processor_matches_preprocess_and_is_fixed() {
+    // A synthetic 6×4 RGB image decoded as a DynamicImage (the processor's
+    // input). The pixel content is arbitrary but deterministic.
+    let mut buf = ::image::RgbImage::new(6, 4);
+    for y in 0..4u32 {
+      for x in 0..6u32 {
+        buf.put_pixel(x, y, ::image::Rgb([(x * 10) as u8, (y * 20) as u8, 90]));
+      }
+    }
+    let img = ::image::DynamicImage::ImageRgb8(buf);
+    // A non-default config (so the test exercises a real resize/normalize), in
+    // the Hwc layout the historical path uses.
+    let cfg = ImageProcessorConfig::new()
+      .with_size((8, 8))
+      .with_layout(Layout::Hwc);
+
+    let proc = FixedGridProcessor::new(cfg, 4);
+    let processed = proc.process(&img).expect("fixed-grid process succeeds");
+    assert!(
+      processed.native().is_none(),
+      "fixed-grid processor attaches no native companions"
+    );
+    assert_eq!(
+      processed.num_tokens(),
+      4,
+      "fixed-grid processor reports the constant count"
+    );
+
+    // The pixels MUST equal the direct preprocess result (byte-identical
+    // fixed-grid behavior).
+    let mut want = crate::vlm::image::preprocess(&img, &cfg).expect("direct preprocess");
+    let mut got = processed.pixels().try_clone().expect("clone pixels");
+    assert_eq!(got.shape(), want.shape(), "preprocessed shape matches");
+    assert_eq!(
+      got.to_vec::<f32>().unwrap(),
+      want.to_vec::<f32>().unwrap(),
+      "fixed-grid process reproduces preprocess element-for-element"
+    );
+  }
 }

@@ -62,11 +62,14 @@ use crate::{
   vlm::{
     image::{ImageProcessorConfig, Layout},
     load::{LoadedVlmModel, VlmModelConstructor, VlmTypeRegistry},
-    model::Model as VlmModel,
+    model::{ImageProcessor, Model as VlmModel, NativeResolution, ProcessedImage},
     models::lfm2_vl::{
       config::ModelConfig,
       language::LanguageModel,
-      processor::Lfm2VlImageInputs,
+      processor::{
+        Lfm2VlImageInputs, Lfm2VlProcessorConfig, num_image_tokens_from_patch_grid,
+        preprocess_image,
+      },
       projector::{
         Lfm2VlMultiModalProjector, PixelUnshuffleBlock, merge_input_ids_with_image_features,
       },
@@ -424,61 +427,60 @@ impl VlmModel for Lfm2Vl {
     self.language_model.embed_tokens(tokens)
   }
 
-  /// Encode one image's NaFlex patch rows into its projected `(N_i, D)` feature
-  /// rows.
+  /// Encode one image's NaFlex inputs into its projected `(N_i, D)` feature
+  /// rows — the cross-model [`crate::vlm::model::Model::encode_image`] entry,
+  /// consuming the [`ProcessedImage`] the [`Lfm2VlImageProcessor`] produced.
   ///
-  /// **LFM2.5-VL caveat.** The native-resolution NaFlex path is inherently a
-  /// function of `(pixel_values, spatial_shapes)` per image and is driven
-  /// through the inherent
-  /// [`Lfm2Vl::encode_image_inputs`] / [`Lfm2Vl::get_input_embeddings`]
-  /// (which carry the per-image [`Lfm2VlImageInputs`] triple). This cross-model
-  /// trait entry takes a single `Array` and therefore only realizes the
-  /// **square fully-active** sub-case: `image` is the flattened patches
-  /// `(1, num_patches, patch_feat)` of an image whose active grid is the full
-  /// square `sqrt(num_patches) x sqrt(num_patches)` (i.e. the whole patch
-  /// budget is active, the common square-image case). The grid is reconstructed
-  /// as that square and the per-image body runs. A non-square / partially-active
-  /// image must use [`Lfm2Vl::encode_image_inputs`] with its real
-  /// `spatial_shapes`; here a `num_patches` that is not a perfect square is a
-  /// typed [`Error::InvariantViolation`] directing the caller to the native
-  /// method.
+  /// The native-resolution NaFlex path is inherently a function of
+  /// `(pixel_values, spatial_shapes)` per image, so this reads
+  /// [`image.pixels()`](ProcessedImage::pixels) (the flattened patch tensor
+  /// `(max_num_patches, patch_feat)`) AND the required
+  /// [`image.native()`](ProcessedImage::native) companions
+  /// (`spatial_shape = [H_p, W_p]`, `patch_mask`), reconstructs the per-image
+  /// [`Lfm2VlImageInputs`] triple, and runs the inherent
+  /// [`Lfm2Vl::encode_image_inputs`] body (`lfm2_vl.py:141-153`). The grid
+  /// `(H_p, W_p)` host integers are read from the small `(2,)` `spatial_shape`
+  /// companion (a 2-element materialization).
   ///
   /// # Errors
-  /// - [`Error::RankMismatch`] if `image` is not rank-3 `(1, num_patches,
-  ///   patch_feat)`;
-  /// - [`Error::InvariantViolation`] if `num_patches` is not a perfect square
-  ///   (use [`Lfm2Vl::encode_image_inputs`] for the general grid);
-  /// - propagates the vision / unshuffle / projector op errors.
-  fn encode_image(&self, image: &Array) -> Result<Array> {
-    let shape = image.shape();
-    if shape.len() != 3 || shape[0] != 1 {
+  /// - [`Error::InvariantViolation`] if `image.native()` is `None` (a
+  ///   native-resolution model requires the NaFlex companions; a fixed-grid
+  ///   [`ProcessedImage`] is rejected here, never a panic);
+  /// - [`Error::RankMismatch`] / [`Error::OutOfRange`] if the `spatial_shape`
+  ///   companion is not a `(2,)` array of `[H_p, W_p]`;
+  /// - propagates the vision / reshape / unshuffle / projector op errors.
+  fn encode_image(&self, image: &ProcessedImage) -> Result<Array> {
+    let native = image.native().ok_or_else(|| {
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "lfm2_vl encode_image: ProcessedImage::native (the NaFlex companions)",
+        "LFM2.5-VL requires the native-resolution spatial_shape + patch_mask companions; this \
+         ProcessedImage carries none (a fixed-grid input) — use the Lfm2VlImageProcessor",
+      ))
+    })?;
+    // Read the patch grid `(H_p, W_p)` host integers from the `(2,)`
+    // spatial_shape companion. `try_clone` shares the device buffer (no copy);
+    // `to_vec` on the owned clone is the only (2-element) materialization.
+    let spatial = native.spatial_shape();
+    let ss_shape = spatial.shape();
+    if ss_shape.as_slice() != [2] {
       return Err(Error::RankMismatch(RankMismatchPayload::new(
-        "lfm2_vl encode_image: image must be rank-3 (1, num_patches, patch_feat) — for the \
-           general native-resolution path use Lfm2Vl::encode_image_inputs with spatial_shapes",
-        shape.len() as u32,
-        shape,
+        "lfm2_vl encode_image: spatial_shape companion must be a (2,) [H_p, W_p] array",
+        ss_shape.len() as u32,
+        ss_shape,
       )));
     }
-    let num_patches = shape[1];
-    let side = (num_patches as f64).sqrt().round() as usize;
-    if side.saturating_mul(side) != num_patches {
-      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-        "lfm2_vl encode_image: num_patches is not a perfect square (the cross-model single-Array \
-           entry only realizes the square fully-active grid)",
-        "use Lfm2Vl::encode_image_inputs with the image's real spatial_shapes for a non-square \
-           or partially-active grid",
-      )));
-    }
-    // Reconstruct the square fully-active NaFlex inputs for this image: a mask
-    // of all-ones over the `num_patches` rows, `spatial_shapes = [side, side]`.
-    let side_i = side as i32;
-    let pv = reshape(
-      image,
-      &[num_patches as i32, dim_i32(&shape, 2, "patch_feat")?],
-    )?;
-    let spatial = Array::from_slice::<i32>(&[side_i, side_i], &(2usize,))?;
-    let mask = Array::from_slice::<i32>(&vec![1i32; num_patches], &(num_patches,))?;
-    let inputs = Lfm2VlImageInputs::from_parts(pv, mask, spatial, side_i, side_i);
+    let mut ss_owned = spatial.try_clone()?;
+    let grid = ss_owned.to_vec::<i32>()?;
+    let (h_p, w_p) = (grid[0], grid[1]);
+    // Reconstruct the NaFlex triple for the inherent per-image body. The
+    // pixel/patch tensor + mask are shared (refcount-only `try_clone`).
+    let inputs = Lfm2VlImageInputs::from_parts(
+      image.pixels().try_clone()?,
+      native.patch_mask().try_clone()?,
+      spatial.try_clone()?,
+      h_p,
+      w_p,
+    );
     self.encode_image_inputs(&inputs)
   }
 
@@ -499,6 +501,127 @@ impl VlmModel for Lfm2Vl {
       .with_rescale_factor(1.0 / 255.0)
       .with_resample(crate::vlm::image::ResizeFilter::Bilinear)
       .with_layout(Layout::Hwc)
+  }
+
+  /// The LFM2.5-VL native-resolution [`ImageProcessor`] — a
+  /// [`Lfm2VlImageProcessor`] wrapping the [SigLIP2 NaFlex
+  /// processor](super::processor::preprocess_image). Overrides the default
+  /// fixed-grid processor: each image is smart-resized to its native patch
+  /// grid within the budget, and its per-image token count
+  /// (`ceil(H_p / f) * ceil(W_p / f)`) is reported on the
+  /// [`ProcessedImage`] for the prompt's placeholder run. The `num_tokens`
+  /// argument the cross-model surface passes for the fixed-grid default is
+  /// unused (the count is per-image and computed by the processor).
+  ///
+  /// # Panics
+  /// Does not panic. The processor config is built from the already-validated
+  /// [`ModelConfig`], whose `image_token_index` / `downsample_factor` /
+  /// `patch_size` / `max_num_patches` cleared
+  /// [`Lfm2VlProcessorConfig::new`]'s positivity checks at construction; an
+  /// unexpected degenerate config surfaces as a typed error from
+  /// [`process`](ImageProcessor::process), not here.
+  fn image_processor(&self, _num_tokens: usize) -> Box<dyn ImageProcessor> {
+    Box::new(Lfm2VlImageProcessor::new(self.config()))
+  }
+}
+
+// ───────────────────────── native-resolution processor ─────────────────────────
+
+/// The LFM2.5-VL native-resolution [`ImageProcessor`] — wraps the SigLIP2
+/// NaFlex [`preprocess_image`] so the cross-model
+/// [`crate::vlm::generate::vlm_generate`] loop drives LFM2.5-VL end-to-end.
+///
+/// [`Model::image_processor`](crate::vlm::model::Model::image_processor) on
+/// [`Lfm2Vl`] returns this in place of the default fixed-grid processor. Its
+/// [`process`](ImageProcessor::process) smart-resizes each decoded image to its
+/// native patch grid, normalizes + patchifies into the
+/// `(max_num_patches, patch_feat)` flattened patch tensor, and returns a
+/// [`ProcessedImage`] carrying that tensor as `pixels`, the `spatial_shape` +
+/// `patch_mask` as the [`NativeResolution`] companions, and the per-image
+/// `ceil(H_p / f) * ceil(W_p / f)` image-token count.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+#[derive(Debug)]
+pub struct Lfm2VlImageProcessor {
+  cfg: Lfm2VlProcessorConfig,
+  downsample_factor: i32,
+}
+
+#[cfg(feature = "lfm2-vl")]
+impl Lfm2VlImageProcessor {
+  /// Build the processor from the model's parsed [`ModelConfig`] — the
+  /// `image_token_index` / `downsample_factor` / vision `patch_size` /
+  /// `max_num_patches` drive the SigLIP2 NaFlex
+  /// [`Lfm2VlProcessorConfig`], with the SigLIP `mean = std = 0.5` defaults.
+  ///
+  /// On the (already-validated) config the `Lfm2VlProcessorConfig::new`
+  /// positivity checks always pass; a degenerate config is clamped to the
+  /// SigLIP defaults so construction is infallible. Any genuine preprocessing
+  /// failure surfaces from [`process`](ImageProcessor::process).
+  pub fn new(config: &ModelConfig) -> Self {
+    let factor = config.downsample_factor.max(1);
+    let patch_size = config.vision_config.patch_size.max(1) as u32;
+    let max_num_patches = config.max_num_patches.max(1) as u32;
+    // `Lfm2VlProcessorConfig::new` only fails on a non-positive
+    // patch_size / max_num_patches / downsample_factor or a negative
+    // image_token; all are clamped positive above and the token index is a
+    // valid id on a constructed model. Fall back to the SigLIP defaults if a
+    // hand-built config ever violates that, so the processor is infallible to
+    // build (preprocessing errors surface per-image from `process`).
+    let cfg = Lfm2VlProcessorConfig::new(
+      config.image_token_index,
+      factor as u32,
+      patch_size,
+      max_num_patches,
+    )
+    .unwrap_or_else(|_| {
+      Lfm2VlProcessorConfig::new(0, 1, 1, 1).expect("SigLIP default processor config is valid")
+    });
+    Self {
+      cfg,
+      downsample_factor: factor,
+    }
+  }
+}
+
+#[cfg(feature = "lfm2-vl")]
+impl ImageProcessor for Lfm2VlImageProcessor {
+  /// Smart-resize → normalize → patchify the decoded image into its NaFlex
+  /// triple, then package it as a [`ProcessedImage`] with the per-image token
+  /// count.
+  ///
+  /// Extracts the decoded image's interleaved RGB bytes + dimensions (the
+  /// SigLIP2 slow processor's `np.array(image)` input), runs
+  /// [`preprocess_image`] (the shared SigLIP2 NaFlex patchify), reads the
+  /// resulting patch grid `(H_p, W_p)`, and reports
+  /// `ceil(H_p / f) * ceil(W_p / f)` image tokens — the
+  /// [`num_image_tokens_from_patch_grid`] count that mirrors the
+  /// [`PixelUnshuffleBlock`] pad.
+  ///
+  /// # Errors
+  /// Propagates [`preprocess_image`] (resize / patchify / overflow /
+  /// allocation) and [`num_image_tokens_from_patch_grid`] errors as typed
+  /// [`crate::Error`]s.
+  fn process(&self, image: &::image::DynamicImage) -> Result<ProcessedImage> {
+    // The SigLIP2 slow processor operates on the decoded RGB image
+    // (`np.array(image.convert("RGB"))`). `to_rgb8()` yields an interleaved
+    // `width * height * 3` RGB buffer (alpha dropped, RGB-ordered).
+    let rgb = image.to_rgb8();
+    let (width, height) = (rgb.width(), rgb.height());
+    let inputs = preprocess_image(rgb.as_raw(), width, height, &self.cfg)?;
+    let (h_p, w_p) = inputs.grid();
+    let num_tokens = num_image_tokens_from_patch_grid(h_p, w_p, self.downsample_factor)? as usize;
+    let Lfm2VlImageInputs {
+      pixel_values,
+      pixel_attention_mask,
+      spatial_shapes,
+      ..
+    } = inputs;
+    Ok(ProcessedImage::new(
+      pixel_values,
+      Some(NativeResolution::new(spatial_shapes, pixel_attention_mask)),
+      num_tokens,
+    ))
   }
 }
 

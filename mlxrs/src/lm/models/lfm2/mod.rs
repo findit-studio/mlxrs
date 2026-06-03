@@ -48,7 +48,8 @@ use crate::{
   dtype::Dtype,
   error::{
     ArithmeticOverflowPayload, Error, InvariantViolationPayload, LengthMismatchPayload,
-    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload, Result,
+    MissingKeyPayload, NonFiniteScalarPayload, OutOfRangePayload, ParsePayload,
+    RankMismatchPayload, Result,
   },
   lm::{
     cache::{ArraysCache, KvCache, MaskMode, StandardKvCache},
@@ -1093,8 +1094,21 @@ impl Lfm2Model {
         cache.len(),
       )));
     }
+    // Rank guard at the indexing site: `h.shape()[1]` (the seq axis) below
+    // would panic on a rank-0/1 `h`. `forward_tokens` always feeds a rank-3
+    // embed output and `Lfm2::forward_embeddings` validates the rank before
+    // delegating here, but guard the index directly so this private decoder
+    // entry can never index out of bounds.
+    let shape = h.shape();
+    if shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Lfm2Model::forward_hidden: hidden states must be rank-3 (batch, seq, hidden)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
     let n_layers = self.layers.len() as i32;
-    let n = h.shape()[1];
+    let n = shape[1];
     let (fa_idx, conv_idx) = self.mask_source_indices(n_layers);
 
     // Build the two masks once (mlx-lm `create_attention_mask` /
@@ -1221,6 +1235,34 @@ impl LmModel for Lfm2 {
     embeddings: &Array,
     cache: &mut [Box<dyn KvCache>],
   ) -> Result<Array> {
+    // Guard the rank + hidden width BEFORE `forward_hidden` indexes
+    // `embeddings.shape()[1]` (the seq axis) — a rank-0/1 array would
+    // otherwise panic on that index. The VLM splice / a caller supplying
+    // pre-merged embeddings must hand a rank-3 `(batch, seq, hidden)` tensor
+    // whose hidden width matches the LM; surface a typed error, never a panic.
+    let shape = embeddings.shape();
+    if shape.len() != 3 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "Lfm2::forward_embeddings: embeddings must be rank-3 (batch, seq, hidden)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
+    let want = self.config.hidden_size;
+    let got = i32::try_from(shape[2]).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Lfm2::forward_embeddings: embeddings hidden dim",
+        "must fit in i32",
+        format_smolstr!("{}", shape[2]),
+      ))
+    })?;
+    if got != want {
+      return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+        "Lfm2::forward_embeddings: embeddings hidden width vs config.hidden_size",
+        want as usize,
+        shape[2],
+      )));
+    }
     let hidden = self.model.forward_hidden(embeddings, cache)?;
     self.as_linear(&hidden)
   }

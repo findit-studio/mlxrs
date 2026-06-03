@@ -949,6 +949,69 @@ fn forward_rejects_wrong_cardinality_cache() {
 }
 
 #[test]
+fn forward_embeddings_rejects_low_rank_without_panic() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model();
+  let mut cache = model.make_cache();
+
+  // Rank-0 scalar: must be a typed RankMismatch, NOT a panic on shape[1].
+  // An empty `[i32; 0]` shape ⇒ a rank-0 (single-element) array.
+  let r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r0, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-0 embeddings → RankMismatch"
+  );
+
+  // Rank-1 `[hidden]`: still RankMismatch (would index shape[1] out of bounds).
+  let r1 = Array::from_slice::<f32>(&[0.0_f32; 4], &(4usize,)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r1, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-1 embeddings → RankMismatch"
+  );
+
+  // Rank-2 `[seq, hidden]` (the common "forgot the batch axis" mistake):
+  // RankMismatch (the LM wants rank-3 `[batch, seq, hidden]`).
+  let r2 = Array::from_slice::<f32>(&[0.0_f32; 8], &(2usize, 4usize)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r2, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-2 embeddings → RankMismatch"
+  );
+}
+
+#[test]
+fn forward_embeddings_rejects_wrong_hidden_width() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model(); // hidden_size = 4
+  let mut cache = model.make_cache();
+
+  // Rank-3 but the hidden width is 8 ≠ config.hidden_size (4): a typed
+  // LengthMismatch naming the hidden-width contract.
+  let wrong = Array::from_slice::<f32>(&[0.0_f32; 16], &(1usize, 2usize, 8usize)).unwrap();
+  match model.forward_embeddings(&wrong, &mut cache) {
+    Err(Error::LengthMismatch(p)) => {
+      assert_eq!(p.expected(), 4, "expected = config.hidden_size");
+      assert_eq!(p.actual(), 8, "actual = supplied hidden width");
+    }
+    other => panic!("expected LengthMismatch(hidden width), got {other:?}"),
+  }
+
+  // The matching rank-3 `[1, 2, 4]` runs (the guard only rejects mismatches) →
+  // `[1, 2, vocab=8]` logits.
+  let ok = Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 2usize, 4usize)).unwrap();
+  let logits = model.forward_embeddings(&ok, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
 fn adjusted_ff_dim_matches_reference_formula() {
   // block_ff_dim=6656, multiple_of=256, multiplier=1.0, adjust=true:
   //   int(2*6656/3)=4437; int(1.0*4437)=4437;

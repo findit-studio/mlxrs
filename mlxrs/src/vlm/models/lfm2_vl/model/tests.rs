@@ -365,25 +365,29 @@ fn get_input_embeddings_no_images_is_text_embeds() {
 // ───────────────────────── cross-model trait ─────────────────────────
 
 #[test]
-fn vlm_trait_encode_image_square_fully_active() {
-  // The cross-model encode_image takes a single (1, num_patches, patch_feat)
-  // Array for a square fully-active grid. num_patches = 16 -> side 4 ->
-  // (4/2)^2 = 4 feature rows.
+fn vlm_trait_encode_image_consumes_processed_image() {
+  // The cross-model encode_image consumes a ProcessedImage carrying the
+  // flattened patch tensor (num_patches, patch_feat) + the native-resolution
+  // companions (spatial_shape [H_p, W_p] = [4, 4], a fully-active patch_mask).
+  // Grid 4x4 -> (4/2)^2 = 4 feature rows.
   let model = dense_model();
-  let pv =
-    crate::ops::shape::reshape(&mat(16, VPATCH_FEAT), &(1usize, 16, VPATCH_FEAT as usize)).unwrap();
-  let feats = VlmModel::encode_image(&model, &pv).unwrap();
+  let pixels = mat(16, VPATCH_FEAT); // (16, patch_feat)
+  let spatial = Array::from_slice::<i32>(&[4, 4], &(2usize,)).unwrap();
+  let mask = Array::from_slice::<i32>(&[1i32; 16], &(16usize,)).unwrap();
+  let processed = ProcessedImage::new(pixels, Some(NativeResolution::new(spatial, mask)), 4);
+  let feats = VlmModel::encode_image(&model, &processed).unwrap();
   assert_eq!(feats.shape(), vec![4, THIDDEN as usize]);
 }
 
 #[test]
-fn vlm_trait_encode_image_non_square_errors() {
-  // A non-perfect-square num_patches can't be realized by the single-Array
-  // entry (use encode_image_inputs); it's a typed error.
+fn vlm_trait_encode_image_missing_native_errors() {
+  // A fixed-grid ProcessedImage (native = None) cannot drive the NaFlex path;
+  // LFM2.5-VL's encode_image rejects it with a typed InvariantViolation
+  // (never a panic) directing the caller to the Lfm2VlImageProcessor.
   let model = dense_model();
-  let pv =
-    crate::ops::shape::reshape(&mat(6, VPATCH_FEAT), &(1usize, 6, VPATCH_FEAT as usize)).unwrap();
-  let err = VlmModel::encode_image(&model, &pv).unwrap_err();
+  let pixels = mat(16, VPATCH_FEAT);
+  let processed = ProcessedImage::new(pixels, None, 4);
+  let err = VlmModel::encode_image(&model, &processed).unwrap_err();
   assert!(matches!(err, Error::InvariantViolation(_)), "got {err}");
 }
 
@@ -394,6 +398,142 @@ fn vlm_trait_image_processor_config_is_siglip() {
   assert_eq!(cfg.mean(), [0.5, 0.5, 0.5]);
   assert_eq!(cfg.std(), [0.5, 0.5, 0.5]);
   assert_eq!(cfg.resample(), crate::vlm::image::ResizeFilter::Bilinear);
+}
+
+// ───────────────────────── native-resolution processor ─────────────────────────
+
+/// Build a deterministic `w × h` RGB PNG at `path` (a real file
+/// `vlm::image::load_image` decodes).
+fn write_png(path: &std::path::Path, w: u32, h: u32) {
+  let mut buf = ::image::RgbImage::new(w, h);
+  for y in 0..h {
+    for x in 0..w {
+      buf.put_pixel(x, y, ::image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+    }
+  }
+  ::image::DynamicImage::ImageRgb8(buf)
+    .save_with_format(path, ::image::ImageFormat::Png)
+    .unwrap();
+}
+
+/// The [`Lfm2VlImageProcessor`] returns a [`ProcessedImage`] with `Some`
+/// native companions and a per-image `num_tokens` equal to
+/// `ceil(H_p / factor) * ceil(W_p / factor)` — the PixelUnshuffle ceil
+/// arithmetic, recomputed independently from the reported grid.
+#[test]
+fn lfm2vl_image_processor_native_count_matches_pixel_unshuffle() {
+  let model = dense_model();
+  let proc = VlmModel::image_processor(&model, 0);
+  // A 32×24 RGB image; the SigLIP2 NaFlex smart-resize picks the grid within
+  // the 1024-patch budget (patch_size = 2).
+  let dir = std::env::temp_dir().join(format!("mlxrs-lfm2vl-proc-{}", std::process::id()));
+  std::fs::create_dir_all(&dir).unwrap();
+  let path = dir.join("img.png");
+  write_png(&path, 32, 24);
+  let img = crate::vlm::image::load_image(&path).unwrap();
+
+  let processed = proc.process(&img).expect("native processor succeeds");
+  let _ = std::fs::remove_file(&path);
+  let _ = std::fs::remove_dir(&dir);
+
+  // Native companions present.
+  let native = processed
+    .native()
+    .expect("native-resolution companions present");
+  // spatial_shape is (2,) = [H_p, W_p].
+  let mut ss = native.spatial_shape().try_clone().unwrap();
+  let grid = ss.to_vec::<i32>().unwrap();
+  assert_eq!(grid.len(), 2, "spatial_shape is [H_p, W_p]");
+  let (h_p, w_p) = (grid[0], grid[1]);
+  // patch_mask is (max_num_patches,) — the active prefix count is H_p*W_p.
+  assert_eq!(
+    native.patch_mask().shape(),
+    vec![model.config().max_num_patches as usize],
+    "patch_mask is max_num_patches long"
+  );
+  // pixels is (max_num_patches, patch_feat).
+  assert_eq!(
+    processed.pixels().shape(),
+    vec![
+      model.config().max_num_patches as usize,
+      VPATCH_FEAT as usize
+    ],
+  );
+  // Independent ceil recompute (the PixelUnshuffle pad): ceil(x/f) = (x + f-1)/f.
+  let f = FACTOR;
+  let want = ((h_p + f - 1) / f) * ((w_p + f - 1) / f);
+  assert_eq!(
+    processed.num_tokens(),
+    want as usize,
+    "num_tokens = ceil(H_p/f) * ceil(W_p/f) (grid {h_p}x{w_p}, factor {f})"
+  );
+  assert!(want > 0, "a real image expands to >= 1 image token");
+}
+
+// ───────────────────────── end-to-end generic vlm_generate ─────────────────────────
+
+/// The generic [`crate::vlm::generate::vlm_generate`] loop drives [`Lfm2Vl`]
+/// end-to-end through the per-model [`ImageProcessor`] seam — the path that
+/// previously failed because the factory-loaded model could not satisfy the
+/// fixed-`num_tokens_per_image` cross-model surface. A synthetic image + a
+/// single-`<image>`-marker prompt yields finite logits via the processor →
+/// encode_image → merge → forward chain.
+#[test]
+fn vlm_generate_drives_lfm2vl_end_to_end() {
+  use crate::{
+    lm::generate::GenConfig,
+    vlm::{
+      generate::{VlmGenConfig, vlm_generate},
+      prompt::MarkerPolicy,
+    },
+  };
+
+  let model = dense_model();
+  let proc = VlmModel::image_processor(&model, 0);
+  let dir = std::env::temp_dir().join(format!("mlxrs-lfm2vl-e2e-{}", std::process::id()));
+  std::fs::create_dir_all(&dir).unwrap();
+  let path = dir.join("img.png");
+  // Small image so the native grid (and image-token run) is modest.
+  write_png(&path, 16, 16);
+
+  // Prompt: <bos=1> <image=IMG> <tok=2>. One marker run of length 1 → one
+  // image; the processor expands the placeholder to the image's token count.
+  let prompt: Vec<u32> = vec![1, IMG as u32, 2];
+  let cache = model.make_cache();
+  // `image_token_id == image_marker_id == IMG`; the per-image count comes from
+  // the processor (the cfg `num_tokens_per_image` is unused on this native-res
+  // path, but a positive value keeps the config well-formed).
+  let cfg = VlmGenConfig::new(
+    GenConfig::default().with_max_tokens(2),
+    IMG as u32,
+    1,
+    MarkerPolicy::Required,
+  );
+
+  let mut it = vlm_generate(
+    &model,
+    proc.as_ref(),
+    &prompt,
+    std::slice::from_ref(&path),
+    cache,
+    cfg,
+  )
+  .expect("vlm_generate constructs and runs the native-resolution prefill");
+  let first = it
+    .next()
+    .expect("at least one decode step")
+    .expect("the prefill + first decode succeed → finite logits");
+  let _ = std::fs::remove_file(&path);
+  let _ = std::fs::remove_dir(&dir);
+
+  // A sampled token id is in-vocab; the logprobs vector is finite.
+  assert!((first.token as i32) < VOCAB, "sampled token id is in-vocab");
+  let lp = first.logprobs.expect("VLM path always yields logprobs");
+  let mut lp = lp.try_clone().unwrap();
+  assert!(
+    lp.to_vec::<f32>().unwrap().iter().all(|v| v.is_finite()),
+    "logprobs are finite"
+  );
 }
 
 // ───────────────────────── quantized path ─────────────────────────
