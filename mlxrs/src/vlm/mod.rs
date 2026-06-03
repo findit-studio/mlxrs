@@ -31,6 +31,10 @@
 //!   primitives ported 1:1 from `mlx-vlm/mlx_vlm/prompt_utils.py`
 //!   (image-token splicing, image-span location, multimodal attention-mask
 //!   construction). Per-model chat templates are out of scope.
+//! - [`models`](crate::vlm::models) — concrete per-model VLM architectures
+//!   (model-support phase), each gated on its own model feature. Currently
+//!   [`lfm2_vl`](crate::vlm::models::lfm2_vl) (LFM2.5-VL: the LFM2 LM + a
+//!   SigLIP2-style vision tower + a pixel-unshuffle projector).
 //! - [`crate::vlm::model`] — the `vlm::Model` trait extending
 //!   `lm::Model` with the image-embedding entry points every VLM forward
 //!   needs (vision encode + token embed + image-into-text embed splice).
@@ -65,6 +69,7 @@ pub mod image;
 pub mod inputs;
 pub mod load;
 pub mod model;
+pub mod models;
 pub mod prompt;
 pub(crate) mod resize;
 pub mod video;

@@ -378,3 +378,268 @@ fn bilinear_rejects_integer_grid_dtype() {
   let err = bilinear_interpolate(&g, 4, 4).unwrap_err();
   assert!(matches!(err, Error::UnsupportedDtype(_)), "got {err}");
 }
+
+// ───────────────────────────── bicubic ─────────────────────────────
+//
+// Reference: `mlx-vlm/mlx_vlm/models/kernels.py`'s `_bicubic_interpolate_mlx`
+// with the SigLIP2 defaults `align_corners=False`, `antialias=False` (Keys'
+// cubic, `a = -0.5`). The expected values are computed by an independent f64
+// reimplementation of that algorithm (NOT by delegating to the code under
+// test), and the canonical small grids are also pinned against hand-computed
+// fractions.
+
+/// Independent f64 Keys'-cubic kernel (`a = -0.5`), written separately from the
+/// `cubic_weight` under test.
+fn ref_cubic(t: f64) -> f64 {
+  let a = -0.5;
+  let at = t.abs();
+  let at2 = at * at;
+  let at3 = at2 * at;
+  if at <= 1.0 {
+    (a + 2.0) * at3 - (a + 3.0) * at2 + 1.0
+  } else if at < 2.0 {
+    a * at3 - 5.0 * a * at2 + 8.0 * a * at - 4.0 * a
+  } else {
+    0.0
+  }
+}
+
+/// Independent f64 reference for one bicubic resampling axis: returns, per
+/// output row, the `(source_index, weight)` taps (only the in-bounds,
+/// renormalized ones — the zero-weight off-grid taps are dropped). Mirrors
+/// `_weights_1d` (support = 2, fs = 1) without reusing the production build.
+fn ref_bicubic_axis(in_d: usize, out_d: usize) -> Vec<Vec<(usize, f64)>> {
+  let in_i = in_d as i64;
+  let mut rows = Vec::with_capacity(out_d);
+  for i in 0..out_d {
+    let center = (i as f64 + 0.5) / out_d as f64 * in_d as f64 - 0.5;
+    let start = (center - 2.0).floor() as i64 + 1;
+    let mut taps: Vec<(i64, f64)> = Vec::new();
+    let mut tot = 0.0;
+    for k in 0..5i64 {
+      let p = start + k;
+      if p >= 0 && p < in_i {
+        let w = ref_cubic(center - p as f64);
+        taps.push((p, w));
+        tot += w;
+      }
+    }
+    let inv = 1.0 / (tot + 1e-8);
+    rows.push(
+      taps
+        .into_iter()
+        .map(|(p, w)| (p as usize, w * inv))
+        .collect(),
+    );
+  }
+  rows
+}
+
+/// Independent f64 bicubic resize of a single-channel `(H, W)` grid
+/// (`B = C = 1`), separable height-then-width like the reference.
+fn ref_bicubic_resize(grid: &[Vec<f64>], out_h: usize, out_w: usize) -> Vec<Vec<f64>> {
+  let h_in = grid.len();
+  let w_in = grid[0].len();
+  let wy = ref_bicubic_axis(h_in, out_h);
+  let wx = ref_bicubic_axis(w_in, out_w);
+  // Height resample → (out_h, w_in).
+  let mut tmp = vec![vec![0.0f64; w_in]; out_h];
+  for (i, trow) in tmp.iter_mut().enumerate() {
+    for (x, cell) in trow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wy[i] {
+        s += w * grid[p][x];
+      }
+      *cell = s;
+    }
+  }
+  // Width resample → (out_h, out_w).
+  let mut out = vec![vec![0.0f64; out_w]; out_h];
+  for (i, orow) in out.iter_mut().enumerate() {
+    for (j, cell) in orow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wx[j] {
+        s += w * tmp[i][p];
+      }
+      *cell = s;
+    }
+  }
+  out
+}
+
+/// Run `bicubic_interpolate` on a single-channel `(H_in, W_in)` grid
+/// (`B = C = 1`) and return the flat `out_h * out_w` row-major output.
+fn bicubic_single_channel(grid: &[Vec<f64>], out_h: usize, out_w: usize) -> Vec<f32> {
+  let h_in = grid.len();
+  let w_in = grid[0].len();
+  let flat: Vec<f32> = grid.iter().flatten().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, h_in, w_in)).unwrap();
+  let out = bicubic_interpolate(&x, out_h, out_w).unwrap();
+  assert_eq!(out.shape(), vec![1, 1, out_h, out_w]);
+  to_vec(&out)
+}
+
+#[test]
+fn bicubic_identity_same_size_is_exact_passthrough() {
+  // out == in on both axes: the source center lands exactly on each pixel, so
+  // the only nonzero cubic tap is weight 1 → the resize is the input unchanged.
+  #[rustfmt::skip]
+  let g = vec![
+    vec![0.0f64, 1.0, 2.0],
+    vec![3.0, 4.0, 5.0],
+    vec![6.0, 7.0, 8.0],
+  ];
+  let got = bicubic_single_channel(&g, 3, 3);
+  let want: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
+  for (i, (gv, w)) in got.iter().zip(want.iter()).enumerate() {
+    assert!((gv - w).abs() < EPS, "idx {i}: got {gv}, want {w}");
+  }
+}
+
+#[test]
+fn bicubic_axis_weights_renormalize_to_one() {
+  // Each output row's surviving (in-bounds) cubic taps renormalize to sum ~1.
+  // `kernels.py` divides by `sum(w) + 1e-8` (an unconditional epsilon, NOT a
+  // guard for a zero sum), so the renormalized sum is exactly `tot/(tot+1e-8)`
+  // — a hair below 1 by `~1e-8/tot`. The tolerance accommodates that faithful
+  // epsilon (`tot` is O(1) for these ratios, so the deviation is `~1e-8`).
+  for (in_d, out_d) in [(4usize, 8usize), (16, 27), (16, 12), (4, 2), (3, 7), (8, 3)] {
+    for (j, taps) in ref_bicubic_axis(in_d, out_d).iter().enumerate() {
+      let s: f64 = taps.iter().map(|&(_, w)| w).sum();
+      assert!(
+        (s - 1.0).abs() < 1e-6,
+        "bicubic axis({in_d},{out_d}) row {j} sum = {s}"
+      );
+    }
+  }
+}
+
+#[test]
+fn bicubic_upsample_1x2_to_1x4_matches_hand_computed() {
+  // A 1x2 horizontal ramp [0, 1] upsampled to 1x4. For each output i the source
+  // center is c = (i+0.5)/4*2 - 0.5 ∈ {-0.25, 0.25, 0.75, 1.25}. With only two
+  // input pixels the in-bounds taps are {0, 1}; the renormalized cubic blend of
+  // values {0, 1} is computed by the independent f64 reference and pinned here.
+  // Note Keys' cubic (a = -0.5) deliberately OVERSHOOTS beyond the [0, 1] data
+  // range at the extrapolated endpoints (the cubic-ringing characteristic) —
+  // got ≈ [-0.088, 0.207, 0.793, 1.088] — which is exactly what the reference
+  // produces, so the op is pinned against the reference, not a (wrong)
+  // in-range / monotonic expectation.
+  let g = vec![vec![0.0f64, 1.0]];
+  let got = bicubic_single_channel(&g, 1, 4);
+  let want = ref_bicubic_resize(&g, 1, 4);
+  for j in 0..4 {
+    let w = want[0][j] as f32;
+    assert!(
+      (got[j] - w).abs() < 1e-5,
+      "col {j}: got {}, want {w}",
+      got[j]
+    );
+  }
+  // The endpoints overshoot the data range (cubic ringing) — a positive pin
+  // that this is the cubic kernel, not a clamped bilinear.
+  assert!(
+    got[0] < 0.0,
+    "left endpoint must undershoot (cubic ringing): {got:?}"
+  );
+  assert!(
+    got[3] > 1.0,
+    "right endpoint must overshoot (cubic ringing): {got:?}"
+  );
+}
+
+#[test]
+fn bicubic_constant_grid_stays_constant() {
+  // The renormalized cubic weights are a partition of unity per output row, so a
+  // constant grid must resample to the same constant everywhere — independent of
+  // the (mixed up/down) resize ratio.
+  let g = vec![vec![5.0f64; 4]; 4];
+  let got = bicubic_single_channel(&g, 7, 2);
+  for (i, v) in got.iter().enumerate() {
+    assert!(
+      (v - 5.0).abs() < 1e-4,
+      "idx {i}: constant grid drifted to {v}"
+    );
+  }
+}
+
+#[test]
+fn bicubic_matches_independent_f64_reference_on_4x4_to_7x7_upsample() {
+  // Cross-check the full op against the independent f64 reference on a
+  // non-trivial grid + non-square-ratio upsample (4x4 → 7x7).
+  let g: Vec<Vec<f64>> = (0..4)
+    .map(|i| (0..4).map(|j| (i * 4 + j) as f64 * 0.5 - 3.0).collect())
+    .collect();
+  let got = bicubic_single_channel(&g, 7, 7);
+  let want = ref_bicubic_resize(&g, 7, 7);
+  for i in 0..7 {
+    for j in 0..7 {
+      let w = want[i][j] as f32;
+      let gv = got[i * 7 + j];
+      assert!((gv - w).abs() < 1e-4, "({i},{j}): got {gv}, want {w}");
+    }
+  }
+}
+
+#[test]
+fn bicubic_matches_independent_f64_reference_on_8x8_to_5x5_downsample() {
+  // Downsample cross-check (5-tap support active on both axes) against the
+  // independent f64 reference.
+  let g: Vec<Vec<f64>> = (0..8)
+    .map(|i| (0..8).map(|j| (i * 8 + j) as f64).collect())
+    .collect();
+  let got = bicubic_single_channel(&g, 5, 5);
+  let want = ref_bicubic_resize(&g, 5, 5);
+  for i in 0..5 {
+    for j in 0..5 {
+      let w = want[i][j] as f32;
+      let gv = got[i * 5 + j];
+      assert!((gv - w).abs() < 1e-4, "({i},{j}): got {gv}, want {w}");
+    }
+  }
+}
+
+#[test]
+fn bicubic_is_independent_per_channel_and_batch() {
+  // A (2, 2, 2, 2) grid: channel/batch index 1 = index 0 + 10. Bicubic is linear
+  // and per-(B,C), so resized slot 1 must equal resized slot 0 + 10 everywhere.
+  // Build (B=1, C=2, 2, 2) where C1 = C0 + 10.
+  #[rustfmt::skip]
+  let c0 = [0.0f32, 1.0, 2.0, 3.0];
+  let mut data = Vec::new();
+  data.extend_from_slice(&c0); // channel 0
+  for v in c0 {
+    data.push(v + 10.0); // channel 1
+  }
+  let x = Array::from_slice::<f32>(&data, &(1, 2, 2, 2)).unwrap();
+  let out = bicubic_interpolate(&x, 4, 4).unwrap();
+  assert_eq!(out.shape(), vec![1, 2, 4, 4]);
+  let got = to_vec(&out);
+  for px in 0..16 {
+    let a = got[px]; // channel 0 plane
+    let b = got[16 + px]; // channel 1 plane
+    assert!((b - (a + 10.0)).abs() < 1e-3, "px {px}: c0={a} c1={b}");
+  }
+}
+
+#[test]
+fn bicubic_rejects_non_rank4_input() {
+  let g3 = Array::from_slice::<f32>(&[1.0f32; 8], &(2, 2, 2)).unwrap();
+  let err = bicubic_interpolate(&g3, 4, 4).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)), "got {err}");
+}
+
+#[test]
+fn bicubic_rejects_zero_dims() {
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate(&x, 0, 4).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "out_h=0: got {err}");
+}
+
+#[test]
+fn bicubic_rejects_integer_input_dtype() {
+  // Fractional cubic weights cannot resample an integer grid → dtype rejected.
+  let g = Array::from_slice::<i32>(&[1, 2, 3, 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate(&g, 4, 4).unwrap_err();
+  assert!(matches!(err, Error::UnsupportedDtype(_)), "got {err}");
+}

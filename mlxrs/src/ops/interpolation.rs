@@ -1,10 +1,18 @@
 //! Spatial interpolation ops.
 //!
-//! Currently the single primitive [`bilinear_interpolate`] — a separable
-//! **bilinear + antialias** resize of a 2-D spatial grid, matching PyTorch
-//! `torch.nn.functional.interpolate(mode="bilinear", align_corners=False,
-//! antialias=True)` exactly (the antialias triangle-filter path of `aten`'s
-//! `UpSampleKernel.cpp`, not the plain 2-tap align-corners=False kernel).
+//! Two primitives:
+//!
+//! - [`bilinear_interpolate`] — a separable **bilinear + antialias** resize of
+//!   a 2-D spatial grid, matching PyTorch
+//!   `torch.nn.functional.interpolate(mode="bilinear", align_corners=False,
+//!   antialias=True)` exactly (the antialias triangle-filter path of `aten`'s
+//!   `UpSampleKernel.cpp`, not the plain 2-tap align-corners=False kernel).
+//! - [`bicubic_interpolate`] — a separable **bicubic** (Keys' cubic, `a =
+//!   -0.5`) resize of a `(B, C, H, W)` batched grid, the pure-MLX fallback
+//!   `mlx-vlm` uses when no Metal kernel is available
+//!   (`mlx-vlm/mlx_vlm/models/kernels.py`'s `_bicubic_interpolate_mlx`). The
+//!   LFM2.5-VL SigLIP2 vision tower resizes its learned position-embedding grid
+//!   per image with this (`vision.py`'s `resize_positional_embeddings`).
 //!
 //! This is the resize SigLIP2 NaFlex (and other native-resolution ViTs)
 //! use to stretch a learned position-embedding grid from its trained
@@ -74,8 +82,10 @@ use crate::{
   error::{ArithmeticOverflowPayload, CapExceededPayload, Error, OutOfRangePayload, Result},
   model_validation::{Extent, elem_count},
   ops::{
+    indexing::take_axis,
     linalg_basic::matmul,
     misc::astype,
+    reduction::sum_axes,
     shape::{contiguous, reshape, transpose_axes},
   },
 };
@@ -367,6 +377,204 @@ pub fn bilinear_interpolate(grid: &Array, out_h: usize, out_w: usize) -> Result<
   // grid is tiny (position-embed sized), so the copy is negligible.
   let out = transpose_axes(&cols, &[1, 0, 2])?;
   contiguous(&out, false)
+}
+
+// ───────────────────────────── bicubic ─────────────────────────────
+
+/// The bicubic tap count for one resampled axis: `int(2 * support + 1)` with
+/// `support = 2.0` (the `align_corners=False`, `antialias=False` path
+/// `mlx-vlm`'s `_bicubic_interpolate_mlx` takes — the only mode the SigLIP2
+/// position-embed resize uses). A `support = 2` Keys' cubic spans the two input
+/// pixels on each side of the source coordinate, so each output row reads `5`
+/// candidate taps; the off-grid ones are zero-weighted and clamp-folded onto a
+/// valid index (their zero weight makes the duplicate read inert).
+const BICUBIC_TAPS: usize = 5;
+
+/// Keys' cubic convolution kernel with `a = -0.5` (`kernels.py`'s
+/// `_cubic_weight`), evaluated in `f64` for the host-side weight build:
+///
+/// ```text
+/// w(t) = (a+2)|t|^3 - (a+3)|t|^2 + 1            for |t| <= 1
+///        a|t|^3 - 5a|t|^2 + 8a|t| - 4a          for 1 < |t| < 2
+///        0                                      for |t| >= 2
+/// ```
+fn cubic_weight(t: f64) -> f64 {
+  const A: f64 = -0.5;
+  let at = t.abs();
+  let at2 = at * at;
+  let at3 = at2 * at;
+  if at <= 1.0 {
+    (A + 2.0) * at3 - (A + 3.0) * at2 + 1.0
+  } else if at < 2.0 {
+    A * at3 - 5.0 * A * at2 + 8.0 * A * at - 4.0 * A
+  } else {
+    0.0
+  }
+}
+
+/// Build the `(out_dim, BICUBIC_TAPS)` per-axis resampling tables for the
+/// bicubic `align_corners=False`, `antialias=False` path — `kernels.py`'s
+/// `_weights_1d` specialized to `support = 2.0`, `fs = 1.0`.
+///
+/// Returns `(pix, weights)` flattened row-major:
+/// - `pix[i * TAPS + k]` is the (clamped-to-`[0, in_dim)`) source index of the
+///   `k`-th tap of output row `i`;
+/// - `weights[i * TAPS + k]` is its (renormalized) cubic weight.
+///
+/// The source coordinate is the half-pixel center `c = (i + 0.5) / out * in -
+/// 0.5`; the first tap starts at `floor(c - support) + 1`; out-of-bounds taps
+/// are zero-weighted (and their index clamped so the on-device gather only ever
+/// reads a valid row), then the surviving weights are renormalized to sum to 1
+/// (matching `_weights_1d`'s `w / (sum(w) + 1e-8)`). `in_dim`, `out_dim >= 1`.
+fn build_bicubic_axis(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
+  // `support = 2.0`, `fs = 1.0` (antialias off). Both factors are small, and
+  // the caller has bounded `in_dim` / `out_dim` to representable spatial dims,
+  // so `out_dim * TAPS` cannot overflow `usize` on any supported platform.
+  let total = out_dim * BICUBIC_TAPS;
+  let mut pix = vec![0i32; total];
+  let mut weights = vec![0.0f32; total];
+  let scale_in = in_dim as f64;
+  let scale_out = out_dim as f64;
+  let in_i = in_dim as i64;
+  for i in 0..out_dim {
+    // `(arange(out) + 0.5) / out * in - 0.5` — the half-pixel source center.
+    let center = (i as f64 + 0.5) / scale_out * scale_in - 0.5;
+    // `start = floor(center - support) + 1` (support = 2).
+    let start = (center - 2.0).floor() as i64 + 1;
+    let row = i * BICUBIC_TAPS;
+    // First pass: unnormalized cubic weights over the TAPS candidate indices,
+    // masking (zero-weighting) the out-of-bounds ones, and their sum.
+    let mut tot = 0.0f64;
+    for k in 0..BICUBIC_TAPS {
+      let p = start + k as i64;
+      let in_bounds = p >= 0 && p < in_i;
+      // `dist = center - p`; `fs = 1.0`, so `cubic_weight(dist / fs)`.
+      let w = if in_bounds {
+        cubic_weight(center - p as f64)
+      } else {
+        0.0
+      };
+      weights[row + k] = w as f32;
+      tot += w;
+      // Clamp the (possibly out-of-bounds) index into `[0, in_dim)` so the
+      // on-device gather always reads a valid row; the zero weight above makes a
+      // clamped duplicate read inert. `kernels.py` does the same `mx.clip`.
+      pix[row + k] = p.clamp(0, in_i - 1) as i32;
+    }
+    // Second pass: renormalize to sum 1 (`w / (sum(w) + 1e-8)`).
+    let inv = 1.0 / (tot + 1e-8);
+    for k in 0..BICUBIC_TAPS {
+      weights[row + k] = (weights[row + k] as f64 * inv) as f32;
+    }
+  }
+  (pix, weights)
+}
+
+/// Bicubic-resize a batched `(B, C, H_in, W_in)` grid to `(B, C, out_h,
+/// out_w)`, matching `mlx-vlm`'s pure-MLX `_bicubic_interpolate_mlx`
+/// (`align_corners=False`, `antialias=False`: Keys' cubic, `a = -0.5`).
+///
+/// This is the resize the LFM2.5-VL SigLIP2 vision tower applies to its learned
+/// position-embedding grid per image (`vision.py`'s
+/// `resize_positional_embeddings` calls `bicubic_interpolate(pos[None], size=(h,
+/// w))`). Like `_bicubic_interpolate_mlx`, the resampling is separable: build a
+/// `(out, TAPS)` cubic-weight table per axis (on the host), gather the candidate
+/// taps along that axis, and contract over the taps. Height is resampled first,
+/// then width — exactly the reference's two-stage `gather + sum`.
+///
+/// `x` is a rank-4 `(B, C, H_in, W_in)` float array; the output is
+/// `(B, C, out_h, out_w)` in the **same dtype** as `x` (computed in `f32` and
+/// cast back, mirroring the reference's `astype(float32)` / restore). The
+/// channel and batch axes pass through untouched (the resize is purely spatial).
+///
+/// ## Errors
+/// - `x` is not rank-4 → [`Error::RankMismatch`].
+/// - any of `H_in`, `W_in`, `out_h`, `out_w` is `0` → [`Error::OutOfRange`].
+/// - `x`'s dtype is non-floating (the cubic weights are fractional; an integer
+///   grid would truncate every sample) → [`Error::UnsupportedDtype`].
+/// - underlying gather / reshape / reduce / cast op errors propagate (a
+///   non-finite grid value flows through unchanged — interpolation is linear in
+///   the samples).
+pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+  let shape = x.shape();
+  if shape.len() != 4 {
+    return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
+      "bicubic_interpolate: input must be rank-4 (B, C, H, W)",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  let (b, c, in_h, in_w) = (shape[0], shape[1], shape[2], shape[3]);
+  for (name, v) in [
+    ("bicubic_interpolate: H_in", in_h),
+    ("bicubic_interpolate: W_in", in_w),
+    ("bicubic_interpolate: out_h", out_h),
+    ("bicubic_interpolate: out_w", out_w),
+  ] {
+    if v == 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        name,
+        "must be a positive spatial dimension (>= 1)",
+        "0",
+      )));
+    }
+  }
+
+  // The cubic weights are fractional, so a non-floating grid would lose every
+  // sample to truncation. Restrict to the float dtypes (the position-embed
+  // table is always float). The reference casts to f32 internally; preserve the
+  // input dtype on the way out so an f16/bf16 grid stays in its dtype.
+  let in_dtype = x.dtype()?;
+  if !matches!(in_dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+    return Err(Error::UnsupportedDtype(
+      crate::error::UnsupportedDtypePayload::new(
+        "bicubic_interpolate: input dtype",
+        in_dtype,
+        &[Dtype::F32, Dtype::F16, Dtype::BF16],
+      ),
+    ));
+  }
+
+  // Compute in f32 (the reference's `x.astype(float32)`), restore the input
+  // dtype at the end.
+  let xf = astype(x, Dtype::F32)?;
+
+  // ── height resample: gather TAPS rows along axis 2, contract over taps ──
+  let (pix_y, wy) = build_bicubic_axis(in_h, out_h);
+  // `x[:, :, pix_y.reshape(-1), :]` → (B, C, out_h * TAPS, W_in).
+  let pix_y_arr = Array::from_slice::<i32>(&pix_y, &(out_h * BICUBIC_TAPS,))?;
+  let gathered_y = take_axis(&xf, &pix_y_arr, 2)?;
+  // → (B, C, out_h, TAPS, W_in).
+  let gathered_y = reshape(&gathered_y, &(b, c, out_h, BICUBIC_TAPS, in_w))?;
+  // weights (out_h, TAPS) → (1, 1, out_h, TAPS, 1) to broadcast, then
+  // `sum(gathered * wy, axis=3)` → (B, C, out_h, W_in).
+  let wy_arr = reshape(
+    &Array::from_slice::<f32>(&wy, &(out_h, BICUBIC_TAPS))?,
+    &(1usize, 1, out_h, BICUBIC_TAPS, 1),
+  )?;
+  let tmp = sum_axes(&gathered_y.multiply(&wy_arr)?, &[3], false)?;
+
+  // ── width resample: gather TAPS columns along axis 3, contract over taps ──
+  let (pix_x, wx) = build_bicubic_axis(in_w, out_w);
+  // `tmp[:, :, :, pix_x.reshape(-1)]` → (B, C, out_h, out_w * TAPS).
+  let pix_x_arr = Array::from_slice::<i32>(&pix_x, &(out_w * BICUBIC_TAPS,))?;
+  let gathered_x = take_axis(&tmp, &pix_x_arr, 3)?;
+  // → (B, C, out_h, out_w, TAPS).
+  let gathered_x = reshape(&gathered_x, &(b, c, out_h, out_w, BICUBIC_TAPS))?;
+  // weights (out_w, TAPS) → (1, 1, 1, out_w, TAPS), then
+  // `sum(gathered * wx, axis=4)` → (B, C, out_h, out_w).
+  let wx_arr = reshape(
+    &Array::from_slice::<f32>(&wx, &(out_w, BICUBIC_TAPS))?,
+    &(1usize, 1, 1, out_w, BICUBIC_TAPS),
+  )?;
+  let result = sum_axes(&gathered_x.multiply(&wx_arr)?, &[4], false)?;
+
+  // Restore the input dtype (the reference's `astype(input_dtype)`).
+  if in_dtype == Dtype::F32 {
+    Ok(result)
+  } else {
+    astype(&result, in_dtype)
+  }
 }
 
 #[cfg(test)]
