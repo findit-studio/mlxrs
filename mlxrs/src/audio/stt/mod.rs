@@ -43,10 +43,20 @@ pub mod model;
 /// `decode_step` + KV cache) and run their own
 /// [`Transcribe`](model::Transcribe) procedure. Each is behind its own cargo
 /// feature.
-#[cfg(any(feature = "wav2vec2", feature = "whisper", feature = "qwen3-asr"))]
+#[cfg(any(
+  feature = "wav2vec2",
+  feature = "whisper",
+  feature = "qwen3-asr",
+  feature = "sensevoice"
+))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(feature = "wav2vec2", feature = "whisper", feature = "qwen3-asr")))
+  doc(cfg(any(
+    feature = "wav2vec2",
+    feature = "whisper",
+    feature = "qwen3-asr",
+    feature = "sensevoice"
+  )))
 )]
 pub mod models;
 pub mod serializers;

@@ -1,0 +1,51 @@
+//! SenseVoice-Small (FunAudioLLM multilingual STT) — `mlx-community/SenseVoiceSmall`.
+//!
+//! A faithful port of mlx-audio's `SenseVoiceSmall`
+//! ([`stt/models/sensevoice/sensevoice.py`][sv], with the swift
+//! `MLXAudioSTT/Models/SenseVoice/` as the second parity reference). SenseVoice
+//! is a **non-autoregressive CTC** recognizer: a single forward over the
+//! fbank / LFR / CMVN features produces per-frame log-probabilities, and a
+//! greedy blank-collapse yields text. There is no decoder, no KV cache, and no
+//! token-by-token loop.
+//!
+//! ## Pipeline
+//!
+//! 1. **Front-end** ([`frontend`]) — Kaldi fbank (reusing
+//!    [`crate::audio::features::compute_fbank_kaldi`] verbatim after a `2^15`
+//!    waveform pre-scale) -> Low-Frame-Rate stacking (`7 x 80 -> 560`, stride
+//!    `6`) -> global CMVN (`(feats + means) * istd`, from the model's `am.mvn`
+//!    or the in-config fallback).
+//! 2. **Encoder** ([`encoder`]) — the FunASR/Paraformer SANM (self-attention
+//!    network with FSMN memory) tower: a width-changing first block, the
+//!    constant-width main stack, a second `tp_encoders` stack, and three
+//!    LayerNorms, fronted by a `sqrt(output_size)` scale + an additive
+//!    sinusoidal position encoding. Every linear is quantize-aware via the
+//!    shared [`crate::nn::MaybeQuantizedLinear`].
+//! 3. **CTC head + rich-info decode** — the `ctc_lo` projection, the prepended
+//!    query-row assembly, the greedy collapse over the speech frames, and the
+//!    language / emotion / event argmax heads. *(Phase 3 — not yet wired in this
+//!    module.)*
+//!
+//! ## Status
+//!
+//! This module currently provides **Phase 1** (the [`config`] +
+//! [`frontend`] glue + `sanitize`) and **Phase 2** (the SANM/FSMN
+//! [`encoder`]). The CTC head, the query-prefix assembly, the rich-info
+//! extraction, the tokenizer decode, and the
+//! [`crate::audio::stt::model::CtcModel`] / [`crate::audio::stt::model::Transcribe`]
+//! trait wiring (Phase 3), plus the file-loading factory + quant resolution +
+//! shard walk (Phase 4), arrive in later changes. The pieces here are exercised
+//! by shape + closed-form oracle tests (no checkpoint).
+//!
+//! [sv]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/stt/models/sensevoice/sensevoice.py
+
+pub mod config;
+pub mod encoder;
+pub mod frontend;
+
+pub use config::{Config, EncoderConfig, FrontendConfig, MODEL_TYPE};
+pub use encoder::{
+  Encoder, EncoderLayerSANM, MultiHeadedAttentionSANM, PositionwiseFeedForward,
+  SinusoidalPositionEncoder,
+};
+pub use frontend::{apply_cmvn, apply_lfr, compute_fbank, parse_am_mvn, sanitize};

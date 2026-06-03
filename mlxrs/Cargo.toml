@@ -35,6 +35,7 @@ siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]     
 whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
 qwen3-asr            = ["qwen3", "audio", "dep:serde", "dep:serde_json"]           # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
 qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
+sensevoice           = ["audio", "tokenizer-spm", "dep:serde", "dep:serde_json"]  # SenseVoice-Small CTC STT (mlx-community/SenseVoiceSmall): Kaldi-fbank+LFR+CMVN front-end, SANM/FSMN encoder, CTC head + rich-info (language/emotion/event); SentencePiece via tokenizer-spm
 embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
 unstable-ops-overload = []
 gguf                 = []
