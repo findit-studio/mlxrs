@@ -18,6 +18,28 @@
 //! [`crate::Error`] instead of building the wrong graph. `mlxrs` is a library,
 //! so a merely *large* (but positive, non-overflowing) field is accepted — the
 //! consuming application owns input bounding.
+//!
+//! ## Image-splitting / tiling config (carried, not consumed)
+//!
+//! [`ModelConfig`] mirrors `config.py`'s image-splitting knobs faithfully —
+//! `do_image_splitting`, `encoder_patch_size`, `max_image_tokens`,
+//! `min_image_tokens`, `max_tiles`, `min_tiles`, `max_pixels_tolerance`,
+//! `tile_size`, `use_thumbnail` (`config.py:76-88`). These are **carried for
+//! config parity** but are **not consumed** by the processor / forward pass:
+//! mlx-vlm's own `processing_lfm2_vl.py` is a compatibility shim that defers to
+//! the *slow* SigLIP2 native-resolution image processor and **deliberately
+//! disables splitting** (`do_image_splitting = False` —
+//! `processing_lfm2_vl.py:129-132, 195-196, 270-273`, with "no tiling support,
+//! just add image tokens" at `processing_lfm2_vl.py:372-373`), and mlx-vlm's
+//! `lfm2_vl.py` forward consumes only the SigLIP2 NaFlex triple (`pixel_values`,
+//! `spatial_shapes`, `pixel_attention_mask` — `lfm2_vl.py:115-205`), never any
+//! tile / thumbnail metadata. The actual tile-grid + split implementation lives
+//! in HuggingFace `transformers` (`Lfm2VlImageProcessorFast`), which the mlx-vlm
+//! reference bypasses (and which is outside the mlx reference tree). The mlxrs
+//! [`crate::vlm::models::lfm2_vl::processor`] therefore mirrors the same
+//! native-resolution (no-split) path. Carrying the fields keeps the config a 1:1
+//! mirror of mlx-vlm `ModelConfig` and leaves the tiling path wired for a future
+//! port from the upstream HF fast processor should it become a faithful target.
 
 use crate::{
   error::{Error, OutOfRangePayload, ParsePayload, Result},
@@ -257,7 +279,7 @@ pub struct ModelConfig {
   pub vision_config: VisionConfig,
   /// Top-level architecture id. `config.py`'s default is `"lfm2-vl"`, but the
   /// released mlx-community checkpoints ship `"lfm2_vl"` (underscore); both are
-  /// accepted by [`validate`](ModelConfig::validate) (see [`MODEL_TYPES`]).
+  /// accepted by [`validate`](ModelConfig::validate).
   #[serde(default = "default_model_type")]
   model_type: String,
   /// Pixel-unshuffle downsample factor applied to the vision grid before the
@@ -285,9 +307,60 @@ pub struct ModelConfig {
   /// (`1024`).
   #[serde(default = "default_max_num_patches")]
   pub max_num_patches: i32,
-  /// Image-splitting tile size in pixels (`512`).
+  /// Whether the HuggingFace fast image processor splits an over-budget image
+  /// into tiles (`config.py:76`, default `true`). Carried for config parity; the
+  /// mlx-vlm processor path this port mirrors deliberately runs with splitting
+  /// **disabled** (the slow `Siglip2ImageProcessor` native-resolution path —
+  /// `processing_lfm2_vl.py:129-132, 195-196, 270-273, 372-373`), so this flag is
+  /// not consumed by [`crate::vlm::models::lfm2_vl::processor`] today. See the
+  /// module-level note on the tiling deferral.
+  #[serde(default = "default_true")]
+  pub do_image_splitting: bool,
+  /// Encoder patch size in pixels used by the tile-grid math of the HF fast image
+  /// processor (`config.py:78`, default `16`). Carried for config parity (the
+  /// native-resolution patch math uses the vision config's `patch_size`).
+  #[serde(default = "default_encoder_patch_size")]
+  pub encoder_patch_size: i32,
+  /// Upper bound on the per-image `<image>`-token budget the HF fast processor
+  /// targets when choosing a tile grid (`config.py:80`, default `256`).
+  #[serde(default = "default_max_image_tokens")]
+  pub max_image_tokens: i32,
+  /// Lower bound on the per-image `<image>`-token budget the HF fast processor
+  /// targets when choosing a tile grid (`config.py:84`, default `64`).
+  #[serde(default = "default_min_image_tokens")]
+  pub min_image_tokens: i32,
+  /// Maximum number of tiles the HF fast processor may split an image into
+  /// (`config.py:83`, default `10`).
+  #[serde(default = "default_max_tiles")]
+  pub max_tiles: i32,
+  /// Minimum number of tiles the HF fast processor splits an over-budget image
+  /// into (`config.py:85`, default `2`).
+  #[serde(default = "default_min_tiles")]
+  pub min_tiles: i32,
+  /// Tolerance multiplier on the patch budget before the HF fast processor
+  /// triggers a tile split (`config.py:82`, default `2.0`).
+  #[serde(default = "default_max_pixels_tolerance")]
+  pub max_pixels_tolerance: f32,
+  /// Image-splitting tile size in pixels (`config.py:86`, default `512`).
   #[serde(default = "default_tile_size")]
   pub tile_size: i32,
+  /// Whether the HF fast processor appends a downscaled thumbnail tile when
+  /// splitting (`config.py:88`, default `false`). Carried for config parity; not
+  /// consumed by the mlx-vlm native-resolution path this port mirrors.
+  #[serde(default)]
+  pub use_thumbnail: bool,
+  /// Whether the prompt brackets each image with the `image_start` / `image_end`
+  /// special tokens around the expanded `<image>` run (`config.py:87`, default
+  /// `true`). The actual bracketing is driven by the processor's resolved token
+  /// ids (see [`crate::vlm::models::lfm2_vl::processor`]); this carries the config
+  /// flag for parity.
+  #[serde(default = "default_true")]
+  pub use_image_special_tokens: bool,
+  /// The projector activation id (`config.py:91`, default `"gelu"`). Carried for
+  /// config parity; the projector forward hard-codes the GELU the reference uses
+  /// (`lfm2_vl.py:36`).
+  #[serde(default = "default_projector_hidden_act")]
+  pub projector_hidden_act: String,
   /// End-of-sequence token id (`7`).
   #[serde(default = "default_eos_token_id")]
   pub eos_token_id: i32,
@@ -330,6 +403,34 @@ fn default_max_num_patches() -> i32 {
 #[cfg(feature = "lfm2-vl")]
 fn default_tile_size() -> i32 {
   512
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_encoder_patch_size() -> i32 {
+  16
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_max_image_tokens() -> i32 {
+  256
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_min_image_tokens() -> i32 {
+  64
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_max_tiles() -> i32 {
+  10
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_min_tiles() -> i32 {
+  2
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_max_pixels_tolerance() -> f32 {
+  2.0
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_projector_hidden_act() -> String {
+  "gelu".to_string()
 }
 #[cfg(feature = "lfm2-vl")]
 fn default_eos_token_id() -> i32 {
@@ -405,10 +506,13 @@ impl ModelConfig {
   /// Reject a structurally invalid model config with a typed error before any
   /// tensor is built.
   ///
-  /// Pins the top-level `model_type` to [`MODEL_TYPES`] (`"lfm2-vl"` /
-  /// `"lfm2_vl"` — mlx-community checkpoints ship the underscore form); requires
+  /// Pins the top-level `model_type` to `"lfm2-vl"` / `"lfm2_vl"`
+  /// (mlx-community checkpoints ship the underscore form); requires
   /// the projector / patch-merge dimensions (`downsample_factor`,
-  /// `projector_hidden_size`, `max_num_patches`, `tile_size`) strictly positive
+  /// `projector_hidden_size`, `max_num_patches`, `tile_size`) and the tile-grid
+  /// cardinality fields (`encoder_patch_size`, `max_image_tokens`,
+  /// `min_image_tokens`, `max_tiles`, `min_tiles`) strictly positive,
+  /// `max_pixels_tolerance` positive-and-finite, the `min_* <= max_*` orderings,
   /// and `image_token_index` / `eos_token_id` non-negative; validates that
   /// `vision_feature_layer` resolves to an in-range kept-layer count; and
   /// validates both tower configs (see [`TextConfig::validate`] /
@@ -418,6 +522,14 @@ impl ModelConfig {
       "lfm2_vl::ModelConfig: model_type",
       self.model_type.as_str(),
       MODEL_TYPES,
+    )?;
+    // The projector forward hard-codes erf GELU (`projector.rs`); pin the
+    // architecture-defining activation so a checkpoint declaring a different
+    // value fails loudly rather than silently running GELU.
+    crate::model_validation::pin_str(
+      "lfm2_vl::ModelConfig: projector_hidden_act",
+      self.projector_hidden_act.as_str(),
+      &["gelu"],
     )?;
     for (name, value) in [
       (
@@ -433,9 +545,49 @@ impl ModelConfig {
         self.max_num_patches,
       ),
       ("lfm2_vl::ModelConfig: tile_size", self.tile_size),
+      (
+        "lfm2_vl::ModelConfig: encoder_patch_size",
+        self.encoder_patch_size,
+      ),
+      (
+        "lfm2_vl::ModelConfig: max_image_tokens",
+        self.max_image_tokens,
+      ),
+      (
+        "lfm2_vl::ModelConfig: min_image_tokens",
+        self.min_image_tokens,
+      ),
+      ("lfm2_vl::ModelConfig: max_tiles", self.max_tiles),
+      ("lfm2_vl::ModelConfig: min_tiles", self.min_tiles),
     ] {
       require_positive(name, value)?;
     }
+    // The tile / token budgets are inclusive `[min, max]` bands; a `min` above
+    // its `max` is structurally invalid (an empty band).
+    for (name, min, max) in [
+      (
+        "lfm2_vl::ModelConfig: min_tiles <= max_tiles",
+        self.min_tiles,
+        self.max_tiles,
+      ),
+      (
+        "lfm2_vl::ModelConfig: min_image_tokens <= max_image_tokens",
+        self.min_image_tokens,
+        self.max_image_tokens,
+      ),
+    ] {
+      if min > max {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          name,
+          "the minimum must not exceed the maximum",
+          smol_str::format_smolstr!("min={min}, max={max}"),
+        )));
+      }
+    }
+    crate::model_validation::require_positive_finite_f32(
+      "lfm2_vl::ModelConfig: max_pixels_tolerance",
+      self.max_pixels_tolerance as f64,
+    )?;
     // Token ids index a vocabulary / placeholder set; a negative id is
     // structurally invalid (it would never match a real token).
     for (name, value) in [

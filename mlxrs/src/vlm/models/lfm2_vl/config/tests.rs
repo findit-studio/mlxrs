@@ -140,8 +140,101 @@ fn model_config_defaults_fill_top_level_fields() {
   assert_eq!(cfg.max_num_patches, 1024);
   assert_eq!(cfg.tile_size, 512);
   assert_eq!(cfg.eos_token_id, 7);
+  // Image-splitting / tiling config defaults (config.py:76-88).
+  assert!(cfg.do_image_splitting);
+  assert_eq!(cfg.encoder_patch_size, 16);
+  assert_eq!(cfg.max_image_tokens, 256);
+  assert_eq!(cfg.min_image_tokens, 64);
+  assert_eq!(cfg.max_tiles, 10);
+  assert_eq!(cfg.min_tiles, 2);
+  assert_eq!(cfg.max_pixels_tolerance, 2.0);
+  assert!(!cfg.use_thumbnail);
+  assert!(cfg.use_image_special_tokens);
+  assert_eq!(cfg.projector_hidden_act, "gelu");
   assert!(cfg.quantization().is_none(), "dense by default");
   cfg.validate().unwrap();
+}
+
+#[test]
+fn model_config_parses_explicit_tiling_fields() {
+  // The image-splitting / tiling config fields (config.py:76-88) parse from JSON
+  // and validate. These are carried for config parity (the mlx-vlm processor
+  // path this port mirrors runs with splitting disabled), so this only pins the
+  // parse + validate, not any splitting behavior.
+  let json = r#"{
+    "text_config": {}, "vision_config": {},
+    "do_image_splitting": false,
+    "encoder_patch_size": 14,
+    "max_image_tokens": 300,
+    "min_image_tokens": 32,
+    "max_tiles": 12,
+    "min_tiles": 4,
+    "max_pixels_tolerance": 1.5,
+    "tile_size": 448,
+    "use_thumbnail": true,
+    "use_image_special_tokens": false,
+    "projector_hidden_act": "gelu"
+  }"#;
+  let cfg = ModelConfig::from_json(json).unwrap();
+  cfg.validate().unwrap();
+  assert!(!cfg.do_image_splitting);
+  assert_eq!(cfg.encoder_patch_size, 14);
+  assert_eq!(cfg.max_image_tokens, 300);
+  assert_eq!(cfg.min_image_tokens, 32);
+  assert_eq!(cfg.max_tiles, 12);
+  assert_eq!(cfg.min_tiles, 4);
+  assert_eq!(cfg.max_pixels_tolerance, 1.5);
+  assert_eq!(cfg.tile_size, 448);
+  assert!(cfg.use_thumbnail);
+  assert!(!cfg.use_image_special_tokens);
+  assert_eq!(cfg.projector_hidden_act, "gelu");
+}
+
+#[test]
+fn model_config_rejects_nonpositive_tiling_cardinality() {
+  for bad in [
+    r#"{"text_config":{},"vision_config":{},"encoder_patch_size":0}"#,
+    r#"{"text_config":{},"vision_config":{},"max_image_tokens":0}"#,
+    r#"{"text_config":{},"vision_config":{},"min_image_tokens":0}"#,
+    r#"{"text_config":{},"vision_config":{},"max_tiles":0}"#,
+    r#"{"text_config":{},"vision_config":{},"min_tiles":-1}"#,
+  ] {
+    let cfg = ModelConfig::from_json(bad).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+      matches!(err, Error::OutOfRange(_)),
+      "expected OutOfRange for {bad}, got {err}"
+    );
+  }
+}
+
+#[test]
+fn model_config_rejects_inverted_tiling_ranges() {
+  // min_tiles > max_tiles is an empty band.
+  let bad_tiles = r#"{"text_config":{},"vision_config":{},"min_tiles":6,"max_tiles":4}"#;
+  let cfg = ModelConfig::from_json(bad_tiles).unwrap();
+  assert!(matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)));
+
+  // min_image_tokens > max_image_tokens is an empty band.
+  let bad_tokens =
+    r#"{"text_config":{},"vision_config":{},"min_image_tokens":300,"max_image_tokens":256}"#;
+  let cfg = ModelConfig::from_json(bad_tokens).unwrap();
+  assert!(matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)));
+}
+
+#[test]
+fn model_config_rejects_nonfinite_pixels_tolerance() {
+  // A non-positive tolerance is OutOfRange; a non-finite one is NonFiniteScalar.
+  let zero = r#"{"text_config":{},"vision_config":{},"max_pixels_tolerance":0.0}"#;
+  let cfg = ModelConfig::from_json(zero).unwrap();
+  assert!(matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)));
+
+  let nan = r#"{"text_config":{},"vision_config":{},"max_pixels_tolerance":"not a number"}"#;
+  // A non-numeric value fails at parse, not validate.
+  assert!(matches!(
+    ModelConfig::from_json(nan).unwrap_err(),
+    Error::Parse(_)
+  ));
 }
 
 #[test]
@@ -192,6 +285,23 @@ fn model_config_accepts_both_model_type_spellings() {
 
   let bogus = r#"{"text_config": {}, "vision_config": {}, "model_type": "lfm2vl"}"#;
   let cfg = ModelConfig::from_json(bogus).unwrap();
+  let err = cfg.validate().unwrap_err();
+  assert!(matches!(err, Error::UnknownEnumValue(_)), "got {err}");
+}
+
+#[test]
+fn model_config_rejects_non_gelu_projector_hidden_act() {
+  // The projector forward hard-codes erf GELU (`projector.rs`); a checkpoint
+  // declaring any other `projector_hidden_act` must fail loudly rather than
+  // silently running GELU with the wrong declared activation.
+  let gelu = r#"{"text_config": {}, "vision_config": {}, "projector_hidden_act": "gelu"}"#;
+  ModelConfig::from_json(gelu)
+    .unwrap()
+    .validate()
+    .expect("projector_hidden_act gelu must validate");
+
+  let relu = r#"{"text_config": {}, "vision_config": {}, "projector_hidden_act": "relu"}"#;
+  let cfg = ModelConfig::from_json(relu).unwrap();
   let err = cfg.validate().unwrap_err();
   assert!(matches!(err, Error::UnknownEnumValue(_)), "got {err}");
 }
