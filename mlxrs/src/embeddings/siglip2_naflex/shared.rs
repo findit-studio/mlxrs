@@ -15,15 +15,20 @@ use std::collections::HashMap;
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{
-    Error, LayerKeyedPayload, MissingKeyPayload, OutOfRangePayload, RankMismatchPayload, Result,
-    ShapePairMismatchPayload,
+    Error, InvariantViolationPayload, LayerKeyedPayload, MissingKeyPayload, OutOfRangePayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload,
   },
-  lm::nn::{
-    attention::{Mask, scaled_dot_product_attention},
-    norm::LayerNorm,
+  lm::{
+    nn::{
+      attention::{Mask, scaled_dot_product_attention},
+      norm::LayerNorm,
+    },
+    quant::PerLayerQuantization,
   },
   model_validation::checked_mul,
+  nn::{MaybeQuantizedEmbedding, MaybeQuantizedLinear, QuantizedLinear},
   ops,
 };
 
@@ -32,6 +37,11 @@ use crate::{
 /// `siglip.py` stores every `nn.Linear` weight as `(out, in)`, so the matmul
 /// is `x @ wᵀ`. With a bias this is the fused `addmm(bias, x, wᵀ, 1, 1)`;
 /// without, a plain `matmul(x, wᵀ)`. Returns a new lazy [`Array`] (no eval).
+///
+/// This is the **dense** projection used directly by the few weight-sliced
+/// projections a packed quantized weight cannot represent (the attention-pool
+/// head's combined-QKV `in_proj`, sliced by logical row); every other
+/// projection goes through the quantize-aware [`QuantLinear`].
 #[cfg(feature = "siglip2-naflex")]
 pub(crate) fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
   let wt = ops::shape::swapaxes(weight, -1, -2)?;
@@ -39,6 +49,286 @@ pub(crate) fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<
     Some(b) => ops::linalg_basic::addmm(b, x, &wt, 1.0, 1.0),
     None => ops::linalg_basic::matmul(x, &wt),
   }
+}
+
+/// A SigLIP2 `nn.Linear` projection `y = x @ Wᵀ (+ b)` — quantize-aware.
+///
+/// Mirrors `mlx.nn.Linear` (`weight` stored `(out, in)`, the forward transposes
+/// it) for a dense checkpoint and `mlx.nn.QuantizedLinear` for an mlx-community
+/// quantized checkpoint (mlx-embeddings' `quantize_model` /
+/// `get_class_predicate`). The two cases share one [`forward`](Self::forward)
+/// call site via the shared [`MaybeQuantizedLinear`], so every SigLIP2
+/// projection (attention q/k/v/out, MLP fc1/fc2, the patch-embed matmul, the
+/// attention-pool out_proj, and the text head) is unchanged whether the weights
+/// are dense or quantized — the Whisper adoption pattern, identically.
+///
+/// Built by [`from_weights`](Self::from_weights), which auto-picks the quantized
+/// variant per layer by the presence of a `<prefix>.scales` sibling (the
+/// `class_predicate`'s `f"{p}.scales" in weights` signal).
+#[cfg(feature = "siglip2-naflex")]
+pub(crate) struct QuantLinear {
+  inner: MaybeQuantizedLinear,
+}
+
+#[cfg(feature = "siglip2-naflex")]
+impl QuantLinear {
+  /// Build a projection from `<prefix>.weight` (+ the dense `<prefix>.bias` when
+  /// `bias` is `true`), auto-picking the dense or quantized variant.
+  ///
+  /// **Dense path** (no `<prefix>.scales` sibling): pops `<prefix>.weight`
+  /// `(out, in)` (+ the `<prefix>.bias` `(out,)` when `bias`), both shape-pinned
+  /// to the config-derived extents via [`take_shaped`] BEFORE materialization —
+  /// byte-identical to the original dense load.
+  ///
+  /// **Quantized path** (`<prefix>.scales` present — the sole `class_predicate`
+  /// signal, requiring `quant` to resolve scheme params): the packed `uint32`
+  /// weight `(out, in * bits / 32)` is structurally gated to the config-derived
+  /// logical `(out, in)` by [`check_quantized_shape`]
+  /// (the quantized analogue of the dense shape-pin), the dense `<prefix>.bias`
+  /// is loaded with the SAME arity the dense path enforces (required + pinned
+  /// `(out,)` when `bias`, dropped otherwise), and the triple is built via the
+  /// shared [`QuantizedLinear::from_parts`].
+  ///
+  /// `quant` carries the parsed per-layer quantization config; a `<prefix>.scales`
+  /// present but no resolvable scheme params (`quant == None`, an explicit
+  /// `Skip`, or no global default) is a typed [`Error::InvariantViolation`],
+  /// never a guessed scheme or a silent fall-through to the dense loader.
+  pub(crate) fn from_weights(
+    weights: &mut HashMap<String, Array>,
+    prefix: &str,
+    out: i32,
+    in_features: i32,
+    bias: bool,
+    quant: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
+    let scales_key = format!("{prefix}.scales");
+    if weights.contains_key(&scales_key) {
+      // Quantized path (the `.scales` sibling is the sole `class_predicate`
+      // signal, as in the shared `MaybeQuantizedLinear::from_weights`): resolve
+      // `(group_size, bits, mode)` for this layer. A `.scales` present with no
+      // resolvable scheme (`quant == None`, or the config resolves no params)
+      // is a typed error, never a silent fall-through to the dense loader.
+      let Some(q) = quant.and_then(|q| q.quantization_for(prefix)) else {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "siglip2 Linear carries a `.scales` sibling but the quantization config resolved no scheme parameters for this layer",
+          "a quantized Linear requires (group_size, bits, mode) from the config `quantization` block",
+        )));
+      };
+      // Pin the packed weight's logical `(out, in)` (and the scales' recovery)
+      // to the config BEFORE construction — the same load-time gate the dense
+      // `take_shaped` enforces.
+      check_quantized_shape(
+        weights,
+        prefix,
+        "siglip2 quantized Linear weight (out, in)",
+        out,
+        in_features,
+        q.group_size,
+        q.bits,
+      )?;
+      // Load the dense output bias with the SAME arity as the dense branch:
+      // required + pinned `(out,)` when `bias`, dropped otherwise. Passed as the
+      // explicit dense bias to `from_parts` (not auto-detected), so dense and
+      // quantized are arity-identical.
+      let dense_bias = if bias {
+        Some(take_shaped(
+          weights,
+          &format!("{prefix}.bias"),
+          "siglip2 Linear bias (out,)",
+          &[out],
+        )?)
+      } else {
+        weights.remove(&format!("{prefix}.bias"));
+        None
+      };
+      // Pop the packed triple by key: `uint32` weight, `.scales`, and the
+      // per-group affine `.biases` (present iff `mode == "affine"`; `from_parts`
+      // enforces the mode/arity contract).
+      let weight = take(weights, &format!("{prefix}.weight"))?;
+      let scales = take(weights, &format!("{prefix}.scales"))?;
+      let quant_biases = weights.remove(&format!("{prefix}.biases"));
+      let q = QuantizedLinear::from_parts(
+        weight,
+        scales,
+        quant_biases,
+        dense_bias,
+        q.group_size,
+        q.bits,
+        q.mode.as_str(),
+      )?;
+      return Ok(Self {
+        inner: MaybeQuantizedLinear::Quantized(q),
+      });
+    }
+
+    // Dense path (unchanged): shape-pin against the config-derived `(out, in)`.
+    let weight = take_shaped(
+      weights,
+      &format!("{prefix}.weight"),
+      "siglip2 Linear weight (out, in)",
+      &[out, in_features],
+    )?;
+    let b = if bias {
+      Some(take_shaped(
+        weights,
+        &format!("{prefix}.bias"),
+        "siglip2 Linear bias (out,)",
+        &[out],
+      )?)
+    } else {
+      None
+    };
+    Ok(Self {
+      inner: MaybeQuantizedLinear::Dense(crate::nn::Linear::new(weight, b)),
+    })
+  }
+
+  /// Wrap a pre-built **dense** `(out, in)` weight (+ optional `(out,)` bias) as
+  /// a [`QuantLinear`] — for the patch-embed projection, whose dense weight is
+  /// the Conv2d kernel reshaped to `(hidden, P^2 * C)` by the caller before it
+  /// reaches a Linear (the quantized patch-embed weight is already packed-2D and
+  /// takes the auto-detecting [`Self::from_weights`] path instead).
+  pub(crate) fn dense(weight: Array, bias: Option<Array>) -> Self {
+    Self {
+      inner: MaybeQuantizedLinear::Dense(crate::nn::Linear::new(weight, bias)),
+    }
+  }
+
+  /// `y = x @ weightᵀ (+ bias)` (dense) or `quantized_matmul(...) (+ bias)`
+  /// (quantized). `x` is `(..., in)`; the result is `(..., out)`.
+  pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
+    self.inner.forward(x)
+  }
+}
+
+/// Validate a quantized layer's packed `<prefix>.weight` + `<prefix>.scales`
+/// against the config-derived `(out, in_features)` BEFORE the quantized layer is
+/// constructed — the quantized analogue of the dense [`expect_shape`] gate, and
+/// the structural twin of Whisper's `Builder::check_quantized_shape`.
+///
+/// The dense path pins every consumed tensor to its exact config shape via
+/// [`take_shaped`]; the quantized path must reach the same load-time gate,
+/// because a corrupt quantized checkpoint could otherwise ship a packed weight
+/// whose *logical* output / input dimension disagrees with the config, and the
+/// first forward would then size projections from the checkpoint tensors instead
+/// of the validated config. The packed `uint32` weight has a different shape than
+/// the dense `(out, in)`, so the recovery mirrors mlx's quantized layout
+/// (`mlx/ops.cpp:107,131,4790-4792`):
+///
+/// - the weight is rank-2 `uint32` `(out, in * bits / 32)`; its leading axis is
+///   the logical output dim (must equal `out`) and its logical input width —
+///   mlx's `w_inner_dims = w.shape(-1) * 32 / bits` — must equal `in_features`;
+/// - the `scales` are rank-2 `(out, in / group_size)`; the leading axis must
+///   equal `out`, and `scales.shape(-1) * group_size` must equal `in_features`.
+///
+/// `group_size` / `bits` are checked `> 0` before they divide (a non-positive
+/// value is a malformed config and an [`Error::OutOfRange`], never a panic). The
+/// per-mode value tables remain mlx-c's; this only pins the structural
+/// relationship to the config the dense gate also enforces. Reads only `shape()`
+/// / `dtype()` metadata (no materialization).
+#[cfg(feature = "siglip2-naflex")]
+fn check_quantized_shape(
+  weights: &HashMap<String, Array>,
+  prefix: &str,
+  descriptor: &'static str,
+  out: i32,
+  in_features: i32,
+  group_size: i32,
+  bits: i32,
+) -> Result<()> {
+  if bits <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "siglip2 quantized layer bits",
+      "must be > 0",
+      smol_str::format_smolstr!("{bits}"),
+    )));
+  }
+  if group_size <= 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "siglip2 quantized layer group_size",
+      "must be > 0",
+      smol_str::format_smolstr!("{group_size}"),
+    )));
+  }
+
+  // Packed weight `(out, in * bits / 32)`, `uint32`.
+  let weight_key = format!("{prefix}.weight");
+  let weight = weights.get(&weight_key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "siglip2: quantized weight not found in checkpoint",
+      &weight_key,
+    ))
+  })?;
+  let w_shape = weight.shape();
+  if w_shape.len() != 2 {
+    let rank = w_shape.len() as u32;
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::RankMismatch(RankMismatchPayload::new(
+        "quantized weight must be rank-2 (out, in * bits / 32)",
+        rank,
+        w_shape,
+      )),
+    )));
+  }
+  if weight.dtype()? != Dtype::U32 {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "quantized weight dtype",
+        "must be `uint32` (the packed-quantized-weight dtype)",
+      )),
+    )));
+  }
+  // Logical output dim is the leading axis; logical input width is mlx's
+  // `w_inner_dims = w.shape(-1) * 32 / bits`. Compare in i64 so the recovery
+  // cannot overflow on a corrupt huge packed width.
+  let logical_in = (w_shape[1] as i64) * 32 / i64::from(bits);
+  if w_shape[0] as i64 != i64::from(out) || logical_in != i64::from(in_features) {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &weight_key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        vec![out.max(0) as usize, in_features.max(0) as usize],
+        vec![w_shape[0], logical_in.max(0) as usize],
+      )),
+    )));
+  }
+
+  // Scales `(out, in / group_size)`: leading axis is `out`, and the per-group
+  // count recovers the same logical input width as the packed weight.
+  let scales_key = format!("{prefix}.scales");
+  let scales = weights.get(&scales_key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      "siglip2: quantized scales not found in checkpoint",
+      &scales_key,
+    ))
+  })?;
+  let s_shape = scales.shape();
+  if s_shape.len() != 2 {
+    let rank = s_shape.len() as u32;
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &scales_key,
+      Error::RankMismatch(RankMismatchPayload::new(
+        "quantized scales must be rank-2 (out, in / group_size)",
+        rank,
+        s_shape,
+      )),
+    )));
+  }
+  let scales_in = (s_shape[1] as i64) * i64::from(group_size);
+  if s_shape[0] as i64 != i64::from(out) || scales_in != i64::from(in_features) {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      &scales_key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "quantized scales (out, in / group_size) must match the config",
+        vec![out.max(0) as usize, in_features.max(0) as usize],
+        vec![s_shape[0], scales_in.max(0) as usize],
+      )),
+    )));
+  }
+
+  Ok(())
 }
 
 /// The exact `approx="precise"` GELU SigLIP2's `MLP` / heads use — the `tanh`
@@ -51,63 +341,51 @@ pub(crate) fn gelu_precise(x: &Array) -> Result<Array> {
 
 /// The two-layer GELU feed-forward (`siglip.py`'s `MLP`):
 /// `fc2(gelu_precise(fc1(x)))`, with biased `Linear(hidden → intermediate)`
-/// then `Linear(intermediate → hidden)`.
+/// then `Linear(intermediate → hidden)`. Both projections are quantize-aware
+/// ([`QuantLinear`]).
 #[cfg(feature = "siglip2-naflex")]
 pub(crate) struct Mlp {
-  fc1_weight: Array,
-  fc1_bias: Array,
-  fc2_weight: Array,
-  fc2_bias: Array,
+  fc1: QuantLinear,
+  fc2: QuantLinear,
 }
 
 #[cfg(feature = "siglip2-naflex")]
 impl Mlp {
   /// Build from `{prefix}.fc1.*` + `{prefix}.fc2.*`, pinning the two Linear
   /// shapes to `(intermediate, hidden)` / `(hidden, intermediate)` and the
-  /// biases to `(intermediate,)` / `(hidden,)`.
+  /// biases to `(intermediate,)` / `(hidden,)`. Each projection auto-picks the
+  /// dense or quantized variant by its `.scales` sibling.
   pub(crate) fn from_weights(
     weights: &mut HashMap<String, Array>,
     prefix: &str,
     hidden: i32,
     intermediate: i32,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
-    let fc1_weight = take_shaped(
+    let fc1 = QuantLinear::from_weights(
       weights,
-      &format!("{prefix}.fc1.weight"),
-      "MLP fc1 weight (intermediate, hidden)",
-      &[intermediate, hidden],
+      &format!("{prefix}.fc1"),
+      intermediate,
+      hidden,
+      true,
+      quant,
     )?;
-    let fc1_bias = take_shaped(
+    let fc2 = QuantLinear::from_weights(
       weights,
-      &format!("{prefix}.fc1.bias"),
-      "MLP fc1 bias (intermediate,)",
-      &[intermediate],
+      &format!("{prefix}.fc2"),
+      hidden,
+      intermediate,
+      true,
+      quant,
     )?;
-    let fc2_weight = take_shaped(
-      weights,
-      &format!("{prefix}.fc2.weight"),
-      "MLP fc2 weight (hidden, intermediate)",
-      &[hidden, intermediate],
-    )?;
-    let fc2_bias = take_shaped(
-      weights,
-      &format!("{prefix}.fc2.bias"),
-      "MLP fc2 bias (hidden,)",
-      &[hidden],
-    )?;
-    Ok(Self {
-      fc1_weight,
-      fc1_bias,
-      fc2_weight,
-      fc2_bias,
-    })
+    Ok(Self { fc1, fc2 })
   }
 
   /// `fc2(gelu_precise(fc1(x)))`.
   pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-    let h = linear(x, &self.fc1_weight, Some(&self.fc1_bias))?;
+    let h = self.fc1.forward(x)?;
     let h = gelu_precise(&h)?;
-    linear(&h, &self.fc2_weight, Some(&self.fc2_bias))
+    self.fc2.forward(&h)
   }
 }
 
@@ -168,14 +446,10 @@ impl LayerDims {
 /// padded-key mask for the NaFlex vision tower.
 #[cfg(feature = "siglip2-naflex")]
 pub(crate) struct Attention {
-  q_weight: Array,
-  q_bias: Array,
-  k_weight: Array,
-  k_bias: Array,
-  v_weight: Array,
-  v_bias: Array,
-  out_weight: Array,
-  out_bias: Array,
+  q: QuantLinear,
+  k: QuantLinear,
+  v: QuantLinear,
+  out: QuantLinear,
   num_heads: i32,
   head_dim: i32,
   /// `head_dim**-0.5`, the SDPA scale.
@@ -185,63 +459,31 @@ pub(crate) struct Attention {
 #[cfg(feature = "siglip2-naflex")]
 impl Attention {
   /// Build from `{prefix}.{q,k,v,out}_proj.{weight,bias}`, pinning each
-  /// projection to `(hidden, hidden)` and each bias to `(hidden,)`.
+  /// projection to `(hidden, hidden)` and each bias to `(hidden,)`. Each
+  /// projection auto-picks the dense or quantized variant by its `.scales`
+  /// sibling.
   pub(crate) fn from_weights(
     weights: &mut HashMap<String, Array>,
     prefix: &str,
     dims: LayerDims,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
     let hidden = dims.hidden;
-    let proj = [hidden, hidden];
+    let proj = |weights: &mut HashMap<String, Array>, name: &str| {
+      QuantLinear::from_weights(
+        weights,
+        &format!("{prefix}.{name}"),
+        hidden,
+        hidden,
+        true,
+        quant,
+      )
+    };
     Ok(Self {
-      q_weight: take_shaped(
-        weights,
-        &format!("{prefix}.q_proj.weight"),
-        "attn q_proj weight (hidden, hidden)",
-        &proj,
-      )?,
-      q_bias: take_shaped(
-        weights,
-        &format!("{prefix}.q_proj.bias"),
-        "attn q_proj bias (hidden,)",
-        &[hidden],
-      )?,
-      k_weight: take_shaped(
-        weights,
-        &format!("{prefix}.k_proj.weight"),
-        "attn k_proj weight (hidden, hidden)",
-        &proj,
-      )?,
-      k_bias: take_shaped(
-        weights,
-        &format!("{prefix}.k_proj.bias"),
-        "attn k_proj bias (hidden,)",
-        &[hidden],
-      )?,
-      v_weight: take_shaped(
-        weights,
-        &format!("{prefix}.v_proj.weight"),
-        "attn v_proj weight (hidden, hidden)",
-        &proj,
-      )?,
-      v_bias: take_shaped(
-        weights,
-        &format!("{prefix}.v_proj.bias"),
-        "attn v_proj bias (hidden,)",
-        &[hidden],
-      )?,
-      out_weight: take_shaped(
-        weights,
-        &format!("{prefix}.out_proj.weight"),
-        "attn out_proj weight (hidden, hidden)",
-        &proj,
-      )?,
-      out_bias: take_shaped(
-        weights,
-        &format!("{prefix}.out_proj.bias"),
-        "attn out_proj bias (hidden,)",
-        &[hidden],
-      )?,
+      q: proj(weights, "q_proj")?,
+      k: proj(weights, "k_proj")?,
+      v: proj(weights, "v_proj")?,
+      out: proj(weights, "out_proj")?,
       num_heads: dims.num_heads,
       head_dim: dims.head_dim,
       scale: dims.scale,
@@ -254,9 +496,9 @@ impl Attention {
     let bsz = dim_i32(&shape, 0, "siglip2 Attention: batch")?;
     let seq = dim_i32(&shape, 1, "siglip2 Attention: seq")?;
 
-    let q = linear(x, &self.q_weight, Some(&self.q_bias))?;
-    let k = linear(x, &self.k_weight, Some(&self.k_bias))?;
-    let v = linear(x, &self.v_weight, Some(&self.v_bias))?;
+    let q = self.q.forward(x)?;
+    let k = self.k.forward(x)?;
+    let v = self.v.forward(x)?;
 
     let q = self.split_heads(&q, bsz, seq)?;
     let k = self.split_heads(&k, bsz, seq)?;
@@ -272,7 +514,7 @@ impl Attention {
       self.head_dim,
     )?;
     let attn = ops::shape::reshape(&attn, &[bsz, seq, embed_dim])?;
-    linear(&attn, &self.out_weight, Some(&self.out_bias))
+    self.out.forward(&attn)
   }
 
   /// `(B, L, C) → (B, n_heads, L, head_dim)`.
@@ -301,6 +543,7 @@ impl EncoderLayer {
     encoder_prefix: &str,
     i: i32,
     dims: LayerDims,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
     let prefix = format!("{encoder_prefix}.layers.{i}");
     let layer_norm1 = build_layer_norm(
@@ -309,7 +552,7 @@ impl EncoderLayer {
       dims.hidden,
       dims.eps,
     )?;
-    let attention = Attention::from_weights(weights, &format!("{prefix}.self_attn"), dims)?;
+    let attention = Attention::from_weights(weights, &format!("{prefix}.self_attn"), dims, quant)?;
     let layer_norm2 = build_layer_norm(
       weights,
       &format!("{prefix}.layer_norm2"),
@@ -321,6 +564,7 @@ impl EncoderLayer {
       &format!("{prefix}.mlp"),
       dims.hidden,
       dims.intermediate,
+      quant,
     )?;
     Ok(Self {
       layer_norm1,
@@ -363,6 +607,31 @@ pub(crate) fn build_layer_norm(
     &[hidden],
   )?;
   Ok(LayerNorm::new(Some(weight), Some(bias), eps))
+}
+
+/// Resolve the per-layer `(group_size, bits, mode)` scheme parameters for an
+/// embedding `prefix` from the parsed quantization config, for
+/// [`MaybeQuantizedEmbedding::from_weights`](crate::nn::MaybeQuantizedEmbedding::from_weights).
+///
+/// Returns `None` when there is no quantization config (`quant == None`) — the
+/// embedding then loads dense if it has no `.scales` sibling, or errors inside
+/// `from_weights` if it does (a `.scales`-without-config inconsistency). Returns
+/// `Some((group_size, bits, mode))` for a config that resolves a scheme for this
+/// layer. A config that is present but resolves `None` for the layer (an
+/// explicit `Skip`, or no global default) maps to `None`, so a `.scales`-bearing
+/// embedding under such a config surfaces the same typed `.scales`-without-params
+/// error from `from_weights` the linear path returns.
+///
+/// `mode` is `QuantMode::as_str`'s `&'static str`, so the returned borrow
+/// outlives the call.
+#[cfg(feature = "siglip2-naflex")]
+pub(crate) fn resolve_quant<'a>(
+  quant: Option<&'a PerLayerQuantization>,
+  prefix: &str,
+) -> Option<(i32, i32, &'a str)> {
+  quant
+    .and_then(|q| q.quantization_for(prefix))
+    .map(|q| (q.group_size, q.bits, q.mode.as_str()))
 }
 
 /// Pull `shape[axis]` as `i32`, erroring on rank underflow or `i32::MAX`
@@ -428,6 +697,42 @@ pub(crate) fn expect_shape(
         descriptor,
         expected_usize,
         actual,
+      )),
+    )));
+  }
+  Ok(())
+}
+
+/// Assert a quantize-aware embedding's **logical** `(num_embeddings, dim)`
+/// equals the config-derived `(rows, dim)`, for BOTH the dense and quantized
+/// arms — the embedding analogue of [`expect_shape`] / [`check_quantized_shape`].
+///
+/// A dense token embedding is pinned to `(vocab, hidden)` by [`expect_shape`] on
+/// its table; the quantized arm has no such gate unless its dequantized logical
+/// shape is checked too. A packed quantized table whose logical row count or
+/// width disagrees with the config would otherwise mis-gather (wrong rows or an
+/// out-of-range gather) at the first forward instead of failing at load. This
+/// reads the logical shape via [`MaybeQuantizedEmbedding::logical_shape`] (no
+/// whole-table dequantization — the quantized width is recovered from the
+/// validated triple's metadata) and rejects a mismatch with the same typed
+/// [`Error::ShapePairMismatch`] wrapped in [`Error::LayerKeyed`] the dense /
+/// quantized-`Linear` gates use, keyed on `<prefix>.weight`.
+#[cfg(feature = "siglip2-naflex")]
+pub(crate) fn expect_logical_shape(
+  embedding: &MaybeQuantizedEmbedding,
+  key: &str,
+  descriptor: &'static str,
+  rows: i32,
+  dim: i32,
+) -> Result<()> {
+  let (actual_rows, actual_dim) = embedding.logical_shape()?;
+  if actual_rows != rows || actual_dim != dim {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      key,
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        vec![rows.max(0) as usize, dim.max(0) as usize],
+        vec![actual_rows.max(0) as usize, actual_dim.max(0) as usize],
       )),
     )));
   }

@@ -72,30 +72,35 @@ use crate::{
     config::VisionConfig,
     processing::NaflexInputs,
     shared::{
-      EncoderLayer, LayerDims, Mlp, build_layer_norm, dim_i32, expect_shape, linear, take,
-      take_shaped,
+      EncoderLayer, LayerDims, Mlp, QuantLinear, build_layer_norm, dim_i32, expect_shape, linear,
+      resolve_quant, take, take_shaped,
     },
   },
   error::{
     CapExceededPayload, Error, OutOfRangePayload, RankMismatchPayload, Result,
     ShapePairMismatchPayload,
   },
-  lm::nn::{
-    attention::{Mask, scaled_dot_product_attention},
-    norm::LayerNorm,
+  lm::{
+    nn::{
+      attention::{Mask, scaled_dot_product_attention},
+      norm::LayerNorm,
+    },
+    quant::PerLayerQuantization,
   },
   model_validation::{checked_mul, require_positive, reserve_or_error},
+  nn::MaybeQuantizedEmbedding,
   ops,
 };
 
-/// The flattened patch-embedding `Linear`: `pixel_values @ W^T + bias`.
+/// The flattened patch-embedding `Linear`: `pixel_values @ W^T + bias` —
+/// quantize-aware.
 ///
-/// `weight` is the (reshaped) Conv2d kernel `(hidden, P^2 * C)`; `bias` is
-/// `(hidden,)`. See the [module docs](self) for why this is a matmul.
+/// The dense weight is the (reshaped) Conv2d kernel `(hidden, P^2 * C)`; the
+/// quantized weight is the packed equivalent whose logical shape is the same
+/// `(hidden, P^2 * C)`. See the [module docs](self) for why this is a matmul.
 #[cfg(feature = "siglip2-naflex")]
 struct PatchEmbed {
-  weight: Array,
-  bias: Array,
+  proj: QuantLinear,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -103,7 +108,7 @@ impl PatchEmbed {
   /// `patch_embeds = pixel_values @ weight^T + bias`, over
   /// `(B, num_patches, P^2 * C) → (B, num_patches, hidden)`.
   fn forward(&self, pixel_values: &Array) -> Result<Array> {
-    linear(pixel_values, &self.weight, Some(&self.bias))
+    self.proj.forward(pixel_values)
   }
 }
 
@@ -120,12 +125,21 @@ impl PatchEmbed {
 struct AttentionPoolHead {
   /// Learned probe `(1, 1, hidden)`.
   probe: Array,
-  /// Combined QKV input projection weight `(3*hidden, hidden)`.
+  /// Combined QKV input projection weight `(3*hidden, hidden)` — held **dense**:
+  /// `MHA.__call__` slices it by logical row (`in_proj.weight[:dims]` /
+  /// `[dims:]`) to project the probe-query and patch-key/value separately, a
+  /// weight-row-slice a packed quantized matrix cannot represent (so the
+  /// reference never quantizes it — the attention-pool head is vision-only, and
+  /// `quantize_model`'s default `skip_vision=True` leaves the whole vision tower
+  /// dense). This field is therefore always the dense `(3*hidden, hidden)`
+  /// matrix; a fully-quantized checkpoint that nonetheless carries the
+  /// `in_proj.scales` sibling is dequantized to this dense matrix at load
+  /// (`build_attention_pool_head`), so the runtime slice path is identical.
   in_proj_weight: Array,
   /// Combined QKV input projection bias `(3*hidden,)`.
   in_proj_bias: Array,
-  out_weight: Array,
-  out_bias: Array,
+  /// Output projection — quantize-aware ([`QuantLinear`]).
+  out_proj: QuantLinear,
   layernorm: LayerNorm,
   mlp: Mlp,
   num_heads: i32,
@@ -174,7 +188,7 @@ impl AttentionPoolHead {
       self.head_dim,
     )?;
     let attn = ops::shape::reshape(&attn, &[bsz, 1, embed_dim])?;
-    let h = linear(&attn, &self.out_weight, Some(&self.out_bias))?; // (B, 1, C)
+    let h = self.out_proj.forward(&attn)?; // (B, 1, C)
 
     // residual = h; h = h + mlp(layernorm(h)).
     let normed = self.layernorm.forward(&h)?;
@@ -246,6 +260,32 @@ impl VisionTower {
   /// config validation cannot run a different graph or drive an oversized
   /// allocation.
   pub fn from_weights(config: &VisionConfig, weights: &mut HashMap<String, Array>) -> Result<Self> {
+    Self::from_weights_quantized(config, weights, None)
+  }
+
+  /// Build the vision tower with an optional parsed quantization config — the
+  /// quantization-aware analogue of [`from_weights`](Self::from_weights) (which
+  /// is just this with `quant == None`).
+  ///
+  /// Each `nn.Linear` (the attention q/k/v/out, the MLP fc1/fc2, the patch-embed
+  /// matmul, and the attention-pool out_proj) auto-picks the dense or quantized
+  /// variant per layer by the presence of a `<prefix>.scales` sibling (the
+  /// `class_predicate`'s `f"{p}.scales" in weights` signal). The position
+  /// embedding is materialized to a dense table at load (dequantized once if
+  /// quantized) because the per-image positional resize reshapes it to a grid and
+  /// bilinear-interpolates it — a packed quantized table cannot be reshaped /
+  /// interpolated, so the dense materialization keeps the resize path unchanged.
+  ///
+  /// A standard mlx-community quantized SigLIP2 checkpoint is produced with
+  /// `skip_vision=True` (`quantize_model`'s default), so in practice the vision
+  /// tower's tensors carry no `.scales` siblings and every layer loads dense; the
+  /// per-layer auto-detect nonetheless loads quantized whichever vision layers a
+  /// checkpoint did quantize.
+  pub fn from_weights_quantized(
+    config: &VisionConfig,
+    weights: &mut HashMap<String, Array>,
+    quant: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
     // Idempotent re-validation: `from_weights` is public, so a caller may
     // build a tower from a directly-constructed (unvalidated) config. This
     // bounds `num_hidden_layers` (and every other dim) before the per-layer
@@ -270,27 +310,61 @@ impl VisionTower {
     let patch_feature_dim = patch_feat as usize;
 
     // ── patch embedding (the Conv2d-as-Linear kernel) ──
-    let patch_weight_raw = take(weights, "embeddings.patch_embedding.weight")?;
-    let patch_weight =
-      reshape_patch_weight(&patch_weight_raw, hidden, patch, channels, patch_feat)?;
-    let patch_bias = take_shaped(
-      weights,
-      "embeddings.patch_embedding.bias",
-      "vision patch-embed bias (hidden,)",
-      &[hidden],
-    )?;
-    let patch_embed = PatchEmbed {
-      weight: patch_weight,
-      bias: patch_bias,
+    // Quantized path (the `.scales` sibling alone is the `class_predicate`
+    // signal, as in the shared loaders): the packed weight is already logical-2D
+    // `(hidden, P^2*C)` — no Conv2d reshape — so it takes the auto-detecting
+    // `QuantLinear::from_weights`, which resolves the scheme (or returns the
+    // typed `.scales`-without-params error) and structurally gates to the
+    // config-derived `(hidden, P^2*C)`. Dense path: reshape the Conv2d kernel to
+    // `(hidden, P^2*C)` (accepting every checkpoint layout) and wrap dense.
+    let patch_embed = if weights.contains_key("embeddings.patch_embedding.scales") {
+      PatchEmbed {
+        proj: QuantLinear::from_weights(
+          weights,
+          "embeddings.patch_embedding",
+          hidden,
+          patch_feat,
+          true,
+          quant,
+        )?,
+      }
+    } else {
+      let patch_weight_raw = take(weights, "embeddings.patch_embedding.weight")?;
+      let patch_weight =
+        reshape_patch_weight(&patch_weight_raw, hidden, patch, channels, patch_feat)?;
+      let patch_bias = take_shaped(
+        weights,
+        "embeddings.patch_embedding.bias",
+        "vision patch-embed bias (hidden,)",
+        &[hidden],
+      )?;
+      PatchEmbed {
+        proj: QuantLinear::dense(patch_weight, Some(patch_bias)),
+      }
     };
 
     // ── position embedding table ──
-    let position_embedding = take_shaped(
-      weights,
-      "embeddings.position_embedding.weight",
-      "vision position-embedding table (num_positions, hidden)",
-      &[num_positions, hidden],
-    )?;
+    // Built quantize-aware then materialized to a dense `(num_positions, hidden)`
+    // table (dequantized once if quantized): the per-image positional resize
+    // reshapes + bilinear-interpolates this table, which a packed quantized table
+    // cannot represent. The materialized table is shape-pinned to the config
+    // (the dense `expect_shape` gate the original load enforced), covering both
+    // the dense and the dequantized-quantized cases.
+    let position_embedding = {
+      let pos_quant = MaybeQuantizedEmbedding::from_weights(
+        weights,
+        "embeddings.position_embedding",
+        resolve_quant(quant, "embeddings.position_embedding"),
+      )?;
+      let table = pos_quant.dense_table(None)?;
+      expect_shape(
+        &table,
+        "embeddings.position_embedding.weight",
+        "vision position-embedding table (num_positions, hidden)",
+        &[num_positions, hidden],
+      )?;
+      table
+    };
     let pos_grid_side = isqrt_exact(num_positions, "VisionConfig: num_patches")?;
 
     // ── encoder layers ──
@@ -305,7 +379,9 @@ impl VisionTower {
       config.num_hidden_layers as usize,
     )?;
     for i in 0..config.num_hidden_layers {
-      layers.push(EncoderLayer::from_weights(weights, "encoder", i, dims)?);
+      layers.push(EncoderLayer::from_weights(
+        weights, "encoder", i, dims, quant,
+      )?);
     }
 
     // ── post-LayerNorm ──
@@ -313,7 +389,7 @@ impl VisionTower {
 
     // ── optional attention-pool head ──
     let head = if config.vision_use_head {
-      Some(build_attention_pool_head(weights, dims)?)
+      Some(build_attention_pool_head(weights, dims, quant)?)
     } else {
       None
     };
@@ -628,11 +704,17 @@ fn reshape_patch_weight(
   }
 }
 
-/// Build the attention-pool head (`head.*`).
+/// Build the attention-pool head (`head.*`). The `out_proj` and the residual
+/// `mlp` are quantize-aware; the combined-QKV `in_proj` is consumed dense (it is
+/// sliced by logical row — see [`AttentionPoolHead::in_proj_weight`]), but a
+/// quantized checkpoint that ships its `.scales` sibling is dequantized to that
+/// dense `(3*hidden, hidden)` matrix at load (never run dense with the siblings
+/// ignored).
 #[cfg(feature = "siglip2-naflex")]
 fn build_attention_pool_head(
   weights: &mut HashMap<String, Array>,
   dims: LayerDims,
+  quant: Option<&PerLayerQuantization>,
 ) -> Result<AttentionPoolHead> {
   let hidden = dims.hidden;
   let three_h = checked_mul(
@@ -648,38 +730,60 @@ fn build_attention_pool_head(
     "attn-pool probe (1, 1, hidden)",
     &[1, 1, hidden],
   )?;
-  let in_proj_weight = take_shaped(
-    weights,
-    "head.attention.in_proj.weight",
-    "attn-pool in_proj weight (3*hidden, hidden)",
-    &[three_h, hidden],
-  )?;
+  // The combined-QKV `in_proj` weight is consumed DENSE (sliced by logical row;
+  // a packed quantized matrix cannot serve a row slice). A dense checkpoint
+  // ships it as the dense `(3*hidden, hidden)` matrix; a fully-quantized
+  // checkpoint instead ships the packed `(weight, scales, biases)` triple under
+  // the SAME `.scales`-sibling signal every other quantized weight uses. When
+  // that sibling is present, dequantize the triple to the dense `(3*hidden,
+  // hidden)` matrix through the shared quantize-aware path (the same materialize
+  // -then-slice strategy the position-embedding table uses above), so a
+  // quantized `in_proj` loads correctly while staying logically dense; the
+  // separate dense `in_proj.bias` (the MHA additive bias, distinct from the
+  // per-group quantization `biases`) is loaded the same way in both cases.
+  let in_proj_weight = if weights.contains_key("head.attention.in_proj.scales") {
+    let packed = MaybeQuantizedEmbedding::from_weights(
+      weights,
+      "head.attention.in_proj",
+      resolve_quant(quant, "head.attention.in_proj"),
+    )?;
+    let table = packed.dense_table(None)?;
+    expect_shape(
+      &table,
+      "head.attention.in_proj.weight",
+      "attn-pool in_proj weight (3*hidden, hidden)",
+      &[three_h, hidden],
+    )?;
+    table
+  } else {
+    take_shaped(
+      weights,
+      "head.attention.in_proj.weight",
+      "attn-pool in_proj weight (3*hidden, hidden)",
+      &[three_h, hidden],
+    )?
+  };
   let in_proj_bias = take_shaped(
     weights,
     "head.attention.in_proj.bias",
     "attn-pool in_proj bias (3*hidden,)",
     &[three_h],
   )?;
-  let out_weight = take_shaped(
+  let out_proj = QuantLinear::from_weights(
     weights,
-    "head.attention.out_proj.weight",
-    "attn-pool out_proj weight (hidden, hidden)",
-    &[hidden, hidden],
-  )?;
-  let out_bias = take_shaped(
-    weights,
-    "head.attention.out_proj.bias",
-    "attn-pool out_proj bias (hidden,)",
-    &[hidden],
+    "head.attention.out_proj",
+    hidden,
+    hidden,
+    true,
+    quant,
   )?;
   let layernorm = build_layer_norm(weights, "head.layernorm", hidden, dims.eps)?;
-  let mlp = Mlp::from_weights(weights, "head.mlp", hidden, dims.intermediate)?;
+  let mlp = Mlp::from_weights(weights, "head.mlp", hidden, dims.intermediate, quant)?;
   Ok(AttentionPoolHead {
     probe,
     in_proj_weight,
     in_proj_bias,
-    out_weight,
-    out_bias,
+    out_proj,
     layernorm,
     mlp,
     num_heads: dims.num_heads,
