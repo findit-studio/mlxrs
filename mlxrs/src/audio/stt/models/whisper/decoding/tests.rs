@@ -1486,6 +1486,95 @@ fn decode_with_fallback_accepts_first_acceptable() {
   assert_eq!(result.temperature, 0.0);
 }
 
+/// REGRESSION (per-temperature option sanitization, `whisper.py:944-952`): a
+/// caller pairing `best_of` with the DEFAULT temperature schedule (which starts
+/// at `0.0`) must work end-to-end. The greedy (`t == 0`) attempt drops `best_of`
+/// and decodes plainly (it would otherwise be rejected by
+/// `verify_options_and_group`'s best_of-with-temperature-0 guard, making
+/// `best_of` unusable through the normal fallback path); the positive-temperature
+/// attempts keep it. Here the very first (`t == 0`) attempt is accepted, so the
+/// result temperature is `0.0` — and crucially the call does not spuriously
+/// error.
+#[test]
+fn decode_with_fallback_drops_best_of_at_greedy_temperature() {
+  let dir = fresh_dir("fallback_bestof_t0");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(2); // eot → short decode
+
+  let mel = tiny_mel();
+  let enc = model.encode(&mel).unwrap();
+
+  // best_of set + the default schedule (starts at 0.0). Pre-fix this errored on
+  // the very first temperature.
+  let base = DecodingOptions {
+    best_of: Some(4),
+    without_timestamps: true,
+    suppress_blank: false,
+    suppress_tokens: SuppressSpec::None,
+    sample_len: Some(3),
+    ..Default::default()
+  };
+  let result = decode_with_fallback(
+    &model,
+    &wrapper,
+    &enc,
+    &base,
+    "en",
+    &DEFAULT_TEMPERATURES,
+    None,
+    None,
+    None,
+  )
+  .unwrap();
+  // Thresholds disabled → the greedy t==0 attempt is accepted (best_of dropped).
+  assert_eq!(result.temperature, 0.0);
+}
+
+/// REGRESSION: with `best_of` + the default schedule AND every threshold made
+/// impossible to satisfy, the fallback walks the WHOLE schedule — the greedy
+/// `t == 0` attempt (best_of dropped) plus the positive-temperature attempts
+/// (best_of active, multi-trajectory) — and returns the last result without ever
+/// erroring. The last temperature (`1.0`) being recorded proves the schedule was
+/// traversed past `t == 0` with `best_of` live rather than rejected at the front.
+#[test]
+fn decode_with_fallback_best_of_traverses_full_schedule() {
+  let dir = fresh_dir("fallback_bestof_full");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let target = 13u32;
+  let model = tiny_model(target);
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  let base = DecodingOptions {
+    best_of: Some(3),
+    without_timestamps: true,
+    suppress_blank: false,
+    suppress_tokens: SuppressSpec::None,
+    sample_len: Some(3),
+    ..Default::default()
+  };
+  // An unsatisfiable logprob threshold → every attempt "needs fallback", so the
+  // loop runs through all of DEFAULT_TEMPERATURES and returns the last result.
+  let result = decode_with_fallback(
+    &model,
+    &wrapper,
+    &enc,
+    &base,
+    "en",
+    &DEFAULT_TEMPERATURES,
+    None,
+    Some(1000.0),
+    None,
+  )
+  .unwrap();
+  assert_eq!(
+    result.temperature,
+    *DEFAULT_TEMPERATURES.last().unwrap(),
+    "the fallback must traverse the whole schedule with best_of live past t==0"
+  );
+}
+
 #[test]
 fn audio_features_passes_through_encoded() {
   // A tensor already shaped (n_audio_ctx, n_audio_state) is treated as
@@ -1506,6 +1595,753 @@ fn audio_features_passes_through_encoded() {
   let encoded = Array::ones::<f32>(&(N_FRAMES / 2, 4usize)).unwrap();
   let feats = task.audio_features(&encoded).unwrap();
   assert_eq!(feats.shape(), vec![1, N_FRAMES / 2, 4]);
+}
+
+// ═══════════════════ batched decode + best-of-N sampling ═══════════════════
+
+/// Assert a `DecodingTask::new` result is an `InvariantViolation` (the task is
+/// not `Debug`, so `.unwrap_err()` cannot be used directly).
+fn expect_task_invariant(res: Result<DecodingTask<'_>>, what: &str) {
+  match res {
+    Err(Error::InvariantViolation(_)) => {}
+    Err(e) => panic!("{what}: expected InvariantViolation, got {e:?}"),
+    Ok(_) => panic!("{what}: expected an error, got Ok"),
+  }
+}
+
+/// Assert a `DecodingTask::new` result is an `OutOfRange`.
+fn expect_task_oob(res: Result<DecodingTask<'_>>, what: &str) {
+  match res {
+    Err(Error::OutOfRange(_)) => {}
+    Err(e) => panic!("{what}: expected OutOfRange, got {e:?}"),
+    Ok(_) => panic!("{what}: expected an error, got Ok"),
+  }
+}
+
+/// Build a `(n_group, n_vocab)` device logits matrix from per-row host slices
+/// (each row the same length).
+fn matrix(rows: &[&[f32]]) -> Array {
+  let g = rows.len();
+  let v = rows.first().map(|r| r.len()).unwrap_or(0);
+  let mut flat: Vec<f32> = Vec::with_capacity(g * v);
+  for r in rows {
+    assert_eq!(r.len(), v, "all rows must share the vocab width");
+    flat.extend_from_slice(r);
+  }
+  Array::from_slice::<f32>(&flat, &[g as i32, v as i32]).unwrap()
+}
+
+// ───────────────────── n_group == 1 PARITY GATE ───────────────────────────
+
+/// THE PARITY GATE: the `n_group == 1` batched decode path is BIT-IDENTICAL to
+/// the existing single-sequence path — same tokens AND same cumulative
+/// log-probability — on the same input. This proves the batching machinery
+/// introduced no regression in the shipped single-sequence decode.
+#[test]
+fn batched_n_group_1_is_bit_identical_to_single_sequence() {
+  let dir = fresh_dir("parity_greedy");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  // Greedy (temperature 0), timestamps on so the timestamp-rule filter is in
+  // the chain too (exercises the per-row filter application against a real
+  // history), suppression on — the full default filter stack.
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    sample_len: Some(5),
+    ..Default::default()
+  };
+  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  assert_eq!(task.n_group, 1, "default options are single-group");
+
+  let ((single_tokens, single_sum), (batched_tokens, batched_sum)) =
+    task.run_both_for_parity(&enc).unwrap();
+
+  assert_eq!(
+    single_tokens, batched_tokens,
+    "batched n_group==1 must emit the identical token sequence"
+  );
+  // f64 cumulative log-prob, bit-for-bit (the per-row formula matches the
+  // single path's scalar formula on a one-row group).
+  assert_eq!(
+    single_sum.to_bits(),
+    batched_sum.to_bits(),
+    "batched n_group==1 must accumulate the identical sum_logprob \
+     (single={single_sum}, batched={batched_sum})"
+  );
+}
+
+/// The parity gate holds with the timestamp filters OFF too (a different filter
+/// chain — only suppress-blank + suppress-tokens), so the equivalence is not an
+/// artifact of one filter configuration.
+#[test]
+fn batched_n_group_1_parity_without_timestamps() {
+  let dir = fresh_dir("parity_no_ts");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(12);
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    without_timestamps: true,
+    sample_len: Some(6),
+    ..Default::default()
+  };
+  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let ((s_tok, s_sum), (b_tok, b_sum)) = task.run_both_for_parity(&enc).unwrap();
+  assert_eq!(s_tok, b_tok);
+  assert_eq!(s_sum.to_bits(), b_sum.to_bits());
+}
+
+/// THE PARITY GATE at `temperature > 0`: with sampling enabled, the `n_group ==
+/// 1` batched **categorical** path must draw with the IDENTICAL PRNG key as the
+/// single path. Both decoders seed `0`, and the batched split-key roles (carry
+/// row 0, sample rows `1..=n_group`) reduce at `n_group == 1` to the single
+/// path's `random::split` (carry the first returned key, sample with the second)
+/// — `split(k)` and `split_num(k, 2)` are the same `bits` rows in order. A
+/// swapped sample/carry role would put the draw on a different key and diverge
+/// the token stream immediately; the greedy (temperature 0) gates above never
+/// reach the categorical draw at all, so this is the only test that pins it.
+#[test]
+fn batched_n_group_1_parity_at_positive_temperature() {
+  let dir = fresh_dir("parity_temp");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(11);
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    without_timestamps: true,
+    temperature: 0.7,
+    sample_len: Some(6),
+    ..Default::default()
+  };
+  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  assert_eq!(task.n_group, 1, "no best_of ⇒ single-group");
+  let ((s_tok, s_sum), (b_tok, b_sum)) = task.run_both_for_parity(&enc).unwrap();
+  assert_eq!(
+    s_tok, b_tok,
+    "temperature>0 batched n_group==1 must sample the IDENTICAL tokens as single \
+     (single={s_tok:?}, batched={b_tok:?})"
+  );
+  assert_eq!(
+    s_sum.to_bits(),
+    b_sum.to_bits(),
+    "temperature>0 batched n_group==1 must accumulate the identical sum_logprob"
+  );
+}
+
+/// DIRECT key-role assertion for `BatchedGreedyDecoder::categorical` at
+/// `n_group == 1` — a stronger pin than the token-equality parity test above,
+/// which a peaked model could pass even with swapped keys. On NON-degenerate
+/// (spread) logits the drawn token genuinely depends on which subkey is used, so
+/// this proves the batched path SAMPLES with `split(key).1` (the single path's
+/// sample key) and CARRIES `split(key).0` (the single path's next key) — the
+/// exact roles whose swap was the bug. The carry-key assertion catches the swap
+/// deterministically even if the two keys happen to draw the same token.
+#[test]
+fn batched_categorical_key_roles_match_single_split_at_n_group_1() {
+  const SEED: u64 = 0;
+  let temp = 1.0f32;
+  let vocab: i32 = 8;
+  // Non-degenerate logits so the categorical draw actually depends on the key.
+  let row: Vec<f32> = (0..vocab).map(|i| (i as f32) * 0.1).collect();
+
+  // Independent expectation from the single-path split roles: carry the FIRST
+  // returned key, sample with the SECOND.
+  let init_key = ops::random::key(SEED).unwrap();
+  let (carry_expected, sample_key) = ops::random::split(&init_key).unwrap();
+  let row1d = Array::from_slice::<f32>(&row, &[vocab]).unwrap();
+  let single_token = {
+    let mut s = crate::lm::sample::categorical_sampling(&row1d, temp, &sample_key).unwrap();
+    s.item::<u32>().unwrap()
+  };
+
+  // Batched n_group == 1 on the same logits and seed.
+  let mut d = BatchedGreedyDecoder::new(temp, /* eot */ 2, /* n_group */ 1, SEED).unwrap();
+  let logits = Array::from_slice::<f32>(&row, &[1, vocab]).unwrap();
+  let drawn = d.categorical(&logits).unwrap();
+
+  // (1) row 0 sampled with split(key).1 (the single-path SAMPLE key).
+  assert_eq!(
+    drawn,
+    vec![single_token],
+    "batched row 0 must sample with split(key).1 (the single-path sample key)"
+  );
+  // (2) the carried key is split(key).0 (the single-path NEXT key), bit-exact —
+  //     deterministic regardless of any token coincidence above.
+  let read_u32 = |a: &Array| -> Vec<u32> {
+    let mut a = a.try_clone().unwrap();
+    a.eval().unwrap();
+    a.to_vec::<u32>().unwrap()
+  };
+  assert_eq!(
+    read_u32(&d.key),
+    read_u32(&carry_expected),
+    "batched must carry split(key).0 as the next-step key"
+  );
+}
+
+/// A `best_of` that cannot be an `i32` tensor batch dimension is rejected at task
+/// CONSTRUCTION (in `verify_options_and_group`), before `main_loop_batched`
+/// reserves any per-row state — a typed `OutOfRange` / `ArithmeticOverflow`,
+/// never a billion-row allocation attempt. (A merely-large but i32-valid
+/// `best_of` stays a fallible allocation, the consumer's concern.)
+#[test]
+fn impossible_best_of_is_rejected_at_construction_before_allocation() {
+  let dir = fresh_dir("huge_best_of");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(9);
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    temperature: 0.7,          // best_of requires temperature > 0
+    best_of: Some(usize::MAX), // cannot index an i32-shaped tensor
+    sample_len: Some(4),
+    ..Default::default()
+  };
+  match DecodingTask::new(&model, &wrapper, options) {
+    Err(Error::OutOfRange(_)) | Err(Error::ArithmeticOverflow(_)) => {}
+    Err(e) => {
+      panic!("expected OutOfRange/ArithmeticOverflow for an impossible best_of, got {e:?}")
+    }
+    Ok(_) => panic!("an impossible best_of must be rejected at construction, got Ok"),
+  }
+}
+
+// ───────────────────── MaximumLikelihoodRanker ────────────────────────────
+
+/// Plain length normalization (`length_penalty is None`): `score =
+/// sum_logprob / length`. The highest-score candidate wins.
+#[test]
+fn ranker_plain_length_normalization_picks_highest_score() {
+  let ranker = MaximumLikelihoodRanker::new(None);
+  // (sum_logprob, length): scores -1.0/2 = -0.5, -1.2/3 = -0.4, -2.0/2 = -1.0.
+  // Candidate 1 has the highest (least-negative) score.
+  let candidates = [(-1.0, 2), (-1.2, 3), (-2.0, 2)];
+  assert_eq!(ranker.rank(&candidates), 1);
+}
+
+/// THE #762 LOCUS: the length-penalty normalization must flip the winner versus
+/// the RAW cumulative log-probability. The candidate with the highest raw
+/// `sum_logprob` is NOT selected once the score is normalized by the
+/// (GNMT-penalized) length — proving the ranker divides by the penalized length,
+/// not the raw sequence length, and that getting that normalization right is what
+/// the upstream best-of fix is about.
+#[test]
+fn ranker_length_penalty_flips_winner_vs_raw_sum_logprob() {
+  // Candidate A: short, slightly worse total logprob. Candidate B: long, best
+  // RAW total logprob — but its extra length penalizes its normalized score.
+  // Raw argmax(sum_logprob) would pick B (−3.0 > −2.4); the length-normalized
+  // ranker must pick A.
+  let a = (-2.4_f64, 4_usize);
+  let b = (-3.0_f64, 20_usize);
+  let raw_winner = if a.0 > b.0 { 0 } else { 1 };
+  assert_eq!(
+    raw_winner, 0,
+    "A already has the higher raw sum_logprob here"
+  );
+
+  // Plain length normalization: A = -2.4/4 = -0.6, B = -3.0/20 = -0.15 → B wins.
+  // So plain normalization FLIPS to B (longer candidates are rewarded).
+  let plain = MaximumLikelihoodRanker::new(None);
+  assert_eq!(
+    plain.rank(&[a, b]),
+    1,
+    "plain length normalization rewards the longer candidate B"
+  );
+
+  // GNMT penalty α = 1.0: penalty(len) = ((5+len)/6)^1.
+  //   A: penalty = 9/6 = 1.5   → score = -2.4/1.5  = -1.6
+  //   B: penalty = 25/6 ≈ 4.17 → score = -3.0/4.17 ≈ -0.72
+  // B still wins under α=1.0. Use a SMALLER α to damp the length reward so the
+  // shorter, higher-raw-logprob candidate A wins — the normalization is what
+  // decides, the #762 concern.
+  let gnmt_strong = MaximumLikelihoodRanker::new(Some(0.0));
+  // α = 0.0 → penalty = ((5+len)/6)^0 = 1 for every length → score = sum_logprob
+  // (raw). So the ranker reduces to raw argmax → A (the higher raw logprob).
+  assert_eq!(
+    gnmt_strong.rank(&[a, b]),
+    0,
+    "α=0 makes the penalty 1 for all lengths → raw argmax picks A"
+  );
+}
+
+/// The GNMT length penalty formula `((5 + len) / 6) ** alpha` is applied exactly
+/// (`decoding.py:229`): a hand-computed score selection.
+#[test]
+fn ranker_gnmt_penalty_matches_formula() {
+  let alpha = 0.5_f64;
+  let ranker = MaximumLikelihoodRanker::new(Some(alpha as f32));
+  // Two candidates; compute the expected scores by the formula and assert the
+  // ranker agrees with the independent argmax.
+  let cands = [(-1.5_f64, 3_usize), (-1.0_f64, 1_usize)];
+  let score = |lp: f64, len: usize| lp / ((5.0 + len as f64) / 6.0).powf(alpha);
+  let s0 = score(-1.5, 3);
+  let s1 = score(-1.0, 1);
+  let expected = if s0 >= s1 { 0 } else { 1 };
+  assert_eq!(ranker.rank(&cands), expected);
+}
+
+/// `np.argmax` tie-breaking: equal scores select the LOWEST index.
+#[test]
+fn ranker_ties_pick_lowest_index() {
+  let ranker = MaximumLikelihoodRanker::new(None);
+  // Identical (sum_logprob, length) → identical score → first index wins.
+  assert_eq!(ranker.rank(&[(-1.0, 2), (-1.0, 2), (-1.0, 2)]), 0);
+}
+
+/// A zero-length candidate under plain normalization is `sum_logprob / 0`. A
+/// finite-score candidate must still be preferred over the resulting non-finite
+/// score (mirroring numpy's `argmax`, which skips `NaN`/keeps a finite max).
+#[test]
+fn ranker_zero_length_nonfinite_score_never_beats_finite() {
+  let ranker = MaximumLikelihoodRanker::new(None);
+  // Candidate 0: zero length, zero logprob → 0/0 = NaN. Candidate 1: finite.
+  assert_eq!(
+    ranker.rank(&[(0.0, 0), (-0.5, 3)]),
+    1,
+    "a NaN (0/0) score must not win over a finite candidate"
+  );
+  // Candidate 0: negative logprob, zero length → -inf. Candidate 1: finite -0.5.
+  // The finite score (-0.5) beats -inf.
+  assert_eq!(ranker.rank(&[(-1.0, 0), (-0.5, 3)]), 1);
+}
+
+// ───────────────── batched greedy decoder behavior ────────────────────────
+
+/// Per-row argmax + per-row independent logprob accumulation at temperature 0:
+/// each candidate selects its own argmax and accumulates its own chosen logprob.
+#[test]
+fn batched_decoder_per_row_argmax_and_logprob() {
+  let mut d = BatchedGreedyDecoder::new(0.0, /* eot */ 2, /* n_group */ 2, 0).unwrap();
+  // Row 0 favors index 3; row 1 favors index 0.
+  let m = matrix(&[&[0.0, 0.0, 0.0, 5.0, 0.0], &[5.0, 0.0, 0.0, 0.0, 0.0]]);
+  // Neither row's last token is eot → both accumulate.
+  let next = d.update(&m, &[1, 1]).unwrap();
+  assert_eq!(next, vec![3, 0]);
+  assert!(!d.all_completed());
+  assert!(d.sum_logprob[0] < 0.0 && d.sum_logprob[1] < 0.0);
+}
+
+/// EOT-STICKY per-row completion: once a row emits eot it stays done — it
+/// re-emits eot, stops contributing to its `sum_logprob`, and is marked
+/// completed; the OTHER rows keep decoding. The group completes only when EVERY
+/// row has emitted eot.
+#[test]
+fn batched_decoder_eot_sticky_per_row() {
+  let mut d = BatchedGreedyDecoder::new(0.0, /* eot */ 2, /* n_group */ 2, 0).unwrap();
+  let m = matrix(&[&[0.0, 0.0, 0.0, 5.0, 0.0], &[0.0, 0.0, 0.0, 5.0, 0.0]]);
+
+  // Step 1: row 0's last token is eot (sticks), row 1's is not (decodes).
+  let next = d.update(&m, &[2, 1]).unwrap();
+  assert_eq!(next[0], 2, "row 0 re-emits eot (sticky)");
+  assert_eq!(next[1], 3, "row 1 decodes its argmax");
+  assert_eq!(
+    d.sum_logprob[0], 0.0,
+    "an eot-stuck row accumulates no logprob"
+  );
+  assert!(
+    d.sum_logprob[1] < 0.0,
+    "row 1 accumulated its chosen logprob"
+  );
+  assert!(
+    !d.all_completed(),
+    "the group is not done while row 1 is still decoding"
+  );
+
+  // Step 2: now row 1's last token is also eot → both stuck → group completes.
+  let next = d.update(&m, &[2, 2]).unwrap();
+  assert_eq!(next, vec![2, 2], "both rows now re-emit eot");
+  assert!(
+    d.all_completed(),
+    "every row has emitted eot → group complete"
+  );
+}
+
+/// A row whose argmax IS the eot id completes that row.
+#[test]
+fn batched_decoder_completes_row_on_argmax_eot() {
+  let mut d = BatchedGreedyDecoder::new(0.0, /* eot */ 2, 1, 0).unwrap();
+  // argmax is the eot id (index 2).
+  let m = matrix(&[&[0.0, 0.0, 9.0, 0.0]]);
+  let next = d.update(&m, &[1]).unwrap();
+  assert_eq!(next, vec![2]);
+  assert!(d.all_completed());
+}
+
+/// THE KEYED-RNG N-WAY SPLIT: at `temperature > 0` the N candidate rows draw
+/// from independent subkeys, so on an identical per-row distribution they can
+/// produce DISTINCT samples (the rows are not all forced to the same token).
+/// With a flat distribution over many tokens and a reasonable group size, at
+/// least two rows differ — proving the per-row key split actually decorrelates
+/// the draws (a single shared key would make every row identical).
+#[test]
+fn batched_decoder_keyed_rng_split_produces_distinct_rows() {
+  let n_group = 8usize;
+  let v = 16usize;
+  // A flat (uniform) distribution: every token equally likely, so distinct
+  // subkeys yield a spread of samples; identical keys would yield identical rows.
+  let flat = vec![0.0_f32; v];
+  let rows: Vec<&[f32]> = (0..n_group).map(|_| flat.as_slice()).collect();
+  let m = matrix(&rows);
+
+  let mut d = BatchedGreedyDecoder::new(1.0, /* eot */ 2, n_group, /* seed */ 7).unwrap();
+  let next = d.update(&m, &vec![1u32; n_group]).unwrap();
+  let distinct: std::collections::HashSet<u32> = next.iter().copied().collect();
+  assert!(
+    distinct.len() >= 2,
+    "the per-row key split must decorrelate the draws (got {next:?})"
+  );
+}
+
+// ──────────────── batched allocation soundness (no panic/abort) ────────────
+
+/// SOUNDNESS: an outsized `best_of` makes the per-row accumulators in
+/// `BatchedGreedyDecoder::new` unsatisfiable; the reservation degrades to a typed
+/// [`Error::AllocFailure`] rather than aborting in an infallible `vec![…;
+/// n_group]`. (No size cap — a large-but-fallible `best_of` is the consumer's
+/// DoS concern; the contract is fallible-no-abort, not a maximum value.) A
+/// `usize::MAX` group deterministically overflows the byte computation so
+/// `try_reserve_exact` returns `Err` on every host (overcommit makes a merely
+/// huge-but-RAM-sized reservation succeed virtually), mirroring the crate's
+/// `reserve_or_error` oversize tests.
+#[test]
+fn batched_decoder_new_huge_n_group_is_alloc_failure_not_abort() {
+  match BatchedGreedyDecoder::new(
+    /* temperature */ 1.0,
+    /* eot */ 2,
+    /* n_group */ usize::MAX,
+    /* seed */ 0,
+  ) {
+    Err(Error::AllocFailure(_)) => {}
+    Err(e) => panic!("expected AllocFailure for a huge n_group, got {e:?}"),
+    Ok(_) => panic!("expected AllocFailure for a huge n_group, got Ok"),
+  }
+}
+
+/// SOUNDNESS: the `n_group + 1` RNG split count is computed with checked
+/// arithmetic — at `n_group == i32::MAX` it returns a typed
+/// [`Error::ArithmeticOverflow`] rather than wrapping to a negative / truncated
+/// `num` (which would feed `split_num` + the carry-row slice bound). Built via a
+/// struct literal so the giant per-row allocations are skipped and only the
+/// arithmetic guard is exercised.
+#[test]
+fn batched_decoder_split_count_overflow_is_typed_error() {
+  let d = BatchedGreedyDecoder {
+    temperature: 1.0,
+    eot: 2,
+    n_group: i32::MAX as usize,
+    // Empty accumulators (no allocation) — `split_count` reads only `n_group`.
+    sum_logprob: Vec::new(),
+    completed: Vec::new(),
+    key: ops::random::key(0).unwrap(),
+  };
+  match d.split_count() {
+    Err(Error::ArithmeticOverflow(_)) => {}
+    Err(e) => panic!("expected ArithmeticOverflow for n_group + 1, got {e:?}"),
+    Ok(v) => panic!("expected an overflow error for n_group + 1, got {v:?}"),
+  }
+  // A within-range n_group resolves to `(g, g + 1)`.
+  let small = BatchedGreedyDecoder::new(1.0, 2, 3, 0).unwrap();
+  assert_eq!(small.split_count().unwrap(), (3, 4));
+}
+
+/// SOUNDNESS: the flattened `(n_group * T)` prefill capacity is computed with
+/// checked arithmetic ([`flat_token_count`]) instead of an unchecked
+/// `rows.iter().map(Vec::len).sum()`. A group / row-length whose product wraps
+/// `i32` returns a typed [`Error::ArithmeticOverflow`]; a dimension past
+/// `i32::MAX` returns [`Error::OutOfRange`] — never a wrapped `usize` capacity
+/// fed to `Vec::with_capacity`. Built via a direct call so the giant flat buffer
+/// is skipped and only the arithmetic guard is exercised (the same technique as
+/// `batched_decoder_split_count_overflow_is_typed_error`).
+#[test]
+fn flatten_rows_capacity_arithmetic_is_checked() {
+  // `n_group * T` overflows `i32` → ArithmeticOverflow (no buffer realized).
+  match flat_token_count(i32::MAX as usize, 2) {
+    Err(Error::ArithmeticOverflow(_)) => {}
+    Err(e) => panic!("expected ArithmeticOverflow for n_group * T, got {e:?}"),
+    Ok(v) => panic!("expected an overflow error for n_group * T, got {v:?}"),
+  }
+  // A dimension past `i32::MAX` (the MLX array-dim bound) → OutOfRange.
+  match flat_token_count(usize::MAX, 1) {
+    Err(Error::OutOfRange(_)) => {}
+    Err(e) => panic!("expected OutOfRange for a > i32::MAX n_group, got {e:?}"),
+    Ok(v) => panic!("expected an out-of-range error, got {v:?}"),
+  }
+  // A within-range group resolves to the exact `n_group * T` product.
+  assert_eq!(flat_token_count(5, 7).unwrap(), 35);
+  assert_eq!(flat_token_count(0, 7).unwrap(), 0);
+}
+
+/// SOUNDNESS + correctness: `flatten_rows` reserves its row-major buffer fallibly
+/// (via the checked [`flat_token_count`]) and still lays the rows out correctly.
+/// It returns a `Result` — a still-infallible `Vec<u32>` version would not
+/// compile against this `.unwrap()` — so a regression to the unchecked path is
+/// caught at build time, and the value check pins the fill.
+#[test]
+fn flatten_rows_is_fallible_and_row_major() {
+  let rows = vec![vec![10u32, 11, 12], vec![20, 21, 22]];
+  let flat = flatten_rows(&rows).unwrap();
+  assert_eq!(flat, vec![10, 11, 12, 20, 21, 22]);
+  // Empty group → empty flat (capacity 0, no panic).
+  assert_eq!(flatten_rows(&[]).unwrap(), Vec::<u32>::new());
+}
+
+/// SOUNDNESS + correctness: `last_tokens_of` reserves its `(n_group,)` output
+/// fallibly instead of an infallible `.collect()`, and still returns each row's
+/// last token (the `fallback` for an empty row). The `Result` return is a
+/// compile-time regression guard against reverting to the infallible collect.
+#[test]
+fn last_tokens_of_is_fallible_and_correct() {
+  let rows = vec![vec![1u32, 2, 9], vec![3, 4, 8], Vec::new()];
+  let last = last_tokens_of(&rows, /* fallback */ 7).unwrap();
+  assert_eq!(
+    last,
+    vec![9, 8, 7],
+    "last token per row, fallback for the empty row"
+  );
+}
+
+/// SOUNDNESS + correctness: `push_row_tokens` reserves each row's single appended
+/// slot fallibly before growing it (instead of an infallible `Vec::push`
+/// reallocation), and still appends each row's next token in lockstep. The
+/// `Result` return is a compile-time regression guard against the infallible
+/// push.
+#[test]
+fn push_row_tokens_is_fallible_and_grows_rows() {
+  let mut rows = vec![vec![1u32], vec![2], vec![3]];
+  push_row_tokens(&mut rows, &[4, 5, 6]).unwrap();
+  assert_eq!(rows, vec![vec![1, 4], vec![2, 5], vec![3, 6]]);
+  // A second step grows them again (the fallible reserve handles every step).
+  push_row_tokens(&mut rows, &[7, 8, 9]).unwrap();
+  assert_eq!(rows, vec![vec![1, 4, 7], vec![2, 5, 8], vec![3, 6, 9]]);
+}
+
+// ───────────────────── best-of-N end-to-end ───────────────────────────────
+
+/// `best_of` + `beam_size` set together → a typed error at task construction
+/// (the reference's mutually-exclusive `_verify_options` check).
+#[test]
+fn best_of_and_beam_size_together_is_typed_error() {
+  let dir = fresh_dir("best_of_beam");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    temperature: 0.5,
+    best_of: Some(3),
+    beam_size: Some(2),
+    ..Default::default()
+  };
+  expect_task_invariant(
+    DecodingTask::new(&model, &wrapper, options),
+    "best_of + beam_size together",
+  );
+}
+
+/// `best_of` with greedy sampling (`temperature == 0`) is incompatible — a typed
+/// error (the reference's `best_of with greedy sampling (T=0)` check).
+#[test]
+fn best_of_with_temperature_zero_is_typed_error() {
+  let dir = fresh_dir("best_of_t0");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    temperature: 0.0,
+    best_of: Some(3),
+    ..Default::default()
+  };
+  expect_task_invariant(
+    DecodingTask::new(&model, &wrapper, options),
+    "best_of with temperature 0",
+  );
+}
+
+/// `beam_size` alone is rejected — beam search is not implemented (a typed
+/// error, rather than carried-and-ignored).
+#[test]
+fn beam_size_alone_is_unsupported_typed_error() {
+  let dir = fresh_dir("beam_only");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    beam_size: Some(2),
+    ..Default::default()
+  };
+  expect_task_invariant(
+    DecodingTask::new(&model, &wrapper, options),
+    "beam_size alone (unsupported)",
+  );
+}
+
+/// `length_penalty` outside `[0, 1]` is rejected (the reference's bound).
+#[test]
+fn length_penalty_out_of_range_is_typed_error() {
+  let dir = fresh_dir("lp_range");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(13);
+  for bad in [-0.1_f32, 1.1_f32] {
+    let options = DecodingOptions {
+      language: Some("en".into()),
+      temperature: 0.5,
+      best_of: Some(2),
+      length_penalty: Some(bad),
+      ..Default::default()
+    };
+    expect_task_oob(
+      DecodingTask::new(&model, &wrapper, options),
+      "length_penalty out of [0,1]",
+    );
+  }
+}
+
+/// BEST-OF-N END-TO-END on a tiny synthetic model: `best_of = N` at
+/// `temperature > 0` decodes N candidate trajectories and the ranker returns one
+/// selected result. The model is biased toward a single target token, so even
+/// under sampling the decode is well-behaved and the result is non-empty with
+/// the target token(s).
+#[test]
+fn best_of_n_end_to_end_decodes_and_ranks() {
+  let dir = fresh_dir("best_of_e2e");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let target = 13u32;
+  let model = tiny_model(target);
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    temperature: 0.5,
+    best_of: Some(5),
+    without_timestamps: true,
+    suppress_blank: false,
+    suppress_tokens: SuppressSpec::None,
+    sample_len: Some(4),
+    ..Default::default()
+  };
+  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  assert_eq!(task.n_group, 5, "best_of resolves n_group");
+
+  let result = task.run(&enc, "en").unwrap();
+  // The head is strongly peaked at `target`, so every sampled token is the
+  // target even under the temperature draw; the ranked winner is non-empty.
+  assert!(
+    !result.tokens.is_empty(),
+    "best-of selected a non-empty result"
+  );
+  assert!(
+    result.tokens.iter().all(|&t| t == target),
+    "the peaked head makes every sampled token the target; got {:?}",
+    result.tokens
+  );
+  assert_eq!(result.language, "en");
+}
+
+/// A best-of decode whose head argmaxes to eot completes immediately with an
+/// empty token list (the ranker still selects a candidate).
+#[test]
+fn best_of_n_all_eot_yields_empty() {
+  let dir = fresh_dir("best_of_eot");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let model = tiny_model(2); // 2 == eot
+  let enc = model.encode(&tiny_mel()).unwrap();
+
+  let options = DecodingOptions {
+    language: Some("en".into()),
+    temperature: 0.5,
+    best_of: Some(3),
+    without_timestamps: true,
+    suppress_blank: false,
+    suppress_tokens: SuppressSpec::None,
+    sample_len: Some(5),
+    ..Default::default()
+  };
+  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let result = task.run(&enc, "en").unwrap();
+  assert!(
+    result.tokens.is_empty(),
+    "all-eot best-of yields empty, got {:?}",
+    result.tokens
+  );
+}
+
+// ───────────────────── batched encoder broadcast ──────────────────────────
+
+/// `broadcast_encoder_states` widens a `(1, …)` encoder output to `(n_group, …)`
+/// and is a clone (unchanged shape) at `n_group == 1`.
+#[test]
+fn broadcast_encoder_states_widens_to_group() {
+  let model = tiny_model(13);
+  let enc = model.encode(&tiny_mel()).unwrap();
+  assert_eq!(enc.shape()[0], 1);
+
+  let b1 = model.broadcast_encoder_states(&enc, 1).unwrap();
+  assert_eq!(
+    b1.shape(),
+    enc.shape(),
+    "n_group==1 leaves the shape unchanged"
+  );
+
+  let b4 = model.broadcast_encoder_states(&enc, 4).unwrap();
+  assert_eq!(
+    b4.shape(),
+    vec![4, enc.shape()[1], enc.shape()[2]],
+    "n_group==4 broadcasts the batch axis"
+  );
+  // Every broadcast row equals the source segment (a real broadcast, not zeros).
+  let src = host_f32(&enc);
+  let wide = host_f32(&b4);
+  let seg = enc.shape()[1] * enc.shape()[2];
+  for g in 0..4 {
+    assert_eq!(
+      &wide[g * seg..(g + 1) * seg],
+      &src[..],
+      "row {g} mirrors the source"
+    );
+  }
+}
+
+/// The batched decode primitive rejects an encoder batch that does not equal
+/// `n_group` (a soundness pin — a mismatched K/V batch would broadcast wrong).
+#[test]
+fn decode_tokens_batched_rejects_group_mismatch() {
+  let model = tiny_model(13);
+  let enc = model.encode(&tiny_mel()).unwrap(); // (1, …)
+  // n_group = 3 but enc batch is 1 → ShapePairMismatch.
+  let tokens = [3u32, 3, 3]; // (n_group=3, T=1) row-major
+  let err = model
+    .decode_tokens_batched(&tokens, 3, &enc, None)
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::ShapePairMismatch(_)),
+    "an enc batch != n_group must be ShapePairMismatch, got {err:?}"
+  );
+
+  // With a correctly-broadcast enc it succeeds, returning (3, 1, V) logits.
+  let wide = model.broadcast_encoder_states(&enc, 3).unwrap();
+  let (logits, _cache) = model
+    .decode_tokens_batched(&tokens, 3, &wide, None)
+    .unwrap();
+  assert_eq!(logits.shape(), vec![3, 1, N_VOCAB]);
+}
+
+/// Read a device array back to a host `Vec<f32>` (for the broadcast assertions).
+/// A broadcast view is non-contiguous, so materialize it first.
+fn host_f32(a: &Array) -> Vec<f32> {
+  let mut c = ops::shape::contiguous(a, false).unwrap();
+  c.to_vec::<f32>().unwrap()
 }
 
 // ───────────────────────── get_suppress_tokens ────────────────────────────

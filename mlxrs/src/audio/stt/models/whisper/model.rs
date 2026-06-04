@@ -587,39 +587,104 @@ impl WhisperModel {
     )
   }
 
-  /// Validate that an encoder-states tensor is exactly one Whisper segment —
-  /// `(1, n_audio_ctx, n_audio_state)` — before it is fed to the decoder's
-  /// cross-attention.
+  /// Validate that an encoder-states tensor is exactly `(expected_group,
+  /// n_audio_ctx, n_audio_state)` — one Whisper segment (the single-sequence
+  /// `expected_group == 1`) or that segment broadcast across the best-of-N
+  /// candidate rows (`expected_group == n_group`) — before it is fed to the
+  /// decoder's cross-attention.
   ///
   /// The decoder's cross-attention projects `xa` and forms its scores from
-  /// `xa.shape()[1]` (the key time axis), so a caller that supplies a longer or
-  /// batched `enc` would drive the cross-attention KV / score buffers past the
-  /// caps the config states for a single `[1, n_audio_ctx, n_audio_state]`
+  /// `xa.shape()[1]` (the key time axis), so a caller that supplies a longer
+  /// encoder extent would drive the cross-attention KV / score buffers past the
+  /// caps the config states for a single `[·, n_audio_ctx, n_audio_state]`
   /// segment (the cross-attention score cap is `n_text_head * n_text_ctx *
   /// n_audio_ctx`, the KV cache cap `n_text_layer * n_audio_ctx * n_audio_state`
-  /// — both assume the encoder extent is exactly `n_audio_ctx`). Pinning the
-  /// extent here makes those caps provably bound the runtime cross-attention
-  /// tensors regardless of caller. The encoder's own `forward` already produces
-  /// this shape, but a direct caller of [`Self::decode_tokens`] /
-  /// [`AutoregressiveStt::decode_step`] (e.g.
-  /// [`super::decoding::detect_language`], which takes `audio_features`
-  /// straight from the caller) could pass any tensor — so the guard lives at the
-  /// decoder entry, not only at the encoder exit.
+  /// — both assume the encoder extent is exactly `n_audio_ctx`). Pinning the two
+  /// inner extents here makes those caps provably bound the runtime
+  /// cross-attention tensors regardless of caller. The batch axis is pinned to
+  /// `expected_group` so it always equals the decoder-input batch: the single-
+  /// sequence path (`expected_group == 1`) rejects any `[B != 1, …]` tensor (its
+  /// queries are `(1, T)`, so a wider K/V would silently broadcast-mismatch), and
+  /// the batched path pins it to `n_group`. The encoder's own `forward` produces
+  /// the `(1, …)` shape, which the decode task broadcasts to `(n_group, …)`
+  /// before a batched decode ([`Self::broadcast_encoder_states`]); a direct
+  /// caller of [`Self::decode_tokens`] / [`AutoregressiveStt::decode_step`] (e.g.
+  /// [`super::decoding::detect_language`], which takes `audio_features` straight
+  /// from the caller) could pass any tensor — so the guard lives at the decoder
+  /// entry, not only at the encoder exit.
   ///
   /// # Errors
-  /// [`Error::ShapePairMismatch`] if `enc.shape() != [1, n_audio_ctx,
-  /// n_audio_state]`.
-  fn validate_encoder_states(&self, enc: &Array) -> Result<()> {
-    let expected = [1usize, self.dims.n_audio_ctx(), self.dims.n_audio_state()];
+  /// [`Error::ShapePairMismatch`] if `enc.shape() != [expected_group,
+  /// n_audio_ctx, n_audio_state]`.
+  fn validate_encoder_states(&self, enc: &Array, expected_group: usize) -> Result<()> {
+    let expected = [
+      expected_group,
+      self.dims.n_audio_ctx(),
+      self.dims.n_audio_state(),
+    ];
     let actual = enc.shape();
     if actual.len() != expected.len() || actual.iter().zip(expected.iter()).any(|(a, e)| a != e) {
       return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
-        "WhisperModel: encoder states must be (1, n_audio_ctx, n_audio_state) — a single Whisper segment",
+        "WhisperModel: encoder states must be (expected_group, n_audio_ctx, n_audio_state) — a single Whisper segment (single-sequence) or broadcast across candidate rows (best-of-N)",
         expected.to_vec(),
         actual,
       )));
     }
     Ok(())
+  }
+
+  /// Broadcast `(1, n_audio_ctx, n_audio_state)` encoder states to `(n_group,
+  /// n_audio_ctx, n_audio_state)` for a batched best-of-N decode — the analogue
+  /// of the reference reusing one audio feature tensor across the `n_group`
+  /// candidate rows (`decoding.py:640` / the `audio_features[::n_group]`
+  /// regrouping at `:670`).
+  ///
+  /// The encoder runs once per utterance, so every candidate shares the same
+  /// audio features; broadcasting (rather than re-encoding) keeps the cross-
+  /// attention K/V batch equal to the self-attention K/V batch (`n_group`) so the
+  /// whole decoder forward batches without any per-row encoder work. `n_group ==
+  /// 1` returns the states unchanged (a clone), so the single-sequence path does
+  /// no broadcast.
+  ///
+  /// # Errors
+  /// - [`Error::ShapePairMismatch`] if `enc` is not `(1, n_audio_ctx,
+  ///   n_audio_state)`;
+  /// - [`Error::OutOfRange`] if `n_group` is `0` or overflows `i32`;
+  /// - propagates the broadcast op error.
+  pub(crate) fn broadcast_encoder_states(&self, enc: &Array, n_group: usize) -> Result<Array> {
+    // The source must be the single-segment `(1, …)` encoder output; reject a
+    // pre-batched tensor here so the broadcast target is unambiguous.
+    let expected = [1usize, self.dims.n_audio_ctx(), self.dims.n_audio_state()];
+    let actual = enc.shape();
+    if actual.len() != expected.len() || actual.iter().zip(expected.iter()).any(|(a, e)| a != e) {
+      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "WhisperModel::broadcast_encoder_states: source must be (1, n_audio_ctx, n_audio_state)",
+        expected.to_vec(),
+        actual,
+      )));
+    }
+    if n_group == 0 {
+      return Err(Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::broadcast_encoder_states: n_group",
+        "must be >= 1",
+        smol_str::format_smolstr!("n_group={n_group}"),
+      )));
+    }
+    if n_group == 1 {
+      return enc.try_clone();
+    }
+    let g = i32::try_from(n_group).map_err(|_| {
+      Error::OutOfRange(crate::error::OutOfRangePayload::new(
+        "WhisperModel::broadcast_encoder_states: n_group",
+        "must fit in i32",
+        smol_str::format_smolstr!("{n_group}"),
+      ))
+    })?;
+    let ctx =
+      i32::try_from(self.dims.n_audio_ctx()).map_err(|_| dim_i32_overflow("n_audio_ctx"))?;
+    let state =
+      i32::try_from(self.dims.n_audio_state()).map_err(|_| dim_i32_overflow("n_audio_state"))?;
+    crate::ops::shape::broadcast_to(enc, &[g, ctx, state])
   }
 
   /// Run the decoder over a token sequence `tokens` `(1, T)` against the
@@ -674,13 +739,62 @@ impl WhisperModel {
     cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
     // Bound the encoder extent BEFORE the decoder cross-attention projects it.
-    self.validate_encoder_states(encoder_states)?;
+    // This single-sequence path builds `(1, T)` queries, so the encoder batch
+    // must be exactly 1 (a wider K/V would silently broadcast-mismatch).
+    self.validate_encoder_states(encoder_states, 1)?;
     // Pass the validated `&[u32]` straight to the decoder: it builds the
     // `(1, T)` `u32` array itself and enforces the empty / `id < n_vocab` /
     // `i32` / `offset + T <= n_text_ctx` guards at the single gather chokepoint —
     // so the value-range / rank / dtype classes are structurally closed there for
     // every caller, with no double Array-build at this layer.
     let (logits, new_cache) = self.decoder.forward(tokens, encoder_states, cache)?;
+    let logits = logits.astype(Dtype::F32)?;
+    Ok((logits, new_cache))
+  }
+
+  /// Run the decoder over `n_group` parallel candidate rows — the batched
+  /// (`n_group > 1`) analogue of [`Self::decode_tokens`] underneath best-of-N
+  /// sampling (the reference's `(n_audio * n_group, T)` decode,
+  /// `decoding.py:657-667`).
+  ///
+  /// `tokens` is the `(n_group, T)` new-window ids in **row-major** order, its
+  /// length an exact multiple of `n_group`. `encoder_states` is the audio
+  /// features broadcast to `(n_group, n_audio_ctx, n_audio_state)` (via
+  /// [`Self::broadcast_encoder_states`]), so every candidate's cross-attention
+  /// K/V batches the same width as its self-attention K/V — the rows decode
+  /// independently. `encoder_states` is extent-validated (its batch axis must
+  /// equal `n_group`); the decoder re-checks the per-row token invariants at its
+  /// single gather chokepoint. Returns `(logits, updated_cache)` with logits
+  /// `(n_group, T, n_vocab)` (cast to `f32`, matching `Inference.logits`).
+  ///
+  /// `n_group == 1` forwards through the same decoder path as
+  /// [`Self::decode_tokens`] (a single `(1, T)` array), so the single-sequence
+  /// numerics are unchanged.
+  ///
+  /// # Errors
+  /// - [`Error::ShapePairMismatch`] if `encoder_states` is not `(n_group,
+  ///   n_audio_ctx, n_audio_state)`;
+  /// - [`Error::OutOfRange`] if `n_group` is `0`, `tokens.len()` is not a
+  ///   multiple of `n_group`, the per-row window is empty / over-context, or an
+  ///   id is `>= n_vocab`;
+  /// - propagates the decoder forward op errors.
+  pub(crate) fn decode_tokens_batched(
+    &self,
+    tokens: &[u32],
+    n_group: usize,
+    encoder_states: &Array,
+    cache: Option<&DecoderKvCache>,
+  ) -> Result<(Array, DecoderKvCache)> {
+    // Bound the encoder extent AND pin its batch axis to `n_group` BEFORE the
+    // decoder cross-attention projects it, so the broadcast K/V line up with the
+    // self-attention rows (a `(1, …)` or wrongly-sized `enc` would otherwise
+    // silently broadcast under MLX rules against the `(n_group, …)` queries,
+    // decoding every row against the wrong feature batch).
+    self.validate_encoder_states(encoder_states, n_group)?;
+    let (logits, new_cache) =
+      self
+        .decoder
+        .forward_batched(tokens, n_group, encoder_states, cache)?;
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
   }
@@ -886,7 +1000,9 @@ impl WhisperModel {
     // forms its scores from `enc.shape()[1]`, so a longer / batched segment must
     // be rejected before it can size the cross-attention buffers past the config
     // caps (which assume a single `[1, n_audio_ctx, n_audio_state]` segment).
-    self.validate_encoder_states(enc)?;
+    // This incremental path builds `(1, T_new)` queries, so the encoder batch
+    // must be exactly 1.
+    self.validate_encoder_states(enc, 1)?;
 
     let cached = cache.len();
     // Reject a token prefix longer than the decoder context BEFORE building the
@@ -939,6 +1055,11 @@ impl WhisperModel {
       task: task_to_whisper(opts.task()),
       language: opts.language().map(str::to_owned),
       temperature: opts.temperature(),
+      // The universal transcribe options expose no best-of / beam knobs; the
+      // high-level path runs the single-sequence decode.
+      best_of: None,
+      beam_size: None,
+      length_penalty: None,
       sample_len: opts.max_new_tokens(),
       prompt: Vec::new(),
       prefix: Vec::new(),
@@ -2499,6 +2620,15 @@ fn task_to_whisper(task: Task) -> WhisperTask {
 fn vocab_overflow(which: &'static str) -> Error {
   Error::OutOfRange(crate::error::OutOfRangePayload::new(
     "WhisperModel::decode_step: dimension",
+    "must fit in i32",
+    smol_str::format_smolstr!("{which} exceeds i32::MAX"),
+  ))
+}
+
+/// A model dimension exceeding `i32::MAX` (the broadcast / batched-decode path).
+fn dim_i32_overflow(which: &'static str) -> Error {
+  Error::OutOfRange(crate::error::OutOfRangePayload::new(
+    "WhisperModel: dimension",
     "must fit in i32",
     smol_str::format_smolstr!("{which} exceeds i32::MAX"),
   ))
