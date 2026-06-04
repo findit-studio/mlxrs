@@ -364,6 +364,45 @@ fn model_config_rejects_non_gelu_projector_hidden_act() {
 }
 
 #[test]
+fn model_config_pins_vision_num_channels_to_3() {
+  // The full LFM2.5-VL model + its image processor are RGB-only: the processor
+  // hard-wires `num_channels = RGB_CHANNELS` (`processor::Lfm2VlProcessorConfig::new`)
+  // and `preprocess_image` rejects any config whose `num_channels != 3` (it uses
+  // the channel count as the patchify stride into an always-3-channel buffer),
+  // and the patch-embed Linear width derives from `num_channels * patch_size^2`.
+  // So a full `ModelConfig` whose `vision_config.num_channels != 3` is a
+  // wrong-architecture / malformed checkpoint and must be rejected at LOAD (a
+  // typed `OutOfRange`), not run a mismatched architecture or fail late at a
+  // vision matmul shape check. `1` (grayscale) and `4` (RGBA) are the most
+  // plausible near-misses; both must be rejected.
+  for bad_channels in [1, 2, 4, 6] {
+    let json =
+      format!(r#"{{"text_config":{{}},"vision_config":{{"num_channels":{bad_channels}}}}}"#);
+    let cfg = ModelConfig::from_json(&json).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+      matches!(err, Error::OutOfRange(_)),
+      "vision_config.num_channels={bad_channels} must be OutOfRange at ModelConfig::validate, got {err}"
+    );
+  }
+  // The RGB value `3` (and the default, which is 3) validates.
+  let rgb = r#"{"text_config":{},"vision_config":{"num_channels":3}}"#;
+  ModelConfig::from_json(rgb)
+    .unwrap()
+    .validate()
+    .expect("num_channels == 3 (RGB) must validate");
+  let defaulted = r#"{"text_config":{},"vision_config":{}}"#;
+  let cfg = ModelConfig::from_json(defaulted).unwrap();
+  assert_eq!(
+    cfg.vision_config.num_channels, 3,
+    "default num_channels is RGB"
+  );
+  cfg
+    .validate()
+    .expect("default (RGB) num_channels must validate");
+}
+
+#[test]
 fn model_config_rejects_negative_image_token_index() {
   let json = r#"{"text_config": {}, "vision_config": {}, "image_token_index": -1}"#;
   let cfg = ModelConfig::from_json(json).unwrap();

@@ -44,7 +44,8 @@
 use crate::{
   error::{Error, OutOfRangePayload, ParsePayload, Result},
   model_validation::{
-    checked_mul, require_cardinality, require_divisible, require_in_range, require_positive,
+    checked_mul, pin_i32, require_cardinality, require_divisible, require_in_range,
+    require_positive,
   },
 };
 
@@ -229,6 +230,22 @@ const VISION_HIDDEN_ACTS: &[&str] = &["gelu_pytorch_tanh"];
 /// underscore via [`VISION_MODEL_TYPES`]).
 #[cfg(feature = "lfm2-vl")]
 const MODEL_TYPES: &[&str] = &["lfm2-vl", "lfm2_vl"];
+
+/// The sole input channel count the full LFM2.5-VL model + its image processor
+/// support: `3` (RGB). The processor is RGB-hard-wired —
+/// [`Lfm2VlProcessorConfig::new`](crate::vlm::models::lfm2_vl::processor::Lfm2VlProcessorConfig::new)
+/// sets `num_channels = RGB_CHANNELS` (`3`) and
+/// [`preprocess_image`](crate::vlm::models::lfm2_vl::processor::preprocess_image)
+/// rejects any processor config whose `num_channels != 3` (the patchify builds a
+/// 3-channel `RgbImage`, resizes into an always-3-channel buffer, and uses the
+/// channel count as the patchify stride) — and the patch-embed `Linear`'s input
+/// width derives from `num_channels * patch_size^2`. So [`ModelConfig::validate`]
+/// pins `vision_config.num_channels` to `3`: a checkpoint declaring a different
+/// channel count is a malformed / wrong-architecture config that would otherwise
+/// either run a mismatched architecture or fail late at a vision matmul shape
+/// check, and is rejected at load instead.
+#[cfg(feature = "lfm2-vl")]
+const RGB_CHANNELS: i32 = 3;
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
@@ -640,8 +657,10 @@ impl ModelConfig {
   /// reservation); requires `max_pixels_tolerance` positive-and-finite, the
   /// `min_* <= max_*` orderings, and `image_token_index` / `eos_token_id`
   /// non-negative; validates that `vision_feature_layer` resolves to an in-range
-  /// kept-layer count; and validates both tower configs (see
-  /// [`TextConfig::validate`] / [`VisionConfig::validate`]).
+  /// kept-layer count; validates both tower configs (see
+  /// [`TextConfig::validate`] / [`VisionConfig::validate`]); and pins
+  /// `vision_config.num_channels` to `3` (the full model + processor are
+  /// RGB-only).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::ModelConfig: model_type",
@@ -765,6 +784,21 @@ impl ModelConfig {
     }
     self.text_config.validate()?;
     self.vision_config.validate()?;
+    // The full LFM2.5-VL model + its image processor are RGB-only: the processor
+    // hard-wires `num_channels = RGB_CHANNELS` (`processor::Lfm2VlProcessorConfig::new`)
+    // and `preprocess_image` rejects any config whose `num_channels != 3` (it
+    // builds a 3-channel `RgbImage` and uses the channel count as the patchify
+    // stride), while the patch-embed `Linear`'s input width derives from
+    // `num_channels * patch_size^2`. `VisionConfig::validate` only bounds
+    // `num_channels` as a cardinality, so pin it to `3` here, in the full-model
+    // path, so a non-3 (wrong-architecture / malformed) checkpoint is a typed
+    // [`Error::OutOfRange`] at load rather than a mismatched architecture or a
+    // late vision-matmul shape failure.
+    pin_i32(
+      "lfm2_vl::ModelConfig: vision_config.num_channels",
+      self.vision_config.num_channels,
+      RGB_CHANNELS,
+    )?;
     // Resolve + range-check the feature-layer selection against the validated
     // vision config (its `num_hidden_layers` is now known positive).
     self.vision_feature_layers_kept()?;
