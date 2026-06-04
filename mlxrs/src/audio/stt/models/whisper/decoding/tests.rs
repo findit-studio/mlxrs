@@ -494,6 +494,78 @@ fn greedy_decoder_completes_on_argmax_eot() {
   assert!(completed);
 }
 
+/// Timing harness for `GreedyDecoder::update` — measures the per-token cost of
+/// the greedy argmax + chosen-logprob selection on a realistic `(n_vocab,)`
+/// logits row. `#[ignore]`d (it runs the device path hundreds of times and is a
+/// measurement, not a correctness assertion); run on a Metal host with:
+///
+/// ```text
+/// cargo test -p mlxrs --features whisper --lib \
+///   audio::stt::models::whisper::decoding::tests::greedy_decoder_update_per_token_timing \
+///   -- --ignored --nocapture --test-threads=1
+/// ```
+///
+/// The logits row is **varied each iteration** (a per-iteration scalar is added
+/// to a fixed base row) so mlx re-evaluates the graph every step rather than
+/// serving a cached result — making the timing reflect a true per-token decode
+/// stall. `last_token != eot` so the chosen-logprob accumulation path runs.
+#[test]
+#[ignore = "timing measurement; run on a Metal host with --ignored --nocapture"]
+fn greedy_decoder_update_per_token_timing() {
+  use std::time::Instant;
+
+  // A realistic large-v3 vocabulary width; the argmax sits at a fixed index so
+  // the chosen-logprob gather runs, and `last_token != eot` so it accumulates.
+  const N_VOCAB: i32 = 51865;
+  const EOT: u32 = 50257;
+  const ARGMAX_IDX: usize = 12_345;
+  const WARMUP: usize = 30;
+  const ITERS: usize = 300;
+
+  // Fixed base row: a small ramp with a clear peak at ARGMAX_IDX so argmax is
+  // deterministic regardless of the per-iteration perturbation.
+  let mut base = vec![0.0f32; N_VOCAB as usize];
+  for (i, v) in base.iter_mut().enumerate() {
+    *v = (i as f32) * 1e-6;
+  }
+  base[ARGMAX_IDX] = 50.0;
+  let base = Array::from_slice::<f32>(&base, &[N_VOCAB]).unwrap();
+
+  let mut d = GreedyDecoder::new(0.0, EOT, 0).unwrap();
+
+  // Build the per-iteration varied row: base + a 0-d scalar that changes every
+  // call. The add keeps the argmax fixed (uniform shift) but forces a fresh
+  // eval; materialize the input before timing so only `update` is measured.
+  let varied = |step: usize| -> Array {
+    let bump = Array::full::<f32>(&[0i32; 0], step as f32 * 1e-4).unwrap();
+    let row = ops::arithmetic::add(&base, &bump).unwrap();
+    crate::transforms::eval(&[&row]).unwrap();
+    row
+  };
+
+  for step in 0..WARMUP {
+    let logits = varied(step);
+    let (next, completed) = d.update(&logits, /* last */ 0).unwrap();
+    assert_eq!(next as usize, ARGMAX_IDX);
+    assert!(!completed);
+  }
+
+  let start = Instant::now();
+  for step in WARMUP..(WARMUP + ITERS) {
+    let logits = varied(step);
+    let (next, _completed) = d.update(&logits, /* last */ 0).unwrap();
+    assert_eq!(next as usize, ARGMAX_IDX);
+  }
+  let elapsed = start.elapsed();
+  let per_token = elapsed / ITERS as u32;
+
+  println!(
+    "GreedyDecoder::update: {ITERS} tokens in {elapsed:?} => {per_token:?}/token \
+     ({:.1} tokens/s)",
+    ITERS as f64 / elapsed.as_secs_f64()
+  );
+}
+
 // ───────────────────── device-vs-scalar filter PARITY ─────────────────────
 
 /// An independent **scalar** reference for the full filter chain + greedy
