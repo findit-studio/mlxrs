@@ -169,3 +169,59 @@ fn inner_exposes_wrapped_lm() {
   let adapter = tiny_adapter();
   assert_eq!(adapter.inner().config().hidden_size, 4);
 }
+
+// ───────────────────── dtype preservation (f16 / bf16) ─────────────────────
+
+/// The tiny weight map with every tensor cast to `dt` — a synthetic bf16 / f16
+/// dense checkpoint for the language path.
+fn tiny_weights_in_dtype(dt: Dtype) -> HashMap<String, Array> {
+  let mut w = tiny_weights();
+  for v in w.values_mut() {
+    *v = crate::ops::misc::astype(v, dt).unwrap();
+  }
+  w
+}
+
+/// The LFM2.5-VL language path (the wrapped LFM2 LM) must keep the activation
+/// dtype: a `dt`-dtype checkpoint forwards token ids AND merged embeddings to
+/// `dt` logits, never silently promoted to f32 (the preserve-activation-dtype
+/// contract; the other language tests are f32-only).
+fn assert_language_path_preserves_dtype(dt: Dtype) {
+  let lm = Lfm2::from_weights(tiny_config(), tiny_weights_in_dtype(dt)).unwrap();
+  let adapter = LanguageModel::new(lm);
+
+  // Text-only forward (ids -> logits) stays in-dtype.
+  let mut cache = adapter.make_cache();
+  let ids = Array::from_slice::<i32>(&[1, 3], &(1usize, 2)).unwrap();
+  let logits = adapter.forward(&ids, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dt,
+    "language forward must keep {dt:?} (no f32 promotion)"
+  );
+
+  // The merged-embeddings forward (the image-splice path) likewise: a `dt`
+  // `(B, T, hidden)` embedding -> `dt` logits.
+  let mut cache2 = adapter.make_cache();
+  let emb_f32 =
+    Array::from_slice::<f32>(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], &(1usize, 2, 4)).unwrap();
+  let emb = crate::ops::misc::astype(&emb_f32, dt).unwrap();
+  let logits2 = adapter.forward_embeddings(&emb, &mut cache2).unwrap();
+  assert_eq!(logits2.shape(), vec![1, 2, 8]);
+  assert_eq!(
+    logits2.dtype().unwrap(),
+    dt,
+    "language forward_embeddings must keep {dt:?}"
+  );
+}
+
+#[test]
+fn language_path_preserves_bf16_dtype() {
+  assert_language_path_preserves_dtype(Dtype::BF16);
+}
+
+#[test]
+fn language_path_preserves_f16_dtype() {
+  assert_language_path_preserves_dtype(Dtype::F16);
+}

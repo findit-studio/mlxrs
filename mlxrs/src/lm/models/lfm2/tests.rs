@@ -706,6 +706,83 @@ fn validate_rejects_unbounded_ffn_multiplier() {
 }
 
 #[test]
+fn validate_rejects_non_finite_or_non_positive_rope_theta() {
+  // The EFFECTIVE `rope_theta` is the base of the attention `Rope`, so a
+  // `0.0` / negative / non-finite base must be a typed config error at load,
+  // not a silently-built `Rope` with invalid (non-finite / inverted) rotation
+  // frequencies. A non-positive base is `OutOfRange`; a non-finite (NaN / +Inf
+  // by overflow) base is `NonFiniteScalar` (the shared `require_positive_finite_f32`
+  // discipline). Sound base config so `rope_theta` is the only malformed field.
+
+  // ── top-level `rope_theta` ──
+  // Zero base (`OutOfRange`).
+  let zero = r#"{"rope_theta": 0.0, "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero),
+    Err(Error::OutOfRange(_))
+  ));
+  // Negative base (`OutOfRange`).
+  let neg = r#"{"rope_theta": -1000.0, "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+  // NaN base — serde's JSON grammar has no NaN literal, so the field is set
+  // directly on an otherwise-valid parsed config and `validate()` called
+  // (`NonFiniteScalar`).
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  let mut nan_cfg = TextConfig::from_json(base).unwrap();
+  nan_cfg.rope_theta = f32::NAN;
+  assert!(matches!(nan_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  // +Inf base (`NonFiniteScalar`).
+  let mut inf_cfg = TextConfig::from_json(base).unwrap();
+  inf_cfg.rope_theta = f32::INFINITY;
+  assert!(matches!(inf_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+
+  // ── via the `rope_parameters` override (`lfm2.py:40-42`) ──
+  // The override is what wins, so an invalid `rope_parameters.rope_theta` must
+  // be rejected the same way even when the top-level field is sound. The
+  // override has folded into the effective `rope_theta` by deserialize-time, so
+  // `from_json` (which runs `validate`) surfaces it for a JSON-expressible
+  // `0.0` / negative.
+  let zero_override = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": 0.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero_override),
+    Err(Error::OutOfRange(_))
+  ));
+  let neg_override = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": -5.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg_override),
+    Err(Error::OutOfRange(_))
+  ));
+  // A NaN override (no JSON literal): set the override map's `rope_theta` to NaN
+  // on a parsed config, re-apply the override, and validate — the effective base
+  // is NaN (`NonFiniteScalar`).
+  let mut nan_override = TextConfig::from_json(base).unwrap();
+  nan_override.rope_parameters = Some(RopeParameters {
+    rope_theta: Some(f32::NAN),
+  });
+  nan_override.apply_rope_parameters_override();
+  assert!(matches!(
+    nan_override.validate(),
+    Err(Error::NonFiniteScalar(_))
+  ));
+
+  // A sound positive base still passes (the override is the realistic 10^6).
+  let ok = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": 1000000.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(TextConfig::from_json(ok).unwrap().validate().is_ok());
+}
+
+#[test]
 fn validate_bounds_conv_l_cache_as_a_cardinality() {
   // `conv_L_cache` sizes runtime allocations (the conv-state array's middle
   // axis, the prefill left-pad, and a host `B * (conv_L_cache - 1)` index Vec),
@@ -1270,12 +1347,19 @@ fn from_weights_quantized_builds_quantized_layers_and_keeps_conv_dense() {
     "token embedding (tied head) must be quantized"
   );
 
-  // Layer 0 = attention: all four projections quantized.
+  // Layer 0 = attention: all four projections quantized. The quantized q/k/v
+  // are NOT fused (fusion concatenates dense weights only), so they stay three
+  // separate quantized projections.
   match &model.model.layers[0].mixer {
     Mixer::Attention(attn) => {
-      assert!(attn.q_proj.is_quantized(), "q_proj quantized");
-      assert!(attn.k_proj.is_quantized(), "k_proj quantized");
-      assert!(attn.v_proj.is_quantized(), "v_proj quantized");
+      match &attn.qkv_proj {
+        QkvProj::Split { q, k, v } => {
+          assert!(q.is_quantized(), "q_proj quantized");
+          assert!(k.is_quantized(), "k_proj quantized");
+          assert!(v.is_quantized(), "v_proj quantized");
+        }
+        QkvProj::Fused { .. } => panic!("quantized q/k/v must stay split, not fused"),
+      }
       assert!(attn.out_proj.is_quantized(), "out_proj quantized");
     }
     Mixer::Conv(_) => panic!("layer 0 should be attention"),
@@ -1409,4 +1493,770 @@ fn resolve_quantization_handles_both_keys() {
     resolve_quantization(r#"{"quantization": {"group_size": 64}}"#),
     Err(Error::Parse(_))
   ));
+}
+
+// ───────────────────────── rope_parameters override ─────────────────────────
+
+#[test]
+fn rope_parameters_theta_overrides_top_level() {
+  // `__post_init__` (`lfm2.py:41-42`): when `rope_parameters` carries a
+  // `rope_theta`, it OVERRIDES the top-level `rope_theta`. Here the top-level is
+  // 1000, the override is 5000 -> the effective theta is 5000.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000.0}}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "rope_parameters.rope_theta must win"
+  );
+}
+
+#[test]
+fn rope_parameters_absent_or_without_theta_keeps_top_level() {
+  // No `rope_parameters` key -> the top-level `rope_theta` is used unchanged.
+  let no_params = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1234.0}"#;
+  assert_eq!(
+    TextConfig::from_json(no_params).unwrap().rope_theta,
+    1234.0,
+    "absent rope_parameters keeps the top-level rope_theta"
+  );
+
+  // A `rope_parameters` present but WITHOUT a `rope_theta` (only unmodeled keys)
+  // also keeps the top-level value (upstream's `"rope_theta" in rope_parameters`
+  // is false), and the extra key is ignored.
+  let no_theta = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1234.0,
+    "rope_parameters": {"rope_type": "default"}}"#;
+  let cfg = TextConfig::from_json(no_theta).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 1234.0,
+    "rope_parameters without rope_theta keeps the top-level value"
+  );
+
+  // An explicit `null` rope_parameters is also a no-op (upstream's
+  // `rope_parameters is not None` is false).
+  let null_params = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 777.0,
+    "rope_parameters": null}"#;
+  assert_eq!(
+    TextConfig::from_json(null_params).unwrap().rope_theta,
+    777.0,
+    "null rope_parameters keeps the top-level value"
+  );
+}
+
+#[test]
+fn rope_parameters_explicit_null_theta_falls_back_to_top_level_without_error() {
+  // A present `rope_parameters` whose `rope_theta` is EXPLICITLY `null`. The
+  // double-`Option` raw mirror (`RawRopeParameters`) distinguishes this from an
+  // absent `rope_theta`, and the raw->public conversion deliberately treats the
+  // explicit null as a graceful fallback to the top-level `rope_theta`. Upstream
+  // (`lfm2.py:40-42`) would set `rope_theta = None` and crash; mlxrs falls back
+  // robustly and does NOT error. The config must load (validate) with the
+  // top-level value preserved.
+  let null_theta = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {"rope_theta": null}}"#;
+  let cfg = TextConfig::from_json(null_theta)
+    .expect("explicit-null rope_parameters.rope_theta must load (robust fallback, no error)");
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "explicit-null rope_theta falls back to the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an explicit-null rope_theta"
+  );
+
+  // It must also BUILD: a model constructed from the config carries the
+  // top-level base in its attention RoPE (the null did not poison the build).
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let build_json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 4242.0,
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let build_cfg = TextConfig::from_json(&build_json)
+    .expect("explicit-null rope_parameters.rope_theta must load for the build path");
+  let model = Lfm2::from_weights(build_cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 4242.0,
+      "the attention RoPE base falls back to the top-level rope_theta on explicit null"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn rope_parameters_empty_map_keeps_top_level() {
+  // A present but EMPTY `rope_parameters` map (the inner `rope_theta` key is
+  // ABSENT). The double-`Option` mirror yields `None` for the missing key, so
+  // the override is a no-op and the top-level `rope_theta` is kept.
+  let empty = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {}}"#;
+  let cfg = TextConfig::from_json(empty).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "an empty rope_parameters map keeps the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an empty rope_parameters map"
+  );
+}
+
+#[test]
+fn rope_parameters_present_value_overrides_to_5000() {
+  // A present `rope_parameters.rope_theta` value (`Some(Some(v))`) overrides the
+  // top-level `rope_theta` (`lfm2.py:40-42`): top-level 1000 -> effective 5000.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000}}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "a present rope_parameters.rope_theta overrides the top-level value to 5000"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    Some(5000.0),
+    "the public override value is Some(5000) for a present rope_theta"
+  );
+}
+
+#[test]
+fn rope_parameters_explicit_null_and_absent_yield_the_same_effective_theta() {
+  // Pin the deliberate fallback as intentional: an EXPLICIT
+  // `rope_parameters.rope_theta: null` and an ABSENT `rope_parameters` must
+  // produce the SAME effective `rope_theta` (both keep the top-level value). The
+  // double-`Option` mirror distinguishes the two JSON shapes during parsing, but
+  // the resolved RoPE base is identical by design.
+  let top_level = 9001.0;
+  let explicit_null = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level},
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let absent = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level}}}"#
+  );
+  let null_theta = TextConfig::from_json(&explicit_null).unwrap().rope_theta;
+  let absent_theta = TextConfig::from_json(&absent).unwrap().rope_theta;
+  assert_eq!(
+    null_theta, absent_theta,
+    "explicit-null and absent rope_parameters must yield the same effective rope_theta"
+  );
+  assert_eq!(
+    null_theta, top_level,
+    "both resolve to the top-level rope_theta"
+  );
+}
+
+#[test]
+fn rope_parameters_override_reaches_the_built_attention_rope() {
+  // The override is applied in `from_json` (the `__post_init__` analogue), so a
+  // model built from the overridden config carries the override in its attention
+  // RoPE `base` — not just in the parsed struct field.
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+    "rope_parameters": {{"rope_theta": 31337.0}}}}"#
+  );
+  let cfg = TextConfig::from_json(&json).unwrap();
+  let model = Lfm2::from_weights(cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => {
+      assert_eq!(
+        attn.rope.base, 31337.0,
+        "the attention RoPE base must carry the rope_parameters override"
+      );
+    }
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn rope_parameters_override_applies_on_direct_serde_without_from_json() {
+  // The override is intrinsic to `TextConfig`'s hand-written `Deserialize`, so a
+  // DIRECT `serde_json::from_str::<TextConfig>` — bypassing `from_json` entirely —
+  // still materializes the overridden `rope_theta`. This is the bypass FINDING 1
+  // closes: a caller who deserializes `TextConfig` directly and feeds it to a
+  // builder must NOT get a stale top-level `rope_theta`.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000.0}}"#;
+  let cfg: TextConfig = serde_json::from_str(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "direct serde_json::from_str::<TextConfig> must carry the rope_parameters override (no from_json)"
+  );
+}
+
+#[test]
+fn builder_renormalizes_rope_override_for_a_mutated_config() {
+  // `__post_init__` re-derives `rope_theta` from `rope_parameters` on EVERY
+  // construction (`lfm2.py:40-42`), and `TextConfig::from_weights_quantized` is
+  // the chokepoint that consumes `rope_theta` to build the attention RoPE. The
+  // `Deserialize` normalizes on the parse path; the builder re-applies the same
+  // override so a config materialized then MUTATED post-deserialize (the fields
+  // are public) into a stale `rope_parameters` / `rope_theta` pair still builds
+  // an attention RoPE with the override's base. Deserialize a config (already
+  // normalized to 31337), then simulate a clone+mutate that desynchronizes the
+  // pair: set the top-level `rope_theta` to a STALE 1000 while leaving
+  // `rope_parameters.rope_theta` at 31337. The built attention RoPE base must be
+  // the override (31337), proving the builder re-normalized rather than reading
+  // the stale top-level value.
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+    "rope_parameters": {{"rope_theta": 31337.0}}}}"#
+  );
+  let mut cfg = TextConfig::from_json(&json).unwrap();
+  // Post-construction mutation: desynchronize the pair (the override field stays
+  // 31337, the top-level field regresses to a stale 1000).
+  cfg.rope_theta = 1000.0;
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    Some(31337.0),
+    "the override field is still 31337 after the mutation"
+  );
+  let model = Lfm2::from_weights(cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the builder must re-apply the rope_parameters override for a mutated config (not read the stale top-level rope_theta)"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+#[cfg(feature = "lfm2-vl")]
+fn vlm_direct_serde_model_config_carries_override_into_built_rope() {
+  // The VLM `ModelConfig` derives `Deserialize`, which deserializes its nested
+  // `text_config` via `TextConfig`'s hand-written `Deserialize` — so the
+  // `__post_init__` override (`lfm2.py:40-42`) is carried even on a DIRECT
+  // `serde_json::from_str::<ModelConfig>` that never calls `ModelConfig::from_json`.
+  // Build the wrapped LM from that directly-deserialized `text_config` and assert
+  // the override reaches the attention RoPE `base` (not just the struct field),
+  // the VLM analogue of `rope_parameters_override_reaches_the_built_attention_rope`
+  // via the direct-serde path. The `text_config` dims mirror `quant_hybrid_config`
+  // so its weights fit `quant_hybrid_dense_weights`; the top-level rope_theta is
+  // 1000 and the override is 31337.
+  use crate::vlm::models::lfm2_vl::config::ModelConfig;
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{
+      "vision_config": {{}},
+      "text_config": {{
+        "hidden_size": {hidden}, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+        "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+        "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+        "rope_parameters": {{"rope_theta": 31337.0}}
+      }}
+    }}"#
+  );
+  // DIRECT serde — NOT `ModelConfig::from_json`.
+  let cfg: ModelConfig = serde_json::from_str(&json).unwrap();
+  assert_eq!(
+    cfg.text_config.rope_theta, 31337.0,
+    "nested text_config override must be carried by ModelConfig's derived Deserialize (direct serde)"
+  );
+  let model = Lfm2::from_weights(cfg.text_config, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the attention RoPE base must carry the override from the directly-deserialized ModelConfig"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+#[cfg(feature = "lfm2-vl")]
+fn vlm_builder_renormalizes_rope_override_for_a_mutated_text_config() {
+  // The VLM builder constructs its LM via `Lfm2::from_weights_quantized` off
+  // `config.text_config` (`lfm2_vl/model.rs`), so the LM builder's
+  // re-normalization (`lfm2.py:40-42`, on every construction) covers the VLM
+  // path: a `text_config` materialized then MUTATED into a stale
+  // `rope_parameters` / `rope_theta` pair still builds an attention RoPE with the
+  // override's base. Deserialize a VLM `ModelConfig` (its nested `text_config`
+  // normalized to 31337), then desynchronize the pair by regressing the
+  // top-level `text_config.rope_theta` to a stale 1000, and build the LM the same
+  // way the VLM does. The attention RoPE base must be the override (31337) — the
+  // mutated-config analogue of `vlm_direct_serde_model_config_carries_override_into_built_rope`.
+  use crate::vlm::models::lfm2_vl::config::ModelConfig;
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{
+      "vision_config": {{}},
+      "text_config": {{
+        "hidden_size": {hidden}, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+        "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+        "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+        "rope_parameters": {{"rope_theta": 31337.0}}
+      }}
+    }}"#
+  );
+  let mut cfg: ModelConfig = serde_json::from_str(&json).unwrap();
+  // Post-construction mutation of the nested `text_config`: the override field
+  // stays 31337, the top-level field regresses to a stale 1000.
+  cfg.text_config.rope_theta = 1000.0;
+  // Build the LM exactly as `Lfm2Vl::from_weights` does (off `text_config`).
+  let model = Lfm2::from_weights(cfg.text_config, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the VLM-path LM builder must re-apply the rope_parameters override for a mutated text_config"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+// ───────────────────── fused QKV projection (perf, exact) ─────────────────────
+
+/// Build a tiny hybrid (layer 0 attention, layer 1 conv) DENSE model from the
+/// shared quant-hybrid fixtures — the smallest arch that exercises an attention
+/// layer's q/k/v projections. All-dense so the QKV is fused.
+fn hybrid_dense_model() -> Lfm2 {
+  Lfm2::from_weights(quant_hybrid_config(), quant_hybrid_dense_weights()).unwrap()
+}
+
+#[test]
+fn dense_qkv_is_fused_quantized_qkv_is_split() {
+  // A dense attention layer fuses q/k/v into one matmul; a quantized one keeps
+  // them separate (the fusion concatenates dense weights only).
+  let dense = hybrid_dense_model();
+  match &dense.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert!(
+      attn.qkv_proj.is_fused(),
+      "all-dense q/k/v must fuse into one projection"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+
+  let quant = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+  match &quant.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert!(
+      !attn.qkv_proj.is_fused(),
+      "quantized q/k/v must stay split (no packed-weight concatenation)"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn fused_qkv_project_matches_three_separate_matmuls_bit_for_bit() {
+  // The fused QKV projection must reproduce `q_proj(x), k_proj(x), v_proj(x)`
+  // EXACTLY (bit-for-bit), since `x @ concat([Wq,Wk,Wv],0)ᵀ` split back into the
+  // three slices is the same dot products in the same order. Reconstruct the
+  // three separate dense projections from the same weights as an independent
+  // oracle and compare with `assert_eq!` (exact equality, not a tolerance).
+  let hidden = QGROUP as usize; // 64
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  let q = Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None);
+  let k = Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None);
+  let v = Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None);
+
+  // The fused projection under test (built exactly as the model builds it).
+  let fused = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  )
+  .unwrap();
+  assert!(fused.is_fused(), "all-dense input must fuse");
+
+  // A representative `(B=2, L=3, hidden)` input.
+  let n = 2 * 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.03 - 0.2).collect();
+  let x = Array::from_slice::<f32>(&data, &(2usize, 3usize, hidden)).unwrap();
+
+  let (fq, fk, fv) = fused.project(&x).unwrap();
+  let sq = q.forward(&x).unwrap();
+  let sk = k.forward(&x).unwrap();
+  let sv = v.forward(&x).unwrap();
+
+  assert_eq!(fq.shape(), sq.shape(), "q shape");
+  assert_eq!(fk.shape(), sk.shape(), "k shape");
+  assert_eq!(fv.shape(), sv.shape(), "v shape");
+  // Exact equality — the fusion is a pure rearrangement, not an approximation.
+  // The fused split yields strided views (a slice of the wide output's last
+  // axis), so make each contiguous before the host read.
+  let read = |a: &Array| -> Vec<f32> {
+    crate::ops::shape::contiguous(a, false)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap()
+  };
+  assert_eq!(read(&fq), read(&sq), "q");
+  assert_eq!(read(&fk), read(&sk), "k");
+  assert_eq!(read(&fv), read(&sv), "v");
+}
+
+#[test]
+fn fused_qkv_with_biases_matches_three_separate_biased_matmuls() {
+  // LFM2's q/k/v are bias-free, but the fusion must preserve bit-identity for ANY
+  // dense checkpoint: when all three projections carry a `(out,)` bias, fusing
+  // `[Wq;Wk;Wv]` AND `[bq;bk;bv]` must reproduce `q_proj(x)+bq, k_proj(x)+bk,
+  // v_proj(x)+bv` EXACTLY — proving the consumed biases are concatenated into the
+  // fused bias, not silently dropped.
+  let hidden = QGROUP as usize; // 64
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  // Distinct deterministic `(hidden,)` biases per projection.
+  let bias = |seed: f32| -> Array {
+    let data: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.001 + seed).collect();
+    Array::from_slice::<f32>(&data, &(hidden,)).unwrap()
+  };
+  let make = || -> (Linear, Linear, Linear) {
+    (
+      Linear::new(
+        take("model.layers.0.self_attn.q_proj.weight"),
+        Some(bias(0.1)),
+      ),
+      Linear::new(
+        take("model.layers.0.self_attn.k_proj.weight"),
+        Some(bias(0.2)),
+      ),
+      Linear::new(
+        take("model.layers.0.self_attn.v_proj.weight"),
+        Some(bias(0.3)),
+      ),
+    )
+  };
+  // Independent oracle: three separate biased projections.
+  let (q, k, v) = make();
+  // The fused projection under test (built exactly as the model builds it).
+  let (fq_in, fk_in, fv_in) = make();
+  let fused = QkvProj::new(fq_in, fk_in, fv_in).unwrap();
+  assert!(fused.is_fused(), "all-dense (biased) input must fuse");
+
+  let n = 2 * 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.03 - 0.2).collect();
+  let x = Array::from_slice::<f32>(&data, &(2usize, 3usize, hidden)).unwrap();
+
+  let (fq, fk, fv) = fused.project(&x).unwrap();
+  let sq = q.forward(&x).unwrap();
+  let sk = k.forward(&x).unwrap();
+  let sv = v.forward(&x).unwrap();
+  let read = |a: &Array| -> Vec<f32> {
+    crate::ops::shape::contiguous(a, false)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap()
+  };
+  // Exact equality — the fused bias split must reproduce each per-proj bias add.
+  assert_eq!(read(&fq), read(&sq), "q (with bias)");
+  assert_eq!(read(&fk), read(&sk), "k (with bias)");
+  assert_eq!(read(&fv), read(&sv), "v (with bias)");
+}
+
+#[test]
+fn fused_qkv_mixed_biases_is_key_collision_not_silent_drop() {
+  // A *mixed* dense q/k/v bias set (some projections carry a bias, some do not)
+  // cannot be a faithful LFM2 checkpoint (the three share one `bias=False` flag)
+  // and must be a typed KeyCollision — never a silent drop of the present biases.
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  let hidden = QGROUP as usize;
+  let bias = Array::from_slice::<f32>(&vec![0.5_f32; hidden], &(hidden,)).unwrap();
+
+  // q biased, k/v bias-free.
+  let r = QkvProj::new(
+    Linear::new(
+      take("model.layers.0.self_attn.q_proj.weight"),
+      Some(bias.try_clone().unwrap()),
+    ),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(r, Err(Error::KeyCollision(_))),
+    "mixed q/k/v biases must be a KeyCollision, got {r:?}"
+  );
+}
+
+#[test]
+fn fused_qkv_rank_below_two_weight_is_typed_error_not_panic() {
+  // A malformed rank-0 / rank-1 q/k/v projection weight reaches the fused dense
+  // path, which reads `shape[0]` and concatenates along axis 0. It must surface a
+  // typed RankMismatch, NEVER an out-of-bounds `shape[0]` slice-index panic.
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+
+  // Rank-0 q_proj weight (an empty shape ⇒ a single-element rank-0 array).
+  let r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  let res0 = QkvProj::new(
+    Linear::new(r0, None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(res0, Err(Error::RankMismatch(_))),
+    "rank-0 q_proj weight → RankMismatch, got {res0:?}"
+  );
+
+  // Rank-1 k_proj weight `[hidden]` (still not the `(out, in)` rank-2 a Linear
+  // weight must be).
+  let hidden = QGROUP as usize;
+  let r1 = Array::from_slice::<f32>(&vec![0.0_f32; hidden], &(hidden,)).unwrap();
+  let res1 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(r1, None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(res1, Err(Error::RankMismatch(_))),
+    "rank-1 k_proj weight → RankMismatch, got {res1:?}"
+  );
+
+  // Rank-0 v_proj weight: `wv` reaches the `concatenate` FFI, so it must be
+  // rank-validated too (not just `wq` / `wk`) — a typed RankMismatch, never an
+  // FFI concat over a rank-0 tensor.
+  let v_r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  let res_v0 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(v_r0, None),
+  );
+  assert!(
+    matches!(res_v0, Err(Error::RankMismatch(_))),
+    "rank-0 v_proj weight → RankMismatch, got {res_v0:?}"
+  );
+
+  // Rank-1 v_proj weight `[hidden]`: same — RankMismatch before the concat.
+  let v_r1 = Array::from_slice::<f32>(&vec![0.0_f32; hidden], &(hidden,)).unwrap();
+  let res_v1 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(v_r1, None),
+  );
+  assert!(
+    matches!(res_v1, Err(Error::RankMismatch(_))),
+    "rank-1 v_proj weight → RankMismatch, got {res_v1:?}"
+  );
+}
+
+// ───────────────────── edge cases: empty / max-length / dtype / shape ─────────
+
+#[test]
+fn forward_empty_sequence_is_typed_error_not_panic() {
+  // A zero-length sequence (`seq_len == 0`) must produce a well-defined
+  // typed `Result::Err`, never a panic. LFM2's short-conv left-pads `Bx` by
+  // `L_cache - 1` (= 2) frames and depthwise-convolves with a kernel of
+  // `L_cache` (= 3); with no real tokens the padded length (2) is below the
+  // kernel (3), so the convolution is undefined — upstream's identical
+  // `mx.pad(...)` + `conv(...)` would raise the same way. The contract here is
+  // that the forward returns a typed error (mlx surfaces it as `Error::MlxOp`),
+  // not that an empty prompt is meaningful.
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+  let empty = Array::from_slice::<i32>(&[] as &[i32], &(1usize, 0usize)).unwrap();
+  // `forward` may build the lazy graph and return `Ok`; the conv error then
+  // surfaces on eval. `and_then(eval)` collapses both into one `is_err`.
+  let result = model.forward(&empty, &mut cache).and_then(|mut l| l.eval());
+  assert!(
+    result.is_err(),
+    "a zero-length sequence must be a typed error, not a panic or silent success"
+  );
+}
+
+#[test]
+fn forward_embeddings_empty_sequence_is_typed_error_not_panic() {
+  // The merged-embeddings entry point (the VLM splice path) is bound by the same
+  // short-conv kernel-vs-padding constraint for a `(B, 0, hidden)` tensor: a
+  // typed `Result::Err`, never a panic.
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+  let hidden = QGROUP as usize;
+  let emb = Array::zeros::<f32>(&(1usize, 0usize, hidden)).unwrap();
+  let result = model.forward_embeddings(&emb, &mut cache);
+  assert!(
+    result.and_then(|mut l| l.eval()).is_err(),
+    "a zero-length merged-embeddings forward must be a typed error, not a panic"
+  );
+}
+
+#[test]
+fn forward_large_position_offset_runs_without_panic() {
+  // A representative large position offset (a prefill seeding the cache to a
+  // large offset, then a decode step) exercises RoPE at a big absolute position
+  // without panic / overflow. `mlx_fast_rope`'s offset is `int`; a position far
+  // into the context must rotate cleanly. We can't cheaply prefill 100k tokens,
+  // so seed the StandardKvCache offset directly and decode one token at that
+  // offset (the RoPE `apply(_, offset)` is where a large offset lands).
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+
+  // Decode a single token; the attention layer rotates it at `cache.offset`.
+  // First run a small prefill so the conv/attention caches are seeded, then a
+  // decode step. The offset reached here is modest, but the RoPE op itself is
+  // exercised; a separate direct RoPE call pins the large-offset path.
+  let prompt = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let _ = model.forward(&prompt, &mut cache).unwrap();
+  let step = Array::from_slice::<i32>(&[11], &(1usize, 1usize)).unwrap();
+  let mut logits = model.forward(&step, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 1, 128]);
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+
+  // Directly exercise RoPE at a position near `max_position_embeddings` (128k):
+  // a `(1, n_heads, 1, head_dim)` step rotated at offset 131_071 must produce
+  // finite values of the same shape (no overflow in the int offset path).
+  let head_dim = 32i32; // hidden/heads = 64/2
+  let q = Array::zeros::<f32>(&(1usize, 2usize, 1usize, head_dim as usize)).unwrap();
+  let rope = Rope::new(head_dim, false, 1_000_000.0, 1.0);
+  let mut rotated = rope.apply(&q, 131_071).unwrap();
+  assert_eq!(rotated.shape(), vec![1, 2, 1, 32]);
+  assert!(
+    rotated
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "RoPE at a large offset must stay finite"
+  );
+}
+
+/// The hybrid dense weight map with every tensor cast to `dt` — a synthetic
+/// bf16 / f16 dense checkpoint (mirrors `tiny_weights_in_dtype` in the
+/// embeddinggemma suite).
+fn hybrid_weights_in_dtype(dt: crate::dtype::Dtype) -> std::collections::HashMap<String, Array> {
+  let mut w = quant_hybrid_dense_weights();
+  for v in w.values_mut() {
+    *v = crate::ops::misc::astype(v, dt).unwrap();
+  }
+  w
+}
+
+/// A `dt`-dtype LFM2 forward must run AND keep the activation dtype — the
+/// logits stay `dt`, never silently promoted to f32. Exercises BOTH layer kinds
+/// (layer 0 attention with RoPE + QK-norm + SDPA, layer 1 short-conv) since a
+/// hidden-state promotion in either mixer would surface here. This is the
+/// preserve-activation-dtype contract the f32-only suites don't cover.
+fn assert_forward_preserves_dtype(dt: crate::dtype::Dtype) {
+  use crate::lm::model::Model as _;
+  let model = Lfm2::from_weights(quant_hybrid_config(), hybrid_weights_in_dtype(dt)).unwrap();
+  let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dt,
+    "LFM2 forward must keep the activation dtype {dt:?} (no f32 promotion in attention/conv/RoPE/norm)"
+  );
+  // Finiteness: read host-side via an f32 cast (a bf16/f16 array is not directly
+  // `to_vec::<f32>`-able).
+  let mut as_f32 = crate::ops::misc::astype(&logits, crate::dtype::Dtype::F32).unwrap();
+  assert!(
+    as_f32
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "{dt:?} forward must be finite"
+  );
+}
+
+#[test]
+fn forward_preserves_bf16_dtype() {
+  assert_forward_preserves_dtype(crate::dtype::Dtype::BF16);
+}
+
+#[test]
+fn forward_preserves_f16_dtype() {
+  assert_forward_preserves_dtype(crate::dtype::Dtype::F16);
+}
+
+#[test]
+fn forward_embeddings_preserves_bf16_dtype() {
+  // The merged-embeddings path (the VLM splice entry) must also preserve dtype:
+  // a bf16 `(B, T, hidden)` embedding tensor forwards to bf16 logits.
+  use crate::lm::model::Model as _;
+  let dt = crate::dtype::Dtype::BF16;
+  let model = Lfm2::from_weights(quant_hybrid_config(), hybrid_weights_in_dtype(dt)).unwrap();
+  let hidden = QGROUP as usize;
+  let n = 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.02 - 0.1).collect();
+  let emb_f32 = Array::from_slice::<f32>(&data, &(1usize, 3usize, hidden)).unwrap();
+  let emb = crate::ops::misc::astype(&emb_f32, dt).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward_embeddings(&emb, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dt,
+    "forward_embeddings must keep the bf16 activation dtype"
+  );
+}
+
+#[test]
+fn from_weights_rejects_wrong_hidden_size_weight() {
+  // A wrong-shaped weight (here `q_proj` built for a different hidden_size)
+  // must surface a typed error from the existing shape validation, not a panic.
+  // The config says hidden=64 (q_proj should be (64, 64)); we plant a (64, 48)
+  // q_proj. The per-head reshape / matmul shape check rejects it.
+  let mut w = quant_hybrid_dense_weights();
+  let wrong = Array::from_slice::<f32>(
+    &vec![0.01_f32; 64 * 48],
+    &(64usize, 48usize), // in-features 48 != hidden 64
+  )
+  .unwrap();
+  w.insert("model.layers.0.self_attn.q_proj.weight".to_string(), wrong);
+
+  // The mismatch surfaces either at load (fused concat width / build) or at the
+  // first forward (matmul contraction `hidden(64) @ (48, *)`), but it MUST be a
+  // typed `Result::Err`, never a panic. Drive both: build then forward.
+  use crate::lm::model::Model as _;
+  let built = Lfm2::from_weights(quant_hybrid_config(), w);
+  let err = match built {
+    Err(e) => e,
+    Ok(model) => {
+      let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+      let mut cache = model.make_cache();
+      model
+        .forward(&tokens, &mut cache)
+        .expect_err("a wrong-hidden q_proj must not forward cleanly")
+    }
+  };
+  // It is a typed error of some variant (shape / matmul) — not a panic.
+  let _ = err;
 }

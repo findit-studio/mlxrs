@@ -147,10 +147,21 @@ impl Lfm2Vl {
   /// - propagates the vision / projector / LM sub-builder validation (including
   ///   the quantized-triple checks).
   pub fn from_weights(
-    config: ModelConfig,
+    mut config: ModelConfig,
     mut weights: HashMap<String, Array>,
     quantization: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
+    // Re-apply `__post_init__`'s RoPE-base precedence (`lfm2.py:40-42`:
+    // `text_config.rope_parameters["rope_theta"]` wins over the top-level
+    // `text_config.rope_theta`) on the nested text config BEFORE it is validated,
+    // handed to the LM builder, and stored. `TextConfig`'s `Deserialize` already
+    // normalizes a freshly parsed config, so this is a no-op there; it is
+    // corrective for a `ModelConfig` materialized then mutated post-deserialize
+    // (the `text_config` field is public) into a stale `rope_parameters` /
+    // `rope_theta` pair. Normalizing the STORED config here — not just the clone
+    // passed to the LM builder below — keeps `config().text_config.rope_theta` in
+    // agreement with the RoPE the built LM actually uses.
+    config.text_config.apply_rope_parameters_override();
     config.validate()?;
 
     // Per-layer scheme resolver over the FULL VL module path namespace — the
@@ -206,6 +217,11 @@ impl Lfm2Vl {
     // keyed under the VL `language_model.` prefix would be an edge case the
     // checkpoint does not use; the global default — what the checkpoint carries
     // — applies regardless.)
+    // `config.text_config` was already RoPE-normalized above, so this clone — and
+    // the model the LM builder constructs from it — share the same effective
+    // `rope_theta` as the `config` stored on `self` below. (The LM builder also
+    // re-applies the override defensively; for this already-normalized clone that
+    // is a no-op.)
     let lm = Lfm2::from_weights_quantized(config.text_config.clone(), lm_weights, quantization)?;
     let language_model = LanguageModel::new(lm);
 
@@ -384,6 +400,86 @@ impl Lfm2Vl {
     )
   }
 
+  /// Build a tiling-enabled [`Lfm2VlProcessorConfig`] from this model's
+  /// [`ModelConfig`] — the SigLIP NaFlex knobs plus the HF
+  /// `Lfm2VlImageProcessor` image-splitting parameters
+  /// (`do_image_splitting`, `min_tiles`, `max_tiles`, `use_thumbnail`,
+  /// `min_image_tokens`, `max_image_tokens`, `encoder_patch_size`, `tile_size`,
+  /// `max_pixels_tolerance`) carried on [`ModelConfig`]. Drives the tiled
+  /// [`split_image`](Self::split_image) path; the SigLIP2 native-resolution
+  /// [`crate::vlm::models::lfm2_vl::preprocess_image`] path ignores the tiling
+  /// knobs.
+  ///
+  /// Also threads the checkpoint's `use_image_special_tokens` (`config.py:87`)
+  /// so [`expand_image_tokens`](super::processor::expand_image_tokens) honors it:
+  /// when `false`, no `image_start` / `image_end` brackets are emitted around the
+  /// `<image>` run (the bracket ids are still left `None` here — supplied by the
+  /// tokenizer-resolving caller — but the flag gates them either way).
+  ///
+  /// # Errors
+  /// Propagates [`Lfm2VlProcessorConfig::new`] / `with_tiling` validation (a
+  /// non-positive dimension, an inverted tile / token band, a non-finite
+  /// tolerance, or a `tile_size` not divisible by `encoder_patch_size`).
+  pub fn processor_config(&self) -> Result<Lfm2VlProcessorConfig> {
+    let c = &self.config;
+    let factor = c.downsample_factor.max(1) as u32;
+    let patch_size = c.vision_config.patch_size.max(1) as u32;
+    let max_num_patches = c.max_num_patches.max(1) as u32;
+    Ok(
+      Lfm2VlProcessorConfig::new(c.image_token_index, factor, patch_size, max_num_patches)?
+        .with_tiling(
+          c.do_image_splitting,
+          c.min_tiles.max(1) as u32,
+          c.max_tiles.max(1) as u32,
+          c.use_thumbnail,
+          c.min_image_tokens.max(1) as u32,
+          c.max_image_tokens.max(1) as u32,
+          c.encoder_patch_size.max(1) as u32,
+          c.tile_size.max(1) as u32,
+          c.max_pixels_tolerance,
+        )?
+        // Honor the checkpoint's `use_image_special_tokens` (`config.py:87`): when
+        // `false`, `expand_image_tokens` emits no image start / end brackets, so
+        // the prompt token layout stays aligned with the reference and the
+        // image-feature / token counts do not desync.
+        .with_use_image_special_tokens(c.use_image_special_tokens),
+    )
+  }
+
+  /// Split ONE decoded interleaved-RGB image into its HF-tiling sub-image
+  /// NaFlex inputs — the
+  /// [`tile_image`](crate::vlm::models::lfm2_vl::tile_image) port, gated on
+  /// [`do_image_splitting`](ModelConfig::do_image_splitting). When splitting is
+  /// enabled and the image is over the size threshold this returns one
+  /// [`Lfm2VlImageInputs`] per tile (+ an optional thumbnail); otherwise a
+  /// single native-resolution sub-image. The returned sub-images flatten
+  /// directly into the `images` slice
+  /// [`get_input_embeddings`](Self::get_input_embeddings) consumes, and their
+  /// per-tile grids ([`Lfm2VlImageInputs::grid`]) drive
+  /// [`expand_image_tokens`](crate::vlm::models::lfm2_vl::expand_image_tokens)
+  /// for the matching `<image>`-token run (each sub-image bracketed +
+  /// concatenated).
+  ///
+  /// This is an **explicit opt-in** tiling API. The default
+  /// [`vlm_generate`](crate::vlm::generate::vlm_generate) inference path uses the
+  /// native-resolution [`Lfm2VlImageProcessor`] (NaFlex, no tiling — faithful to
+  /// mlx-vlm, which forces `do_image_splitting = False`); it does **not** call
+  /// this. Routing tiling through `vlm_generate` is a deferred follow-up that
+  /// needs the [`ImageProcessor`] trait extended to emit multiple sub-images per
+  /// image (see the [`Lfm2VlImageProcessor`] docs).
+  ///
+  /// `rgb` is `width * height * 3` row-major interleaved RGB bytes. The
+  /// processor config is built by [`processor_config`](Self::processor_config).
+  ///
+  /// # Errors
+  /// Propagates [`processor_config`](Self::processor_config) and
+  /// [`tile_image`](crate::vlm::models::lfm2_vl::tile_image) (the grid math,
+  /// resize, patchify, and budget checks).
+  pub fn split_image(&self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<Lfm2VlImageInputs>> {
+    let cfg = self.processor_config()?;
+    crate::vlm::models::lfm2_vl::processor::tile_image(rgb, width, height, &cfg)
+  }
+
   /// `lfm2_vl.py`'s `__call__` (`:188-205`): the full multimodal forward —
   /// [`get_input_embeddings`](Self::get_input_embeddings) then the LFM2 LM over
   /// the merged embeddings → `(B, T, vocab_size)` logits.
@@ -544,6 +640,24 @@ impl VlmModel for Lfm2Vl {
 /// [`ProcessedImage`] carrying that tensor as `pixels`, the `spatial_shape` +
 /// `patch_mask` as the [`NativeResolution`] companions, and the per-image
 /// `ceil(H_p / f) * ceil(W_p / f)` image-token count.
+///
+/// ## Primary path is NaFlex; tiling is opt-in
+///
+/// This primary path is **always** native-resolution NaFlex and **never** tiles,
+/// faithful to mlx-vlm — whose `processing_lfm2_vl.py` defers to the slow
+/// SigLIP2 processor and FORCES `do_image_splitting = False`
+/// (`processing_lfm2_vl.py:196, 270-273`); the HF-transformers image-tiling path
+/// lives only in `Lfm2VlImageProcessorFast`. So [`new`](Self::new) pins
+/// `do_image_splitting = false` on the config here (it is not silently advertised
+/// then ignored), and `process` does not consult the splitting flag.
+///
+/// The HF tiling math is still ported and reachable as an **explicit opt-in** via
+/// [`Lfm2Vl::split_image`](Lfm2Vl::split_image) (which honors the checkpoint's
+/// `do_image_splitting`). Wiring tiling into this primary `vlm_generate` flow
+/// would require extending the [`ImageProcessor`] trait so a single `process`
+/// call can return multiple tile + thumbnail sub-images (today it returns one
+/// [`ProcessedImage`]) and threading their per-tile grids into the prompt
+/// `<image>`-run expansion — a deferred follow-up, intentionally not done here.
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 #[derive(Debug)]
@@ -581,7 +695,15 @@ impl Lfm2VlImageProcessor {
     )
     .unwrap_or_else(|_| {
       Lfm2VlProcessorConfig::new(0, 1, 1, 1).expect("SigLIP default processor config is valid")
-    });
+    })
+    // The primary `ImageProcessor` path is native-resolution NaFlex and never
+    // tiles; pin `do_image_splitting = false` so the config does not advertise a
+    // split this path will not perform. This mirrors mlx-vlm, which FORCES
+    // `do_image_splitting = False` for its slow SigLIP2 NaFlex processor
+    // (`processing_lfm2_vl.py:196, 270-273`); the opt-in
+    // [`Lfm2Vl::split_image`](Lfm2Vl::split_image) tiling path keeps the
+    // checkpoint's flag via [`processor_config`](Lfm2Vl::processor_config).
+    .with_do_image_splitting(false);
     Self {
       cfg,
       downsample_factor: factor,

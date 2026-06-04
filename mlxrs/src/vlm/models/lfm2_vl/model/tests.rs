@@ -242,6 +242,45 @@ fn from_weights_missing_weight_is_typed_error() {
   assert!(matches!(err, Error::MissingKey(_)), "got {err}");
 }
 
+#[test]
+fn from_weights_stores_a_rope_normalized_text_config() {
+  // `__post_init__` (`lfm2.py:40-42`): `text_config.rope_parameters.rope_theta`
+  // wins over the top-level `text_config.rope_theta`. A freshly deserialized
+  // `ModelConfig` is already normalized by `TextConfig`'s `Deserialize`, so this
+  // pins the corrective path for a `ModelConfig` materialized then MUTATED into a
+  // stale `rope_parameters` / `rope_theta` pair (the `text_config` field is
+  // public): `Lfm2Vl::from_weights` must re-apply the override on the STORED
+  // config, so `config().text_config.rope_theta` reflects the override the built
+  // LM actually uses — not the stale top-level value.
+  let mut cfg = tiny_config(false);
+  // Desynchronize the pair: a stale top-level base of 1000, an override of 31337.
+  cfg.text_config.rope_parameters = Some(crate::lm::models::lfm2::RopeParameters {
+    rope_theta: Some(31337.0),
+  });
+  cfg.text_config.rope_theta = 1000.0;
+  let model = Lfm2Vl::from_weights(cfg, dense_weights(), None).unwrap();
+  assert_eq!(
+    model.config().text_config.rope_theta,
+    31337.0,
+    "the stored text_config must carry the rope_parameters override, not the stale top-level rope_theta"
+  );
+}
+
+#[test]
+fn from_weights_rejects_non_finite_rope_theta_via_text_config_validate() {
+  // The effective `rope_theta` finite/positive check in `TextConfig::validate`
+  // runs on the VLM path too (`ModelConfig::validate` validates the nested text
+  // config). A stale-pair mutation that makes the EFFECTIVE base 0.0 must be a
+  // typed config error at build, not a silently-built invalid `Rope`. Here the
+  // override is 0.0 (it wins over a sound top-level base).
+  let mut cfg = tiny_config(false);
+  cfg.text_config.rope_parameters = Some(crate::lm::models::lfm2::RopeParameters {
+    rope_theta: Some(0.0),
+  });
+  let err = Lfm2Vl::from_weights(cfg, dense_weights(), None).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+}
+
 // ───────────────────────── encode_image_inputs ─────────────────────────
 
 #[test]
@@ -521,6 +560,78 @@ fn vlm_trait_image_processor_config_is_siglip() {
   assert_eq!(cfg.mean(), [0.5, 0.5, 0.5]);
   assert_eq!(cfg.std(), [0.5, 0.5, 0.5]);
   assert_eq!(cfg.resample(), crate::vlm::image::ResizeFilter::Bilinear);
+}
+
+#[test]
+fn processor_config_threads_use_image_special_tokens() {
+  // The `ModelConfig::use_image_special_tokens` flag (default true) must reach
+  // the built `Lfm2VlProcessorConfig`, so a `false` checkpoint does not emit
+  // image start/end brackets (`processing_lfm2_vl.py:330-331, 388-400`).
+  let model = dense_model();
+  assert!(
+    model.config().use_image_special_tokens,
+    "tiny config defaults the flag to true (upstream parity)"
+  );
+  assert!(
+    model.processor_config().unwrap().use_image_special_tokens(),
+    "the default-true flag must thread through processor_config()"
+  );
+
+  // A checkpoint with the flag OFF must produce a processor config with
+  // bracketing disabled.
+  let mut cfg = tiny_config(false);
+  cfg.use_image_special_tokens = false;
+  let model_off = Lfm2Vl::from_weights(cfg, dense_weights(), None).unwrap();
+  let cfg_off = model_off.processor_config().unwrap();
+  assert!(
+    !cfg_off.use_image_special_tokens(),
+    "use_image_special_tokens=false must thread through to suppress brackets"
+  );
+
+  // Regression for the natural caller order `processor_config()?.
+  // with_special_tokens(start, end)`: supplying the bracket ids after the `false`
+  // checkpoint threaded its flag must NOT re-enable bracketing — the flag, not
+  // the id presence, governs emission (`processing_lfm2_vl.py:388-400`).
+  let cfg_off_with_ids = cfg_off.with_special_tokens(Some(100), Some(101));
+  assert!(
+    !cfg_off_with_ids.use_image_special_tokens(),
+    "with_special_tokens must not flip a `false` checkpoint's flag back on"
+  );
+  let image_id = cfg_off_with_ids.image_token();
+  let ids = [1, image_id, 2];
+  let grids = [(4, 4)];
+  let out =
+    crate::vlm::models::lfm2_vl::expand_image_tokens(&ids, &grids, &cfg_off_with_ids).unwrap();
+  assert!(
+    !out.contains(&100) && !out.contains(&101),
+    "no image start/end brackets emitted for a `false` checkpoint, even with the ids supplied"
+  );
+}
+
+#[test]
+fn primary_image_processor_pins_no_split() {
+  // The model config defaults `do_image_splitting = true` (HF default), but the
+  // primary native-resolution `ImageProcessor` path never tiles, so its config
+  // must pin `do_image_splitting = false` — faithful to mlx-vlm, which forces it
+  // false for the slow SigLIP2 path. This guarantees the primary path does not
+  // silently advertise a split it will not perform.
+  let model = dense_model();
+  assert!(
+    model.config().do_image_splitting,
+    "tiny config defaults do_image_splitting to true (HF parity)"
+  );
+  let proc = Lfm2VlImageProcessor::new(model.config());
+  assert!(
+    !proc.cfg.do_image_splitting(),
+    "the primary NaFlex processor must pin do_image_splitting=false"
+  );
+
+  // The opt-in tiling config (built via processor_config) STILL reflects the
+  // checkpoint's flag — only the primary processor path pins it false.
+  assert!(
+    model.processor_config().unwrap().do_image_splitting(),
+    "split_image()'s config keeps the checkpoint's do_image_splitting"
+  );
 }
 
 // ───────────────────────── native-resolution processor ─────────────────────────

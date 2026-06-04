@@ -111,33 +111,8 @@ impl Linear {
     quant: Option<(i32, i32, &str)>,
     bias: Option<Array>,
   ) -> Result<Self> {
-    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
-    if weights.contains_key(&scales_key) {
-      let Some((group_size, bits, mode)) = quant else {
-        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-          "lfm2::Linear::from_weights_with_bias: checkpoint carries a `.scales` sibling for this projection but no quantization config resolved scheme parameters",
-          "a quantized Linear requires (group_size, bits, mode) from the config `quantization` block",
-        )));
-      };
-      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
-      let scales = take_required(weights, prefix, SCALES_SUFFIX)?;
-      let quant_biases = weights.remove(&format!("{prefix}{BIASES_SUFFIX}"));
-      let q = crate::nn::QuantizedLinear::from_parts(
-        weight,
-        scales,
-        quant_biases,
-        bias,
-        group_size,
-        bits,
-        mode,
-      )?;
-      Ok(Self {
-        inner: MaybeQuantizedLinear::Quantized(q),
-      })
-    } else {
-      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
-      Ok(Self::new(weight, bias))
-    }
+    let inner = MaybeQuantizedLinear::from_weights_with_bias(weights, prefix, quant, bias)?;
+    Ok(Self { inner })
   }
 
   /// `y = x @ weight.T (+ bias)` (dense) or `quantized_matmul(...) (+ bias)`
@@ -153,6 +128,39 @@ impl Linear {
   #[cfg(test)]
   pub fn is_quantized(&self) -> bool {
     self.inner.is_quantized()
+  }
+
+  /// The dense `(out, in)` weight when this is a dense projection, else `None`
+  /// (a quantized projection holds a packed `uint32` weight + scales/biases, not
+  /// a plain dense matrix).
+  ///
+  /// Used by the attention QKV builder to concatenate three dense `q/k/v`
+  /// projections into one fused matmul (an exact, numerically-identical
+  /// rearrangement); a quantized projection returns `None` and stays a separate
+  /// quantized matmul.
+  pub fn dense_weight(&self) -> Option<&Array> {
+    match &self.inner {
+      MaybeQuantizedLinear::Dense(l) => Some(l.weight_ref()),
+      MaybeQuantizedLinear::Quantized(_) => None,
+    }
+  }
+
+  /// The dense `(out,)` output bias when this is a dense projection that carries
+  /// one, else `None` (a dense projection without a bias, or a quantized one).
+  ///
+  /// Paired with [`Self::dense_weight`] by the attention QKV builder: when the
+  /// three dense `q/k/v` weights are concatenated into one fused matmul, their
+  /// biases (if any) are concatenated into the fused bias the same way, so the
+  /// fused split reproduces each projection's bias add bit-for-bit. LFM2's
+  /// attention projections are bias-free (`bias=False`, `lfm2.py:68-70`), so on
+  /// a faithful checkpoint this is always `None`; the accessor exists so a
+  /// (hypothetical) biased dense projection is fused faithfully rather than
+  /// having its bias silently dropped.
+  pub fn dense_bias(&self) -> Option<&Array> {
+    match &self.inner {
+      MaybeQuantizedLinear::Dense(l) => l.bias(),
+      MaybeQuantizedLinear::Quantized(_) => None,
+    }
   }
 }
 

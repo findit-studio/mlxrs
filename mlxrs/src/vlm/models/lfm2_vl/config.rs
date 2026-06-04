@@ -18,15 +18,87 @@
 //! [`crate::Error`] instead of building the wrong graph. `mlxrs` is a library,
 //! so a merely *large* (but positive, non-overflowing) field is accepted — the
 //! consuming application owns input bounding.
+//!
+//! ## Image-splitting / tiling config (carried, not consumed)
+//!
+//! [`ModelConfig`] mirrors `config.py`'s image-splitting knobs faithfully —
+//! `do_image_splitting`, `encoder_patch_size`, `max_image_tokens`,
+//! `min_image_tokens`, `max_tiles`, `min_tiles`, `max_pixels_tolerance`,
+//! `tile_size`, `use_thumbnail` (`config.py:76-88`). These are **carried for
+//! config parity** but are **not consumed** by the processor / forward pass:
+//! mlx-vlm's own `processing_lfm2_vl.py` is a compatibility shim that defers to
+//! the *slow* SigLIP2 native-resolution image processor and **deliberately
+//! disables splitting** (`do_image_splitting = False` —
+//! `processing_lfm2_vl.py:129-132, 195-196, 270-273`, with "no tiling support,
+//! just add image tokens" at `processing_lfm2_vl.py:372-373`), and mlx-vlm's
+//! `lfm2_vl.py` forward consumes only the SigLIP2 NaFlex triple (`pixel_values`,
+//! `spatial_shapes`, `pixel_attention_mask` — `lfm2_vl.py:115-205`), never any
+//! tile / thumbnail metadata. The actual tile-grid + split implementation lives
+//! in HuggingFace `transformers` (`Lfm2VlImageProcessorFast`), which the mlx-vlm
+//! reference bypasses (and which is outside the mlx reference tree). The mlxrs
+//! [`crate::vlm::models::lfm2_vl::processor`] therefore mirrors the same
+//! native-resolution (no-split) path. Carrying the fields keeps the config a 1:1
+//! mirror of mlx-vlm `ModelConfig` and leaves the tiling path wired for a future
+//! port from the upstream HF fast processor should it become a faithful target.
 
 use crate::{
   error::{Error, OutOfRangePayload, ParsePayload, Result},
-  model_validation::{checked_mul, require_divisible, require_positive},
+  model_validation::{
+    checked_mul, pin_i32, require_cardinality, require_divisible, require_in_range,
+    require_positive,
+  },
 };
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use crate::lm::models::lfm2::TextConfig;
+
+/// Inclusive upper bound on every *width*-like vision / projector config field —
+/// a matmul axis or embedding-table column (`hidden_size`, `intermediate_size`,
+/// `image_size`, `patch_size`, `num_patches`, `projector_hidden_size`). A width
+/// sizes a layer's parameter tensor, so a hostile value drives an oversized
+/// allocation; `1 << 20` (`1048576`) bounds every width — the real SigLIP2 tower
+/// widths are a few thousand and the position grid `256`, all far below — while
+/// keeping a malformed width a recoverable [`Error::OutOfRange`]. Mirrors the
+/// EmbeddingGemma / LFM2-LM config width-cap (`MAX_CONFIG_DIM`) discipline; the
+/// LFM2 text tower carries its own (`2^24`) cap, applied by
+/// [`TextConfig::validate`].
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_CONFIG_DIM: i32 = 1 << 20;
+
+/// Inclusive upper bound on every *cardinality*-like vision config field — a
+/// count that sizes an eager per-unit `Vec` or loop (`num_hidden_layers`,
+/// `num_attention_heads`, `num_channels`). A SigLIP2 tower has 12-27 layers and
+/// 12-16 heads; `4096` is far above any legitimate count while still bounding
+/// the per-layer build loop a hostile `num_hidden_layers` could drive. Matches
+/// the EmbeddingGemma / SigLIP2 / LFM2-LM config `MAX_CARDINALITY` intent.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_CARDINALITY: i32 = 4096;
+
+/// Inclusive upper bound on the per-image patch budget (`max_num_patches`, and
+/// the HF tile-grid token budgets `min_image_tokens` / `max_image_tokens`,
+/// `encoder_patch_size`, `tile_size`, `downsample_factor`). `max_num_patches`
+/// is the **leading dimension of the `pixel_values` allocation**
+/// (`max_num_patches x num_channels * patch_size^2`) the native + tiled
+/// patchify paths zero-fill ([`crate::vlm::models::lfm2_vl::processor`]), so an
+/// unbounded value from a malformed checkpoint would drive an oversized
+/// allocation per image regardless of the [`MAX_TILES`] tile-count cap.
+///
+/// HuggingFace `image_processing_lfm2_vl.py` imposes no hard ceiling on
+/// `max_num_patches` (the SigLIP2 NaFlex default is `256`; the released
+/// `LiquidAI/LFM2.5-VL` MLX checkpoints ship `1024`), so the bound is generous:
+/// `1 << 16` (`65536`) is ~64x the `1024` default — it never rejects a sane
+/// checkpoint — while bounding a single image's `pixel_values` leading dimension
+/// to a sane size (the derived total-element cap
+/// [`crate::vlm::models::lfm2_vl::processor`]'s `MAX_PIXEL_VALUES_ELEMENTS`
+/// bounds the full product `max_num_patches * patch_size^2 * channels`). The
+/// tile-grid token budgets share this cap since they index the same patch-budget
+/// space.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_PATCH_BUDGET: i32 = 1 << 16;
 
 // ═══════════════════════════════ VisionConfig ══════════════════════════════
 
@@ -78,6 +150,19 @@ pub struct VisionConfig {
   /// `eps` shared by every `LayerNorm` (`1e-6`).
   #[serde(default = "default_vision_layer_norm_eps")]
   pub layer_norm_eps: f64,
+  /// The encoder-MLP activation (`config.py:65`, default `"gelu_pytorch_tanh"`).
+  /// `vision.py:67` builds the MLP as `nn.GELU(approx="precise")`, whose
+  /// `__call__` dispatches `precise` (and its PyTorch alias `tanh`) to
+  /// `mlx.nn.gelu_approx` — the **tanh** approximation
+  /// (`mlx/python/mlx/nn/layers/activations.py:584-585`, `gelu_approx` at `:182`).
+  /// The HuggingFace activation id for that tanh GELU is `gelu_pytorch_tanh`, so
+  /// the config value and the impl agree. The MLP forward
+  /// ([`crate::vlm::models::lfm2_vl::vision`]) hard-codes that tanh GELU, so
+  /// [`validate`](Self::validate) pins this field to `"gelu_pytorch_tanh"` — a
+  /// checkpoint declaring any other activation fails loudly rather than silently
+  /// running the tanh GELU under a mismatched declared activation.
+  #[serde(default = "default_vision_hidden_act")]
+  pub hidden_act: String,
 }
 
 #[cfg(feature = "lfm2-vl")]
@@ -120,11 +205,47 @@ fn default_vision_num_patches() -> i32 {
 fn default_vision_layer_norm_eps() -> f64 {
   1e-6
 }
+#[cfg(feature = "lfm2-vl")]
+fn default_vision_hidden_act() -> String {
+  "gelu_pytorch_tanh".to_string()
+}
 
 /// The two architecture ids `vision.py`'s `VisionModel` accepts
 /// (`["lfm2_vl", "siglip2_vision_model"]`).
 #[cfg(feature = "lfm2-vl")]
 const VISION_MODEL_TYPES: &[&str] = &["lfm2_vl", "siglip2_vision_model"];
+
+/// The sole vision-MLP activation the tower implements: the tanh GELU
+/// (`mlx.nn.GELU(approx="precise")` → `gelu_approx`, `vision.py:67`), whose
+/// HuggingFace id is `gelu_pytorch_tanh` (`config.py:65`). The MLP forward
+/// hard-codes this activation, so `validate` pins `hidden_act` to it.
+#[cfg(feature = "lfm2-vl")]
+const VISION_HIDDEN_ACTS: &[&str] = &["gelu_pytorch_tanh"];
+
+/// The top-level architecture ids the LFM2.5-VL [`ModelConfig`] accepts.
+/// `config.py`'s default is `"lfm2-vl"` (hyphen, `config.py:75`), but the
+/// released mlx-community checkpoints (e.g. `mlx-community/LFM2.5-VL-450M-6bit` /
+/// `-8bit`) ship `model_type: "lfm2_vl"` (underscore). Both are accepted so a
+/// checkpoint with either spelling loads (the `VisionConfig` already accepts the
+/// underscore via [`VISION_MODEL_TYPES`]).
+#[cfg(feature = "lfm2-vl")]
+const MODEL_TYPES: &[&str] = &["lfm2-vl", "lfm2_vl"];
+
+/// The sole input channel count the full LFM2.5-VL model + its image processor
+/// support: `3` (RGB). The processor is RGB-hard-wired —
+/// [`Lfm2VlProcessorConfig::new`](crate::vlm::models::lfm2_vl::processor::Lfm2VlProcessorConfig::new)
+/// sets `num_channels = RGB_CHANNELS` (`3`) and
+/// [`preprocess_image`](crate::vlm::models::lfm2_vl::processor::preprocess_image)
+/// rejects any processor config whose `num_channels != 3` (the patchify builds a
+/// 3-channel `RgbImage`, resizes into an always-3-channel buffer, and uses the
+/// channel count as the patchify stride) — and the patch-embed `Linear`'s input
+/// width derives from `num_channels * patch_size^2`. So [`ModelConfig::validate`]
+/// pins `vision_config.num_channels` to `3`: a checkpoint declaring a different
+/// channel count is a malformed / wrong-architecture config that would otherwise
+/// either run a mismatched architecture or fail late at a vision matmul shape
+/// check, and is rejected at load instead.
+#[cfg(feature = "lfm2-vl")]
+const RGB_CHANNELS: i32 = 3;
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
@@ -176,26 +297,59 @@ impl VisionConfig {
   /// tensor is built.
   ///
   /// Pins `model_type` to one of `vision.py`'s accepted ids
-  /// (`"lfm2_vl"` / `"siglip2_vision_model"`); requires every dimension / count
-  /// (`hidden_size`, `intermediate_size`, the layer + head counts,
-  /// `num_channels`, `image_size`, `patch_size`, `num_patches`) strictly
-  /// positive; requires `hidden_size` divisible by `num_attention_heads` (the
-  /// per-head split); requires `num_patches` a perfect square (the trained
-  /// position grid is `sqrt(num_patches) x sqrt(num_patches)`); and validates
-  /// that the derived `patch_feature_dim` (`num_channels * patch_size^2`)
-  /// arithmetic does not overflow (a wrapped width would be UB downstream).
+  /// (`"lfm2_vl"` / `"siglip2_vision_model"`); pins `hidden_act` to the tanh
+  /// GELU the MLP implements (`"gelu_pytorch_tanh"`, `vision.py:67` /
+  /// `config.py:65`); bounds every width-like field (`hidden_size`,
+  /// `intermediate_size`, `image_size`, `patch_size`, `num_patches`) by
+  /// [`MAX_CONFIG_DIM`] and every cardinality-like field (the layer + head
+  /// counts, `num_channels`) by [`MAX_CARDINALITY`] — each rejecting both a
+  /// non-positive and an oversized value, so a hostile dimension cannot drive an
+  /// oversized parameter / position-table / per-layer allocation; requires
+  /// `hidden_size` divisible by `num_attention_heads` (the per-head split);
+  /// requires `num_patches` a perfect square (the trained position grid is
+  /// `sqrt(num_patches) x sqrt(num_patches)`); and validates that the derived
+  /// `patch_feature_dim` (`num_channels * patch_size^2`) arithmetic does not
+  /// overflow (a wrapped width would be UB downstream).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::VisionConfig: model_type",
       self.model_type.as_str(),
       VISION_MODEL_TYPES,
     )?;
+    // The vision MLP forward (`vision.rs`) hard-codes the tanh GELU
+    // (`nn.GELU(approx="precise")` → `gelu_approx`); pin the architecture-defining
+    // activation so a checkpoint declaring a different `hidden_act` fails loudly
+    // rather than silently running the tanh GELU under a mismatched declaration.
+    crate::model_validation::pin_str(
+      "lfm2_vl::VisionConfig: hidden_act",
+      self.hidden_act.as_str(),
+      VISION_HIDDEN_ACTS,
+    )?;
+    // Width-like fields name a matmul axis / embedding-table column (the
+    // patch-embed Linear width derives from `num_channels * patch_size^2`, the
+    // position table has `num_patches` rows). `require_in_range(_, 1,
+    // MAX_CONFIG_DIM)` rejects both a non-positive and an oversized value as one
+    // [`Error::OutOfRange`], so a hostile width cannot drive an oversized
+    // parameter / position-table allocation. Mirrors the EmbeddingGemma width-cap.
     for (name, value) in [
       ("lfm2_vl::VisionConfig: hidden_size", self.hidden_size),
       (
         "lfm2_vl::VisionConfig: intermediate_size",
         self.intermediate_size,
       ),
+      ("lfm2_vl::VisionConfig: image_size", self.image_size),
+      ("lfm2_vl::VisionConfig: patch_size", self.patch_size),
+      ("lfm2_vl::VisionConfig: num_patches", self.num_patches),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
+    // Cardinality-like fields size an eager per-unit `Vec` / loop (the encoder
+    // builds a `Vec` of `num_hidden_layers` layers; the per-head split iterates
+    // `num_attention_heads`; the patchify channel loop runs `num_channels`
+    // times), so each takes the much tighter [`MAX_CARDINALITY`] cap: a
+    // non-positive count is [`Error::OutOfRange`], an over-cap one
+    // [`Error::CapExceeded`].
+    for (name, value) in [
       (
         "lfm2_vl::VisionConfig: num_attention_heads",
         self.num_attention_heads,
@@ -205,11 +359,8 @@ impl VisionConfig {
         self.num_hidden_layers,
       ),
       ("lfm2_vl::VisionConfig: num_channels", self.num_channels),
-      ("lfm2_vl::VisionConfig: image_size", self.image_size),
-      ("lfm2_vl::VisionConfig: patch_size", self.patch_size),
-      ("lfm2_vl::VisionConfig: num_patches", self.num_patches),
     ] {
-      require_positive(name, value)?;
+      require_cardinality(name, i64::from(value), MAX_CARDINALITY as u64)?;
     }
     require_divisible(
       "lfm2_vl::VisionConfig: hidden_size",
@@ -246,7 +397,9 @@ pub struct ModelConfig {
   pub text_config: TextConfig,
   /// Vision-tower config (`vision_config`).
   pub vision_config: VisionConfig,
-  /// Top-level architecture id (`"lfm2-vl"`).
+  /// Top-level architecture id. `config.py`'s default is `"lfm2-vl"`, but the
+  /// released mlx-community checkpoints ship `"lfm2_vl"` (underscore); both are
+  /// accepted by [`validate`](ModelConfig::validate).
   #[serde(default = "default_model_type")]
   model_type: String,
   /// Pixel-unshuffle downsample factor applied to the vision grid before the
@@ -274,9 +427,60 @@ pub struct ModelConfig {
   /// (`1024`).
   #[serde(default = "default_max_num_patches")]
   pub max_num_patches: i32,
-  /// Image-splitting tile size in pixels (`512`).
+  /// Whether the HuggingFace fast image processor splits an over-budget image
+  /// into tiles (`config.py:76`, default `true`). Carried for config parity; the
+  /// mlx-vlm processor path this port mirrors deliberately runs with splitting
+  /// **disabled** (the slow `Siglip2ImageProcessor` native-resolution path —
+  /// `processing_lfm2_vl.py:129-132, 195-196, 270-273, 372-373`), so this flag is
+  /// not consumed by [`crate::vlm::models::lfm2_vl::processor`] today. See the
+  /// module-level note on the tiling deferral.
+  #[serde(default = "default_true")]
+  pub do_image_splitting: bool,
+  /// Encoder patch size in pixels used by the tile-grid math of the HF fast image
+  /// processor (`config.py:78`, default `16`). Carried for config parity (the
+  /// native-resolution patch math uses the vision config's `patch_size`).
+  #[serde(default = "default_encoder_patch_size")]
+  pub encoder_patch_size: i32,
+  /// Upper bound on the per-image `<image>`-token budget the HF fast processor
+  /// targets when choosing a tile grid (`config.py:80`, default `256`).
+  #[serde(default = "default_max_image_tokens")]
+  pub max_image_tokens: i32,
+  /// Lower bound on the per-image `<image>`-token budget the HF fast processor
+  /// targets when choosing a tile grid (`config.py:84`, default `64`).
+  #[serde(default = "default_min_image_tokens")]
+  pub min_image_tokens: i32,
+  /// Maximum number of tiles the HF fast processor may split an image into
+  /// (`config.py:83`, default `10`).
+  #[serde(default = "default_max_tiles")]
+  pub max_tiles: i32,
+  /// Minimum number of tiles the HF fast processor splits an over-budget image
+  /// into (`config.py:85`, default `2`).
+  #[serde(default = "default_min_tiles")]
+  pub min_tiles: i32,
+  /// Tolerance multiplier on the patch budget before the HF fast processor
+  /// triggers a tile split (`config.py:82`, default `2.0`).
+  #[serde(default = "default_max_pixels_tolerance")]
+  pub max_pixels_tolerance: f32,
+  /// Image-splitting tile size in pixels (`config.py:86`, default `512`).
   #[serde(default = "default_tile_size")]
   pub tile_size: i32,
+  /// Whether the HF fast processor appends a downscaled thumbnail tile when
+  /// splitting (`config.py:88`, default `false`). Carried for config parity; not
+  /// consumed by the mlx-vlm native-resolution path this port mirrors.
+  #[serde(default)]
+  pub use_thumbnail: bool,
+  /// Whether the prompt brackets each image with the `image_start` / `image_end`
+  /// special tokens around the expanded `<image>` run (`config.py:87`, default
+  /// `true`). The actual bracketing is driven by the processor's resolved token
+  /// ids (see [`crate::vlm::models::lfm2_vl::processor`]); this carries the config
+  /// flag for parity.
+  #[serde(default = "default_true")]
+  pub use_image_special_tokens: bool,
+  /// The projector activation id (`config.py:91`, default `"gelu"`). Carried for
+  /// config parity; the projector forward hard-codes the GELU the reference uses
+  /// (`lfm2_vl.py:36`).
+  #[serde(default = "default_projector_hidden_act")]
+  pub projector_hidden_act: String,
   /// End-of-sequence token id (`7`).
   #[serde(default = "default_eos_token_id")]
   pub eos_token_id: i32,
@@ -321,6 +525,53 @@ fn default_tile_size() -> i32 {
   512
 }
 #[cfg(feature = "lfm2-vl")]
+fn default_encoder_patch_size() -> i32 {
+  16
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_max_image_tokens() -> i32 {
+  256
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_min_image_tokens() -> i32 {
+  64
+}
+/// Upper bound on `max_tiles` enforced at config load
+/// ([`ModelConfig::validate`] /
+/// [`Lfm2VlProcessorConfig::with_tiling`](crate::vlm::models::lfm2_vl::processor::Lfm2VlProcessorConfig::with_tiling)).
+///
+/// HuggingFace `image_processing_lfm2_vl.py` imposes no hard cap on `max_tiles`
+/// (its default is `10`), but the tile-grid candidate builder
+/// (`_target_ratios`) reserves and iterates a set bounded by `max_tiles^2`. An
+/// unbounded `max_tiles` from a malformed checkpoint would drive a quadratic
+/// reservation / loop before the pixel caps apply, so the cardinality is bound
+/// here — the same load-time discipline the other tile-grid fields follow.
+///
+/// `1024` is ~100x the realistic default of `10`, so it never rejects a sane
+/// checkpoint, while `max_tiles^2 = 2^20` keeps the candidate reservation
+/// (`(u32, u32)` pairs) at ~8 MiB worst case and every downstream
+/// `tile_size * grid` product within `u32` (the grid side is `<= max_tiles`).
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_TILES: i32 = 1024;
+
+#[cfg(feature = "lfm2-vl")]
+fn default_max_tiles() -> i32 {
+  10
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_min_tiles() -> i32 {
+  2
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_max_pixels_tolerance() -> f32 {
+  2.0
+}
+#[cfg(feature = "lfm2-vl")]
+fn default_projector_hidden_act() -> String {
+  "gelu".to_string()
+}
+#[cfg(feature = "lfm2-vl")]
 fn default_eos_token_id() -> i32 {
   7
 }
@@ -331,6 +582,12 @@ impl ModelConfig {
   /// Parse a [`ModelConfig`] from an in-memory `config.json` string. A
   /// malformed-JSON failure maps to [`Error::Parse`]; absent keys take their
   /// checkpoint defaults; unmodeled keys are ignored.
+  ///
+  /// The nested `text_config` is the LFM2 LM [`TextConfig`], whose hand-written
+  /// `Deserialize` applies `__post_init__`'s RoPE-base precedence
+  /// (`lfm2.py:40-42`) intrinsically — so it runs here too, during the
+  /// `ModelConfig` derive's deserialization of `text_config`, and on a direct
+  /// `serde_json::from_str::<ModelConfig>` alike, with no separate step.
   pub fn from_json(json: &str) -> Result<Self> {
     serde_json::from_str(json).map_err(|e| {
       Error::Parse(ParsePayload::new(
@@ -388,18 +645,40 @@ impl ModelConfig {
   /// Reject a structurally invalid model config with a typed error before any
   /// tensor is built.
   ///
-  /// Pins the top-level `model_type` to `"lfm2-vl"`; requires the projector /
-  /// patch-merge dimensions (`downsample_factor`, `projector_hidden_size`,
-  /// `max_num_patches`, `tile_size`) strictly positive and `image_token_index`
-  /// / `eos_token_id` non-negative; validates that `vision_feature_layer`
-  /// resolves to an in-range kept-layer count; and validates both tower configs
-  /// (see [`TextConfig::validate`] / [`VisionConfig::validate`]).
+  /// Pins the top-level `model_type` to `"lfm2-vl"` / `"lfm2_vl"`
+  /// (mlx-community checkpoints ship the underscore form); bounds the projector
+  /// width fields (`downsample_factor`, `projector_hidden_size`) by
+  /// [`MAX_CONFIG_DIM`]; bounds the patch-budget fields (`max_num_patches` — the
+  /// leading dimension of the `pixel_values` allocation — `tile_size`,
+  /// `encoder_patch_size`, `max_image_tokens`, `min_image_tokens`) by
+  /// [`MAX_PATCH_BUDGET`] so a hostile budget cannot drive an oversized per-image
+  /// allocation; requires `max_tiles` / `min_tiles` positive and `max_tiles`
+  /// within the [`MAX_TILES`] cardinality cap (its `max_tiles^2` candidate
+  /// reservation); requires `max_pixels_tolerance` positive-and-finite, the
+  /// `min_* <= max_*` orderings, and `image_token_index` / `eos_token_id`
+  /// non-negative; validates that `vision_feature_layer` resolves to an in-range
+  /// kept-layer count; validates both tower configs (see
+  /// [`TextConfig::validate`] / [`VisionConfig::validate`]); and pins
+  /// `vision_config.num_channels` to `3` (the full model + processor are
+  /// RGB-only).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::ModelConfig: model_type",
       self.model_type.as_str(),
-      &["lfm2-vl"],
+      MODEL_TYPES,
     )?;
+    // The projector forward hard-codes erf GELU (`projector.rs`); pin the
+    // architecture-defining activation so a checkpoint declaring a different
+    // value fails loudly rather than silently running GELU.
+    crate::model_validation::pin_str(
+      "lfm2_vl::ModelConfig: projector_hidden_act",
+      self.projector_hidden_act.as_str(),
+      &["gelu"],
+    )?;
+    // Width-like fields name a matmul axis (the projector `Linear`s) / a fold
+    // factor (`downsample_factor` squares into the projector input width). Bound
+    // each by [`MAX_CONFIG_DIM`] — a non-positive or oversized value is one
+    // [`Error::OutOfRange`].
     for (name, value) in [
       (
         "lfm2_vl::ModelConfig: downsample_factor",
@@ -409,14 +688,83 @@ impl ModelConfig {
         "lfm2_vl::ModelConfig: projector_hidden_size",
         self.projector_hidden_size,
       ),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
+    // Patch-budget fields index the per-image patch space. `max_num_patches` is
+    // the **leading dimension of the `pixel_values` allocation** the patchify
+    // paths zero-fill, so an unbounded value drives an oversized per-image
+    // allocation regardless of the [`MAX_TILES`] tile-count cap; the HF tile-grid
+    // token budgets (`tile_size`, `encoder_patch_size`, `min`/`max_image_tokens`)
+    // index the same space. Bound each by [`MAX_PATCH_BUDGET`] (the derived
+    // total-element cap in `processor` bounds the full `pixel_values` product).
+    for (name, value) in [
       (
         "lfm2_vl::ModelConfig: max_num_patches",
         self.max_num_patches,
       ),
       ("lfm2_vl::ModelConfig: tile_size", self.tile_size),
+      (
+        "lfm2_vl::ModelConfig: encoder_patch_size",
+        self.encoder_patch_size,
+      ),
+      (
+        "lfm2_vl::ModelConfig: max_image_tokens",
+        self.max_image_tokens,
+      ),
+      (
+        "lfm2_vl::ModelConfig: min_image_tokens",
+        self.min_image_tokens,
+      ),
+    ] {
+      require_in_range(name, value, 1, MAX_PATCH_BUDGET)?;
+    }
+    // The tile counts are bounded just below: `max_tiles` by the [`MAX_TILES`]
+    // cardinality cap (its `max_tiles^2` candidate reservation) and `min_tiles`
+    // by the `min_tiles <= max_tiles` ordering. Require both positive here first.
+    for (name, value) in [
+      ("lfm2_vl::ModelConfig: max_tiles", self.max_tiles),
+      ("lfm2_vl::ModelConfig: min_tiles", self.min_tiles),
     ] {
       require_positive(name, value)?;
     }
+    // `max_tiles` is the cardinality of the tile-grid candidate set, whose
+    // builder (`processor::target_ratios`) reserves and iterates `max_tiles^2`
+    // pairs; bound it so a malformed checkpoint cannot drive a quadratic
+    // reservation / loop. HF imposes no hard cap, so the bound is generous.
+    if self.max_tiles > MAX_TILES {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "lfm2_vl::ModelConfig: max_tiles",
+        "must not exceed the tile-grid cardinality cap (1024)",
+        smol_str::format_smolstr!("{}", self.max_tiles),
+      )));
+    }
+    // The tile / token budgets are inclusive `[min, max]` bands; a `min` above
+    // its `max` is structurally invalid (an empty band).
+    for (name, min, max) in [
+      (
+        "lfm2_vl::ModelConfig: min_tiles <= max_tiles",
+        self.min_tiles,
+        self.max_tiles,
+      ),
+      (
+        "lfm2_vl::ModelConfig: min_image_tokens <= max_image_tokens",
+        self.min_image_tokens,
+        self.max_image_tokens,
+      ),
+    ] {
+      if min > max {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          name,
+          "the minimum must not exceed the maximum",
+          smol_str::format_smolstr!("min={min}, max={max}"),
+        )));
+      }
+    }
+    crate::model_validation::require_positive_finite_f32(
+      "lfm2_vl::ModelConfig: max_pixels_tolerance",
+      self.max_pixels_tolerance as f64,
+    )?;
     // Token ids index a vocabulary / placeholder set; a negative id is
     // structurally invalid (it would never match a real token).
     for (name, value) in [
@@ -436,6 +784,21 @@ impl ModelConfig {
     }
     self.text_config.validate()?;
     self.vision_config.validate()?;
+    // The full LFM2.5-VL model + its image processor are RGB-only: the processor
+    // hard-wires `num_channels = RGB_CHANNELS` (`processor::Lfm2VlProcessorConfig::new`)
+    // and `preprocess_image` rejects any config whose `num_channels != 3` (it
+    // builds a 3-channel `RgbImage` and uses the channel count as the patchify
+    // stride), while the patch-embed `Linear`'s input width derives from
+    // `num_channels * patch_size^2`. `VisionConfig::validate` only bounds
+    // `num_channels` as a cardinality, so pin it to `3` here, in the full-model
+    // path, so a non-3 (wrong-architecture / malformed) checkpoint is a typed
+    // [`Error::OutOfRange`] at load rather than a mismatched architecture or a
+    // late vision-matmul shape failure.
+    pin_i32(
+      "lfm2_vl::ModelConfig: vision_config.num_channels",
+      self.vision_config.num_channels,
+      RGB_CHANNELS,
+    )?;
     // Resolve + range-check the feature-layer selection against the validated
     // vision config (its `num_hidden_layers` is now known positive).
     self.vision_feature_layers_kept()?;

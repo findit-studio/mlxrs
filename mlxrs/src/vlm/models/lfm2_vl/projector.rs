@@ -20,8 +20,13 @@
 //! `lfm2_vl.py`'s `Lfm2VlMultiModalProjector` maps the unshuffled vision width
 //! into the LM's token space: an optional `LayerNorm(in)` (when
 //! `projector_use_layernorm`), then `Linear(in, projector_hidden) → gelu →
-//! Linear(projector_hidden, text_hidden)`. Both `Linear`s are routed through the
-//! shared quantize-aware
+//! Linear(projector_hidden, text_hidden)`. Both `Linear`s are built with
+//! `bias=config.projector_bias` (`lfm2_vl.py:20-30`), so `projector_bias` is the
+//! authoritative gate on the two `linear_*.bias` tensors — modeled here through
+//! the [`take_if`] +
+//! [`MaybeQuantizedLinear::from_weights_with_bias`](crate::nn::MaybeQuantizedLinear::from_weights_with_bias)
+//! seam (required when `true`, forbidden when `false`) rather than an opportunistic
+//! auto-consume. Both `Linear`s are routed through the shared quantize-aware
 //! [`crate::nn::MaybeQuantizedLinear`], so the 8-bit
 //! `LiquidAI/LFM2.5-VL-450M-MLX-8bit` checkpoint loads through the same code
 //! path as a dense one (each layer's `.scales` sibling is the load-bearing
@@ -64,7 +69,7 @@ use crate::{
   dtype::Dtype,
   error::{Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload, Result},
   lm::nn::{activations::gelu, norm::LayerNorm},
-  model_validation::{checked_mul, require_positive, reserve_or_error},
+  model_validation::{checked_mul, require_positive, reserve_or_error, take_if},
   nn::MaybeQuantizedLinear,
   ops::{
     self,
@@ -231,10 +236,15 @@ impl Lfm2VlMultiModalProjector {
   /// (the VL-level `multi_modal_projector` prefix already stripped):
   /// `layer_norm.{weight,bias}` (present iff `projector_use_layernorm`),
   /// `linear_1.{weight,bias,scales,biases}`,
-  /// `linear_2.{weight,bias,scales,biases}`. The optional `linear_*.bias` is
-  /// auto-consumed by [`MaybeQuantizedLinear::from_weights`] when present
-  /// (`projector_bias` controls whether the checkpoint carries one); both the
-  /// dense and quantized paths apply it.
+  /// `linear_2.{weight,bias,scales,biases}`. The `linear_*.bias` presence is
+  /// gated by the authoritative `projector_bias` config flag
+  /// (`lfm2_vl.py:20-30` builds both `Linear`s with `bias=config.projector_bias`):
+  /// when `projector_bias`, each `.bias` is REQUIRED; when not, a stray `.bias`
+  /// is rejected. The bias is taken through the
+  /// [`take_if`] gate and applied on both the
+  /// dense and quantized paths via
+  /// [`MaybeQuantizedLinear::from_weights_with_bias`] (NOT the auto-consuming
+  /// `from_weights`).
   ///
   /// `quant` resolves a layer path's `(group_size, bits, mode)` from the parsed
   /// quantization config (`None` for a dense layer); a quantized layer is
@@ -244,8 +254,10 @@ impl Lfm2VlMultiModalProjector {
   ///
   /// # Errors
   /// - [`Error::MissingKey`] for an absent required weight (the `linear_*`
-  ///   weights, or the `layer_norm` affine params when
-  ///   `projector_use_layernorm`);
+  ///   weights, the `layer_norm` affine params when `projector_use_layernorm`,
+  ///   or a `linear_*.bias` required by `projector_bias`);
+  /// - [`Error::KeyCollision`] for a stray `linear_*.bias` present when
+  ///   `projector_bias` is `false`;
   /// - propagates the [`MaybeQuantizedLinear`] quantized-triple validation.
   pub fn from_weights(
     config: &ModelConfig,
@@ -268,12 +280,44 @@ impl Lfm2VlMultiModalProjector {
       None
     };
 
-    // The two projection widths are read from the checkpoint shapes by
-    // `MaybeQuantizedLinear::from_weights` (the quantize-aware builder needs no
-    // per-axis width); the config dims are validated above and pinned again by
-    // the loaded weight shapes.
-    let linear_1 = MaybeQuantizedLinear::from_weights(weights, "linear_1", quant("linear_1"))?;
-    let linear_2 = MaybeQuantizedLinear::from_weights(weights, "linear_2", quant("linear_2"))?;
+    // The two projection widths are read from the checkpoint shapes by the
+    // quantize-aware builder (it needs no per-axis width); the config dims are
+    // validated above and pinned again by the loaded weight shapes.
+    //
+    // `projector_bias` is authoritative (`lfm2_vl.py:20-30` builds both
+    // projector `Linear`s with `bias=config.projector_bias`): when set, each
+    // REQUIRES its dense `.bias`; when unset, a stray projection bias is a
+    // collision. `take_if` enforces that gate and TAKES the bias, which is then
+    // passed explicitly to `from_weights_with_bias` (which does NOT auto-consume
+    // an optional `.bias`), applied on both the dense and quantized paths — so
+    // the dense-bias arity matches the reference whether the projection is dense
+    // or quantized, mirroring the LFM2 LM's `conv_bias` gating. The plain
+    // `from_weights` would instead silently apply a stray bias (or silently omit
+    // a required one), ignoring `projector_bias`.
+    let linear_1_bias = take_if(
+      weights,
+      "projector_bias",
+      config.projector_bias,
+      "linear_1.bias",
+    )?;
+    let linear_1 = MaybeQuantizedLinear::from_weights_with_bias(
+      weights,
+      "linear_1",
+      quant("linear_1"),
+      linear_1_bias,
+    )?;
+    let linear_2_bias = take_if(
+      weights,
+      "projector_bias",
+      config.projector_bias,
+      "linear_2.bias",
+    )?;
+    let linear_2 = MaybeQuantizedLinear::from_weights_with_bias(
+      weights,
+      "linear_2",
+      quant("linear_2"),
+      linear_2_bias,
+    )?;
 
     Ok(Self {
       layer_norm,
