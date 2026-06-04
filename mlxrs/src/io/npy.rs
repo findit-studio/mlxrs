@@ -1071,7 +1071,9 @@ pub fn load_npz(path: &Path) -> Result<HashMap<String, Array>> {
     let name = member.name().to_string();
     let is_stored = member.compression() == zip::CompressionMethod::Stored;
     // `data_start()` is populated by `by_index` above (it sets up the member
-    // reader, which records the data offset), so reading it here does not panic.
+    // reader, which records the data offset). The zip crate returns it as an
+    // `Option<u64>` (`None` only if the offset was never resolved); a `None`
+    // here is a malformed/unsupported member, surfaced as a typed parse error.
     let data_start = member.data_start();
     let uncompressed = member.size();
     drop(member);
@@ -1082,6 +1084,8 @@ pub fn load_npz(path: &Path) -> Result<HashMap<String, Array>> {
       // out-of-range offset/length): `start + len` must not overflow and must lie
       // within `mapped`. The resulting slice is parsed exactly like a standalone
       // `.npy` file — same header validation, same exact payload-length check.
+      let data_start =
+        data_start.ok_or_else(|| npy_err("npz member has no resolved data offset"))?;
       let start =
         usize::try_from(data_start).map_err(|_| npy_err("npz member data offset exceeds usize"))?;
       let len =
