@@ -1022,20 +1022,22 @@ impl<'a> DecodingTask<'a> {
   ///    most_attened_frame <= frame_threshold: current_tokens =
   ///    current_tokens[:, :-1]; break`).
   ///
-  /// On the final chunk (`is_last`) the reference relaxes the threshold to a
-  /// fixed value (`4` frames upstream) and runs the decode to eot; the caller
-  /// passes the effective `frame_threshold` (the streaming layer substitutes the
-  /// last-chunk value), and `is_last` lets an eot-completed decode finish the
-  /// utterance (there is no more audio, so a token at the boundary is still
-  /// committed rather than waited on).
+  /// The AlignAtt inequality is applied on EVERY chunk, including the final one.
+  /// The reference does not commit every last-chunk token unconditionally; it
+  /// applies the same inequality with a *looser* threshold on the final segment
+  /// (`4 if is_last else frame_threshold` upstream) so a boundary-attending tail
+  /// token is still held back. The streaming layer resolves that here by passing
+  /// the EFFECTIVE `frame_threshold` for the chunk (the last-chunk value on the
+  /// final chunk); an eot-completed decode finishes the utterance via the loop's
+  /// normal eot stop, independent of any final-chunk flag.
   ///
   /// Returns the [`AlignedDecode`]: the committed sampled tokens (between the sot
   /// sequence and the AlignAtt stop / eot), the per-committed-token argmax
   /// frames, the no-speech probability, and whether the decode hit eot.
   ///
   /// `frame_threshold` is the AlignAtt `f` (in encoder frames; one frame ≈ 0.02
-  /// s) ALREADY resolved for this chunk (the caller passes the last-chunk value
-  /// when `is_last`). `content_frames` is the real encoder-frame count
+  /// s) ALREADY resolved for this chunk (the caller passes the looser last-chunk
+  /// value on the final chunk). `content_frames` is the real encoder-frame count
   /// (`available_mel_frames / 2`).
   ///
   /// # Errors
@@ -1048,7 +1050,6 @@ impl<'a> DecodingTask<'a> {
     enc: &Array,
     content_frames: usize,
     frame_threshold: usize,
-    is_last: bool,
   ) -> Result<AlignedDecode> {
     use crate::audio::stt::models::whisper::model::WhisperDecodeCache;
 
@@ -1106,12 +1107,14 @@ impl<'a> DecodingTask<'a> {
       // the last entry of the per-token frame vector.
       let most_attended = frames.last().copied().unwrap_or(0);
 
-      // AlignAtt commit/wait: if the token's evidence is within `frame_threshold`
-      // frames of the audio end, it may change with more audio → drop it and
-      // wait. On the final chunk there is no more audio, so the token commits
-      // regardless (the reference still emits every decoded token on the last
-      // chunk).
-      if !alignatt_should_commit(content_frames, most_attended, frame_threshold, is_last) {
+      // AlignAtt commit/wait: if the token's evidence is within the effective
+      // `frame_threshold` frames of the audio end, it may change with more audio
+      // → drop it and wait. The caller passes the already-resolved threshold for
+      // this chunk (the looser `last_chunk_frame_threshold` on the final chunk),
+      // so a boundary-attending tail token is still held back on the last chunk —
+      // the reference's `content_mel_len - most_attened_frame <= (4 if is_last
+      // else frame_threshold)` applies the inequality on every chunk.
+      if !alignatt_should_commit(content_frames, most_attended, frame_threshold) {
         // Wait: revert the provisional token and stop committing for this chunk
         // (the reference's `current_tokens = current_tokens[:, :-1]; break`).
         tokens.pop();
@@ -1155,25 +1158,29 @@ impl<'a> DecodingTask<'a> {
 /// behind the live audio edge — `content_frames - most_attended_frame >
 /// frame_threshold`. Returns `false` (WAIT) when the frame is within
 /// `frame_threshold` of the end, mirroring the Simul-Whisper reference's `if
-/// content_mel_len - most_attened_frame <= frame_threshold: ... break`
+/// content_mel_len - most_attened_frame <= (4 if is_last else frame_threshold):
+/// current_tokens = current_tokens[:, :-1]; break`
 /// (`backspacetg/simul_whisper`, `transcriber/simul_whisper.py`).
 ///
-/// On the FINAL chunk (`is_last`) there is no more audio to wait for, so the
-/// token always commits regardless of the threshold (the reference still emits
-/// every decoded token on the last chunk). `content_frames.saturating_sub` keeps
-/// the subtraction non-negative if a frame somehow exceeds `content_frames` (a
-/// degenerate-attention argmax past the content slice); such a frame is at/over
-/// the edge, so it correctly resolves to WAIT on a non-final chunk.
+/// The inequality is applied UNCONDITIONALLY — there is no final-chunk
+/// short-circuit. The reference does not commit every last-chunk token; it
+/// applies the same inequality with a *looser* threshold on the final segment
+/// (`4` frames upstream) so a boundary-attending tail token is still held back.
+/// The streaming layer encodes that by passing the EFFECTIVE threshold for the
+/// chunk (`last_chunk_frame_threshold` for the final chunk,
+/// [`super::streaming::StreamingOptions::frame_threshold`] otherwise), so this
+/// function sees the already-resolved `f` and just evaluates the inequality.
+///
+/// `content_frames.saturating_sub` keeps the subtraction non-negative if a frame
+/// somehow exceeds `content_frames` (a degenerate-attention argmax past the
+/// content slice); such a frame is at/over the edge, so it correctly resolves to
+/// WAIT.
 #[inline]
 pub(crate) fn alignatt_should_commit(
   content_frames: usize,
   most_attended_frame: usize,
   frame_threshold: usize,
-  is_last: bool,
 ) -> bool {
-  if is_last {
-    return true;
-  }
   content_frames.saturating_sub(most_attended_frame) > frame_threshold
 }
 

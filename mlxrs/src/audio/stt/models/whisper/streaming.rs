@@ -58,7 +58,10 @@ use crate::{
 };
 
 use super::{
-  audio::{N_FRAMES, N_SAMPLES, SAMPLE_RATE, TOKENS_PER_SECOND, log_mel_spectrogram_whisper},
+  audio::{
+    N_FRAMES, N_SAMPLES, N_SAMPLES_PER_TOKEN, SAMPLE_RATE, TOKENS_PER_SECOND,
+    log_mel_spectrogram_whisper,
+  },
   decoding::{DecodingOptions, DecodingTask, SuppressSpec},
   model::WhisperModel,
   tokenizer::{HFTokenizerWrapper, Task as WhisperTask},
@@ -362,27 +365,36 @@ impl StreamingStep {
 /// no decode state; this session owns the audio buffer and the committed token
 /// history.
 ///
-/// The buffer is bounded by Whisper's 30-second window: a stream longer than
-/// `N_SAMPLES` keeps only the most recent 30 seconds for encoding (the
-/// committed text continues to accumulate). A real long-form streaming
-/// application would slide a 30-second window with a re-anchored timestamp
-/// origin; this session targets the per-window incremental-emission case the
-/// AlignAtt policy governs.
+/// The buffer is bounded by Whisper's 30-second window. When a stream grows past
+/// `N_SAMPLES` the window slides forward: the already-committed audio is dropped
+/// (the seek advances PAST the committed-audio watermark, so the overlap is
+/// never re-decoded) and the uncommitted tail is retained. The already-committed
+/// tokens are carried as the next decode's conditioning prefix (the Simul-Whisper
+/// `current_tokens` continuation), so the committed transcript and its absolute
+/// timings stay strictly monotonic across slides — no token or timing is
+/// re-emitted from the retained overlap. The per-token timings live in the
+/// absolute stream timeline (anchored by the window origin), not reset per
+/// window.
 pub struct WhisperStreaming<'a> {
   model: &'a WhisperModel,
   tokenizer: HFTokenizerWrapper<'a>,
   options: StreamingOptions,
-  /// The growing audio buffer (mono `f32`, `SAMPLE_RATE` Hz). Capped to the
-  /// most recent [`N_SAMPLES`] for encoding.
+  /// The growing audio buffer (mono `f32`, `SAMPLE_RATE` Hz). On a window slide
+  /// the leading committed samples are drained (up to the `committed_samples`
+  /// watermark); the buffer holds the still-uncommitted tail (capped to the most
+  /// recent [`N_SAMPLES`] for encoding).
   audio: Vec<f32>,
   /// Every token committed so far (sampled ids only, no sot/eot), in order —
-  /// the running transcript across every window.
+  /// the running transcript across every window. Append-only: the prefix
+  /// continuation means each decode appends ONLY the new tokens past the carried
+  /// committed prefix, so already-emitted tokens are never re-appended.
   committed: Vec<u32>,
-  /// The tokens committed for the CURRENT 30-second window, forced as the decode
-  /// prefix so each step CONTINUES the decode past them (the Simul-Whisper
-  /// `current_tokens` continuation) rather than re-decoding and re-emitting the
-  /// committed text. Reset when the window slides ([`Self::push_audio`]).
-  committed_in_window: Vec<u32>,
+  /// The committed-audio watermark: the number of leading stream samples
+  /// (absolute, across every window) whose audio has already been transcribed —
+  /// the furthest-attended committed encoder frame mapped to samples. Monotonic
+  /// non-decreasing. On a window slide the origin is advanced to at least this
+  /// watermark so committed audio is dropped rather than re-decoded.
+  committed_samples: usize,
   /// The number of samples consumed at the start of the current 30-second
   /// window (the window origin), so absolute token times account for windows
   /// already slid past. `0` until the buffer first exceeds [`N_SAMPLES`].
@@ -413,7 +425,7 @@ impl<'a> WhisperStreaming<'a> {
       options,
       audio: Vec::new(),
       committed: Vec::new(),
-      committed_in_window: Vec::new(),
+      committed_samples: 0,
       window_origin_samples: 0,
     }
   }
@@ -439,11 +451,19 @@ impl<'a> WhisperStreaming<'a> {
 
   /// Append `samples` (mono `f32` at [`SAMPLE_RATE`] Hz) to the audio buffer.
   ///
-  /// The buffer is capped to the most recent [`N_SAMPLES`] (30 s): once it
-  /// exceeds the window the oldest samples are dropped, the window origin
-  /// advances (so absolute token times stay anchored), and the in-window decode
-  /// prefix resets — the next step re-decodes the new 30-second window from
-  /// scratch while the global committed transcript keeps accumulating.
+  /// When the buffer grows past [`N_SAMPLES`] (30 s) the window slides forward.
+  /// The slide advances the window origin to at least the committed-audio
+  /// watermark (`committed_samples`), so the already-transcribed leading audio is
+  /// DROPPED rather than retained-and-re-decoded — the standard Whisper seek
+  /// advance. The committed tokens are carried as the next decode's prefix
+  /// (the Simul-Whisper continuation), so the retained-overlap text is never
+  /// re-emitted and the committed transcript stays strictly monotonic. The
+  /// window origin only grows, anchoring absolute token times.
+  ///
+  /// If the still-uncommitted tail alone exceeds the window (only when a single
+  /// push adds far more than 30 s of un-committable audio at once), the slide
+  /// falls back to the most-recent [`N_SAMPLES`] live edge; even then no
+  /// committed token is re-emitted (the committed audio is always dropped first).
   ///
   /// # Errors
   /// [`Error::AllocFailure`](crate::Error::AllocFailure) if the buffer cannot be
@@ -455,14 +475,21 @@ impl<'a> WhisperStreaming<'a> {
       samples.len(),
     )?;
     self.audio.extend_from_slice(samples);
-    // Keep only the most recent N_SAMPLES; advance the window origin by the
-    // dropped count so absolute token times stay anchored, and reset the
-    // in-window decode prefix (the new window is decoded fresh).
+    // Slide the window once the buffer exceeds N_SAMPLES. Advance the origin
+    // (absolute) to drop the committed audio (`committed_samples`) so the overlap
+    // is not re-decoded, and at least far enough to keep the window within
+    // N_SAMPLES. Clamp to the samples actually buffered so the drain stays in
+    // bounds. The committed tokens are carried as the next decode's prefix
+    // (`window_prefix`), so dropping their audio does not lose the continuation.
     if self.audio.len() > N_SAMPLES {
-      let drop = self.audio.len() - N_SAMPLES;
-      self.audio.drain(..drop);
-      self.window_origin_samples += drop;
-      self.committed_in_window.clear();
+      let fit_origin = self.window_origin_samples + (self.audio.len() - N_SAMPLES);
+      let max_origin = self.window_origin_samples + self.audio.len();
+      let new_origin = fit_origin.max(self.committed_samples).min(max_origin);
+      let drop = new_origin - self.window_origin_samples;
+      if drop > 0 {
+        self.audio.drain(..drop);
+        self.window_origin_samples = new_origin;
+      }
     }
     Ok(())
   }
@@ -548,12 +575,17 @@ impl<'a> WhisperStreaming<'a> {
     };
     let task = DecodingTask::new(self.model, &self.tokenizer, decode)?;
 
+    // The EFFECTIVE AlignAtt threshold for this chunk: the looser
+    // `last_chunk_frame_threshold` on the final chunk (so the tail is not held
+    // back when no more audio will arrive), else `frame_threshold`. The decode
+    // applies the SAME inequality with whichever threshold this resolves to —
+    // mirroring the reference's `(4 if is_last else frame_threshold)`.
     let frame_threshold = if is_last {
       self.options.last_chunk_frame_threshold
     } else {
       self.options.frame_threshold
     };
-    let aligned = task.decode_aligned(&enc, content_frames, frame_threshold, is_last)?;
+    let aligned = task.decode_aligned(&enc, content_frames, frame_threshold)?;
 
     // The encoder frame origin (in seconds) of the current window. Tokens are
     // timed by their argmax encoder frame within the window plus this offset.
@@ -572,9 +604,10 @@ impl<'a> WhisperStreaming<'a> {
       tokens.push(CommittedToken::new(id, start, end));
     }
 
-    // Decode the committed text and append the new ids to BOTH the running
-    // transcript and the in-window prefix (so the next step continues past
-    // them). The two extends are bounded by the same fallible reservation.
+    // Decode the committed text and append the new ids to the running
+    // transcript. This is append-only: the carried committed prefix means
+    // `decode_aligned` already stripped it from `aligned.tokens`, so only the
+    // NEW tokens past the prefix are appended (no re-emission of the overlap).
     let text = self.tokenizer.decode(&aligned.tokens, false)?;
     crate::model_validation::reserve_or_error(
       &mut self.committed,
@@ -582,12 +615,18 @@ impl<'a> WhisperStreaming<'a> {
       aligned.tokens.len(),
     )?;
     self.committed.extend_from_slice(&aligned.tokens);
-    crate::model_validation::reserve_or_error(
-      &mut self.committed_in_window,
-      "WhisperStreaming: in-window prefix",
-      aligned.tokens.len(),
-    )?;
-    self.committed_in_window.extend_from_slice(&aligned.tokens);
+
+    // Advance the committed-audio watermark to the furthest-attended committed
+    // encoder frame (mapped to absolute samples), so the next window slide drops
+    // this audio rather than re-decoding it. Monotonic (`max`) and clamped to the
+    // samples buffered in this window, so the watermark never runs past the
+    // audio actually seen.
+    if let Some(&max_frame) = aligned.frames.iter().max() {
+      let committed_end =
+        self.window_origin_samples + (max_frame + 1).saturating_mul(N_SAMPLES_PER_TOKEN);
+      let buffered_end = self.window_origin_samples + self.audio.len();
+      self.committed_samples = self.committed_samples.max(committed_end).min(buffered_end);
+    }
 
     Ok(StreamingStep::new(
       tokens,
@@ -638,20 +677,23 @@ impl<'a> WhisperStreaming<'a> {
     Ok(steps)
   }
 
-  /// The in-window committed-token prefix forced at the start of the next
-  /// chunk's decode (so the decode continues past it) — the current window's
-  /// committed ids, capped to the smaller of
-  /// [`StreamingOptions::max_prompt_tokens`] and `cap` (the context-derived
-  /// ceiling the caller computes to leave room for new tokens). Empty when
-  /// previous-text conditioning is off or nothing is committed in this window
-  /// yet (the decode then starts fresh from the sot sequence).
+  /// The committed-token prefix forced at the start of the next chunk's decode
+  /// (so the decode CONTINUES past it — the Simul-Whisper `current_tokens`
+  /// continuation) — the recent tail of the running committed transcript, capped
+  /// to the smaller of [`StreamingOptions::max_prompt_tokens`] and `cap` (the
+  /// context-derived ceiling the caller computes to leave room for new tokens).
+  /// Drawing from the running transcript (not a per-window buffer) carries the
+  /// continuation across window slides, so a slid window re-decodes only the
+  /// uncommitted tail behind this prefix. Empty when previous-text conditioning
+  /// is off or nothing is committed yet (the decode then starts fresh from the
+  /// sot sequence).
   fn window_prefix(&self, cap: usize) -> Vec<u32> {
     if !self.options.condition_on_previous_text || self.options.max_prompt_tokens == 0 {
       return Vec::new();
     }
     let keep = self.options.max_prompt_tokens.min(cap);
-    let start = self.committed_in_window.len().saturating_sub(keep);
-    self.committed_in_window[start..].to_vec()
+    let start = self.committed.len().saturating_sub(keep);
+    self.committed[start..].to_vec()
   }
 
   /// Build a streaming session using the tokenizer ATTACHED to `model`

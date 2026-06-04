@@ -36,16 +36,10 @@ use crate::{
 
 /// The AlignAtt commit/wait inequality, computed independently of the code
 /// under test: COMMIT iff the most-attended frame is strictly more than `f`
-/// frames before the content end. On the final chunk every token commits.
-fn oracle_should_commit(
-  content_frames: usize,
-  most_attended: usize,
-  f: usize,
-  is_last: bool,
-) -> bool {
-  if is_last {
-    return true;
-  }
+/// frames before the content end. The inequality applies on every chunk; the
+/// final chunk differs only in the (looser) effective `f` the caller passes, not
+/// in whether the inequality runs.
+fn oracle_should_commit(content_frames: usize, most_attended: usize, f: usize) -> bool {
   // `content - frame > f` ⇔ the frame is safely behind the live edge.
   (content_frames as i64 - most_attended as i64) > f as i64
 }
@@ -57,13 +51,13 @@ fn alignatt_policy_waits_at_audio_boundary() {
   let f = 10usize;
   // frame 95: content - 95 = 5 <= 10 → within threshold → WAIT.
   assert!(
-    !alignatt_should_commit(content, 95, f, false),
+    !alignatt_should_commit(content, 95, f),
     "frame at the boundary must NOT commit (wait for more audio)"
   );
   // frame 90: content - 90 = 10 <= 10 → exactly at threshold → WAIT (the
   // reference's `<=`).
   assert!(
-    !alignatt_should_commit(content, 90, f, false),
+    !alignatt_should_commit(content, 90, f),
     "frame exactly f from the end must wait (reference uses <=)"
   );
 }
@@ -75,12 +69,12 @@ fn alignatt_policy_commits_earlier_frame() {
   let f = 10usize;
   // frame 80: content - 80 = 20 > 10 → COMMIT.
   assert!(
-    alignatt_should_commit(content, 80, f, false),
+    alignatt_should_commit(content, 80, f),
     "an earlier frame (well behind the edge) must commit"
   );
   // frame 89: content - 89 = 11 > 10 → COMMIT (just past the threshold).
   assert!(
-    alignatt_should_commit(content, 89, f, false),
+    alignatt_should_commit(content, 89, f),
     "one frame past the threshold must commit"
   );
 }
@@ -88,32 +82,40 @@ fn alignatt_policy_commits_earlier_frame() {
 #[test]
 fn alignatt_policy_matches_oracle_over_grid() {
   // Exhaustive agreement with the independent oracle across a grid of
-  // (content, frame, threshold, is_last).
+  // (content, frame, threshold).
   for &content in &[1usize, 10, 100, 1500] {
     for frame in 0..content {
       for &f in &[0usize, 1, 4, 10, 25, 50] {
-        for &is_last in &[false, true] {
-          assert_eq!(
-            alignatt_should_commit(content, frame, f, is_last),
-            oracle_should_commit(content, frame, f, is_last),
-            "policy != oracle at content={content}, frame={frame}, f={f}, last={is_last}"
-          );
-        }
+        assert_eq!(
+          alignatt_should_commit(content, frame, f),
+          oracle_should_commit(content, frame, f),
+          "policy != oracle at content={content}, frame={frame}, f={f}"
+        );
       }
     }
   }
 }
 
 #[test]
-fn alignatt_policy_last_chunk_always_commits() {
-  // On the final chunk there is no more audio to wait for, so every token
-  // commits regardless of how close to the edge its frame is.
-  for frame in 0..50usize {
-    assert!(
-      alignatt_should_commit(50, frame, 25, true),
-      "is_last must commit frame {frame} regardless of threshold"
-    );
-  }
+fn alignatt_policy_final_chunk_still_applies_inequality() {
+  // The final chunk is NOT a commit-all short-circuit: the inequality still runs
+  // with the (looser) effective threshold the streaming layer passes for the last
+  // chunk. With the default last-chunk threshold of 4, a frame within 4 of the
+  // end is still HELD BACK, while an earlier frame commits — matching the
+  // reference's `content_mel_len - most_attened_frame <= (4 if is_last else f)`.
+  let content = 50usize;
+  let last_f = DEFAULT_LAST_CHUNK_FRAME_THRESHOLD; // 4
+  // frame 49: content - 49 = 1 <= 4 → boundary-attending tail → WAIT even on the
+  // final chunk (the old commit-all short-circuit would have committed it).
+  assert!(
+    !alignatt_should_commit(content, content - 1, last_f),
+    "a boundary-attending final-chunk frame must still be held back at f={last_f}"
+  );
+  // frame 45: content - 45 = 5 > 4 → clearly in-window → COMMIT.
+  assert!(
+    alignatt_should_commit(content, content - 1 - last_f, last_f),
+    "a clearly-in-window final-chunk frame must commit at f={last_f}"
+  );
 }
 
 #[test]
@@ -125,11 +127,11 @@ fn alignatt_policy_threshold_shifts_commit_boundary() {
   for &f in &[5usize, 10, 20, 30] {
     let boundary = content - f - 1; // last committing frame
     assert!(
-      alignatt_should_commit(content, boundary, f, false),
+      alignatt_should_commit(content, boundary, f),
       "frame {boundary} must commit at f={f}"
     );
     assert!(
-      !alignatt_should_commit(content, boundary + 1, f, false),
+      !alignatt_should_commit(content, boundary + 1, f),
       "frame {} must wait at f={f}",
       boundary + 1
     );
@@ -430,6 +432,159 @@ fn committed_token_timing_is_ordered_and_in_window() {
     );
     assert!(t.start() >= 0.0, "absolute start non-negative");
   }
+}
+
+#[test]
+fn streaming_window_slide_does_not_re_emit_committed_audio() {
+  // A stream longer than the 30 s window must slide WITHOUT re-decoding and
+  // re-emitting the retained overlap. Feed > N_SAMPLES of audio in chunks; once
+  // the buffer exceeds the window it slides (the committed audio is dropped past
+  // the watermark, the committed tokens are carried as the decode prefix).
+  // Assert: (1) a slide actually occurred, (2) the global committed history only
+  // ever GROWS, and (3) every committed token's absolute start time is
+  // monotonically non-decreasing across the whole stream — the timeline never
+  // jumps backward into an already-committed time range (re-emitting the overlap
+  // would replay the overlap's earlier absolute times).
+  let dir = fresh_dir("stream_slide");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper =
+    HFTokenizerWrapper::new(&tok, true, 2, Some("en"), WhisperTask::Transcribe).unwrap();
+  let model = stream_model(13); // biased to "d" (id 13)
+
+  let opts = StreamingOptions::new()
+    .with_language("en")
+    .with_frame_threshold(2);
+  let mut session = WhisperStreaming::new(&model, wrapper, opts);
+
+  // 11 s per chunk × 4 = 44 s > 30 s, so the window slides on the 3rd and 4th
+  // pushes. Each chunk has distinct content so the encoder/attention differ.
+  let chunk_samples = 11 * SAMPLE_RATE as usize;
+  let mut total_pushed = 0usize;
+  let mut all_starts: Vec<f64> = Vec::new();
+  let mut all_ends: Vec<f64> = Vec::new();
+  let mut prev_history = 0usize;
+  let mut slid = false;
+
+  for c in 0..4usize {
+    let chunk: Vec<f32> = (0..chunk_samples)
+      .map(|i| (((i + c * 13) % (43 + c)) as f32 / 43.0) - 0.5)
+      .collect();
+    session.push_audio(&chunk).unwrap();
+    total_pushed += chunk_samples;
+    // A slide caps the buffer at N_SAMPLES even though more has been pushed.
+    if total_pushed > N_SAMPLES {
+      assert!(
+        session.buffered_samples() <= N_SAMPLES,
+        "buffer must be capped to N_SAMPLES after a slide (pushed={total_pushed}, buffered={})",
+        session.buffered_samples()
+      );
+      slid = true;
+    }
+    let is_last = c == 3;
+    let step = session.step(is_last).unwrap();
+
+    // The running committed history only grows (no rollback / shrink).
+    let now = session.committed_tokens().len();
+    assert!(
+      now >= prev_history,
+      "committed history must not shrink across a slide: {prev_history} -> {now}"
+    );
+    prev_history = now;
+
+    for t in step.tokens() {
+      all_starts.push(t.start());
+      all_ends.push(t.end());
+    }
+  }
+
+  assert!(
+    slid,
+    "the 44 s stream must have slid the 30 s window at least once"
+  );
+  assert!(
+    all_starts.len() >= 2,
+    "the stream must commit several tokens across the slide to exercise dedup (got {})",
+    all_starts.len()
+  );
+
+  // The committed-token timeline is strictly forward: each token's absolute start
+  // is >= the previous token's start, and never regresses below an earlier
+  // token's END (which is what re-emitting the retained overlap would do — the
+  // same audio committed twice at the same absolute time).
+  let mut max_end = f64::NEG_INFINITY;
+  for i in 0..all_starts.len() {
+    if i > 0 {
+      assert!(
+        all_starts[i] >= all_starts[i - 1] - 1e-9,
+        "absolute start times must not jump backward (token {i}: {} < {})",
+        all_starts[i],
+        all_starts[i - 1]
+      );
+    }
+    // No committed token starts before the furthest already-committed audio END
+    // by more than one frame of rounding slack — i.e. the overlap is never
+    // re-decoded into an earlier absolute time.
+    assert!(
+      all_starts[i] >= max_end - frame_to_seconds(1) - 1e-9,
+      "token {i} start {} regresses into already-committed time (max committed end {max_end})",
+      all_starts[i]
+    );
+    max_end = max_end.max(all_ends[i]);
+  }
+
+  // All committed ids are the biased target and in vocab (sanity: real commits).
+  assert!(
+    session.committed_tokens().iter().all(|&id| id == 13),
+    "all committed tokens are the biased target id"
+  );
+}
+
+#[test]
+fn streaming_final_chunk_threshold_is_not_inert() {
+  // The final chunk does NOT commit-all. The streaming layer passes
+  // `last_chunk_frame_threshold` as the effective AlignAtt threshold, and the
+  // decode applies the SAME inequality with it. So a huge last-chunk threshold
+  // (every frame is within it of the edge) makes the final chunk commit NOTHING
+  // — proving the threshold is respected, not short-circuited — while a zero
+  // last-chunk threshold flushes the tail (any frame is > 0 from the edge). The
+  // non-final threshold is held huge throughout so only the final-chunk threshold
+  // governs the flush.
+  let dir = fresh_dir("stream_last_thresh");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+
+  let audio: Vec<f32> = (0..16_000)
+    .map(|i| ((i % 41) as f32 / 41.0) - 0.5)
+    .collect();
+
+  let final_flush_count = |last_f: usize| -> usize {
+    let wrapper =
+      HFTokenizerWrapper::new(&tok, true, 2, Some("en"), WhisperTask::Transcribe).unwrap();
+    let opts = StreamingOptions::new()
+      .with_language("en")
+      .with_frame_threshold(100_000) // huge: no non-final commit ever
+      .with_last_chunk_frame_threshold(last_f);
+    let mut session = WhisperStreaming::new(&model, wrapper, opts);
+    session.push_audio(&audio).unwrap();
+    // Final chunk: the only path that can emit (the non-final threshold is huge).
+    session.step(true).unwrap().tokens().len()
+  };
+
+  // A boundary-attending tail: with last_f larger than any content frame, the
+  // inequality `content - frame > last_f` is always false → the final chunk holds
+  // EVERYTHING back. Under the old `is_last` commit-all short-circuit this would
+  // have flushed regardless — the bug this asserts is fixed.
+  assert_eq!(
+    final_flush_count(100_000),
+    0,
+    "a huge last-chunk threshold must hold the final tail back (no commit-all)"
+  );
+  // last_f = 0: every decoded frame is > 0 from the content end → the final chunk
+  // flushes the tail (the clearly-in-window case).
+  assert!(
+    final_flush_count(0) > 0,
+    "a zero last-chunk threshold must flush the final tail (clearly in window)"
+  );
 }
 
 // ───────────────────────── fixtures ───────────────────────────────────────
