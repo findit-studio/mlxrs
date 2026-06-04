@@ -689,20 +689,32 @@ impl GreedyDecoder {
     // device. argmax along the last axis ties to the lowest index, matching the
     // CPU path and mlx.
     let next = if self.temperature == 0.0 {
-      let mut idx = ops::misc::argmax(logits, Some(-1), false)?;
+      // Greedy: select the token AND its log-probability with a SINGLE GPU→CPU
+      // sync. Build the whole graph lazily — the argmax index, plus `logits -
+      // logsumexp(logits)` gathered at that index via `take_along_axis` on the
+      // LAZY index (so no intermediate round-trip) — then one `eval` materializes
+      // both. This mirrors the reference's single `async_eval` per token
+      // (`logprobs[arange, argmax]`) instead of two blocking `item()` stalls.
+      let mut idx = ops::misc::argmax(logits, Some(-1), true)?; // (1,) keepdim for the gather
+      let lse = ops::reduction::logsumexp(logits, true)?; // (1,)
+      let chosen = ops::indexing::take_along_axis(logits, &idx, -1)?; // (1,) the argmax logit
+      let mut logprob = ops::arithmetic::subtract(&chosen, &lse)?; // (1,) logprob at the argmax
+      crate::transforms::eval(&[&idx, &logprob])?; // the ONLY sync this step
+      // Both reads below hit already-materialized arrays — no further sync.
+      if last_token != self.eot {
+        self.sum_logprob += logprob.item::<f32>()? as f64;
+      }
       idx.item::<u32>()?
     } else {
-      self.categorical(logits)?
+      // Sampling: `categorical` draws + materializes the token itself; its
+      // logprob is read separately, and only when it will be accumulated
+      // (`decoding.py:315-318`).
+      let token = self.categorical(logits)?;
+      if last_token != self.eot {
+        self.sum_logprob += self.chosen_logprob(logits, token)?;
+      }
+      token
     };
-
-    // `logprobs = logits - logsumexp(logits)`; accumulate the chosen token's
-    // logprob unless the previous token was eot (`decoding.py:315-318`). The
-    // logsumexp + the chosen-logit gather run on device; only the resulting
-    // scalar logprob is read back.
-    if last_token != self.eot {
-      let chosen_logprob = self.chosen_logprob(logits, next)?;
-      self.sum_logprob += chosen_logprob;
-    }
 
     // Once eot has been emitted, it sticks (`decoding.py:320-321`).
     let next = if last_token == self.eot {
