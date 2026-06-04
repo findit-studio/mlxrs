@@ -555,6 +555,38 @@ impl WhisperModel {
     self.dtype
   }
 
+  /// Build an [`HFTokenizerWrapper`] from the model's **attached** tokenizer for
+  /// the given `language` / `task` — the wrapper-construction the high-level
+  /// [`Transcribe`] impl runs internally, exposed so the streaming session
+  /// ([`super::streaming::WhisperStreaming::with_model_tokenizer`]) can build the
+  /// same wrapper from a model loaded with [`Self::with_tokenizer`].
+  ///
+  /// # Errors
+  /// - [`Error::InvariantViolation`] if no tokenizer is attached (use
+  ///   [`Self::with_tokenizer`], or build the wrapper explicitly and call
+  ///   [`super::streaming::WhisperStreaming::new`]);
+  /// - propagates [`HFTokenizerWrapper::new`] (a missing Whisper special token).
+  pub(crate) fn streaming_tokenizer(
+    &self,
+    language: Option<&str>,
+    task: WhisperTask,
+  ) -> Result<HFTokenizerWrapper<'_>> {
+    let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "WhisperModel::streaming_tokenizer",
+        "requires an attached tokenizer (use WhisperModel::with_tokenizer, or build \
+         the HFTokenizerWrapper explicitly and call WhisperStreaming::new)",
+      ))
+    })?;
+    HFTokenizerWrapper::new(
+      tokenizer,
+      self.dims.is_multilingual(),
+      self.dims.num_languages(),
+      language,
+      task,
+    )
+  }
+
   /// Validate that an encoder-states tensor is exactly one Whisper segment —
   /// `(1, n_audio_ctx, n_audio_state)` — before it is fed to the decoder's
   /// cross-attention.
@@ -889,6 +921,287 @@ impl WhisperModel {
         ))
       })?;
     Ok(new_tokens)
+  }
+
+  /// Map the universal [`TranscribeOptions`] onto the lower-level
+  /// [`WhisperTranscribeOptions`], wiring EVERY surfaced knob: the task /
+  /// language / timestamp flags, the generated-token cap (`sample_len`), the
+  /// temperature schedule (a positive temperature pins a single-temperature
+  /// decode; greedy keeps the default fallback schedule), the
+  /// compression-ratio / logprob / no-speech thresholds, the
+  /// `condition_on_previous_text` / `initial_prompt` conditioning, the
+  /// word-timestamp flag, and the `clip_timestamps` restriction.
+  ///
+  /// Shared by [`Transcribe::transcribe`] and [`Self::transcribe_detailed`] so
+  /// the two entries honor the options identically.
+  fn whisper_transcribe_options(&self, opts: &TranscribeOptions) -> WhisperTranscribeOptions {
+    let decode = DecodingOptions {
+      task: task_to_whisper(opts.task()),
+      language: opts.language().map(str::to_owned),
+      temperature: opts.temperature(),
+      sample_len: opts.max_new_tokens(),
+      prompt: Vec::new(),
+      prefix: Vec::new(),
+      suppress_tokens: SuppressSpec::NonSpeech,
+      suppress_blank: true,
+      without_timestamps: opts.no_timestamps(),
+      max_initial_timestamp: Some(1.0),
+    };
+    let temperatures = if opts.temperature() > 0.0 {
+      vec![opts.temperature()]
+    } else {
+      decoding::DEFAULT_TEMPERATURES.to_vec()
+    };
+    WhisperTranscribeOptions {
+      decode,
+      temperatures,
+      compression_ratio_threshold: opts.compression_ratio_threshold(),
+      logprob_threshold: opts.logprob_threshold(),
+      no_speech_threshold: opts.no_speech_threshold(),
+      word_timestamps: opts.word_timestamps(),
+      condition_on_previous_text: opts.condition_on_previous_text(),
+      initial_prompt: opts.initial_prompt().map(str::to_owned),
+      clip_timestamps: opts.clip_timestamps().to_vec(),
+      ..WhisperTranscribeOptions::default()
+    }
+  }
+
+  /// Transcribe a mono waveform and return the **rich** Whisper result — the
+  /// per-segment token ids, seek-derived time offsets, the decode statistics
+  /// (avg-logprob / no-speech / compression-ratio / temperature), and (when
+  /// [`TranscribeOptions::word_timestamps`] is set) the per-word cross-attention
+  /// timings — fields the universal [`Transcription`] cannot hold.
+  ///
+  /// This is the inherent analogue of
+  /// [`SenseVoiceModel::transcribe_rich`](super::super::sensevoice::model::SenseVoiceModel::transcribe_rich):
+  /// the universal [`Transcribe::transcribe`] returns the standard
+  /// [`Transcription`] (text + language + segment spans), and a caller wanting
+  /// the richer per-segment data calls this instead. It honors EVERY universal
+  /// option (the same internal option mapping the universal path uses), so the
+  /// two entries decode identically and only differ in the result richness.
+  ///
+  /// Requires an attached tokenizer ([`Self::with_tokenizer`]); the lower-level
+  /// [`super::decoding::transcribe`] takes an explicit tokenizer for a model
+  /// loaded without one.
+  ///
+  /// # Errors
+  /// - [`Error::InvariantViolation`] if no tokenizer is attached;
+  /// - propagates the waveform validation, front-end, encoder, decoder, and
+  ///   decoding-task op errors (the same set as [`Transcribe::transcribe`]).
+  pub fn transcribe_detailed(
+    &self,
+    audio: &Array,
+    opts: &TranscribeOptions,
+  ) -> Result<WhisperTranscription> {
+    let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "WhisperModel::transcribe_detailed",
+        "requires an attached tokenizer (use WhisperModel::with_tokenizer, or the \
+           lower-level audio::stt::models::whisper::decoding::transcribe with an \
+           explicit HFTokenizerWrapper)",
+      ))
+    })?;
+    let wrapper = HFTokenizerWrapper::new(
+      tokenizer,
+      self.dims.is_multilingual(),
+      self.dims.num_languages(),
+      opts.language(),
+      task_to_whisper(opts.task()),
+    )?;
+
+    let mel = log_mel_spectrogram_whisper(audio, self.dims.n_mels(), N_SAMPLES)?;
+    let content_frames = mel.shape()[0].saturating_sub(N_FRAMES);
+
+    let whisper_opts = self.whisper_transcribe_options(opts);
+    let result = decoding::transcribe(self, &wrapper, &mel, content_frames, &whisper_opts)?;
+    Ok(WhisperTranscription::from_result(result))
+  }
+}
+
+// ───────────────────── rich transcription result (PR-E) ────────────────────
+
+/// One word's cross-attention timing on a [`WhisperSegment`] — the public
+/// analogue of the decoding-layer [`super::decoding::Word`], surfaced only when
+/// [`TranscribeOptions::word_timestamps`] is set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhisperWord {
+  /// The word text (including any leading space / merged punctuation).
+  word: String,
+  /// The word start time in seconds (absolute, including the segment offset).
+  start: f64,
+  /// The word end time in seconds (absolute).
+  end: f64,
+  /// The mean per-token probability of the word's tokens.
+  probability: f64,
+}
+
+impl WhisperWord {
+  /// The word text.
+  #[inline(always)]
+  pub fn word(&self) -> &str {
+    &self.word
+  }
+
+  /// The word start time in seconds (absolute).
+  #[inline(always)]
+  pub const fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// The word end time in seconds (absolute).
+  #[inline(always)]
+  pub const fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// The mean per-token probability of the word's tokens.
+  #[inline(always)]
+  pub const fn probability(&self) -> f64 {
+    self.probability
+  }
+}
+
+/// One rich Whisper segment — the per-window decode result with the fields the
+/// universal [`Segment`] cannot hold: the sampled **token ids**, the
+/// seek-derived **time offsets** (`start` / `end`), the decode statistics
+/// (temperature / avg-logprob / no-speech-prob / compression-ratio), and the
+/// per-word timings (when word timestamps were requested).
+#[derive(Debug, Clone)]
+pub struct WhisperSegment {
+  start: f64,
+  end: f64,
+  text: String,
+  tokens: Vec<u32>,
+  temperature: f32,
+  avg_logprob: f64,
+  no_speech_prob: f64,
+  compression_ratio: f64,
+  words: Vec<WhisperWord>,
+}
+
+impl WhisperSegment {
+  /// The segment start time in seconds (the seek-derived window offset).
+  #[inline(always)]
+  pub const fn start(&self) -> f64 {
+    self.start
+  }
+
+  /// The segment end time in seconds.
+  #[inline(always)]
+  pub const fn end(&self) -> f64 {
+    self.end
+  }
+
+  /// The decoded text for this segment.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// The sampled token ids for this segment.
+  #[inline(always)]
+  pub fn tokens(&self) -> &[u32] {
+    &self.tokens
+  }
+
+  /// The temperature this segment was decoded at.
+  #[inline(always)]
+  pub const fn temperature(&self) -> f32 {
+    self.temperature
+  }
+
+  /// The mean token log-probability for this segment.
+  #[inline(always)]
+  pub const fn avg_logprob(&self) -> f64 {
+    self.avg_logprob
+  }
+
+  /// The no-speech probability for this segment.
+  #[inline(always)]
+  pub const fn no_speech_prob(&self) -> f64 {
+    self.no_speech_prob
+  }
+
+  /// The compression ratio of this segment's text.
+  #[inline(always)]
+  pub const fn compression_ratio(&self) -> f64 {
+    self.compression_ratio
+  }
+
+  /// The per-word timings — empty unless [`TranscribeOptions::word_timestamps`]
+  /// was set.
+  #[inline(always)]
+  pub fn words(&self) -> &[WhisperWord] {
+    &self.words
+  }
+}
+
+/// The rich Whisper transcription returned by [`WhisperModel::transcribe_detailed`]
+/// — the full text, the detected/configured language, and the per-window
+/// [`WhisperSegment`]s carrying the token ids, seek offsets, decode statistics,
+/// and per-word timings the universal [`Transcription`] omits.
+///
+/// The universal [`Transcribe::transcribe`] returns the standard
+/// [`Transcription`]; this is the model-local rich result (mirroring
+/// [`SenseVoiceResult`](super::super::sensevoice::model::SenseVoiceResult)).
+#[derive(Debug, Clone)]
+pub struct WhisperTranscription {
+  text: String,
+  language: String,
+  segments: Vec<WhisperSegment>,
+}
+
+impl WhisperTranscription {
+  /// Convert a decoding-layer [`super::decoding::TranscribeResult`] into the
+  /// public rich result.
+  fn from_result(result: decoding::TranscribeResult) -> Self {
+    let segments = result
+      .segments
+      .into_iter()
+      .map(|s| WhisperSegment {
+        start: s.start,
+        end: s.end,
+        text: s.text,
+        tokens: s.tokens,
+        temperature: s.temperature,
+        avg_logprob: s.avg_logprob,
+        no_speech_prob: s.no_speech_prob,
+        compression_ratio: s.compression_ratio,
+        words: s
+          .words
+          .into_iter()
+          .map(|w| WhisperWord {
+            word: w.word,
+            start: w.start,
+            end: w.end,
+            probability: w.probability,
+          })
+          .collect(),
+      })
+      .collect();
+    Self {
+      text: result.text,
+      language: result.language,
+      segments,
+    }
+  }
+
+  /// The full transcribed text.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    &self.text
+  }
+
+  /// The detected / configured language code.
+  #[inline(always)]
+  pub fn language(&self) -> &str {
+    &self.language
+  }
+
+  /// The per-window rich segments.
+  #[inline(always)]
+  pub fn segments(&self) -> &[WhisperSegment] {
+    &self.segments
   }
 }
 
@@ -2150,45 +2463,14 @@ impl Transcribe for WhisperModel {
     let total_frames = mel.shape()[0];
     let content_frames = total_frames.saturating_sub(N_FRAMES);
 
-    // Map the golden options onto the decoding task's options: greedy
-    // (`temperature == 0`) keeps the default fallback schedule; an explicit
-    // positive temperature pins a single-temperature decode. The generated-
-    // token cap maps onto `sample_len` (clamped by the decoder context inside
-    // the task).
-    let decode = DecodingOptions {
-      task: task_to_whisper(opts.task()),
-      language: opts.language().map(str::to_owned),
-      temperature: opts.temperature(),
-      sample_len: opts.max_new_tokens(),
-      prompt: Vec::new(),
-      prefix: Vec::new(),
-      suppress_tokens: SuppressSpec::NonSpeech,
-      suppress_blank: true,
-      without_timestamps: opts.no_timestamps(),
-      max_initial_timestamp: Some(1.0),
-    };
-    let temperatures = if opts.temperature() > 0.0 {
-      vec![opts.temperature()]
-    } else {
-      decoding::DEFAULT_TEMPERATURES.to_vec()
-    };
-    // The universal `Transcribe` contract surfaces no word-timestamp knob (it is
-    // a Whisper-specific feature, driven through the lower-level
-    // `decoding::transcribe`), so this path keeps word timestamps off — the
-    // default decode path. The remaining word-timestamp fields take their
-    // defaults.
-    let whisper_opts = WhisperTranscribeOptions {
-      decode,
-      temperatures,
-      compression_ratio_threshold: Some(decoding::DEFAULT_COMPRESSION_RATIO_THRESHOLD),
-      logprob_threshold: Some(decoding::DEFAULT_LOGPROB_THRESHOLD),
-      no_speech_threshold: Some(decoding::DEFAULT_NO_SPEECH_THRESHOLD),
-      ..WhisperTranscribeOptions::default()
-    };
-
+    let whisper_opts = self.whisper_transcribe_options(opts);
     let result = decoding::transcribe(self, &wrapper, &mel, content_frames, &whisper_opts)?;
 
-    // Convert the Whisper transcribe result into the universal `Transcription`.
+    // Convert the Whisper transcribe result into the universal `Transcription`
+    // (text + language + segment spans). The richer per-segment fields (token
+    // ids, word timings, seek-derived offsets) are surfaced through the
+    // inherent [`Self::transcribe_detailed`] / [`WhisperTranscription`] instead,
+    // mirroring how SenseVoice keeps its rich tags model-local.
     let segments = result
       .segments
       .iter()

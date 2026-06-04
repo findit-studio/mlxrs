@@ -33,6 +33,9 @@
 //! - [`timing`] — word-level timestamps via cross-attention DTW
 //!   ([`timing::find_alignment`] / [`timing::add_word_timestamps`]) +
 //!   the hallucination-anomaly heuristic.
+//! - [`streaming`] — AlignAtt attention-guided streaming transcription
+//!   ([`streaming::WhisperStreaming`]) on top of the cross-attention /
+//!   alignment-head infrastructure.
 
 pub mod audio;
 pub mod config;
@@ -41,5 +44,6 @@ pub mod decoding;
 pub(crate) mod encoder;
 pub(crate) mod layers;
 pub mod model;
+pub mod streaming;
 pub mod timing;
 pub mod tokenizer;
