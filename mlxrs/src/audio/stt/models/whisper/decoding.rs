@@ -996,6 +996,206 @@ impl<'a> DecodingTask<'a> {
     let p = cell.item::<f32>()?;
     Ok(p as f64)
   }
+
+  /// Run the AlignAtt-policy decode of one streaming chunk's already-encoded
+  /// `enc` over the `content_frames` real encoder frames available — the
+  /// attention-guided streaming step for [`super::streaming`].
+  ///
+  /// This reuses the task's resolved sot/prefix prompt, its logit filters, and
+  /// its [`GreedyDecoder`] (exactly the machinery [`Self::run`] /
+  /// [`Self::main_loop`] use), but drives the loop with the AlignAtt commit/wait
+  /// policy (Papi, Negri, Turchi 2023; the Simul-Whisper reference
+  /// `backspacetg/simul_whisper`, `transcriber/simul_whisper.py`) instead of
+  /// decoding the whole 30-second window:
+  ///
+  /// 1. prefill the initial tokens (sot sequence + any committed-prefix prompt),
+  ///    reading the no-speech probability off the sot position of that forward;
+  /// 2. then, token by token: filter the last-position logits, sample the next
+  ///    token, and compute the token's most-attended audio frame from the
+  ///    decode's cross-attention restricted to the model's alignment heads
+  ///    ([`timing::alignatt_frame_attention`]);
+  /// 3. **commit** the token if its argmax frame is more than `frame_threshold`
+  ///    frames from the end of the available audio (`content_frames -
+  ///    most_attended_frame > frame_threshold`); otherwise the token's evidence
+  ///    sits at the audio boundary and may change with more audio, so it is
+  ///    **dropped** and the decode stops (the reference's `if content_mel_len -
+  ///    most_attened_frame <= frame_threshold: current_tokens =
+  ///    current_tokens[:, :-1]; break`).
+  ///
+  /// On the final chunk (`is_last`) the reference relaxes the threshold to a
+  /// fixed value (`4` frames upstream) and runs the decode to eot; the caller
+  /// passes the effective `frame_threshold` (the streaming layer substitutes the
+  /// last-chunk value), and `is_last` lets an eot-completed decode finish the
+  /// utterance (there is no more audio, so a token at the boundary is still
+  /// committed rather than waited on).
+  ///
+  /// Returns the [`AlignedDecode`]: the committed sampled tokens (between the sot
+  /// sequence and the AlignAtt stop / eot), the per-committed-token argmax
+  /// frames, the no-speech probability, and whether the decode hit eot.
+  ///
+  /// `frame_threshold` is the AlignAtt `f` (in encoder frames; one frame ≈ 0.02
+  /// s) ALREADY resolved for this chunk (the caller passes the last-chunk value
+  /// when `is_last`). `content_frames` is the real encoder-frame count
+  /// (`available_mel_frames / 2`).
+  ///
+  /// # Errors
+  /// - [`Error::OutOfRange`] if `content_frames` is `0`, the alignment heads are
+  ///   empty / mis-indexed, or a dimension overflows `i32`;
+  /// - propagates the encoder-states validation, decoder forward, filter, and
+  ///   sampler op errors.
+  pub(crate) fn decode_aligned(
+    &self,
+    enc: &Array,
+    content_frames: usize,
+    frame_threshold: usize,
+    is_last: bool,
+  ) -> Result<AlignedDecode> {
+    use crate::audio::stt::models::whisper::model::WhisperDecodeCache;
+
+    let mut decoder = GreedyDecoder::new(self.options.temperature, self.tokenizer.eot(), 0)?;
+    let mut tokens: Vec<u32> = self.initial_tokens.clone();
+    let mut cache = WhisperDecodeCache::new();
+
+    // First forward: the whole initial prefix (the sot sequence plus any forced
+    // continuation prefix the streaming layer set, e.g. the committed in-window
+    // tokens). The no-speech probability is a property of this prefill's sot
+    // position, matching `main_loop`.
+    let (logits3d, _cross_qk) = self
+      .model
+      .decode_step_with_cross_qk(&mut cache, enc, &tokens)?;
+    let no_speech_prob = self.no_speech_prob(&logits3d)?;
+
+    // The committed argmax frame per sampled token (parallel to the sampled tail
+    // `tokens[sample_begin..]`).
+    let mut committed_frames: Vec<usize> = Vec::new();
+    let mut completed = false;
+
+    // Sampled steps: filter → sample → AlignAtt commit/wait. Bounded by the
+    // decode context and the `sample_len` cap. The guard is `< n_ctx` (not
+    // `<=`): each iteration provisionally pushes ONE token before forwarding it,
+    // so entering at `len == n_ctx` would forward an `n_ctx + 1` prefix past the
+    // decoder's positional table. Stopping at `len == n_ctx` keeps every
+    // forwarded prefix `<= n_ctx` (a token at the context boundary is simply not
+    // emitted — the streaming caller slides the window for more).
+    let mut logits3d = logits3d;
+    let mut step = 0usize;
+    while !completed && step < self.sample_len && tokens.len() < self.n_ctx {
+      // Filter + sample the next token off the last-position row.
+      let row = last_position_row(&logits3d)?;
+      let row = self.apply_filters(&row, &tokens)?;
+      let last_token = *tokens.last().unwrap_or(&self.tokenizer.sot());
+      let (next, done) = decoder.update(&row, last_token)?;
+
+      if done {
+        // eot: the decode is complete. The eot itself carries no audio frame, so
+        // it is never committed (the reference truncates the eot token); whether
+        // the upstream utterance is finished is reported via `completed`.
+        completed = true;
+        break;
+      }
+
+      // Provisionally extend, forward the new token to obtain ITS cross-
+      // attention, then apply the AlignAtt policy to decide commit vs wait. The
+      // `< n_ctx` loop guard keeps this pushed prefix `<= n_ctx`.
+      tokens.push(next);
+      let (next_logits, cross_qk) = self
+        .model
+        .decode_step_with_cross_qk(&mut cache, enc, &tokens)?;
+      let frames = timing::alignatt_frame_attention(self.model, &cross_qk, content_frames)?;
+      // The just-sampled token is the LAST decoded position; its argmax frame is
+      // the last entry of the per-token frame vector.
+      let most_attended = frames.last().copied().unwrap_or(0);
+
+      // AlignAtt commit/wait: if the token's evidence is within `frame_threshold`
+      // frames of the audio end, it may change with more audio → drop it and
+      // wait. On the final chunk there is no more audio, so the token commits
+      // regardless (the reference still emits every decoded token on the last
+      // chunk).
+      if !alignatt_should_commit(content_frames, most_attended, frame_threshold, is_last) {
+        // Wait: revert the provisional token and stop committing for this chunk
+        // (the reference's `current_tokens = current_tokens[:, :-1]; break`).
+        tokens.pop();
+        break;
+      }
+
+      // Commit the token and its frame; continue decoding.
+      committed_frames.push(most_attended);
+      logits3d = next_logits;
+      step += 1;
+    }
+
+    // The committed sampled tokens: `tokens[sample_begin..]` truncated at the
+    // first eot (defensive — a committed eot is never pushed above).
+    let sampled: Vec<u32> = {
+      let tail = tokens.get(self.sample_begin..).unwrap_or(&[]);
+      let end = tail
+        .iter()
+        .position(|&t| t == self.tokenizer.eot())
+        .unwrap_or(tail.len());
+      tail[..end].to_vec()
+    };
+    // `committed_frames` is parallel to the committed sampled tokens; clamp to
+    // the sampled length in case the loop committed past a defensive truncation.
+    committed_frames.truncate(sampled.len());
+
+    Ok(AlignedDecode {
+      tokens: sampled,
+      frames: committed_frames,
+      no_speech_prob,
+      completed,
+    })
+  }
+}
+
+/// The AlignAtt commit/wait decision for ONE just-decoded token — the policy's
+/// core inequality, factored out as a pure function so it can be tested against
+/// an independent oracle on synthetic frames.
+///
+/// Returns `true` (COMMIT) when the token's most-attended audio frame is safely
+/// behind the live audio edge — `content_frames - most_attended_frame >
+/// frame_threshold`. Returns `false` (WAIT) when the frame is within
+/// `frame_threshold` of the end, mirroring the Simul-Whisper reference's `if
+/// content_mel_len - most_attened_frame <= frame_threshold: ... break`
+/// (`backspacetg/simul_whisper`, `transcriber/simul_whisper.py`).
+///
+/// On the FINAL chunk (`is_last`) there is no more audio to wait for, so the
+/// token always commits regardless of the threshold (the reference still emits
+/// every decoded token on the last chunk). `content_frames.saturating_sub` keeps
+/// the subtraction non-negative if a frame somehow exceeds `content_frames` (a
+/// degenerate-attention argmax past the content slice); such a frame is at/over
+/// the edge, so it correctly resolves to WAIT on a non-final chunk.
+#[inline]
+pub(crate) fn alignatt_should_commit(
+  content_frames: usize,
+  most_attended_frame: usize,
+  frame_threshold: usize,
+  is_last: bool,
+) -> bool {
+  if is_last {
+    return true;
+  }
+  content_frames.saturating_sub(most_attended_frame) > frame_threshold
+}
+
+/// The result of one AlignAtt streaming decode ([`DecodingTask::decode_aligned`]).
+///
+/// Carries the tokens the AlignAtt policy COMMITTED for this chunk (the
+/// just-decoded ones whose most-attended audio frame is safely behind the audio
+/// boundary), each token's argmax encoder frame (for timing), the prefill's
+/// no-speech probability, and whether the decode reached eot.
+#[derive(Debug, Clone)]
+pub(crate) struct AlignedDecode {
+  /// The committed sampled token ids (sot sequence + prompt stripped, truncated
+  /// before any eot).
+  pub tokens: Vec<u32>,
+  /// The most-attended encoder frame per committed token (parallel to
+  /// [`Self::tokens`]).
+  pub frames: Vec<usize>,
+  /// `P(<|nospeech|>)` read off the prefill's sot position (`NaN` if the model
+  /// has no no-speech token).
+  pub no_speech_prob: f64,
+  /// Whether the decode reached eot (the chunk's utterance is finished).
+  pub completed: bool,
 }
 
 /// Build the `(prompt) + sot_sequence + (prefix)` initial token prefix —

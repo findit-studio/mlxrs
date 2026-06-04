@@ -555,6 +555,38 @@ impl WhisperModel {
     self.dtype
   }
 
+  /// Build an [`HFTokenizerWrapper`] from the model's **attached** tokenizer for
+  /// the given `language` / `task` — the wrapper-construction the high-level
+  /// [`Transcribe`] impl runs internally, exposed so the streaming session
+  /// ([`super::streaming::WhisperStreaming::with_model_tokenizer`]) can build the
+  /// same wrapper from a model loaded with [`Self::with_tokenizer`].
+  ///
+  /// # Errors
+  /// - [`Error::InvariantViolation`] if no tokenizer is attached (use
+  ///   [`Self::with_tokenizer`], or build the wrapper explicitly and call
+  ///   [`super::streaming::WhisperStreaming::new`]);
+  /// - propagates [`HFTokenizerWrapper::new`] (a missing Whisper special token).
+  pub(crate) fn streaming_tokenizer(
+    &self,
+    language: Option<&str>,
+    task: WhisperTask,
+  ) -> Result<HFTokenizerWrapper<'_>> {
+    let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+      Error::InvariantViolation(InvariantViolationPayload::new(
+        "WhisperModel::streaming_tokenizer",
+        "requires an attached tokenizer (use WhisperModel::with_tokenizer, or build \
+         the HFTokenizerWrapper explicitly and call WhisperStreaming::new)",
+      ))
+    })?;
+    HFTokenizerWrapper::new(
+      tokenizer,
+      self.dims.is_multilingual(),
+      self.dims.num_languages(),
+      language,
+      task,
+    )
+  }
+
   /// Validate that an encoder-states tensor is exactly one Whisper segment —
   /// `(1, n_audio_ctx, n_audio_state)` — before it is fed to the decoder's
   /// cross-attention.

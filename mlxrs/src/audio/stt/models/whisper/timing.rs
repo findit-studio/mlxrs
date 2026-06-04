@@ -416,6 +416,116 @@ pub fn find_alignment(
   )
 }
 
+/// The per-token argmax audio frame from a decode's cross-attention — the
+/// AlignAtt alignment signal (the streaming policy in [`super::streaming`]).
+///
+/// Given the per-decoder-layer `cross_qk` of one forward (each `(1,
+/// n_text_head, T, n_audio_ctx)`, from
+/// [`WhisperModel::decode_step_with_cross_qk`] /
+/// [`WhisperModel::forward_with_cross_qk`]) this stacks the model's alignment
+/// heads, normalizes the weights exactly as the word-timestamp alignment does,
+/// restricts to the `content_frames` real (non-pad) encoder frames, and returns
+/// `argmax_frame[t]` — the encoder frame each token position `t` most attends
+/// to.
+///
+/// The normalization mirrors the Simul-Whisper AlignAtt reference
+/// (`backspacetg/simul_whisper`, `transcriber/simul_whisper.py`, the
+/// `attn_of_alignment_heads` block): stack the alignment heads into `(heads, T,
+/// frames)`, std-normalize across the **token** axis (`(w - mean) / std`,
+/// `std_mean(..., dim=-2, unbiased=False)`), median-filter (width 7) along the
+/// frame axis, average over heads, then `argmax` along the frame axis per
+/// token. Unlike the DTW path ([`find_alignment`]) there is no softmax: AlignAtt
+/// reads the most-attended frame directly off the normalized weights, the same
+/// way the reference does (`torch.argmax(attn_of_alignment_heads[-1, :])`).
+///
+/// `content_frames` is the number of real encoder frames available so far
+/// (`available_mel_frames / 2`, the encoder's conv stride-2 downsample). It is
+/// clamped to the cross-attention's `n_audio_ctx` width so a caller passing a
+/// larger value cannot slice past the attention.
+///
+/// Returns one `usize` per token position (length `T`, the cross-attention's
+/// token axis). The AlignAtt policy reads only the LAST position's frame, but
+/// the whole vector is returned so a caller can also inspect earlier positions
+/// (the reference keeps the full matrix).
+///
+/// # Errors
+/// - [`Error::OutOfRange`] if the alignment heads are empty, a head indexes a
+///   layer without cross-attention, `content_frames` is `0` (no frame to argmax
+///   over), or a dimension overflows `i32`;
+/// - [`Error::AllocFailure`](crate::Error::AllocFailure) if a host scratch
+///   buffer cannot be reserved;
+/// - propagates the stack / softmax-free normalize / median-filter op errors.
+pub(crate) fn alignatt_frame_attention(
+  model: &WhisperModel,
+  cross_qk: &[Option<Array>],
+  content_frames: usize,
+) -> Result<Vec<usize>> {
+  if content_frames == 0 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Whisper AlignAtt: content frames",
+      "must be > 0 (no audio frame to align a token against)",
+      format_smolstr!("content_frames=0"),
+    )));
+  }
+  // Clamp the content-frame count to the cross-attention's actual frame width
+  // (`n_audio_ctx`), so a caller passing a larger value cannot slice past the
+  // attention. The first present cross-qk carries the width as its last axis.
+  let n_audio_ctx = cross_qk
+    .iter()
+    .find_map(|q| q.as_ref())
+    .map(|q| q.shape()[3])
+    .ok_or_else(|| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "Whisper AlignAtt: cross-attention",
+        "must carry at least one decoder layer's cross-attention weights",
+        format_smolstr!("all None"),
+      ))
+    })?;
+  let frames = content_frames.min(n_audio_ctx);
+
+  // Stack the alignment heads' cross-attention into `(heads, T, frames)`,
+  // keeping the first `frames` columns — the same head selection + slice the
+  // word-timestamp DTW uses (reuses the model's alignment heads; no separate
+  // head choice).
+  let weights = stack_alignment_heads(model, cross_qk, frames)?;
+  let weights = weights.astype(Dtype::F32)?;
+  // `(w - mean) / std` across the token axis, std floored (degenerate-column
+  // safe) — `normalize_alignment_weights`, matching the reference's
+  // `std_mean(dim=-2, unbiased=False)` normalization. No softmax (the AlignAtt
+  // reference reads the most-attended frame off the normalized weights).
+  let mut normalized = normalize_alignment_weights(&weights)?.astype(Dtype::F32)?;
+
+  // Median-filter along the frame axis (host; width 7), then average over the
+  // head axis into the `(tokens, frames)` matrix — the reference's
+  // `median_filter(..., 7)` then `.mean(dim=0)`.
+  let (heads_n, rows, cols) = three_dims(&normalized)?;
+  let planes = checked_area(heads_n, rows, "AlignAtt planes (heads * tokens)")?;
+  let host = host_copy_f32(&mut normalized)?;
+  let filtered = median_filter(&host, planes, cols, MEDIAN_FILTER_WIDTH)?;
+  let matrix = mean_over_heads(&filtered, heads_n, rows, cols)?;
+
+  // `argmax` along the frame axis for every token row — `torch.argmax(.., dim=
+  // 0)` per position. Each row has `cols == frames >= 1` entries (the
+  // `content_frames == 0` guard above ensures a non-empty frame axis), so the
+  // argmax is always well defined.
+  let mut out: Vec<usize> = Vec::new();
+  reserve_or_error(&mut out, "Whisper AlignAtt: per-token argmax frames", rows)?;
+  for r in 0..rows {
+    let mut best_frame = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for c in 0..cols {
+      let v = matrix.at(r, c);
+      // Strict `>` keeps the FIRST frame on ties, matching `torch.argmax`.
+      if v > best_val {
+        best_val = v;
+        best_frame = c;
+      }
+    }
+    out.push(best_frame);
+  }
+  Ok(out)
+}
+
 /// Compute per-word timings for a window's `segments` and attach them — a
 /// faithful port of `add_word_timestamps` (`timing.py:219-329`).
 ///
