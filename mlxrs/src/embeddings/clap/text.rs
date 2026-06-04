@@ -31,12 +31,17 @@
 //! ## Pooling → text feature + projection
 //!
 //! CLAP's text path takes the **first** sequence position (`<s>` / CLS,
-//! position 0) of the last hidden state — `ClapModel.get_text_features` uses
-//! `text_outputs[0][:, 0, :]` (the `last_hidden_state` CLS), NOT a BERT
-//! `pooler` dense+tanh — and feeds it to the text projection
+//! position 0) of the last hidden state, then runs it through the RoBERTa
+//! `ClapTextPooler` (a `dense` `Linear(hidden, hidden)` + `tanh`):
+//! `ClapModel.text_model` is built with the default `add_pooling_layer = True`,
+//! and `ClapModel.get_text_features` feeds `text_outputs.pooler_output` (the
+//! pooled CLS) — NOT the raw CLS token — into the text projection
 //! (`ClapProjectionLayer`: `linear1 → ReLU → linear2`, `projection_dim = 512`,
-//! activation `relu`). The projected `(B, 512)` vector is L2-normalized into the
-//! shared contrastive space (mirroring `siglip.py`'s `normalize_embeddings`).
+//! activation `relu`). This matches the Xenova ONNX export that the project
+//! reference (`textclap`) consumes, whose golden text embeddings are generated
+//! through HF `get_text_features` (pooler included). The projected `(B, 512)`
+//! vector is L2-normalized into the shared contrastive space (mirroring
+//! `siglip.py`'s `normalize_embeddings`).
 //!
 //! ## Quant + dtype
 //!
@@ -64,15 +69,15 @@ use crate::{
   array::Array,
   dtype::Dtype,
   embeddings::{
-    Embedding, Padding, TextEmbedder, TextEncoding,
+    Embedding, Padding, SWIFT_L2_EPS, TextEmbedder, TextEncoding,
     clap::{
       config::ClapConfig,
       shared::{
-        ClapProjectionLayer, LayerDims, RobertaLayer, build_layer_norm, cast_like, dim_i32,
-        expect_logical_shape, expect_shape, resolve_quant,
+        ClapProjectionLayer, LayerDims, QuantLinear, RobertaLayer, build_layer_norm, cast_like,
+        dim_i32, expect_logical_shape, expect_shape, resolve_quant,
       },
     },
-    l2_normalize,
+    l2_normalize_eps,
   },
   error::{Error, OutOfRangePayload, RankMismatchPayload, Result, ShapePairMismatchPayload},
   lm::{
@@ -308,6 +313,51 @@ impl RobertaEncoder {
   }
 }
 
+// ═══════════════════════════════ ClapTextPooler ════════════════════════════
+
+/// RoBERTa's `ClapTextPooler` (`pooler`): a `dense` `Linear(hidden, hidden)`
+/// followed by `tanh`, applied to the CLS token (`hidden_states[:, 0]`).
+///
+/// `ClapModel.text_model` is constructed with the default `add_pooling_layer =
+/// True`, and `ClapModel.get_text_features` feeds `text_outputs.pooler_output`
+/// (this pooler's output) — NOT the raw CLS token — into `text_projection`. The
+/// checkpoint ships `text_model.pooler.dense.{weight,bias}` (stripped to
+/// `pooler.dense.*` in the text sub-map) for exactly this layer.
+#[cfg(feature = "clap")]
+struct ClapTextPooler {
+  /// `pooler.dense` — `Linear(hidden, hidden)` with bias; quantize-aware.
+  dense: QuantLinear,
+}
+
+#[cfg(feature = "clap")]
+impl ClapTextPooler {
+  /// Build from the `pooler.dense.{weight,bias}` `(hidden, hidden)` / `(hidden,)`
+  /// keys of the text sub-map, auto-picking the dense or quantized variant.
+  fn from_weights(
+    weights: &mut HashMap<String, Array>,
+    hidden: i32,
+    quant: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
+    let dense = QuantLinear::from_weights(weights, "pooler.dense", hidden, hidden, true, quant)?;
+    Ok(Self { dense })
+  }
+
+  /// `(B, hidden) CLS token → (B, hidden)` pooled output: `tanh(dense(cls))`.
+  ///
+  /// `tanh` is built over the dense output, so it inherits the activation dtype
+  /// (no f16/bf16 → f32 promotion).
+  fn forward(&self, cls: &Array) -> Result<Array> {
+    let pooled = self.dense.forward(cls)?;
+    ops::arithmetic::tanh(&pooled)
+  }
+
+  /// `true` if the `dense` projection loaded quantized (test-only).
+  #[cfg(test)]
+  fn is_quantized(&self) -> bool {
+    self.dense.is_quantized()
+  }
+}
+
 // ═══════════════════════════════ ClapTextModel ═════════════════════════════
 
 /// The CLAP RoBERTa text tower (`ClapTextModel`) + the CLAP text projection.
@@ -320,7 +370,8 @@ impl RobertaEncoder {
 /// 2. `RobertaEncoder` — `num_hidden_layers` post-norm layers with the additive
 ///    padding mask.
 /// 3. CLS pooling — the first sequence position of the last hidden state.
-/// 4. `ClapProjectionLayer` — `linear1 → ReLU → linear2` → L2-normalize.
+/// 4. `ClapTextPooler` — `dense` + `tanh` on the CLS token (`pooler_output`).
+/// 5. `ClapProjectionLayer` — `linear1 → ReLU → linear2` → L2-normalize.
 ///
 /// Built via [`from_weights`](Self::from_weights) /
 /// [`from_weights_quantized`](Self::from_weights_quantized). It implements the
@@ -333,6 +384,7 @@ impl RobertaEncoder {
 pub struct ClapTextModel {
   embeddings: ClapTextEmbeddings,
   encoder: RobertaEncoder,
+  pooler: ClapTextPooler,
   text_projection: ClapProjectionLayer,
 }
 
@@ -346,7 +398,8 @@ impl ClapTextModel {
   /// `encoder.layer.{i}.attention.self.{query,key,value}.{weight,bias}`,
   /// `encoder.layer.{i}.attention.output.{dense.{weight,bias},LayerNorm.{weight,bias}}`,
   /// `encoder.layer.{i}.{intermediate.dense,output.dense}.{weight,bias}`,
-  /// `encoder.layer.{i}.output.LayerNorm.{weight,bias}`, and
+  /// `encoder.layer.{i}.output.LayerNorm.{weight,bias}`,
+  /// `pooler.dense.{weight,bias}`, and
   /// `text_projection.{linear1,linear2}.{weight,bias}`.
   pub fn from_weights(config: &ClapConfig, weights: &mut HashMap<String, Array>) -> Result<Self> {
     Self::from_weights_quantized(config, weights, None)
@@ -381,12 +434,14 @@ impl ClapTextModel {
 
     let embeddings = ClapTextEmbeddings::from_weights(config, weights, eps, quant)?;
     let encoder = RobertaEncoder::from_weights(config, weights, dims, quant)?;
+    let pooler = ClapTextPooler::from_weights(weights, hidden, quant)?;
     let text_projection =
       ClapProjectionLayer::from_weights("text_projection", weights, hidden, projection_dim, quant)?;
 
     Ok(Self {
       embeddings,
       encoder,
+      pooler,
       text_projection,
     })
   }
@@ -395,10 +450,11 @@ impl ClapTextModel {
   /// `{0,1}` attention mask) to the L2-normalized `(batch, 512)` text embedding.
   ///
   /// Mirrors `ClapModel.get_text_features`: embeddings → RoBERTa encoder (with
-  /// the additive padding mask) → CLS (`last_hidden_state[:, 0, :]`) → text
-  /// projection → L2-normalize. `input_ids` is pinned to exactly rank-2 (the
-  /// public [`embed_text`](Self::embed_text) accepts an untrusted array; the
-  /// embedding gather + CLS slice are only defined for a rank-2 batch).
+  /// the additive padding mask) → CLS (`last_hidden_state[:, 0, :]`) → pooler
+  /// (`dense` + `tanh`) → text projection → L2-normalize. `input_ids` is pinned
+  /// to exactly rank-2 (the public [`embed_text`](Self::embed_text) accepts an
+  /// untrusted array; the embedding gather + CLS slice are only defined for a
+  /// rank-2 batch).
   pub fn encode_text(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
     let shape = input_ids.shape();
     if shape.len() != 2 {
@@ -444,18 +500,27 @@ impl ClapTextModel {
     // CLS pooling: last_hidden_state[:, 0, :] → (B, hidden).
     let cls = pool_cls(&hidden)?;
 
+    // RoBERTa pooler: tanh(dense(cls)) → (B, hidden). `ClapModel.text_model`
+    // enables the pooler (`add_pooling_layer = True`) and feeds its
+    // `pooler_output` to the projection.
+    let pooled = self.pooler.forward(&cls)?;
+
     // Text projection (linear1 → ReLU → linear2) → (B, 512).
-    let projected = self.text_projection.forward(&cls)?;
+    let projected = self.text_projection.forward(&pooled)?;
 
     // L2-normalize into the shared contrastive space (textclap normalizes the
-    // tower output itself — `TEXT_OUTPUT_IS_UNIT_NORM = false`).
-    l2_normalize(&projected)
+    // tower output itself — `TEXT_OUTPUT_IS_UNIT_NORM = false`). `SWIFT_L2_EPS`
+    // (`1e-12`) matches HF `F.normalize`'s default eps, used for BOTH towers
+    // (the audio tower normalizes with the same eps).
+    l2_normalize_eps(&projected, SWIFT_L2_EPS)
   }
 
   /// `true` if every encoder projection loaded quantized (test-only).
   #[cfg(test)]
   pub(crate) fn all_projections_quantized(&self) -> bool {
-    self.encoder.all_quantized() && self.text_projection.all_quantized()
+    self.encoder.all_quantized()
+      && self.pooler.is_quantized()
+      && self.text_projection.all_quantized()
   }
 
   /// `true` if the word embedding loaded from a quantized checkpoint (test-only).

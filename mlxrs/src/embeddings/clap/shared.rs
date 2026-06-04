@@ -1595,6 +1595,11 @@ mod swin {
 
       // Partition → (nw·B, win², C), attend, reverse.
       let windows = window_partition(&shifted, self.window)?;
+      // The SW-MSA mask depends only on the (fixed-per-stage) padded resolution,
+      // window, and shift, so it could be precomputed at construction (like
+      // `RelativePositionBias`) rather than rebuilt each forward. Deferred: the
+      // per-stage padded dims are not currently threaded into `from_weights`, so
+      // caching is a constructor refactor, not a local change (see #365).
       let shift_mask = if self.shift > 0 {
         Some(shifted_window_mask(
           height_pad,

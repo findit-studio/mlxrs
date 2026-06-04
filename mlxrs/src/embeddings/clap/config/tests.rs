@@ -45,6 +45,10 @@ fn defaults_match_architecture_constants() {
   assert_eq!(t.type_vocab_size, 1);
   assert_eq!(t.pad_token_id, 1);
   assert_eq!(t.hidden_act(), "gelu");
+  // The text tower uses the RoBERTa LayerNorm default (`1e-12`), distinct from
+  // the audio tower's `1e-5`.
+  assert_eq!(t.layer_norm_eps, 1e-12);
+  assert_eq!(a.layer_norm_eps, 1e-5);
 }
 
 /// A minimal `{}` config parses to all-defaults (forward-compatible:
@@ -334,6 +338,20 @@ fn validate_rejects_non_default_text_layer_norm_eps() {
     matches!(err, Error::OutOfRange(_)),
     "expected OutOfRange for text layer_norm_eps, got {err:?}"
   );
+}
+
+/// The real `laion/clap-htsat-unfused` checkpoint serializes
+/// `text_config.layer_norm_eps = 1e-12` (the RoBERTa default). It must VALIDATE
+/// (the pin and the default are `1e-12`, not `1e-5`); the previous `1e-5` pin
+/// used exact equality and rejected the real checkpoint, breaking loading.
+#[test]
+fn validate_accepts_checkpoint_text_layer_norm_eps_1e_12() {
+  let json = r#"{ "text_config": { "layer_norm_eps": 1e-12 } }"#;
+  let cfg = ClapConfig::from_json(json).expect("parses");
+  assert_eq!(cfg.text_config.layer_norm_eps, 1e-12);
+  cfg
+    .validate()
+    .expect("real checkpoint text layer_norm_eps (1e-12) validates");
 }
 
 /// A non-`gelu` text `hidden_act` is rejected (pinned to exact GELU;

@@ -22,8 +22,9 @@
 //! ([`config::ClapConfig`] = [`config::ClapAudioConfig`] +
 //! [`config::ClapTextConfig`] + projection dims), the mel / spectrogram
 //! front-end ([`mel`]), the RoBERTa **text tower** ([`text::ClapTextModel`] —
-//! embeddings + post-norm encoder + CLS pooling + the text projection +
-//! L2-normalize), and the HTSAT Swin **audio tower** ([`audio::HtsatAudioTower`] —
+//! embeddings + post-norm encoder + CLS pooling + the `pooler` (dense+tanh) +
+//! the text projection + L2-normalize), and the HTSAT Swin **audio tower**
+//! ([`audio::HtsatAudioTower`] —
 //! the `reshape_mel2img` mel→image fold, the patch-embed stem, the four Swin
 //! stages, and the token-semantic mean-pool producing the `(B, 768)` pooled
 //! audio feature) into [`ClapModel`], adding the **audio projection** (the CLAP
@@ -164,8 +165,8 @@ pub struct ClapModel {
   mel: Mel,
   /// The HTSAT Swin audio tower → the `(B, 768)` pooled audio feature.
   audio: AudioTower,
-  /// The RoBERTa text tower (owns its CLS pooling + `text_projection` +
-  /// L2-normalize, the [`TextEmbedder`] impl).
+  /// The RoBERTa text tower (owns its CLS pooling + `pooler` (dense+tanh) +
+  /// `text_projection` + L2-normalize, the [`TextEmbedder`] impl).
   text: TextModel,
   /// The audio projection head (`Linear(768 → 512) → ReLU → Linear(512 → 512)`)
   /// over the pooled audio feature.
@@ -290,8 +291,9 @@ impl ClapModel {
   /// `(batch, projection_dim)`.
   ///
   /// Delegates to the text tower's [`encode_text`](ClapTextModel::encode_text)
-  /// (RoBERTa → CLS → `text_projection` → L2-normalize), which already returns
-  /// the projected, normalized embedding (`ClapModel.get_text_features`).
+  /// (RoBERTa → CLS → `pooler` (dense+tanh) → `text_projection` → L2-normalize),
+  /// which already returns the projected, normalized embedding
+  /// (`ClapModel.get_text_features`).
   pub fn embed_text(&self, input_ids: &Array, attention_mask: &Array) -> Result<Embedding> {
     Ok(Embedding::new(
       self.text.encode_text(input_ids, attention_mask)?,
@@ -487,9 +489,9 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
 /// [`Error::AllocFailure`]).
 ///
 /// The parsed `1_Pooling/config.json` (`_pooling`) is **ignored**: CLAP is a
-/// dual-tower contrastive model that bakes its own fixed text pooling (CLS) +
-/// dynamic-right-pad scheme; it does not consume a sentence-encoder pooling
-/// config.
+/// dual-tower contrastive model that bakes its own fixed text pooling (CLS +
+/// the RoBERTa `pooler` dense+tanh) + dynamic-right-pad scheme; it does not
+/// consume a sentence-encoder pooling config.
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub fn constructor() -> EmbeddingModelConstructor {

@@ -8,6 +8,7 @@
 //!   killer test (ids `[0, 5, 9, 1, 1]`, `pad = 1` → `[2, 3, 4, 1, 1]`);
 //! - the **additive padding mask** (`{0, -inf}` form + the activation dtype);
 //! - **CLS pooling** (`last_hidden_state[:, 0, :]`);
+//! - the **RoBERTa pooler** (`tanh(dense(cls))`, in the forward path);
 //! - the **ReLU** projection activation + the `linear1 → ReLU → linear2`
 //!   projection math (hand-computed);
 //! - one **RoBERTa post-norm layer** (shape + that the additive mask actually
@@ -451,6 +452,9 @@ fn clap_text_weights() -> HashMap<String, Array> {
   for i in 0..LAYERS {
     insert_layer(&mut w, i);
   }
+  // RoBERTa pooler: `dense` Linear(hidden, hidden) + bias (tanh has no params).
+  w.insert("pooler.dense.weight".to_string(), mat(HIDDEN, HIDDEN));
+  w.insert("pooler.dense.bias".to_string(), vec1(HIDDEN));
   w.insert(
     "text_projection.linear1.weight".to_string(),
     mat(PROJ, HIDDEN),
@@ -495,6 +499,91 @@ fn tower_forward_shape_and_unit_norm() {
       "row {row} has non-finite components"
     );
   }
+}
+
+#[test]
+fn pooler_applies_dense_then_tanh_closed_form() {
+  // `ClapTextPooler::forward(cls)` must compute `tanh(cls @ Wᵀ + b)` (HF
+  // `ClapTextPooler`: dense `Linear(hidden, hidden)` + tanh on the CLS token),
+  // NOT pass the CLS token through. Build a 1×2 pooler with known weights and
+  // check against the hand-computed value.
+  let mut w = HashMap::new();
+  // W = [[1, 0], [0, 2]], b = [0.5, -0.5]. dense([1, 1]) = [1.5, 1.5].
+  w.insert(
+    "pooler.dense.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 2.0], &(2usize, 2usize)).unwrap(),
+  );
+  w.insert(
+    "pooler.dense.bias".to_string(),
+    Array::from_slice::<f32>(&[0.5, -0.5], &(2usize,)).unwrap(),
+  );
+  let pooler = ClapTextPooler::from_weights(&mut w, 2, None).unwrap();
+  let cls = Array::from_slice::<f32>(&[1.0, 1.0], &(1usize, 2usize)).unwrap();
+  let got = read_f32(&pooler.forward(&cls).unwrap());
+  // dense: [1*1 + 0*1 + 0.5, 0*1 + 2*1 - 0.5] = [1.5, 1.5]; then tanh.
+  let want = [1.5_f32.tanh(), 1.5_f32.tanh()];
+  for (g, e) in got.iter().zip(want.iter()) {
+    assert!(
+      (g - e).abs() < 1e-6,
+      "pooler must be tanh(dense(cls)): {got:?}"
+    );
+  }
+}
+
+#[test]
+fn tower_output_depends_on_pooler_weights() {
+  // The pooler is actually in the forward path (not dropped): perturbing only
+  // `pooler.dense.weight` changes the tower output. A plain-CLS path (skipping
+  // the pooler) would be invariant to the pooler weights.
+  let cfg = clap_config();
+  let (ids, mask) = ids_and_mask();
+
+  let mut w = clap_text_weights();
+  let base = read_f32(
+    &ClapTextModel::from_weights(&cfg, &mut w)
+      .unwrap()
+      .encode_text(&ids, &mask)
+      .unwrap(),
+  );
+
+  let mut w2 = clap_text_weights();
+  // A distinct, non-degenerate pooler weight (scaled identity-ish fill).
+  let perturbed: Vec<f32> = (0..(HIDDEN * HIDDEN) as usize)
+    .map(|n| ((n % 11) as f32) * 0.02 + 0.003)
+    .collect();
+  w2.insert(
+    "pooler.dense.weight".to_string(),
+    Array::from_slice::<f32>(&perturbed, &(HIDDEN as usize, HIDDEN as usize)).unwrap(),
+  );
+  let perturbed_out = read_f32(
+    &ClapTextModel::from_weights(&cfg, &mut w2)
+      .unwrap()
+      .encode_text(&ids, &mask)
+      .unwrap(),
+  );
+
+  let max_abs_diff = base
+    .iter()
+    .zip(perturbed_out.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f32, f32::max);
+  assert!(
+    max_abs_diff > 1e-4,
+    "changing pooler.dense.weight must change the tower output (the pooler is in the path); max |Δ| = {max_abs_diff}"
+  );
+}
+
+#[test]
+fn tower_missing_pooler_weight_errors() {
+  // The pooler is a required layer: dropping `pooler.dense.weight` must error at
+  // load (the checkpoint always ships it; a missing one is a malformed map).
+  let cfg = clap_config();
+  let mut w = clap_text_weights();
+  w.remove("pooler.dense.weight");
+  assert!(
+    ClapTextModel::from_weights(&cfg, &mut w).is_err(),
+    "a missing pooler.dense.weight must error at load"
+  );
 }
 
 #[test]
@@ -707,10 +796,11 @@ fn tower_loads_and_forwards_quantized_checkpoint() {
   let mut w = clap_text_weights();
 
   // Quantize every nn.Linear: the attention q/k/v + output dense, the FFN
-  // intermediate/output dense, and the two projection layers. The word/position/
-  // token_type embeddings and the LayerNorms stay dense (the position table is
-  // sliced; LayerNorm weights are not quantizable). This mirrors quantizing only
-  // the Linears, which still exercises the quantized load + forward path.
+  // intermediate/output dense, the pooler dense, and the two projection layers.
+  // The word/position/token_type embeddings and the LayerNorms stay dense (the
+  // position table is sliced; LayerNorm weights are not quantizable). This
+  // mirrors quantizing only the Linears, which still exercises the quantized
+  // load + forward path.
   for i in 0..LAYERS {
     let l = format!("encoder.layer.{i}");
     for p in ["query", "key", "value"] {
@@ -720,6 +810,7 @@ fn tower_loads_and_forwards_quantized_checkpoint() {
     quantize_weight_in_place(&mut w, &format!("{l}.intermediate.dense"));
     quantize_weight_in_place(&mut w, &format!("{l}.output.dense"));
   }
+  quantize_weight_in_place(&mut w, "pooler.dense");
   quantize_weight_in_place(&mut w, "text_projection.linear1");
   quantize_weight_in_place(&mut w, "text_projection.linear2");
 

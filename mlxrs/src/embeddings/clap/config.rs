@@ -170,7 +170,7 @@ pub struct ClapTextConfig {
   /// `ClapTextConfig.pad_token_id`.
   #[serde(default = "default_text_pad_token_id")]
   pub pad_token_id: i32,
-  /// `eps` shared by every `LayerNorm` (`1e-5`). HF
+  /// `eps` shared by every `LayerNorm` (`1e-12`, the RoBERTa default). HF
   /// `ClapTextConfig.layer_norm_eps`.
   #[serde(default = "default_text_layer_norm_eps")]
   pub layer_norm_eps: f64,
@@ -318,7 +318,7 @@ fn default_text_pad_token_id() -> i32 {
 }
 #[cfg(feature = "clap")]
 fn default_text_layer_norm_eps() -> f64 {
-  1e-5
+  1e-12
 }
 #[cfg(feature = "clap")]
 fn default_text_hidden_act() -> String {
@@ -542,8 +542,9 @@ impl ClapTextConfig {
     ] {
       pin_i32(name, actual, expected)?;
     }
-    // The shared LayerNorm epsilon is fixed for the checkpoint.
-    pin_f64("ClapTextConfig: layer_norm_eps", self.layer_norm_eps, 1e-5)?;
+    // The shared LayerNorm epsilon is fixed for the checkpoint (`1e-12`, the
+    // RoBERTa default — distinct from the audio tower's `1e-5`).
+    pin_f64("ClapTextConfig: layer_norm_eps", self.layer_norm_eps, 1e-12)?;
     // The encoder + FFN use exact GELU; pin the activation id.
     pin_str(
       "ClapTextConfig: hidden_act",

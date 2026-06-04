@@ -295,22 +295,25 @@ fn tokenize_labels_batch(
   let seq_len = rows.iter().map(Vec::len).max().unwrap_or(0);
 
   let mut ids: Vec<i32> = Vec::with_capacity(rows.len() * seq_len);
-  let mut mask: Vec<i32> = Vec::with_capacity(rows.len() * seq_len);
+  // The attention mask is an f32 `{0, 1}` array — `build_additive_mask`
+  // compares it against an f32 `0` (matching the encode pipeline + the text
+  // tower unit tests).
+  let mut mask: Vec<f32> = Vec::with_capacity(rows.len() * seq_len);
   for row in &rows {
     for j in 0..seq_len {
       if j < row.len() {
         ids.push(row[j] as i32);
-        mask.push(1);
+        mask.push(1.0);
       } else {
         ids.push(PAD_TOKEN_ID);
-        mask.push(0);
+        mask.push(0.0);
       }
     }
   }
   let shape = (rows.len(), seq_len);
   (
     Array::from_slice::<i32>(&ids, &shape).expect("label ids array"),
-    Array::from_slice::<i32>(&mask, &shape).expect("label mask array"),
+    Array::from_slice::<f32>(&mask, &shape).expect("label mask array"),
   )
 }
 
