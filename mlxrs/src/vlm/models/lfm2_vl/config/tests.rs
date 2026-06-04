@@ -411,3 +411,160 @@ fn model_config_applies_rope_parameters_override_on_nested_text_config() {
   // The override leaves an otherwise-valid config valid.
   cfg.validate().unwrap();
 }
+
+// ──────────────────── config-controlled-allocation caps ─────────────────────
+//
+// Every config field that multiplies into a Vec reservation or a tensor
+// allocation is bounded at `validate()` so a hostile-but-parseable config cannot
+// drive an oversized allocation. Width-like fields take `MAX_CONFIG_DIM`,
+// cardinality-like fields `MAX_CARDINALITY`, and the per-image patch budget
+// `MAX_PATCH_BUDGET` — each rejecting both a non-positive and an oversized value.
+
+#[test]
+fn model_config_rejects_oversized_max_num_patches() {
+  // `max_num_patches` is the leading dimension of the `pixel_values` allocation
+  // the patchify paths zero-fill; a value near `i32::MAX` would drive a multi-TB
+  // buffer. Bounded by `MAX_PATCH_BUDGET` at load (an over-cap value is the
+  // ranged `OutOfRange`).
+  let over = MAX_PATCH_BUDGET + 1;
+  let bad = format!(r#"{{"text_config":{{}},"vision_config":{{}},"max_num_patches":{over}}}"#);
+  let cfg = ModelConfig::from_json(&bad).unwrap();
+  assert!(
+    matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)),
+    "max_num_patches above the patch-budget cap must be OutOfRange"
+  );
+  // A near-`i32::MAX` `max_num_patches` would size a multi-TB `pixel_values`
+  // buffer; it is rejected at load.
+  let huge = format!(
+    r#"{{"text_config":{{}},"vision_config":{{}},"max_num_patches":{}}}"#,
+    i32::MAX
+  );
+  assert!(matches!(
+    ModelConfig::from_json(&huge)
+      .unwrap()
+      .validate()
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  // The cap value itself is in-bound (generous but faithful).
+  let at_cap =
+    format!(r#"{{"text_config":{{}},"vision_config":{{}},"max_num_patches":{MAX_PATCH_BUDGET}}}"#);
+  ModelConfig::from_json(&at_cap)
+    .unwrap()
+    .validate()
+    .expect("max_num_patches == cap validates");
+}
+
+#[test]
+fn model_config_rejects_oversized_patch_budget_fields() {
+  // The HF tile-grid budgets index the same per-image patch space as
+  // `max_num_patches`, so each is bounded by `MAX_PATCH_BUDGET`.
+  let over = MAX_PATCH_BUDGET + 1;
+  for field in ["tile_size", "encoder_patch_size", "max_image_tokens"] {
+    let bad = format!(r#"{{"text_config":{{}},"vision_config":{{}},"{field}":{over}}}"#);
+    let cfg = ModelConfig::from_json(&bad).unwrap();
+    assert!(
+      matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)),
+      "{field} above the patch-budget cap must be OutOfRange"
+    );
+  }
+}
+
+#[test]
+fn model_config_rejects_oversized_width_fields() {
+  // The projector width fields name a matmul axis / fold factor, bounded by
+  // `MAX_CONFIG_DIM`.
+  let over = i64::from(MAX_CONFIG_DIM) + 1;
+  for field in ["downsample_factor", "projector_hidden_size"] {
+    let bad = format!(r#"{{"text_config":{{}},"vision_config":{{}},"{field}":{over}}}"#);
+    let cfg = ModelConfig::from_json(&bad).unwrap();
+    assert!(
+      matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)),
+      "{field} above the width cap must be OutOfRange"
+    );
+  }
+}
+
+#[test]
+fn vision_config_rejects_oversized_width_fields() {
+  // Vision width fields (matmul axis / position-table column) are bounded by
+  // `MAX_CONFIG_DIM` — both a non-positive and an oversized value is `OutOfRange`.
+  // `hidden_size` is divisible by `num_attention_heads` (12), so use a multiple.
+  let over_w = i64::from(MAX_CONFIG_DIM) + 12;
+  for field in [
+    "hidden_size",
+    "intermediate_size",
+    "image_size",
+    "patch_size",
+  ] {
+    let bad = format!(r#"{{"model_type":"lfm2_vl","{field}":{over_w}}}"#);
+    let cfg = VisionConfig::from_json(&bad).unwrap();
+    assert!(
+      matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)),
+      "vision {field} above the width cap must be OutOfRange"
+    );
+  }
+  // `num_patches` (the position-table row count) is bounded by the width cap too;
+  // `MAX_CONFIG_DIM == 1024^2` is itself a perfect square, so the next larger
+  // perfect square (`1025^2`) is over-cap and rejected by the range check (which
+  // runs before the perfect-square check).
+  let over_sq = 1025i64 * 1025;
+  let bad = format!(r#"{{"model_type":"lfm2_vl","num_patches":{over_sq}}}"#);
+  assert!(matches!(
+    VisionConfig::from_json(&bad)
+      .unwrap()
+      .validate()
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+}
+
+#[test]
+fn vision_config_rejects_oversized_cardinality_fields() {
+  // Vision cardinality fields size an eager per-unit `Vec` / loop, bounded by
+  // `MAX_CARDINALITY`; an over-cap value is `CapExceeded` (distinct from the
+  // `OutOfRange` a non-positive value yields).
+  let over = i64::from(MAX_CARDINALITY) + 1;
+  for field in ["num_hidden_layers", "num_channels"] {
+    let bad = format!(r#"{{"model_type":"lfm2_vl","{field}":{over}}}"#);
+    let cfg = VisionConfig::from_json(&bad).unwrap();
+    assert!(
+      matches!(cfg.validate().unwrap_err(), Error::CapExceeded(_)),
+      "vision {field} above the cardinality cap must be CapExceeded"
+    );
+  }
+  // `num_attention_heads` over the cap: keep `hidden_size` divisible by it so the
+  // cap check (not the head-split divisibility) is what fires. `MAX_CARDINALITY +
+  // 1 == 4097` is prime-ish; use a `hidden_size` that is its multiple.
+  let heads = MAX_CARDINALITY + 1;
+  let hidden = i64::from(heads); // hidden_size == heads ⇒ divisible, head_dim == 1
+  let bad =
+    format!(r#"{{"model_type":"lfm2_vl","num_attention_heads":{heads},"hidden_size":{hidden}}}"#);
+  assert!(matches!(
+    VisionConfig::from_json(&bad)
+      .unwrap()
+      .validate()
+      .unwrap_err(),
+    Error::CapExceeded(_)
+  ));
+}
+
+#[test]
+fn vision_config_at_caps_validates() {
+  // A generous-but-in-bound config validates: widths at `MAX_CONFIG_DIM`,
+  // cardinalities at `MAX_CARDINALITY`. `num_patches == 1024^2 == MAX_CONFIG_DIM`
+  // is a perfect square at the width cap; `hidden_size` must stay divisible by
+  // `num_attention_heads` (use `MAX_CARDINALITY` heads ⇒ head_dim 256). Keep
+  // `patch_size`/`num_channels` small so `patch_feature_dim` does not overflow.
+  let hidden = MAX_CONFIG_DIM; // divisible by MAX_CARDINALITY (1<<20 / 4096 == 256)
+  let json = format!(
+    r#"{{"model_type":"lfm2_vl","hidden_size":{hidden},"intermediate_size":{MAX_CONFIG_DIM},
+        "num_hidden_layers":{MAX_CARDINALITY},"num_attention_heads":{MAX_CARDINALITY},
+        "num_channels":3,"image_size":{MAX_CONFIG_DIM},"patch_size":16,
+        "num_patches":{MAX_CONFIG_DIM}}}"#
+  );
+  VisionConfig::from_json(&json)
+    .unwrap()
+    .validate()
+    .expect("config at the caps validates");
+}

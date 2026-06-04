@@ -107,6 +107,31 @@ const MAX_SOURCE_DIM: usize = 1 << 16;
 /// arithmetic so `width * height * 3` cannot wrap (a wrapped length would be UB).
 const MAX_SOURCE_PIXELS: usize = 1 << 29;
 
+/// Total-element cap on a single image's (or sub-image's) `pixel_values`
+/// allocation — the `max_num_patches * (num_channels * patch_size^2)` f32 buffer
+/// the native + tiled patchify paths zero-fill.
+///
+/// `max_num_patches` is config-controlled
+/// ([`Lfm2VlProcessorConfig`], from the validated
+/// [`ModelConfig`](super::config::ModelConfig)), and `patch_size` is config-
+/// controlled too, so the **product** that sizes the buffer is the cumulative
+/// allocation a hostile-but-validated config could drive — the per-field caps
+/// ([`super::config::MAX_PATCH_BUDGET`] on `max_num_patches`,
+/// [`super::config::MAX_CONFIG_DIM`] on `patch_size`) each bound one factor but
+/// not their product (`65536 * (3 * 1048576^2)` overflows a sane budget while
+/// each factor is in range). This caps the product directly, before the
+/// reserve / zero-fill, so the cumulative per-image allocation is bounded — the
+/// bounded-memory-caps discipline (a cap bounds every intermediate buffer, not
+/// one field).
+///
+/// HuggingFace `image_processing_lfm2_vl.py` imposes no hard cap (its realistic
+/// `pixel_values` is `max_num_patches <= 1024` rows of `768` ⇒ ~786 K f32), so
+/// the bound is generous: `1 << 30` (`1_073_741_824` f32 ≈ 4 GiB) is ~1365x the
+/// real `1024 * 768` budget — it never rejects a sane checkpoint — while keeping
+/// an over-budget patchify a recoverable [`Error::CapExceeded`] instead of an
+/// oversized allocation.
+const MAX_PIXEL_VALUES_ELEMENTS: usize = 1 << 30;
+
 // ═══════════════════════════ Lfm2VlProcessorConfig ══════════════════════════
 
 /// The LFM2.5-VL image-processor parameters — `processing_lfm2_vl.py`'s
@@ -212,16 +237,34 @@ impl Lfm2VlProcessorConfig {
   ///
   /// # Errors
   /// [`Error::OutOfRange`] if `patch_size`, `max_num_patches`, or
-  /// `downsample_factor` is `0`, or if `image_token` is negative.
+  /// `downsample_factor` is `0` or exceeds its config allocation cap
+  /// (`max_num_patches` by [`MAX_PATCH_BUDGET`](super::config::MAX_PATCH_BUDGET),
+  /// `patch_size` / `downsample_factor` by
+  /// [`MAX_CONFIG_DIM`](super::config::MAX_CONFIG_DIM)), or if `image_token` is
+  /// negative. These bound the patch-budget / width factors of the per-image
+  /// `pixel_values` allocation whether the config arrives validated or directly
+  /// through this builder.
   pub fn new(
     image_token: i32,
     downsample_factor: u32,
     patch_size: u32,
     max_num_patches: u32,
   ) -> Result<Self> {
-    require_positive_u32("lfm2_vl processor: patch_size", patch_size)?;
-    require_positive_u32("lfm2_vl processor: max_num_patches", max_num_patches)?;
-    require_positive_u32("lfm2_vl processor: downsample_factor", downsample_factor)?;
+    require_within_u32(
+      "lfm2_vl processor: patch_size",
+      patch_size,
+      super::config::MAX_CONFIG_DIM,
+    )?;
+    require_within_u32(
+      "lfm2_vl processor: max_num_patches",
+      max_num_patches,
+      super::config::MAX_PATCH_BUDGET,
+    )?;
+    require_within_u32(
+      "lfm2_vl processor: downsample_factor",
+      downsample_factor,
+      super::config::MAX_CONFIG_DIM,
+    )?;
     if image_token < 0 {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
         "lfm2_vl processor: image_token",
@@ -261,12 +304,15 @@ impl Lfm2VlProcessorConfig {
   /// # Errors
   /// [`Error::OutOfRange`] if any cardinality field
   /// (`min_tiles` / `max_tiles` / `min_image_tokens` / `max_image_tokens` /
-  /// `encoder_patch_size` / `tile_size`) is `0`, [`Error::OutOfRange`] if
-  /// `max_tiles` exceeds the tile-grid cardinality cap
-  /// ([`MAX_TILES`](super::config::MAX_TILES)), [`Error::OutOfRange`] if
-  /// `min_tiles > max_tiles` or `min_image_tokens > max_image_tokens`,
+  /// `encoder_patch_size` / `tile_size`) is `0`; [`Error::OutOfRange`] if a
+  /// patch-budget field (`min_image_tokens` / `max_image_tokens` /
+  /// `encoder_patch_size` / `tile_size`) exceeds
+  /// [`MAX_PATCH_BUDGET`](super::config::MAX_PATCH_BUDGET); [`Error::OutOfRange`]
+  /// if `max_tiles` exceeds the tile-grid cardinality cap
+  /// ([`MAX_TILES`](super::config::MAX_TILES)); [`Error::OutOfRange`] if
+  /// `min_tiles > max_tiles` or `min_image_tokens > max_image_tokens`;
   /// [`Error::NonFiniteScalar`] / [`Error::OutOfRange`] if
-  /// `max_pixels_tolerance` is non-finite / non-positive, and
+  /// `max_pixels_tolerance` is non-finite / non-positive; and
   /// [`Error::DivisibilityConstraint`] if `tile_size` is not a whole multiple of
   /// `encoder_patch_size` (a tile must split into a whole patch grid).
   #[allow(clippy::too_many_arguments)]
@@ -282,15 +328,28 @@ impl Lfm2VlProcessorConfig {
     tile_size: u32,
     max_pixels_tolerance: f32,
   ) -> Result<Self> {
+    // The tile counts are positive here (`max_tiles` is then bounded by the
+    // [`MAX_TILES`](super::config::MAX_TILES) cardinality cap below, `min_tiles`
+    // by the `min_tiles <= max_tiles` ordering).
     for (name, value) in [
       ("lfm2_vl tiling: min_tiles", min_tiles),
       ("lfm2_vl tiling: max_tiles", max_tiles),
+    ] {
+      require_positive_u32(name, value)?;
+    }
+    // The patch-budget fields index the per-image patch space (the same space as
+    // `max_num_patches`), so bound each by
+    // [`MAX_PATCH_BUDGET`](super::config::MAX_PATCH_BUDGET) — mirroring
+    // [`ModelConfig::validate`](super::config::ModelConfig::validate) — so a
+    // direct builder caller cannot install an oversized budget the validated
+    // config path would reject.
+    for (name, value) in [
       ("lfm2_vl tiling: min_image_tokens", min_image_tokens),
       ("lfm2_vl tiling: max_image_tokens", max_image_tokens),
       ("lfm2_vl tiling: encoder_patch_size", encoder_patch_size),
       ("lfm2_vl tiling: tile_size", tile_size),
     ] {
-      require_positive_u32(name, value)?;
+      require_within_u32(name, value, super::config::MAX_PATCH_BUDGET)?;
     }
     // Bound `max_tiles` to the tile-grid cardinality cap before any tile-grid
     // work: `target_ratios` reserves / iterates `max_tiles^2` candidates, so an
@@ -626,6 +685,99 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
   Ok(())
 }
 
+/// Reject a `u32` dimension outside the inclusive band `[1, cap]` — the
+/// processor-construction analogue of the config-load
+/// [`require_in_range`](crate::model_validation::require_in_range), so a config
+/// field that drives an allocation is bounded whether it reaches the processor
+/// through the validated [`ModelConfig`](super::config::ModelConfig) or directly
+/// via the public [`Lfm2VlProcessorConfig`] builders. `cap` is the corresponding
+/// `i32` config cap; it is non-negative by construction.
+#[cfg(feature = "lfm2-vl")]
+fn require_within_u32(context: &'static str, value: u32, cap: i32) -> Result<()> {
+  require_positive_u32(context, value)?;
+  // `cap` is one of the `super::config` caps (`> 0`), so `cap as u32` is lossless.
+  if value > cap as u32 {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "must not exceed the config allocation cap",
+      smol_str::format_smolstr!("{value} (allowed [1, {cap}])"),
+    )));
+  }
+  Ok(())
+}
+
+/// The `(per_patch, total)` element counts of a `pixel_values` buffer —
+/// `per_patch = patch_size^2 * channels` (the flattened per-patch width) and
+/// `total = max_num_patches * per_patch` (the full leading-padded buffer) — with
+/// the cumulative-allocation guard the native + tiled patchify paths share.
+///
+/// The total is the size of the f32 buffer both paths reserve and zero-fill, and
+/// both of its config-controlled factors (`max_num_patches`, `patch_size`) are
+/// bounded **individually** at config load
+/// ([`super::config::MAX_PATCH_BUDGET`] / [`super::config::MAX_CONFIG_DIM`]) —
+/// but not their **product**, the quantity that actually sizes the allocation.
+/// This routes the product through [`elem_count`] (each factor an [`Extent`]
+/// capped at the per-image element cap, the running product checked against
+/// `MAX_PIXEL_VALUES_ELEMENTS`), so an overflow is a typed
+/// [`Error::ArithmeticOverflow`] and an over-budget product a typed
+/// [`Error::CapExceeded`] — never an oversized allocation. `per_patch` is
+/// recomputed here for the patchify offset arithmetic; it is a factor of the
+/// in-range `total`, so it cannot overflow.
+#[cfg(feature = "lfm2-vl")]
+fn pixel_values_element_count(
+  patch_size: usize,
+  channels: usize,
+  max_num_patches: usize,
+) -> Result<(usize, usize)> {
+  // The full product `patch_size * patch_size * channels * max_num_patches`,
+  // each factor an [`Extent`] capped per-axis at the per-image element cap and
+  // the running product checked against it. A factor at the cap with the others
+  // `> 1` overflows the running product into [`Error::CapExceeded`] before any
+  // narrowing, so the per-axis cap can be the total cap itself.
+  let total = elem_count(
+    "lfm2_vl pixel_values element count (max_num_patches * patch_size^2 * channels)",
+    &[
+      Extent::new(
+        "lfm2_vl pixel_values: patch_size",
+        patch_size,
+        MAX_PIXEL_VALUES_ELEMENTS,
+      )?,
+      Extent::new(
+        "lfm2_vl pixel_values: patch_size",
+        patch_size,
+        MAX_PIXEL_VALUES_ELEMENTS,
+      )?,
+      Extent::new(
+        "lfm2_vl pixel_values: channels",
+        channels,
+        MAX_PIXEL_VALUES_ELEMENTS,
+      )?,
+      Extent::new(
+        "lfm2_vl pixel_values: max_num_patches",
+        max_num_patches,
+        MAX_PIXEL_VALUES_ELEMENTS,
+      )?,
+    ],
+    MAX_PIXEL_VALUES_ELEMENTS,
+  )?;
+  // `per_patch = patch_size^2 * channels` is a factor of the in-range `total`, so
+  // this cannot overflow.
+  let per_patch = patch_size
+    .checked_mul(patch_size)
+    .and_then(|pp| pp.checked_mul(channels))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl pixel_values: per-patch width (patch_size^2 * channels)",
+        "usize",
+        [
+          ("patch_size", patch_size as u64),
+          ("channels", channels as u64),
+        ],
+      ))
+    })?;
+  Ok((per_patch, total))
+}
+
 /// Native-resolution preprocess one interleaved RGB image into
 /// [`Lfm2VlImageInputs`].
 ///
@@ -646,7 +798,8 @@ fn require_positive_u32(context: &'static str, value: u32) -> Result<()> {
 ///   [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`] /
 ///   [`Error::LengthMismatch`].
 /// - the `pixel_values` element count `max_num_patches * (3 * patch_size^2)`
-///   overflows `usize` → [`Error::ArithmeticOverflow`].
+///   overflows `usize` → [`Error::ArithmeticOverflow`], or exceeds the per-image
+///   element cap `MAX_PIXEL_VALUES_ELEMENTS` → [`Error::CapExceeded`].
 /// - the selected grid `H_p * W_p` exceeds `max_num_patches` (an adversarial
 ///   dimension whose feasible scale range is below the search floor) →
 ///   [`Error::CapExceeded`].
@@ -707,34 +860,15 @@ pub fn preprocess_image(
   }
 
   // Per-patch flattened width = C * P^2; the `pixel_values` element count is
-  // `max_num_patches * per_patch`. Both overflow-checked so a hostile config
-  // cannot wrap the allocation size (a wrapped size would be UB).
+  // `max_num_patches * per_patch`. The product is the cumulative per-image
+  // allocation a hostile-but-validated config could drive (both `max_num_patches`
+  // and `patch_size` are config-controlled), so it is overflow-checked AND
+  // bounded by `MAX_PIXEL_VALUES_ELEMENTS` before the reserve / zero-fill — a
+  // wrap is a typed `ArithmeticOverflow`, an over-budget product a typed
+  // `CapExceeded`, never an oversized allocation.
   let p = patch_size as usize;
-  let per_patch = p
-    .checked_mul(p)
-    .and_then(|pp| pp.checked_mul(channels))
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "lfm2_vl preprocess: per-patch width (patch_size^2 * channels)",
-        "usize",
-        [
-          ("patch_size", u64::from(patch_size)),
-          ("channels", RGB_CHANNELS as u64),
-        ],
-      ))
-    })?;
-  let total_floats = (max_num_patches as usize)
-    .checked_mul(per_patch)
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "lfm2_vl preprocess: pixel_values size (max_num_patches * per_patch)",
-        "usize",
-        [
-          ("max_num_patches", u64::from(max_num_patches)),
-          ("per_patch", per_patch as u64),
-        ],
-      ))
-    })?;
+  let (per_patch, total_floats) =
+    pixel_values_element_count(p, channels, max_num_patches as usize)?;
 
   // 1. Target patch grid (the authoritative SigLIP2 NaFlex oracle formula,
   //    shared verbatim with the embeddings NaFlex path).
@@ -1567,7 +1701,8 @@ pub fn plan_tiles(height: u32, width: u32, cfg: &Lfm2VlProcessorConfig) -> Resul
 /// - [`Error::OutOfRange`] for a zero dimension;
 /// - [`Error::LengthMismatch`] if `rgb.len()` disagrees with `width*height*3`;
 /// - [`Error::CapExceeded`] if a tile / thumbnail patch grid exceeds
-///   `max_num_patches`;
+///   `max_num_patches`, or a sub-image's `pixel_values` element count exceeds the
+///   per-image element cap `MAX_PIXEL_VALUES_ELEMENTS`;
 /// - propagates the [`plan_tiles`] grid-math, the [`resize`], and the
 ///   [`Array::from_slice`] errors.
 #[cfg(feature = "lfm2-vl")]
@@ -1828,31 +1963,14 @@ fn patchify_rgba_region(
   }
 
   // Per-patch flattened width = C * p^2; the pixel buffer is
-  // `max_num_patches * per_patch` (overflow-checked).
+  // `max_num_patches * per_patch`. Same cumulative-allocation guard as the native
+  // path: overflow-checked AND bounded by `MAX_PIXEL_VALUES_ELEMENTS` before the
+  // reserve / zero-fill (a wrap is `ArithmeticOverflow`, an over-budget product
+  // `CapExceeded`).
   let pu = p as usize;
   let channels = RGB_CHANNELS as usize;
-  let per_patch = pu
-    .checked_mul(pu)
-    .and_then(|pp| pp.checked_mul(channels))
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "lfm2_vl tile patchify: per-patch width (p^2 * channels)",
-        "usize",
-        [("p", u64::from(p)), ("channels", RGB_CHANNELS as u64)],
-      ))
-    })?;
-  let total_floats = (max_num_patches as usize)
-    .checked_mul(per_patch)
-    .ok_or_else(|| {
-      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
-        "lfm2_vl tile patchify: pixel_values size (max_num_patches * per_patch)",
-        "usize",
-        [
-          ("max_num_patches", u64::from(max_num_patches)),
-          ("per_patch", per_patch as u64),
-        ],
-      ))
-    })?;
+  let (per_patch, total_floats) =
+    pixel_values_element_count(pu, channels, max_num_patches as usize)?;
 
   let mut pixel_values: Vec<f32> = Vec::new();
   reserve_or_error(

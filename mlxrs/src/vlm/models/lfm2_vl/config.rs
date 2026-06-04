@@ -43,12 +43,61 @@
 
 use crate::{
   error::{Error, OutOfRangePayload, ParsePayload, Result},
-  model_validation::{checked_mul, require_divisible, require_positive},
+  model_validation::{
+    checked_mul, require_cardinality, require_divisible, require_in_range, require_positive,
+  },
 };
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use crate::lm::models::lfm2::TextConfig;
+
+/// Inclusive upper bound on every *width*-like vision / projector config field —
+/// a matmul axis or embedding-table column (`hidden_size`, `intermediate_size`,
+/// `image_size`, `patch_size`, `num_patches`, `projector_hidden_size`). A width
+/// sizes a layer's parameter tensor, so a hostile value drives an oversized
+/// allocation; `1 << 20` (`1048576`) bounds every width — the real SigLIP2 tower
+/// widths are a few thousand and the position grid `256`, all far below — while
+/// keeping a malformed width a recoverable [`Error::OutOfRange`]. Mirrors the
+/// EmbeddingGemma / LFM2-LM config width-cap (`MAX_CONFIG_DIM`) discipline; the
+/// LFM2 text tower carries its own (`2^24`) cap, applied by
+/// [`TextConfig::validate`].
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_CONFIG_DIM: i32 = 1 << 20;
+
+/// Inclusive upper bound on every *cardinality*-like vision config field — a
+/// count that sizes an eager per-unit `Vec` or loop (`num_hidden_layers`,
+/// `num_attention_heads`, `num_channels`). A SigLIP2 tower has 12-27 layers and
+/// 12-16 heads; `4096` is far above any legitimate count while still bounding
+/// the per-layer build loop a hostile `num_hidden_layers` could drive. Matches
+/// the EmbeddingGemma / SigLIP2 / LFM2-LM config `MAX_CARDINALITY` intent.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_CARDINALITY: i32 = 4096;
+
+/// Inclusive upper bound on the per-image patch budget (`max_num_patches`, and
+/// the HF tile-grid token budgets `min_image_tokens` / `max_image_tokens`,
+/// `encoder_patch_size`, `tile_size`, `downsample_factor`). `max_num_patches`
+/// is the **leading dimension of the `pixel_values` allocation**
+/// (`max_num_patches x num_channels * patch_size^2`) the native + tiled
+/// patchify paths zero-fill ([`crate::vlm::models::lfm2_vl::processor`]), so an
+/// unbounded value from a malformed checkpoint would drive an oversized
+/// allocation per image regardless of the [`MAX_TILES`] tile-count cap.
+///
+/// HuggingFace `image_processing_lfm2_vl.py` imposes no hard ceiling on
+/// `max_num_patches` (the SigLIP2 NaFlex default is `256`; the released
+/// `LiquidAI/LFM2.5-VL` MLX checkpoints ship `1024`), so the bound is generous:
+/// `1 << 16` (`65536`) is ~64x the `1024` default — it never rejects a sane
+/// checkpoint — while bounding a single image's `pixel_values` leading dimension
+/// to a sane size (the derived total-element cap
+/// [`crate::vlm::models::lfm2_vl::processor`]'s `MAX_PIXEL_VALUES_ELEMENTS`
+/// bounds the full product `max_num_patches * patch_size^2 * channels`). The
+/// tile-grid token budgets share this cap since they index the same patch-budget
+/// space.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_PATCH_BUDGET: i32 = 1 << 16;
 
 // ═══════════════════════════════ VisionConfig ══════════════════════════════
 
@@ -233,11 +282,14 @@ impl VisionConfig {
   /// Pins `model_type` to one of `vision.py`'s accepted ids
   /// (`"lfm2_vl"` / `"siglip2_vision_model"`); pins `hidden_act` to the tanh
   /// GELU the MLP implements (`"gelu_pytorch_tanh"`, `vision.py:67` /
-  /// `config.py:65`); requires every dimension / count (`hidden_size`,
-  /// `intermediate_size`, the layer + head counts, `num_channels`, `image_size`,
-  /// `patch_size`, `num_patches`) strictly positive; requires `hidden_size`
-  /// divisible by `num_attention_heads` (the per-head split); requires
-  /// `num_patches` a perfect square (the trained position grid is
+  /// `config.py:65`); bounds every width-like field (`hidden_size`,
+  /// `intermediate_size`, `image_size`, `patch_size`, `num_patches`) by
+  /// [`MAX_CONFIG_DIM`] and every cardinality-like field (the layer + head
+  /// counts, `num_channels`) by [`MAX_CARDINALITY`] — each rejecting both a
+  /// non-positive and an oversized value, so a hostile dimension cannot drive an
+  /// oversized parameter / position-table / per-layer allocation; requires
+  /// `hidden_size` divisible by `num_attention_heads` (the per-head split);
+  /// requires `num_patches` a perfect square (the trained position grid is
   /// `sqrt(num_patches) x sqrt(num_patches)`); and validates that the derived
   /// `patch_feature_dim` (`num_channels * patch_size^2`) arithmetic does not
   /// overflow (a wrapped width would be UB downstream).
@@ -256,12 +308,31 @@ impl VisionConfig {
       self.hidden_act.as_str(),
       VISION_HIDDEN_ACTS,
     )?;
+    // Width-like fields name a matmul axis / embedding-table column (the
+    // patch-embed Linear width derives from `num_channels * patch_size^2`, the
+    // position table has `num_patches` rows). `require_in_range(_, 1,
+    // MAX_CONFIG_DIM)` rejects both a non-positive and an oversized value as one
+    // [`Error::OutOfRange`], so a hostile width cannot drive an oversized
+    // parameter / position-table allocation. Mirrors the EmbeddingGemma width-cap.
     for (name, value) in [
       ("lfm2_vl::VisionConfig: hidden_size", self.hidden_size),
       (
         "lfm2_vl::VisionConfig: intermediate_size",
         self.intermediate_size,
       ),
+      ("lfm2_vl::VisionConfig: image_size", self.image_size),
+      ("lfm2_vl::VisionConfig: patch_size", self.patch_size),
+      ("lfm2_vl::VisionConfig: num_patches", self.num_patches),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
+    // Cardinality-like fields size an eager per-unit `Vec` / loop (the encoder
+    // builds a `Vec` of `num_hidden_layers` layers; the per-head split iterates
+    // `num_attention_heads`; the patchify channel loop runs `num_channels`
+    // times), so each takes the much tighter [`MAX_CARDINALITY`] cap: a
+    // non-positive count is [`Error::OutOfRange`], an over-cap one
+    // [`Error::CapExceeded`].
+    for (name, value) in [
       (
         "lfm2_vl::VisionConfig: num_attention_heads",
         self.num_attention_heads,
@@ -271,11 +342,8 @@ impl VisionConfig {
         self.num_hidden_layers,
       ),
       ("lfm2_vl::VisionConfig: num_channels", self.num_channels),
-      ("lfm2_vl::VisionConfig: image_size", self.image_size),
-      ("lfm2_vl::VisionConfig: patch_size", self.patch_size),
-      ("lfm2_vl::VisionConfig: num_patches", self.num_patches),
     ] {
-      require_positive(name, value)?;
+      require_cardinality(name, i64::from(value), MAX_CARDINALITY as u64)?;
     }
     require_divisible(
       "lfm2_vl::VisionConfig: hidden_size",
@@ -561,17 +629,19 @@ impl ModelConfig {
   /// tensor is built.
   ///
   /// Pins the top-level `model_type` to `"lfm2-vl"` / `"lfm2_vl"`
-  /// (mlx-community checkpoints ship the underscore form); requires
-  /// the projector / patch-merge dimensions (`downsample_factor`,
-  /// `projector_hidden_size`, `max_num_patches`, `tile_size`) and the tile-grid
-  /// cardinality fields (`encoder_patch_size`, `max_image_tokens`,
-  /// `min_image_tokens`, `max_tiles`, `min_tiles`) strictly positive,
-  /// `max_tiles` within the [`MAX_TILES`] cardinality cap,
-  /// `max_pixels_tolerance` positive-and-finite, the `min_* <= max_*` orderings,
-  /// and `image_token_index` / `eos_token_id` non-negative; validates that
-  /// `vision_feature_layer` resolves to an in-range kept-layer count; and
-  /// validates both tower configs (see [`TextConfig::validate`] /
-  /// [`VisionConfig::validate`]).
+  /// (mlx-community checkpoints ship the underscore form); bounds the projector
+  /// width fields (`downsample_factor`, `projector_hidden_size`) by
+  /// [`MAX_CONFIG_DIM`]; bounds the patch-budget fields (`max_num_patches` — the
+  /// leading dimension of the `pixel_values` allocation — `tile_size`,
+  /// `encoder_patch_size`, `max_image_tokens`, `min_image_tokens`) by
+  /// [`MAX_PATCH_BUDGET`] so a hostile budget cannot drive an oversized per-image
+  /// allocation; requires `max_tiles` / `min_tiles` positive and `max_tiles`
+  /// within the [`MAX_TILES`] cardinality cap (its `max_tiles^2` candidate
+  /// reservation); requires `max_pixels_tolerance` positive-and-finite, the
+  /// `min_* <= max_*` orderings, and `image_token_index` / `eos_token_id`
+  /// non-negative; validates that `vision_feature_layer` resolves to an in-range
+  /// kept-layer count; and validates both tower configs (see
+  /// [`TextConfig::validate`] / [`VisionConfig::validate`]).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::ModelConfig: model_type",
@@ -586,6 +656,10 @@ impl ModelConfig {
       self.projector_hidden_act.as_str(),
       &["gelu"],
     )?;
+    // Width-like fields name a matmul axis (the projector `Linear`s) / a fold
+    // factor (`downsample_factor` squares into the projector input width). Bound
+    // each by [`MAX_CONFIG_DIM`] — a non-positive or oversized value is one
+    // [`Error::OutOfRange`].
     for (name, value) in [
       (
         "lfm2_vl::ModelConfig: downsample_factor",
@@ -595,6 +669,17 @@ impl ModelConfig {
         "lfm2_vl::ModelConfig: projector_hidden_size",
         self.projector_hidden_size,
       ),
+    ] {
+      require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
+    }
+    // Patch-budget fields index the per-image patch space. `max_num_patches` is
+    // the **leading dimension of the `pixel_values` allocation** the patchify
+    // paths zero-fill, so an unbounded value drives an oversized per-image
+    // allocation regardless of the [`MAX_TILES`] tile-count cap; the HF tile-grid
+    // token budgets (`tile_size`, `encoder_patch_size`, `min`/`max_image_tokens`)
+    // index the same space. Bound each by [`MAX_PATCH_BUDGET`] (the derived
+    // total-element cap in `processor` bounds the full `pixel_values` product).
+    for (name, value) in [
       (
         "lfm2_vl::ModelConfig: max_num_patches",
         self.max_num_patches,
@@ -612,6 +697,13 @@ impl ModelConfig {
         "lfm2_vl::ModelConfig: min_image_tokens",
         self.min_image_tokens,
       ),
+    ] {
+      require_in_range(name, value, 1, MAX_PATCH_BUDGET)?;
+    }
+    // The tile counts are bounded just below: `max_tiles` by the [`MAX_TILES`]
+    // cardinality cap (its `max_tiles^2` candidate reservation) and `min_tiles`
+    // by the `min_tiles <= max_tiles` ordering. Require both positive here first.
+    for (name, value) in [
       ("lfm2_vl::ModelConfig: max_tiles", self.max_tiles),
       ("lfm2_vl::ModelConfig: min_tiles", self.min_tiles),
     ] {

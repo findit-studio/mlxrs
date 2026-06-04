@@ -738,3 +738,126 @@ fn config_rejects_zero_patch_and_negative_token() {
     Error::OutOfRange(_)
   ));
 }
+
+// ─────────────────── config-controlled-allocation caps ───────────────────
+//
+// The patch-budget / width factors of the per-image `pixel_values` allocation
+// are bounded at `Lfm2VlProcessorConfig` construction (so a direct builder
+// caller cannot bypass the validated-config caps), and their PRODUCT — the
+// quantity that actually sizes the buffer — is bounded by the derived element
+// cap in both patchify paths.
+
+use crate::vlm::models::lfm2_vl::config::{MAX_CONFIG_DIM, MAX_PATCH_BUDGET};
+
+#[test]
+fn processor_config_rejects_oversized_allocation_fields() {
+  // `max_num_patches` (the pixel_values leading dim) is bounded by
+  // `MAX_PATCH_BUDGET`; `patch_size` / `downsample_factor` (width factors) by
+  // `MAX_CONFIG_DIM`. A near-`i32::MAX` value is rejected at construction (before
+  // it can size the allocation), not just at config load.
+  let over_budget = MAX_PATCH_BUDGET as u32 + 1;
+  assert!(
+    matches!(
+      Lfm2VlProcessorConfig::new(396, 2, 16, over_budget).unwrap_err(),
+      Error::OutOfRange(_)
+    ),
+    "max_num_patches over MAX_PATCH_BUDGET must be rejected"
+  );
+  assert!(matches!(
+    Lfm2VlProcessorConfig::new(396, 2, 16, i32::MAX as u32).unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  let over_dim = MAX_CONFIG_DIM as u32 + 1;
+  assert!(
+    matches!(
+      Lfm2VlProcessorConfig::new(396, 2, over_dim, 16).unwrap_err(),
+      Error::OutOfRange(_)
+    ),
+    "patch_size over MAX_CONFIG_DIM must be rejected"
+  );
+  assert!(matches!(
+    Lfm2VlProcessorConfig::new(396, over_dim, 16, 16).unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  // The caps themselves construct (generous-but-faithful).
+  Lfm2VlProcessorConfig::new(396, 2, 16, MAX_PATCH_BUDGET as u32)
+    .expect("max_num_patches == cap constructs");
+}
+
+#[test]
+fn with_tiling_rejects_oversized_patch_budget_fields() {
+  let base = Lfm2VlProcessorConfig::new(396, 2, 16, 1024).unwrap();
+  let over = MAX_PATCH_BUDGET as u32 + 1;
+  // The patch-budget cap is checked before the tile_size-divisibility gate, so a
+  // single over-budget field is the rejected cause in each case.
+  let cases: [(u32, u32, u32, u32); 3] = [
+    (64, over, 16, 512),  // max_image_tokens over the cap
+    (64, 256, over, 512), // encoder_patch_size over the cap
+    (64, 256, 16, over),  // tile_size over the cap
+  ];
+  for (min_tok, max_tok, enc_p, tile) in cases {
+    let err = base
+      .with_tiling(true, 2, 10, false, min_tok, max_tok, enc_p, tile, 2.0)
+      .unwrap_err();
+    assert!(
+      matches!(err, Error::OutOfRange(_)),
+      "patch-budget field over the cap must be OutOfRange, got {err}"
+    );
+  }
+}
+
+#[test]
+fn pixel_values_element_count_caps_the_product() {
+  // The product `max_num_patches * patch_size^2 * channels` is bounded by
+  // `MAX_PIXEL_VALUES_ELEMENTS` even when each factor is individually in range:
+  // `max_num_patches = MAX_PATCH_BUDGET` (65536) and `patch_size = 256`
+  // (< MAX_CONFIG_DIM) give a product ~1.29e10 > 2^30.
+  let max_np = MAX_PATCH_BUDGET as usize;
+  let err = pixel_values_element_count(256, 3, max_np).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-budget product must be CapExceeded, got {err}"
+  );
+  // A realistic budget (1024 patches, patch 16, RGB) is well within the cap and
+  // returns `(per_patch=768, total=1024*768)`.
+  let (per_patch, total) = pixel_values_element_count(16, 3, 1024).unwrap();
+  assert_eq!(per_patch, 768);
+  assert_eq!(total, 1024 * 768);
+}
+
+#[test]
+fn preprocess_rejects_over_budget_pixel_values() {
+  // The derived element cap rejects an over-budget patchify BEFORE the
+  // reserve / resize. A tiny 4x4 image, but `max_num_patches = MAX_PATCH_BUDGET`
+  // and `patch_size = 256` push the `pixel_values` product over
+  // `MAX_PIXEL_VALUES_ELEMENTS` (~1.29e10 > 2^30). The config constructs (each
+  // factor in range); the allocation is what's bounded.
+  let cfg = Lfm2VlProcessorConfig::new(396, 2, 256, MAX_PATCH_BUDGET as u32).unwrap();
+  let rgb = vec![0u8; 4 * 4 * 3];
+  let err = preprocess_image(&rgb, 4, 4, &cfg).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-budget pixel_values must be CapExceeded before allocating, got {err}"
+  );
+}
+
+#[test]
+fn tile_image_rejects_over_budget_pixel_values() {
+  // Same derived element cap on the tiled patchify path. Build a tiling config
+  // whose `max_num_patches` * `encoder_patch_size`^2 * 3 exceeds the element cap.
+  // encoder_patch_size = 256 (a multiple constraint: tile_size must be a multiple
+  // of it; use tile_size = 256). max_num_patches = MAX_PATCH_BUDGET. A small
+  // single-sub-image path (256x256, not too large under these big budgets) still
+  // sizes its sub-image buffer to the over-cap product.
+  let cfg = Lfm2VlProcessorConfig::new(396, 2, 256, MAX_PATCH_BUDGET as u32)
+    .unwrap()
+    .with_tiling(true, 2, 10, false, 64, 256, 256, 256, 2.0)
+    .unwrap();
+  let (w, h) = (256u32, 256u32);
+  let rgb = vec![0u8; (w * h * 3) as usize];
+  let err = tile_image(&rgb, w, h, &cfg).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-budget tiled pixel_values must be CapExceeded, got {err}"
+  );
+}
