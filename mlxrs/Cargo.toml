@@ -76,7 +76,7 @@ unicode-general-category = { version = "1", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
 llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
-zip = { version = "2", optional = true, default-features = false, features = ["deflate"] } # NumPy .npz ZIP read/write (stored + DEFLATE members) for the `npz` feature
+zip = { version = "8", optional = true, default-features = false, features = ["deflate"] } # NumPy .npz ZIP read/write (stored + DEFLATE members) for the `npz` feature
 memmapix = { version = "0.9", optional = true } # memory-map .npy / .npz files on load (peak load memory ~3x→~1x); memmap2-compatible API
 
 [target.'cfg(unix)'.dependencies]
