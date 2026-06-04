@@ -382,34 +382,75 @@ pub fn bilinear_interpolate(grid: &Array, out_h: usize, out_w: usize) -> Result<
 // ───────────────────────────── bicubic ─────────────────────────────
 
 /// The bicubic tap count for one resampled axis: `int(2 * support + 1)` with
-/// `support = 2.0` (the `align_corners=False`, `antialias=False` path
-/// `mlx-vlm`'s `_bicubic_interpolate_mlx` takes — the only mode the SigLIP2
-/// position-embed resize uses). A `support = 2` Keys' cubic spans the two input
-/// pixels on each side of the source coordinate, so each output row reads `5`
-/// candidate taps; the off-grid ones are zero-weighted and clamp-folded onto a
-/// valid index (their zero weight makes the duplicate read inert).
+/// `support = 2.0`. A `support = 2` cubic spans the two input pixels on each side
+/// of the source coordinate, so each output row reads `5` candidate taps. The
+/// four taps `floor-1..floor+2` are the active window (PyTorch's bicubic uses
+/// exactly these four; `mlx-vlm`'s `_bicubic_interpolate_mlx` uses the same
+/// support-2 window); the fifth tap (`floor+3`, distance `∈ (2, 3]`) is always
+/// zero-weighted by the cubic kernel, and off-grid taps are clamp-folded onto a
+/// valid index. Both bicubic paths (mlx-vlm Keys' `a = -0.5` and PyTorch's
+/// `A = -0.75`) share this 5-candidate layout.
 const BICUBIC_TAPS: usize = 5;
 
-/// Keys' cubic convolution kernel with `a = -0.5` (`kernels.py`'s
-/// `_cubic_weight`), evaluated in `f64` for the host-side weight build:
+/// Cubic-convolution coefficient for the `mlx-vlm` / SigLIP2 bicubic path
+/// (`kernels.py`'s `_cubic_weight`): Keys' cubic with `a = -0.5`.
+const CUBIC_A_KEYS: f64 = -0.5;
+
+/// Cubic-convolution coefficient for PyTorch's bicubic path
+/// (`torch.nn.functional.interpolate(mode="bicubic")`): `A = -0.75`, the value
+/// `get_cubic_upsample_coefficients` hard-codes in
+/// `aten/src/ATen/native/UpSample.h`. This is the kernel HF CLAP's
+/// `reshape_mel2img` resize runs through (it calls PyTorch bicubic), so the CLAP
+/// `align_corners=True` path must use this coefficient, not Keys' `-0.5`.
+const CUBIC_A_PYTORCH: f64 = -0.75;
+
+/// Two-piece cubic convolution kernel parameterized by the coefficient `A`,
+/// evaluated in `f64` for the host-side weight build:
 ///
 /// ```text
-/// w(t) = (a+2)|t|^3 - (a+3)|t|^2 + 1            for |t| <= 1
-///        a|t|^3 - 5a|t|^2 + 8a|t| - 4a          for 1 < |t| < 2
+/// w(t) = (A+2)|t|^3 - (A+3)|t|^2 + 1            for |t| <= 1
+///        A|t|^3 - 5A|t|^2 + 8A|t| - 4A          for 1 < |t| < 2
 ///        0                                      for |t| >= 2
 /// ```
-fn cubic_weight(t: f64) -> f64 {
-  const A: f64 = -0.5;
+///
+/// The `|t| <= 1` branch is PyTorch's `cubic_convolution1(|t|, A)` and the
+/// `1 < |t| < 2` branch its `cubic_convolution2(|t|, A)`
+/// (`aten/src/ATen/native/UpSample.h`); with `A = -0.5` it is Keys' cubic
+/// (`kernels.py`'s `_cubic_weight`), with `A = -0.75` it is PyTorch's bicubic
+/// kernel. Both forms are a partition of unity over the four `floor-1..floor+2`
+/// taps, so the four in-window coefficients sum to `1` for any source phase.
+fn cubic_weight(t: f64, a: f64) -> f64 {
   let at = t.abs();
   let at2 = at * at;
   let at3 = at2 * at;
   if at <= 1.0 {
-    (A + 2.0) * at3 - (A + 3.0) * at2 + 1.0
+    // PyTorch `cubic_convolution1(at, a)`.
+    (a + 2.0) * at3 - (a + 3.0) * at2 + 1.0
   } else if at < 2.0 {
-    A * at3 - 5.0 * A * at2 + 8.0 * A * at - 4.0 * A
+    // PyTorch `cubic_convolution2(at, a)`.
+    a * at3 - 5.0 * a * at2 + 8.0 * a * at - 4.0 * a
   } else {
     0.0
   }
+}
+
+/// How a bicubic axis builder handles taps that fall outside `[0, in_dim)`.
+///
+/// The two reference bicubic implementations differ ONLY here (the kernel form,
+/// the 5-tap window, and the index clamp are shared):
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CubicBoundary {
+  /// `mlx-vlm`'s `_bicubic_interpolate_mlx` (`kernels.py`'s `_weights_1d`):
+  /// zero-weight every out-of-bounds tap, then renormalize the surviving
+  /// in-bounds weights to sum to 1 (`w / (sum(w) + 1e-8)`).
+  ZeroRenormalize,
+  /// PyTorch's `interpolate(mode="bicubic")`
+  /// (`aten/src/ATen/native/cpu/UpSampleKernel.cpp`'s
+  /// `upsample_get_value_bounded`): keep the full cubic coefficient on an
+  /// out-of-bounds tap and read the **replicated edge** pixel
+  /// (`data[clamp(x, 0, width-1)]`); do NOT renormalize — the four
+  /// `get_cubic_upsample_coefficients` already sum to 1 by construction.
+  ReplicateEdge,
 }
 
 /// Build the `(out_dim, BICUBIC_TAPS)` per-axis resampling tables for the
@@ -427,44 +468,130 @@ fn cubic_weight(t: f64) -> f64 {
 /// reads a valid row), then the surviving weights are renormalized to sum to 1
 /// (matching `_weights_1d`'s `w / (sum(w) + 1e-8)`). `in_dim`, `out_dim >= 1`.
 fn build_bicubic_axis(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
+  let scale_in = in_dim as f64;
+  let scale_out = out_dim as f64;
+  // `(arange(out) + 0.5) / out * in - 0.5` — the half-pixel source center;
+  // Keys' cubic (`a = -0.5`) with the mlx-vlm zero-weight + renormalize edge.
+  build_bicubic_axis_with(
+    in_dim,
+    out_dim,
+    CUBIC_A_KEYS,
+    CubicBoundary::ZeroRenormalize,
+    |i| (i as f64 + 0.5) / scale_out * scale_in - 0.5,
+  )
+}
+
+/// Build the `(out_dim, BICUBIC_TAPS)` per-axis resampling tables for the
+/// bicubic **`align_corners=True`**, `antialias=False` path — PyTorch
+/// `nn.functional.interpolate(mode="bicubic", align_corners=True)` (the variant
+/// HF CLAP's `reshape_mel2img` uses to stretch the mel spectrogram's time axis).
+///
+/// This is a faithful port of PyTorch's bicubic, NOT the mlx-vlm Keys' variant,
+/// so it differs from [`build_bicubic_axis`] in two ways:
+///
+/// 1. **Coefficient**: the cubic uses `A = -0.75` ([`CUBIC_A_PYTORCH`], the value
+///    `get_cubic_upsample_coefficients` hard-codes in
+///    `aten/src/ATen/native/UpSample.h`), not Keys' `-0.5`.
+/// 2. **Source-coordinate map**: `align_corners=True` aligns the input/output
+///    endpoints exactly, so for an output axis of length `out > 1` the source
+///    center is `c = i · (in − 1) / (out − 1)` (`i = 0 → 0`, `i = out − 1 →
+///    in − 1`), with NO half-pixel `−0.5` shift. For `out == 1` PyTorch maps to
+///    the single source coordinate `0` (it avoids the `out − 1 == 0` division).
+///
+/// The boundary handling is [`CubicBoundary::ReplicateEdge`] — PyTorch's
+/// `upsample_get_value_bounded`
+/// (`aten/src/ATen/native/cpu/UpSampleKernel.cpp`): an out-of-range tap keeps its
+/// full cubic coefficient and reads the **replicated edge** pixel
+/// (`data[clamp(x, 0, width-1)]`), with NO renormalization (the four
+/// coefficients already sum to 1). The 5-tap window starting at `floor(c) − 1`
+/// and the `[0, in_dim)` index clamp are shared with [`build_bicubic_axis`].
+/// `in_dim`, `out_dim >= 1`.
+fn build_bicubic_axis_aligned(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
+  let scale = if out_dim > 1 {
+    (in_dim as f64 - 1.0) / (out_dim as f64 - 1.0)
+  } else {
+    0.0
+  };
+  build_bicubic_axis_with(
+    in_dim,
+    out_dim,
+    CUBIC_A_PYTORCH,
+    CubicBoundary::ReplicateEdge,
+    |i| i as f64 * scale,
+  )
+}
+
+/// Shared core for the two bicubic axis builders: given the cubic coefficient
+/// `a`, the out-of-bounds `boundary` policy, and a `center(i)` that maps an
+/// output index to its (fractional) source coordinate, build the
+/// `(out_dim, BICUBIC_TAPS)` clamped-index + cubic-weight tables. The callers
+/// differ ONLY in those three parameters (the `align_corners` coordinate map,
+/// `A`, and the edge handling); the 5-tap window, the kernel form, and the
+/// `[0, in_dim)` index clamp are identical.
+///
+/// In both modes the index is clamped to `[0, in_dim)` so the on-device gather
+/// only ever reads a valid row. The weight handling differs per [`CubicBoundary`]:
+/// - [`CubicBoundary::ZeroRenormalize`]: out-of-bounds taps are zero-weighted,
+///   then the surviving weights are renormalized to sum to 1 (`w / (sum(w) +
+///   1e-8)`) — `kernels.py`'s `_weights_1d`.
+/// - [`CubicBoundary::ReplicateEdge`]: every tap (in- or out-of-bounds) keeps its
+///   full cubic coefficient, and the clamped index makes an out-of-bounds tap
+///   read the replicated edge pixel; NO renormalization — PyTorch's
+///   `upsample_get_value_bounded`. The four `floor-1..floor+2` cubic taps already
+///   sum to 1, and the fifth (`floor+3`, distance `∈ (2, 3]`) is exactly
+///   zero-weighted by the kernel, so the row sums to 1 without renormalizing.
+fn build_bicubic_axis_with(
+  in_dim: usize,
+  out_dim: usize,
+  a: f64,
+  boundary: CubicBoundary,
+  center: impl Fn(usize) -> f64,
+) -> (Vec<i32>, Vec<f32>) {
   // `support = 2.0`, `fs = 1.0` (antialias off). Both factors are small, and
   // the caller has bounded `in_dim` / `out_dim` to representable spatial dims,
   // so `out_dim * TAPS` cannot overflow `usize` on any supported platform.
   let total = out_dim * BICUBIC_TAPS;
   let mut pix = vec![0i32; total];
   let mut weights = vec![0.0f32; total];
-  let scale_in = in_dim as f64;
-  let scale_out = out_dim as f64;
   let in_i = in_dim as i64;
   for i in 0..out_dim {
-    // `(arange(out) + 0.5) / out * in - 0.5` — the half-pixel source center.
-    let center = (i as f64 + 0.5) / scale_out * scale_in - 0.5;
-    // `start = floor(center - support) + 1` (support = 2).
+    let center = center(i);
+    // `start = floor(center - support) + 1` (support = 2) = `floor(center) - 1`,
+    // so the five candidate taps are `floor-1 .. floor+3`; the first four are
+    // PyTorch's `floor-1..floor+2` window and the fifth (distance `∈ (2, 3]`) is
+    // always zero-weighted by the cubic kernel.
     let start = (center - 2.0).floor() as i64 + 1;
     let row = i * BICUBIC_TAPS;
-    // First pass: unnormalized cubic weights over the TAPS candidate indices,
-    // masking (zero-weighting) the out-of-bounds ones, and their sum.
+    // First pass: cubic weights over the TAPS candidate indices.
     let mut tot = 0.0f64;
     for k in 0..BICUBIC_TAPS {
       let p = start + k as i64;
       let in_bounds = p >= 0 && p < in_i;
-      // `dist = center - p`; `fs = 1.0`, so `cubic_weight(dist / fs)`.
-      let w = if in_bounds {
-        cubic_weight(center - p as f64)
+      // `dist = center - p`; `fs = 1.0`, so `cubic_weight(dist / fs, a)`.
+      // ReplicateEdge keeps the full coefficient on every tap (the clamped index
+      // reads the edge pixel); ZeroRenormalize masks out-of-bounds taps to 0.
+      let w = if in_bounds || boundary == CubicBoundary::ReplicateEdge {
+        cubic_weight(center - p as f64, a)
       } else {
         0.0
       };
       weights[row + k] = w as f32;
       tot += w;
       // Clamp the (possibly out-of-bounds) index into `[0, in_dim)` so the
-      // on-device gather always reads a valid row; the zero weight above makes a
-      // clamped duplicate read inert. `kernels.py` does the same `mx.clip`.
+      // on-device gather always reads a valid row. Under ReplicateEdge a clamped
+      // out-of-bounds tap reads the replicated edge pixel (PyTorch); under
+      // ZeroRenormalize its zero weight makes the duplicate read inert
+      // (`kernels.py`'s `mx.clip`).
       pix[row + k] = p.clamp(0, in_i - 1) as i32;
     }
-    // Second pass: renormalize to sum 1 (`w / (sum(w) + 1e-8)`).
-    let inv = 1.0 / (tot + 1e-8);
-    for k in 0..BICUBIC_TAPS {
-      weights[row + k] = (weights[row + k] as f64 * inv) as f32;
+    // Second pass: ZeroRenormalize divides by the surviving sum (`w / (sum(w) +
+    // 1e-8)`). ReplicateEdge leaves the weights as-is: the four in-window cubic
+    // coefficients already sum to 1 (PyTorch does not renormalize).
+    if boundary == CubicBoundary::ZeroRenormalize {
+      let inv = 1.0 / (tot + 1e-8);
+      for k in 0..BICUBIC_TAPS {
+        weights[row + k] = (weights[row + k] as f64 * inv) as f32;
+      }
     }
   }
   (pix, weights)
@@ -489,13 +616,67 @@ fn build_bicubic_axis(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
 ///
 /// ## Errors
 /// - `x` is not rank-4 → [`Error::RankMismatch`].
-/// - any of `H_in`, `W_in`, `out_h`, `out_w` is `0` → [`Error::OutOfRange`].
+/// - any of `B`, `C`, `H_in`, `W_in`, `out_h`, `out_w` is `0` →
+///   [`Error::OutOfRange`]; or exceeds the per-axis cap (`MAX_INTERP_DIM`, 4096)
+///   → [`Error::CapExceeded`].
+/// - a per-axis tap table (`out_dim * BICUBIC_TAPS`) exceeds
+///   `MAX_INTERP_WEIGHT_ELEMS`, or any resample tensor — the height/width gather
+///   (`B * C * out_h * TAPS * W_in`, `B * C * out_h * out_w * TAPS`), the
+///   post-height intermediate, or the output — exceeds the resample cap
+///   (`MAX_INTERP_RESAMPLE_ELEMS`), even with every axis within `MAX_INTERP_DIM`
+///   → [`Error::CapExceeded`] (or [`Error::ArithmeticOverflow`] if the product
+///   overflows `usize`), rejected before any host vector / device tensor is
+///   built.
 /// - `x`'s dtype is non-floating (the cubic weights are fractional; an integer
 ///   grid would truncate every sample) → [`Error::UnsupportedDtype`].
 /// - underlying gather / reshape / reduce / cast op errors propagate (a
 ///   non-finite grid value flows through unchanged — interpolation is linear in
 ///   the samples).
 pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+  bicubic_resample(x, out_h, out_w, build_bicubic_axis)
+}
+
+/// Bicubic-resize a batched `(B, C, H_in, W_in)` grid to `(B, C, out_h, out_w)`
+/// with **`align_corners=True`** — PyTorch
+/// `nn.functional.interpolate(mode="bicubic", align_corners=True)`.
+///
+/// This is the resize HF CLAP's `ClapAudioEncoder.reshape_mel2img` applies to
+/// the log-mel spectrogram before the patch-embed (it upsamples the time axis
+/// from the mel frame count to `spec_size · freq_ratio` with `align_corners=True`
+/// bicubic). It is a faithful port of PyTorch's bicubic, so it differs from the
+/// mlx-vlm-flavored [`bicubic_interpolate`] in three ways (see the private
+/// `build_bicubic_axis_aligned`): the cubic coefficient is PyTorch's `A = -0.75`
+/// (not Keys' `-0.5`); the source-coordinate map aligns the endpoints with no
+/// half-pixel shift; and out-of-range taps replicate the edge pixel with NO
+/// renormalization (`upsample_get_value_bounded`) rather than zero-weight +
+/// renormalize. The separable gather + cubic-weight contract, the dtype handling,
+/// the bounds, and the errors are identical.
+///
+/// `x` is a rank-4 `(B, C, H_in, W_in)` float array; the output is
+/// `(B, C, out_h, out_w)` in the **same dtype** as `x` (computed in `f32` and
+/// cast back). The channel and batch axes pass through untouched.
+///
+/// ## Errors
+/// Identical to [`bicubic_interpolate`]: rank ≠ 4 → [`Error::RankMismatch`]; a
+/// zero spatial dim → [`Error::OutOfRange`]; an over-cap dimension or resample
+/// tensor → [`Error::CapExceeded`] / [`Error::ArithmeticOverflow`]; a
+/// non-floating dtype → [`Error::UnsupportedDtype`]; underlying gather / reshape
+/// / reduce / cast errors propagate.
+pub fn bicubic_interpolate_align_corners(x: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+  bicubic_resample(x, out_h, out_w, build_bicubic_axis_aligned)
+}
+
+/// The shared separable-bicubic resample, parameterized by the per-axis weight
+/// builder (`align_corners` false vs true). Validates the rank / spatial dims /
+/// dtype, then resamples height (axis 2) and width (axis 3) via a `gather +
+/// weighted sum` over the `BICUBIC_TAPS` candidate taps — the two-stage
+/// reference path mlx-vlm's `_bicubic_interpolate_mlx` uses.
+fn bicubic_resample(
+  x: &Array,
+  out_h: usize,
+  out_w: usize,
+  build_axis: impl Fn(usize, usize) -> (Vec<i32>, Vec<f32>),
+) -> Result<Array> {
   let shape = x.shape();
   if shape.len() != 4 {
     return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
@@ -505,20 +686,74 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
     )));
   }
   let (b, c, in_h, in_w) = (shape[0], shape[1], shape[2], shape[3]);
-  for (name, v) in [
-    ("bicubic_interpolate: H_in", in_h),
-    ("bicubic_interpolate: W_in", in_w),
-    ("bicubic_interpolate: out_h", out_h),
-    ("bicubic_interpolate: out_w", out_w),
-  ] {
-    if v == 0 {
-      return Err(Error::OutOfRange(OutOfRangePayload::new(
-        name,
-        "must be a positive spatial dimension (>= 1)",
-        "0",
-      )));
-    }
-  }
+  // Reject a zero (→ `OutOfRange`) or over-cap (→ `CapExceeded`) spatial
+  // dimension on every axis — mirroring the bilinear path's `check_dim`. The
+  // batch / channel axes are bounded the same way so the resample-tensor
+  // products below have a valid per-factor cap (and stay within the matmul /
+  // gather `i32` shapes); both real callers are well under the cap (CLAP audio
+  // is `B`-small, `C = 1`; the SigLIP2 position-embed grid `C` is the embed
+  // dim, a few thousand at most).
+  check_dim("bicubic_interpolate: B", b)?;
+  check_dim("bicubic_interpolate: C", c)?;
+  check_dim("bicubic_interpolate: H_in", in_h)?;
+  check_dim("bicubic_interpolate: W_in", in_w)?;
+  check_dim("bicubic_interpolate: out_h", out_h)?;
+  check_dim("bicubic_interpolate: out_w", out_w)?;
+
+  // Bound the caller-controlled `out_h`/`out_w` intermediates BEFORE building
+  // any host vector / gather index / device tensor — the same dimension + total
+  // element caps the bilinear path applies. `check_dim` proved every axis is
+  // `<= MAX_INTERP_DIM`, so each is a valid `Extent`; `elem_count` is the
+  // checked product (overflow → `ArithmeticOverflow`, over-cap → `CapExceeded`)
+  // against the resample cap. The gather index / weight host vectors are
+  // `out_dim * BICUBIC_TAPS`, and the two gathered device tensors —
+  // `(B, C, out_h * TAPS, W_in)` then `(B, C, out_h, out_w * TAPS)` — are the
+  // largest buffers, so capping their products bounds the whole chain.
+  let ext = |v: usize| Extent::new("bicubic_interpolate: spatial dim", v, MAX_INTERP_DIM);
+  let taps_e = ext(BICUBIC_TAPS)?;
+  let (b_e, c_e) = (ext(b)?, ext(c)?);
+  // `in_h` is bounded by its `check_dim` above but is not a buffer-size factor:
+  // the height resample gathers only `out_h * BICUBIC_TAPS` rows from `x` (the
+  // tap indices, clamped into `[0, in_h)`) and casts *those* to f32 — it never
+  // materializes a full-input f32 copy — so only `in_w` multiplies the gather /
+  // intermediate tensors below.
+  let in_w_e = ext(in_w)?;
+  let (out_h_e, out_w_e) = (ext(out_h)?, ext(out_w)?);
+  // Per-axis gather index / weight host vectors `out_dim * BICUBIC_TAPS`.
+  elem_count(
+    "bicubic_interpolate: height tap-table elements (out_h * TAPS)",
+    &[out_h_e, taps_e],
+    MAX_INTERP_WEIGHT_ELEMS,
+  )?;
+  elem_count(
+    "bicubic_interpolate: width tap-table elements (out_w * TAPS)",
+    &[out_w_e, taps_e],
+    MAX_INTERP_WEIGHT_ELEMS,
+  )?;
+  // Height-gather tensor `(B, C, out_h * TAPS, W_in)`.
+  elem_count(
+    "bicubic_interpolate: height-gather elements (B * C * out_h * TAPS * W_in)",
+    &[b_e, c_e, out_h_e, taps_e, in_w_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
+  // Post-height intermediate `(B, C, out_h, W_in)`.
+  elem_count(
+    "bicubic_interpolate: height-resample elements (B * C * out_h * W_in)",
+    &[b_e, c_e, out_h_e, in_w_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
+  // Width-gather tensor `(B, C, out_h, out_w * TAPS)`.
+  elem_count(
+    "bicubic_interpolate: width-gather elements (B * C * out_h * out_w * TAPS)",
+    &[b_e, c_e, out_h_e, out_w_e, taps_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
+  // Final output `(B, C, out_h, out_w)`.
+  elem_count(
+    "bicubic_interpolate: output elements (B * C * out_h * out_w)",
+    &[b_e, c_e, out_h_e, out_w_e],
+    MAX_INTERP_RESAMPLE_ELEMS,
+  )?;
 
   // The cubic weights are fractional, so a non-floating grid would lose every
   // sample to truncation. Restrict to the float dtypes (the position-embed
@@ -535,15 +770,23 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
     ));
   }
 
-  // Compute in f32 (the reference's `x.astype(float32)`), restore the input
-  // dtype at the end.
-  let xf = astype(x, Dtype::F32)?;
-
   // ── height resample: gather TAPS rows along axis 2, contract over taps ──
-  let (pix_y, wy) = build_bicubic_axis(in_h, out_h);
+  let (pix_y, wy) = build_axis(in_h, out_h);
   // `x[:, :, pix_y.reshape(-1), :]` → (B, C, out_h * TAPS, W_in).
   let pix_y_arr = Array::from_slice::<i32>(&pix_y, &(out_h * BICUBIC_TAPS,))?;
-  let gathered_y = take_axis(&xf, &pix_y_arr, 2)?;
+  // The reference casts the whole input to f32 up front (`x.astype(float32)`)
+  // then gathers. We gather in the input dtype and cast the *gathered* rows
+  // instead: the gather only copies elements, so it commutes with the
+  // elementwise cast (bit-identical result), but the f32 buffer is now the
+  // height-gather tensor — already bounded by its `elem_count` cap above —
+  // rather than a full-input f32 copy whose size scales with the uncapped
+  // `in_h`. The width resample then runs on `tmp`, which is already f32.
+  let gathered_y = take_axis(x, &pix_y_arr, 2)?;
+  let gathered_y = if in_dtype == Dtype::F32 {
+    gathered_y
+  } else {
+    astype(&gathered_y, Dtype::F32)?
+  };
   // → (B, C, out_h, TAPS, W_in).
   let gathered_y = reshape(&gathered_y, &(b, c, out_h, BICUBIC_TAPS, in_w))?;
   // weights (out_h, TAPS) → (1, 1, out_h, TAPS, 1) to broadcast, then
@@ -555,7 +798,7 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
   let tmp = sum_axes(&gathered_y.multiply(&wy_arr)?, &[3], false)?;
 
   // ── width resample: gather TAPS columns along axis 3, contract over taps ──
-  let (pix_x, wx) = build_bicubic_axis(in_w, out_w);
+  let (pix_x, wx) = build_axis(in_w, out_w);
   // `tmp[:, :, :, pix_x.reshape(-1)]` → (B, C, out_h, out_w * TAPS).
   let pix_x_arr = Array::from_slice::<i32>(&pix_x, &(out_w * BICUBIC_TAPS,))?;
   let gathered_x = take_axis(&tmp, &pix_x_arr, 3)?;

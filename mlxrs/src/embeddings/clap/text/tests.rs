@@ -24,7 +24,10 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::{dtype::Dtype, embeddings::clap::shared::RobertaLayer};
+use crate::{
+  dtype::Dtype,
+  embeddings::clap::shared::{RobertaLayer, relu},
+};
 
 // ───────────────────────── small Array helpers ─────────────────────────
 

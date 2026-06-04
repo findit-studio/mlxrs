@@ -643,3 +643,491 @@ fn bicubic_rejects_integer_input_dtype() {
   let err = bicubic_interpolate(&g, 4, 4).unwrap_err();
   assert!(matches!(err, Error::UnsupportedDtype(_)), "got {err}");
 }
+
+#[test]
+fn bicubic_rejects_oversize_output_dim() {
+  // An over-cap `out_w` (> MAX_INTERP_DIM) is rejected by the per-axis dimension
+  // guard with a typed `CapExceeded` — mirroring the bilinear oversize-dim test —
+  // before any host tap table / device gather is built. The grid stays tiny so
+  // the rejection is the only allocation.
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate(&x, 4, MAX_INTERP_DIM + 1).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "out_w huge: got {err}"
+  );
+}
+
+#[test]
+fn bicubic_rejects_over_product_resample_tensor() {
+  // Every axis is within the per-axis `MAX_INTERP_DIM` (4096) cap, yet a resample
+  // TENSOR blows past `MAX_INTERP_RESAMPLE_ELEMS` (64 Mi): with a tiny `(1, 1, 2,
+  // 2)` grid, `out_h = out_w = MAX_INTERP_DIM` makes the width-gather tensor
+  // `B * C * out_h * out_w * TAPS = 1 * 1 * 4096 * 4096 * 5 ≈ 84 Mi` elements. The
+  // op must reject it with a typed `CapExceeded` BEFORE any device array / gather
+  // is built — the grid stays a negligible 4 f32. This is the hole the per-axis
+  // caps alone missed (the bilinear path already caps the analogous product).
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate(&x, MAX_INTERP_DIM, MAX_INTERP_DIM).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-product resample tensor must be a typed CapExceeded, got {err}"
+  );
+  // Sanity (compile-time): the width-gather product exceeds the resample cap, so
+  // this is exclusively the resample-product guard firing, not the per-axis cap —
+  // both axes are exactly at MAX_INTERP_DIM, in range.
+  const {
+    assert!(MAX_INTERP_DIM * MAX_INTERP_DIM * BICUBIC_TAPS > MAX_INTERP_RESAMPLE_ELEMS);
+  }
+}
+
+#[test]
+fn bicubic_rejects_over_product_height_gather_with_wide_input() {
+  // The FIRST gather tensor is `(B, C, out_h * TAPS, W_in)` — `B*C*out_h*TAPS*W_in`
+  // elements. Reproduce that blow-up cheaply by keeping the grid thin in height
+  // (`H_in = 2`) but wide (`W_in = 4096`) while `out_h = 4096`: the height-gather
+  // product `1*1*4096*5*4096 ≈ 84 Mi > 64 Mi` is rejected before the gather, but
+  // the grid is just `2 * 4096 = 8 Ki` f32. `out_w = 1` keeps the later products
+  // small so the HEIGHT-gather guard is the one that trips.
+  let w_in = MAX_INTERP_DIM; // 4096
+  let data = vec![0.0f32; 2 * w_in]; // (1, 1, 2, 4096) — 8 Ki f32
+  let x = Array::from_slice::<f32>(&data, &(1, 1, 2, w_in)).unwrap();
+  let err = bicubic_interpolate(&x, MAX_INTERP_DIM, 1).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "over-product height-gather tensor must be a typed CapExceeded, got {err}"
+  );
+  // Sanity (compile-time): the height-gather product (`out_h * TAPS * W_in` with
+  // `out_h = W_in = MAX_INTERP_DIM`) exceeds the resample cap, while a tap table
+  // (`out_dim * TAPS`) stays well within `MAX_INTERP_WEIGHT_ELEMS`.
+  const {
+    assert!(MAX_INTERP_DIM * BICUBIC_TAPS * MAX_INTERP_DIM > MAX_INTERP_RESAMPLE_ELEMS);
+    assert!(MAX_INTERP_DIM * BICUBIC_TAPS <= MAX_INTERP_WEIGHT_ELEMS);
+  }
+}
+
+#[test]
+fn bicubic_aligned_rejects_over_product_resample_tensor() {
+  // The cap guards live in the shared `bicubic_resample`, so the CLAP
+  // align_corners=True entry point rejects the same adversarial `(out_h, out_w)`
+  // with a typed `CapExceeded` (the path that actually feeds `reshape_mel2img`).
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate_align_corners(&x, MAX_INTERP_DIM, MAX_INTERP_DIM).unwrap_err();
+  assert!(
+    matches!(err, Error::CapExceeded(_)),
+    "aligned over-product resample tensor must be a typed CapExceeded, got {err}"
+  );
+}
+
+// ─────────────────────── bicubic align_corners = True ───────────────────────
+//
+// The HF CLAP `reshape_mel2img` resize runs through PyTorch
+// `nn.functional.interpolate(mode="bicubic", align_corners=True)`, which is a
+// DIFFERENT kernel from the mlx-vlm Keys' bicubic above:
+//
+//   1. cubic coefficient `A = -0.75` (not Keys' `-0.5`);
+//   2. source-coordinate map `c = i * (in - 1) / (out - 1)` (endpoints aligned,
+//      no half-pixel shift), `c = 0` when `out == 1`;
+//   3. EDGE-REPLICATE boundary with NO renormalization — an out-of-range tap
+//      keeps its full cubic coefficient and reads the clamped (edge) pixel
+//      (`upsample_get_value_bounded`); the four coefficients already sum to 1.
+//
+// The oracle below is reimplemented INDEPENDENTLY from PyTorch's own formulas
+// (`aten/src/ATen/native/UpSample.h`'s `cubic_convolution1` / `cubic_convolution2`
+// / `get_cubic_upsample_coefficients`, and `UpSampleKernel.cpp`'s
+// `upsample_get_value_bounded`), NOT from the code under test — in particular it
+// does NOT reuse `ref_cubic` (A = -0.5) and does NOT renormalize.
+
+/// PyTorch `cubic_convolution1(x, A)` for `|x| <= 1`
+/// (`aten/src/ATen/native/UpSample.h`), written independently.
+fn pt_cubic_conv1(x: f64, a: f64) -> f64 {
+  ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+}
+
+/// PyTorch `cubic_convolution2(x, A)` for `1 < |x| < 2`
+/// (`aten/src/ATen/native/UpSample.h`), written independently.
+fn pt_cubic_conv2(x: f64, a: f64) -> f64 {
+  ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+}
+
+/// PyTorch `get_cubic_upsample_coefficients(t)` with `A = -0.75`
+/// (`aten/src/ATen/native/UpSample.h`): the four taps `floor-1..floor+2`
+/// weighted by the cubic of their distance to the fractional source phase `t`.
+fn pt_cubic_coeffs(t: f64) -> [f64; 4] {
+  const A: f64 = -0.75;
+  [
+    pt_cubic_conv2(t + 1.0, A),
+    pt_cubic_conv1(t, A),
+    pt_cubic_conv1(1.0 - t, A),
+    pt_cubic_conv2((1.0 - t) + 1.0, A),
+  ]
+}
+
+/// Independent f64 reference for one PyTorch `align_corners=True` bicubic axis,
+/// returning, per output row, the four `(clamped_source_index, coefficient)`
+/// taps — edge-replicate (clamp the index to `[0, in-1]`) and NO renormalization,
+/// exactly `upsample_get_value_bounded`. The four coefficients sum to 1 by
+/// construction; off-grid taps simply re-read the clamped edge pixel.
+fn pt_bicubic_axis_aligned(in_d: usize, out_d: usize) -> Vec<[(usize, f64); 4]> {
+  let in_i = in_d as i64;
+  let scale = if out_d > 1 {
+    (in_d as f64 - 1.0) / (out_d as f64 - 1.0)
+  } else {
+    0.0
+  };
+  let mut rows = Vec::with_capacity(out_d);
+  for i in 0..out_d {
+    let real_x = i as f64 * scale;
+    let input_index = real_x.floor() as i64;
+    let t = real_x - input_index as f64;
+    let coeffs = pt_cubic_coeffs(t);
+    let mut taps = [(0usize, 0.0f64); 4];
+    for (k, slot) in taps.iter_mut().enumerate() {
+      let idx = input_index - 1 + k as i64;
+      let clamped = idx.max(0).min(in_i - 1) as usize; // upsample_get_value_bounded
+      *slot = (clamped, coeffs[k]);
+    }
+    rows.push(taps);
+  }
+  rows
+}
+
+/// Independent f64 PyTorch `align_corners=True` bicubic resize of a
+/// single-channel grid (separable height-then-width).
+fn pt_bicubic_resize_aligned(grid: &[Vec<f64>], out_h: usize, out_w: usize) -> Vec<Vec<f64>> {
+  let h_in = grid.len();
+  let w_in = grid[0].len();
+  let wy = pt_bicubic_axis_aligned(h_in, out_h);
+  let wx = pt_bicubic_axis_aligned(w_in, out_w);
+  let mut tmp = vec![vec![0.0f64; w_in]; out_h];
+  for (i, trow) in tmp.iter_mut().enumerate() {
+    for (x, cell) in trow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wy[i] {
+        s += w * grid[p][x];
+      }
+      *cell = s;
+    }
+  }
+  let mut out = vec![vec![0.0f64; out_w]; out_h];
+  for (i, orow) in out.iter_mut().enumerate() {
+    for (j, cell) in orow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wx[j] {
+        s += w * tmp[i][p];
+      }
+      *cell = s;
+    }
+  }
+  out
+}
+
+#[test]
+fn bicubic_aligned_identity_same_size_is_exact_passthrough() {
+  // out == in: `scale = (n-1)/(n-1) = 1`, so center i maps to source i exactly →
+  // one unit tap per row → the resize is the input unchanged.
+  let flat: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 3, 3)).unwrap();
+  let out = bicubic_interpolate_align_corners(&x, 3, 3).unwrap();
+  let got = to_vec(&out);
+  for (a, b) in got.iter().zip(flat.iter()) {
+    assert!((a - b).abs() < EPS, "aligned identity differs: {a} vs {b}");
+  }
+}
+
+#[test]
+fn bicubic_aligned_preserves_corner_values_on_upsample() {
+  // The defining property of align_corners=True: the four corner output pixels
+  // equal the four corner input pixels EXACTLY (endpoints map to endpoints), so
+  // upsampling a grid leaves its corners pinned (unlike align_corners=False).
+  let flat: [f32; 9] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0];
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 3, 3)).unwrap();
+  let (oh, ow) = (7usize, 5usize);
+  let out = bicubic_interpolate_align_corners(&x, oh, ow).unwrap();
+  let v = to_vec(&out);
+  let at = |r: usize, c: usize| v[r * ow + c];
+  assert!(
+    (at(0, 0) - 10.0).abs() < 1e-3,
+    "top-left corner not pinned: {}",
+    at(0, 0)
+  );
+  assert!(
+    (at(0, ow - 1) - 30.0).abs() < 1e-3,
+    "top-right corner not pinned: {}",
+    at(0, ow - 1)
+  );
+  assert!(
+    (at(oh - 1, 0) - 70.0).abs() < 1e-3,
+    "bottom-left corner not pinned: {}",
+    at(oh - 1, 0)
+  );
+  assert!(
+    (at(oh - 1, ow - 1) - 90.0).abs() < 1e-3,
+    "bottom-right corner not pinned: {}",
+    at(oh - 1, ow - 1)
+  );
+}
+
+#[test]
+fn bicubic_aligned_matches_independent_pytorch_reference_on_4x4_to_7x7_upsample() {
+  // Cross-check the full align_corners=True op against the INDEPENDENT PyTorch
+  // (A = -0.75, edge-replicate, no-renormalize) f64 oracle on an interior-heavy
+  // upsample (4x4 → 7x7). 7 = 2*(4-1)+1 makes the aligned source coordinates land
+  // on a mix of exact-integer and half-integer phases, exercising several `t`.
+  let mut g = vec![vec![0.0f64; 4]; 4];
+  for (r, row) in g.iter_mut().enumerate() {
+    for (c, cell) in row.iter_mut().enumerate() {
+      *cell = ((r * 4 + c) as f64) * 0.3 - 1.1; // deterministic, signed
+    }
+  }
+  let flat: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 4, 4)).unwrap();
+  let got = to_vec(&bicubic_interpolate_align_corners(&x, 7, 7).unwrap());
+  let want = pt_bicubic_resize_aligned(&g, 7, 7);
+  for (i, wrow) in want.iter().enumerate() {
+    for (j, &w) in wrow.iter().enumerate() {
+      let g = got[i * 7 + j];
+      assert!((g as f64 - w).abs() < 1e-4, "aligned ({i},{j}) {g} vs {w}");
+    }
+  }
+}
+
+#[test]
+fn bicubic_aligned_tall_input_gathers_rows_before_casting() {
+  // A tall input (large `H_in`, tiny output) is exactly the case the height
+  // gather bounds: only `out_h * BICUBIC_TAPS` rows are read from `x`, so the
+  // resample never materializes a full-input f32 copy whose size scales with the
+  // uncapped `H_in`. Verify the gather-before-cast path is (1) numerically
+  // faithful to the independent PyTorch f64 oracle for a tall f32 input, and
+  // (2) for an f16 input, equivalent to the reference's cast-input-to-f32-first
+  // order within f16 output rounding — gathering then casting equals casting
+  // then gathering, since the gather only copies elements.
+  let (in_h, w, out_h) = (48usize, 3usize, 6usize);
+  let mut g = vec![vec![0.0f64; w]; in_h];
+  for (r, row) in g.iter_mut().enumerate() {
+    for (c, cell) in row.iter_mut().enumerate() {
+      // Deterministic, signed, modest magnitude so f16 stays precise.
+      *cell = (((r * w + c) as f64) * 0.013 - 0.31).sin();
+    }
+  }
+  let flat: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
+  let x_f32 = Array::from_slice::<f32>(&flat, &(1, 1, in_h, w)).unwrap();
+
+  // (1) tall f32 input vs the independent PyTorch oracle.
+  let got_f32 = to_vec(&bicubic_interpolate_align_corners(&x_f32, out_h, w).unwrap());
+  let want = pt_bicubic_resize_aligned(&g, out_h, w);
+  for (i, wrow) in want.iter().enumerate() {
+    for (j, &wv) in wrow.iter().enumerate() {
+      let gv = got_f32[i * w + j];
+      assert!(
+        (gv as f64 - wv).abs() < 1e-4,
+        "tall f32 aligned ({i},{j}) {gv} vs {wv}"
+      );
+    }
+  }
+
+  // (2) tall f16 input: gather-then-cast must match the f32 path within f16
+  // output rounding, and the op must preserve the f16 input dtype on the way out.
+  let x_f16 = astype(&x_f32, Dtype::F16).unwrap();
+  let out_f16 = bicubic_interpolate_align_corners(&x_f16, out_h, w).unwrap();
+  assert_eq!(
+    out_f16.dtype().unwrap(),
+    Dtype::F16,
+    "f16 input must yield an f16 result"
+  );
+  let got_f16 = to_vec(&astype(&out_f16, Dtype::F32).unwrap());
+  for (k, (&a, &b)) in got_f16.iter().zip(got_f32.iter()).enumerate() {
+    assert!(
+      (a - b).abs() < 5e-3,
+      "tall f16 gather-then-cast diverges from the f32 path at {k}: {a} vs {b}"
+    );
+  }
+}
+
+#[test]
+fn bicubic_aligned_1001_to_1024_row_matches_pytorch_formula_interior_and_boundary() {
+  // The exact resize CLAP's `reshape_mel2img` performs on the time axis: a known
+  // 1001-long input row upsampled to 1024 with align_corners=True bicubic. Drive
+  // it as a `(1, 1, 1, 1001)` width resize so the op runs the real 1-D path, and
+  // compare every output column against the INDEPENDENT PyTorch oracle
+  // (A = -0.75, edge-replicate, no-renormalize) — including the boundary columns
+  // 0 and 1023, where the off-grid tap makes edge-replicate vs the old
+  // clamp-renormalize differ.
+  let in_w = 1001usize;
+  let out_w = 1024usize;
+  // A deterministic non-linear row (so the cubic is actually exercised, not a
+  // ramp the kernel reproduces trivially).
+  let row: Vec<f64> = (0..in_w)
+    .map(|i| (i as f64 * 0.017).sin() * 3.0 + (i as f64) * 0.002)
+    .collect();
+  let grid = vec![row];
+  let flat: Vec<f32> = grid[0].iter().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 1, in_w)).unwrap();
+  let got = to_vec(&bicubic_interpolate_align_corners(&x, 1, out_w).unwrap());
+  let want = pt_bicubic_resize_aligned(&grid, 1, out_w);
+  for j in 0..out_w {
+    let w = want[0][j] as f32;
+    assert!(
+      (got[j] - w).abs() < 1e-3,
+      "1001->1024 col {j}: got {}, want {w}",
+      got[j]
+    );
+  }
+  // Pin the two boundary columns explicitly: column 0's source coordinate is
+  // exactly input 0 (its `floor-1 = -1` tap edge-replicates input[0]), and column
+  // 1023's is exactly input 1000 (its `floor+2 = 1001` tap edge-replicates
+  // input[1000]) — align_corners pins both endpoints to the input samples.
+  assert!(
+    (got[0] as f64 - grid[0][0]).abs() < 1e-4,
+    "left endpoint not pinned to input[0]: {} vs {}",
+    got[0],
+    grid[0][0]
+  );
+  assert!(
+    (got[out_w - 1] as f64 - grid[0][in_w - 1]).abs() < 1e-4,
+    "right endpoint not pinned to input[last]: {} vs {}",
+    got[out_w - 1],
+    grid[0][in_w - 1]
+  );
+}
+
+#[test]
+fn bicubic_aligned_4_to_8_edge_columns_are_pytorch_edge_replicate() {
+  // A small edge-heavy upsample (4 → 8, align_corners=True) where the boundary
+  // handling is DECISIVE: at output column 0 the source coordinate is 0, so the
+  // `floor-1 = -1` tap is off-grid; PyTorch edge-replicates input[0] there (and
+  // does NOT renormalize), while the old clamp-renormalize convention would
+  // redistribute that tap's weight. Compare the whole 1-D resize against the
+  // independent PyTorch oracle, then assert the boundary columns specifically.
+  let in_w = 4usize;
+  let out_w = 8usize;
+  let row = vec![vec![2.0f64, -1.0, 5.0, 0.5]]; // signed, non-monotone
+  let flat: Vec<f32> = row[0].iter().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 1, in_w)).unwrap();
+  let got = to_vec(&bicubic_interpolate_align_corners(&x, 1, out_w).unwrap());
+  let want = pt_bicubic_resize_aligned(&row, 1, out_w);
+  for j in 0..out_w {
+    let w = want[0][j] as f32;
+    assert!(
+      (got[j] - w).abs() < 1e-4,
+      "4->8 edge col {j}: got {}, want {w}",
+      got[j]
+    );
+  }
+  // Endpoints pin exactly to the input corners (align_corners property), and
+  // column 0 specifically equals the PyTorch edge-replicate result computed by
+  // hand from the A = -0.75 coefficients at phase t = 0 (only the center tap is
+  // nonzero, so it is exactly input[0]).
+  assert!((got[0] as f64 - row[0][0]).abs() < 1e-4, "col0: {}", got[0]);
+  assert!(
+    (got[out_w - 1] as f64 - row[0][in_w - 1]).abs() < 1e-4,
+    "col7: {}",
+    got[out_w - 1]
+  );
+}
+
+#[test]
+fn bicubic_aligned_pytorch_a_minus_0_75_differs_from_old_keys_a_minus_0_5() {
+  // Regression: the CLAP align_corners=True path must use PyTorch's A = -0.75
+  // edge-replicate kernel, NOT the previous Keys' A = -0.5 zero-weight +
+  // renormalize kernel. Recompute what the OLD aligned builder produced (the same
+  // aligned coordinate map, but `ref_cubic` = A = -0.5, off-grid taps dropped and
+  // renormalized — written inline so this pins a real kernel change) and assert
+  // the live op DIFFERS on a boundary-heavy upsample where both the coefficient
+  // and the edge handling bite.
+  fn old_keys_aligned_axis(in_d: usize, out_d: usize) -> Vec<Vec<(usize, f64)>> {
+    let in_i = in_d as i64;
+    let scale = if out_d > 1 {
+      (in_d as f64 - 1.0) / (out_d as f64 - 1.0)
+    } else {
+      0.0
+    };
+    let mut rows = Vec::with_capacity(out_d);
+    for i in 0..out_d {
+      let center = i as f64 * scale;
+      let start = (center - 2.0).floor() as i64 + 1;
+      let mut taps: Vec<(i64, f64)> = Vec::new();
+      let mut tot = 0.0;
+      for k in 0..5i64 {
+        let p = start + k;
+        if p >= 0 && p < in_i {
+          let w = ref_cubic(center - p as f64); // A = -0.5 (old)
+          taps.push((p, w));
+          tot += w;
+        }
+      }
+      let inv = 1.0 / (tot + 1e-8); // renormalize (old)
+      rows.push(
+        taps
+          .into_iter()
+          .map(|(p, w)| (p as usize, w * inv))
+          .collect(),
+      );
+    }
+    rows
+  }
+  let row = vec![1.0f64, 5.0, 2.0, 8.0, 3.0];
+  let in_w = row.len();
+  let out_w = 9usize;
+  let flat: Vec<f32> = row.iter().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 1, in_w)).unwrap();
+  let got = to_vec(&bicubic_interpolate_align_corners(&x, 1, out_w).unwrap());
+  // Old A=-0.5 + zero-renormalize aligned resize, computed inline.
+  let old_axis = old_keys_aligned_axis(in_w, out_w);
+  let old: Vec<f64> = old_axis
+    .iter()
+    .map(|taps| taps.iter().map(|&(p, w)| w * row[p]).sum())
+    .collect();
+  let differs = got
+    .iter()
+    .zip(old.iter())
+    .any(|(g, o)| (*g as f64 - o).abs() > 1e-3);
+  assert!(
+    differs,
+    "new A=-0.75 edge-replicate path matched the old A=-0.5 renormalize path: got={got:?} old={old:?}"
+  );
+  // And the live op must still MATCH the PyTorch oracle (positive pin that the
+  // difference is toward PyTorch, not arbitrary).
+  let want = pt_bicubic_resize_aligned(&[row], 1, out_w);
+  for j in 0..out_w {
+    assert!(
+      (got[j] as f64 - want[0][j]).abs() < 1e-3,
+      "col {j}: got {} vs pytorch {}",
+      got[j],
+      want[0][j]
+    );
+  }
+}
+
+#[test]
+fn bicubic_aligned_differs_from_unaligned_on_upsample() {
+  // align_corners True vs False must NOT be the same resampling (the CLAP
+  // faithfulness point): upsampling a non-constant grid gives different
+  // interiors under the two coordinate maps (and now also under the different
+  // coefficient + edge handling).
+  let x = Array::from_slice::<f32>(&[1.0f32, 5.0, 2.0, 8.0], &(1, 1, 1, 4)).unwrap();
+  let aligned = to_vec(&bicubic_interpolate_align_corners(&x, 1, 9).unwrap());
+  let unaligned = to_vec(&bicubic_interpolate(&x, 1, 9).unwrap());
+  let differs = aligned
+    .iter()
+    .zip(unaligned.iter())
+    .any(|(a, b)| (a - b).abs() > 1e-3);
+  assert!(
+    differs,
+    "align_corners True and False produced identical upsamples"
+  );
+}
+
+#[test]
+fn bicubic_aligned_rejects_non_rank4_input() {
+  let g3 = Array::from_slice::<f32>(&[1.0f32; 8], &(2, 2, 2)).unwrap();
+  let err = bicubic_interpolate_align_corners(&g3, 4, 4).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)), "got {err}");
+}
+
+#[test]
+fn bicubic_aligned_rejects_zero_dims() {
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate_align_corners(&x, 4, 0).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "out_w=0: got {err}");
+}
