@@ -1,6 +1,6 @@
 //! Tests for AlignAtt attention-guided streaming.
 //!
-//! Three layers:
+//! Layers:
 //! 1. the pure AlignAtt commit/wait policy
 //!    ([`super::super::decoding::alignatt_should_commit`]) on synthetic frames —
 //!    an independent oracle of the inequality;
@@ -9,7 +9,18 @@
 //!    cross-attention, asserting the argmax frame tracks a controlled peak;
 //! 3. the streaming loop over a synthetic multi-chunk input — committed tokens
 //!    grow monotonically (no re-emission / rollback), and the `frame_threshold`
-//!    knob shifts the commit boundary.
+//!    knob shifts the commit boundary;
+//! 4. the dedup watermark — a repeated `step` over the same buffer never
+//!    re-emits, and the no-duplicate guarantee holds even with the conditioning
+//!    prefix OFF (the watermark, not the prefix, enforces it);
+//! 5. backpressure — a push whose uncommitted tail would exceed one 30 s window
+//!    is rejected (typed `CapExceeded`) and the buffer is left unchanged, so no
+//!    earlier speech is silently dropped;
+//! 6. degenerate buffers (empty / sub-window / final-flush) commit nothing or
+//!    flush without re-emission;
+//! 7. the committed-audio watermark is monotonic and never overruns the buffered
+//!    audio; consecutive lossless slides keep absolute timings strictly forward
+//!    with no duplication; the prefix cap interacts correctly with the watermark.
 
 use std::{
   collections::HashMap,
@@ -436,15 +447,22 @@ fn committed_token_timing_is_ordered_and_in_window() {
 
 #[test]
 fn streaming_window_slide_does_not_re_emit_committed_audio() {
-  // A stream longer than the 30 s window must slide WITHOUT re-decoding and
-  // re-emitting the retained overlap. Feed > N_SAMPLES of audio in chunks; once
-  // the buffer exceeds the window it slides (the committed audio is dropped past
-  // the watermark, the committed tokens are carried as the decode prefix).
-  // Assert: (1) a slide actually occurred, (2) the global committed history only
-  // ever GROWS, and (3) every committed token's absolute start time is
-  // monotonically non-decreasing across the whole stream — the timeline never
-  // jumps backward into an already-committed time range (re-emitting the overlap
-  // would replay the overlap's earlier absolute times).
+  // A stream that fills the 30 s window then receives more audio must slide
+  // WITHOUT re-decoding and re-emitting the committed overlap AND without
+  // discarding any UNcommitted audio. The biased synthetic model commits its
+  // tokens at encoder frame 0, so each window commits one frame-width
+  // (`N_SAMPLES_PER_TOKEN`) of audio; the slide then advances the origin by
+  // exactly that committed lead — a lossless slide. (A push whose uncommitted
+  // tail would exceed one window is rejected as backpressure, covered by
+  // `streaming_push_rejects_overlong_uncommitted_tail`; here the tail stays
+  // within the window.)
+  //
+  // Assert: (1) the slide advanced the origin by the committed lead, (2) the
+  // buffer retained a FULL window of the most-recent audio (no silent loss),
+  // (3) the committed history only GROWS, and (4) every committed token's
+  // absolute start time is monotonically non-decreasing — the timeline never
+  // regresses into an already-committed span (which re-emitting the overlap
+  // would do).
   let dir = fresh_dir("stream_slide");
   let tok = write_tokenizer(dir.as_path());
   let wrapper =
@@ -456,50 +474,60 @@ fn streaming_window_slide_does_not_re_emit_committed_audio() {
     .with_frame_threshold(2);
   let mut session = WhisperStreaming::new(&model, wrapper, opts);
 
-  // 11 s per chunk × 4 = 44 s > 30 s, so the window slides on the 3rd and 4th
-  // pushes. Each chunk has distinct content so the encoder/attention differ.
-  let chunk_samples = 11 * SAMPLE_RATE as usize;
-  let mut total_pushed = 0usize;
   let mut all_starts: Vec<f64> = Vec::new();
   let mut all_ends: Vec<f64> = Vec::new();
-  let mut prev_history = 0usize;
-  let mut slid = false;
 
-  for c in 0..4usize {
-    let chunk: Vec<f32> = (0..chunk_samples)
-      .map(|i| (((i + c * 13) % (43 + c)) as f32 / 43.0) - 0.5)
-      .collect();
-    session.push_audio(&chunk).unwrap();
-    total_pushed += chunk_samples;
-    // A slide caps the buffer at N_SAMPLES even though more has been pushed.
-    if total_pushed > N_SAMPLES {
-      assert!(
-        session.buffered_samples() <= N_SAMPLES,
-        "buffer must be capped to N_SAMPLES after a slide (pushed={total_pushed}, buffered={})",
-        session.buffered_samples()
-      );
-      slid = true;
-    }
-    let is_last = c == 3;
-    let step = session.step(is_last).unwrap();
+  // Fill the window with 30 s of audio and commit (advances the committed-audio
+  // watermark into the window).
+  let fill: Vec<f32> = (0..N_SAMPLES)
+    .map(|i| ((i % 43) as f32 / 43.0) - 0.5)
+    .collect();
+  session.push_audio(&fill).unwrap();
+  let s0 = session.step(false).unwrap();
+  assert!(!s0.is_empty(), "the filled window must commit some tokens");
+  for t in s0.tokens() {
+    all_starts.push(t.start());
+    all_ends.push(t.end());
+  }
+  let committed_lead = session.committed_samples;
+  assert!(
+    committed_lead > 0 && committed_lead <= N_SAMPLES,
+    "the committed-audio watermark must advance into the window (got {committed_lead})"
+  );
+  let origin_before = session.window_origin_samples;
+  let history_before = session.committed_tokens().len();
 
-    // The running committed history only grows (no rollback / shrink).
-    let now = session.committed_tokens().len();
-    assert!(
-      now >= prev_history,
-      "committed history must not shrink across a slide: {prev_history} -> {now}"
-    );
-    prev_history = now;
+  // Push exactly the committed lead more audio: buffer = N_SAMPLES + lead, whose
+  // uncommitted tail (N_SAMPLES) still fits one window, so the slide drops ONLY
+  // the committed lead — a lossless slide.
+  let extra: Vec<f32> = (0..committed_lead)
+    .map(|i| (((i + 7) % 41) as f32 / 41.0) - 0.5)
+    .collect();
+  session.push_audio(&extra).unwrap();
 
-    for t in step.tokens() {
-      all_starts.push(t.start());
-      all_ends.push(t.end());
-    }
+  // (1) The slide advanced the origin by the committed lead, and (2) the buffer
+  // retained a FULL window of the most-recent audio — no uncommitted audio lost.
+  assert_eq!(
+    session.window_origin_samples,
+    origin_before + committed_lead,
+    "the slide must advance the window origin by the committed lead"
+  );
+  assert_eq!(
+    session.buffered_samples(),
+    N_SAMPLES,
+    "the slide must retain the full uncommitted tail (no silent loss)"
+  );
+
+  let s1 = session.step(false).unwrap();
+  for t in s1.tokens() {
+    all_starts.push(t.start());
+    all_ends.push(t.end());
   }
 
+  // (3) The running committed history only grows (no rollback / shrink).
   assert!(
-    slid,
-    "the 44 s stream must have slid the 30 s window at least once"
+    session.committed_tokens().len() >= history_before,
+    "committed history must not shrink across a slide"
   );
   assert!(
     all_starts.len() >= 2,
@@ -507,8 +535,8 @@ fn streaming_window_slide_does_not_re_emit_committed_audio() {
     all_starts.len()
   );
 
-  // The committed-token timeline is strictly forward: each token's absolute start
-  // is >= the previous token's start, and never regresses below an earlier
+  // (4) The committed-token timeline is strictly forward: each token's absolute
+  // start is >= the previous token's start, and never regresses below an earlier
   // token's END (which is what re-emitting the retained overlap would do — the
   // same audio committed twice at the same absolute time).
   let mut max_end = f64::NEG_INFINITY;
@@ -521,9 +549,6 @@ fn streaming_window_slide_does_not_re_emit_committed_audio() {
         all_starts[i - 1]
       );
     }
-    // No committed token starts before the furthest already-committed audio END
-    // by more than one frame of rounding slack — i.e. the overlap is never
-    // re-decoded into an earlier absolute time.
     assert!(
       all_starts[i] >= max_end - frame_to_seconds(1) - 1e-9,
       "token {i} start {} regresses into already-committed time (max committed end {max_end})",
@@ -585,6 +610,451 @@ fn streaming_final_chunk_threshold_is_not_inert() {
     final_flush_count(0) > 0,
     "a zero last-chunk threshold must flush the final tail (clearly in window)"
   );
+}
+
+// ───────────────────────── 4. dedup invariant ─────────────────────────────
+// The dedup watermark must hold INDEPENDENTLY of the conditioning prefix: a
+// repeated `step` over the same buffer never re-emits, even with the prefix off.
+
+/// Build a streaming session over the biased model with explicit conditioning
+/// (`cond` = `condition_on_previous_text`, `cap` = `max_prompt_tokens`). A fresh
+/// tokenizer per session (the wrapper borrows it for the session's lifetime).
+fn dedup_session<'a>(
+  model: &'a WhisperModel,
+  tok: &'a Tokenizer,
+  cond: bool,
+  cap: usize,
+) -> WhisperStreaming<'a> {
+  let wrapper = HFTokenizerWrapper::new(tok, true, 2, Some("en"), WhisperTask::Transcribe).unwrap();
+  let opts = StreamingOptions::new()
+    .with_language("en")
+    .with_frame_threshold(2)
+    .with_condition_on_previous_text(cond)
+    .with_max_prompt_tokens(cap);
+  WhisperStreaming::new(model, wrapper, opts)
+}
+
+#[test]
+fn streaming_repeated_step_same_buffer_is_append_only() {
+  // With the prefix ON (the default conditioning), a repeated `step` over the SAME
+  // buffer must be APPEND-ONLY: the already-committed prefix is preserved verbatim
+  // and never re-emitted. (The forced prefix makes `decode_aligned` CONTINUE past
+  // the committed tail, so a degenerate always-repeat model may legitimately
+  // append more NEW positions on the continuation — that is not re-emission, since
+  // those tokens carry their own later frames. The exact no-growth guarantee with
+  // the prefix OFF is asserted by `streaming_repeated_step_no_prefix_no_duplicate`;
+  // here the invariant under test is that the prior committed span is never
+  // rewritten or duplicated.)
+  let dir = fresh_dir("dedup_repeat");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  let audio: Vec<f32> = (0..16_000)
+    .map(|i| ((i % 41) as f32 / 41.0) - 0.5)
+    .collect();
+  session.push_audio(&audio).unwrap();
+
+  let _ = session.step(false).unwrap();
+  let after_first = session.committed_tokens().to_vec();
+  assert!(
+    !after_first.is_empty(),
+    "the first step must commit something to exercise dedup"
+  );
+
+  // A second step over the identical buffer: the prior committed prefix is
+  // preserved verbatim (append-only — no re-emission of the committed span).
+  let _ = session.step(false).unwrap();
+  let after_second = session.committed_tokens().to_vec();
+  assert!(
+    after_second.len() >= after_first.len(),
+    "the committed history must not shrink on a re-step"
+  );
+  assert_eq!(
+    &after_second[..after_first.len()],
+    after_first.as_slice(),
+    "a repeated step must preserve the prior committed prefix verbatim (no re-emission)"
+  );
+}
+
+#[test]
+fn streaming_repeated_step_no_prefix_no_duplicate() {
+  // The pivotal decoupled-dedup case: with conditioning OFF and
+  // `max_prompt_tokens = 0` (NO forced prefix at all), a repeated `step` over the
+  // same buffer must STILL not duplicate. The decode restarts from the sot
+  // sequence each time and re-emits the whole window, so the watermark —
+  // decoupled from the prefix — is the only thing dropping the already-committed
+  // tokens. Without that watermark this would re-append the entire transcript on
+  // every step.
+  let dir = fresh_dir("dedup_noprefix");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  // Both knobs that disable the forced prefix: conditioning off AND a zero cap.
+  let mut session = dedup_session(&model, &tok, false, 0);
+
+  let audio: Vec<f32> = (0..16_000)
+    .map(|i| ((i % 41) as f32 / 41.0) - 0.5)
+    .collect();
+  session.push_audio(&audio).unwrap();
+
+  let s1 = session.step(false).unwrap();
+  let after_first = session.committed_tokens().to_vec();
+  assert!(
+    !after_first.is_empty(),
+    "the first prefix-off step must commit something"
+  );
+  let first_emitted = s1.tokens().len();
+  assert_eq!(
+    first_emitted,
+    after_first.len(),
+    "the first step emits exactly what it commits"
+  );
+
+  // Re-step several times over the SAME buffer: the committed history is frozen.
+  for round in 0..3usize {
+    let s = session.step(false).unwrap();
+    assert!(
+      s.is_empty(),
+      "round {round}: a prefix-off re-step must emit nothing (no duplicate)"
+    );
+    assert_eq!(
+      session.committed_tokens(),
+      after_first.as_slice(),
+      "round {round}: the committed history must be unchanged across re-steps"
+    );
+  }
+}
+
+#[test]
+fn streaming_no_prefix_incremental_audio_only_grows() {
+  // With the prefix OFF, feeding MORE audio incrementally must still only append
+  // the genuinely-new suffix (the watermark drops the re-decoded committed lead),
+  // and the earlier committed prefix is preserved verbatim — a from-scratch
+  // re-decode each step never re-emits, and growth comes only from new audio.
+  let dir = fresh_dir("dedup_noprefix_grow");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, false, 0);
+
+  let mut prev: Vec<u32> = Vec::new();
+  for c in 0..3usize {
+    let chunk: Vec<f32> = (0..7_000)
+      .map(|i| (((i + c * 11) % 41) as f32 / 41.0) - 0.5)
+      .collect();
+    session.push_audio(&chunk).unwrap();
+    let _ = session.step(false).unwrap();
+    let now = session.committed_tokens().to_vec();
+    assert!(
+      now.len() >= prev.len(),
+      "prefix-off history must not shrink: {} -> {}",
+      prev.len(),
+      now.len()
+    );
+    assert_eq!(
+      &now[..prev.len()],
+      prev.as_slice(),
+      "prefix-off: the earlier committed prefix must be preserved verbatim"
+    );
+    prev = now;
+  }
+}
+
+// ───────────────────────── 5. backpressure (no silent loss) ───────────────
+
+#[test]
+fn streaming_push_rejects_overlong_uncommitted_tail() {
+  // A single push whose UNcommitted tail would exceed one 30 s window is rejected
+  // as typed backpressure (`CapExceeded`), and the buffer is left UNCHANGED so the
+  // caller keeps its samples — no silent loss of earlier speech.
+  let dir = fresh_dir("backpressure_single");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  // N_SAMPLES + 1 in one push: nothing committed yet, so the whole thing is the
+  // uncommitted tail → over the window cap.
+  let too_long: Vec<f32> = vec![0.0; N_SAMPLES + 1];
+  let err = session.push_audio(&too_long).unwrap_err();
+  assert!(
+    matches!(err, crate::Error::CapExceeded(_)),
+    "an over-long uncommitted push must be CapExceeded, got {err:?}"
+  );
+  assert_eq!(
+    session.buffered_samples(),
+    0,
+    "a rejected push must leave the buffer unchanged (caller keeps the samples)"
+  );
+}
+
+#[test]
+fn streaming_zero_commit_growth_eventually_backpressures_no_loss() {
+  // The "policy commits nothing for > 30 s" path: a model that commits nothing
+  // (a huge frame_threshold) accumulates the uncommitted tail until a push would
+  // exceed the window — then backpressure fires and the buffer is unchanged. The
+  // earliest audio is NEVER silently dropped while it remains uncommitted.
+  let dir = fresh_dir("backpressure_zerocommit");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let wrapper =
+    HFTokenizerWrapper::new(&tok, true, 2, Some("en"), WhisperTask::Transcribe).unwrap();
+  // A huge non-final threshold so nothing ever commits on a non-final step.
+  let opts = StreamingOptions::new()
+    .with_language("en")
+    .with_frame_threshold(1_000_000);
+  let mut session = WhisperStreaming::new(&model, wrapper, opts);
+
+  // Push in 10 s chunks; the third would bring the buffer to 30 s exactly (OK),
+  // the fourth would exceed it with nothing committed → backpressure, no loss.
+  let ten_s: Vec<f32> = vec![0.25; 10 * SAMPLE_RATE as usize];
+  session.push_audio(&ten_s).unwrap();
+  let _ = session.step(false).unwrap();
+  session.push_audio(&ten_s).unwrap();
+  let _ = session.step(false).unwrap();
+  session.push_audio(&ten_s).unwrap(); // buffer now exactly N_SAMPLES
+  let _ = session.step(false).unwrap();
+  assert_eq!(
+    session.buffered_samples(),
+    N_SAMPLES,
+    "buffer at exactly one window"
+  );
+  assert!(
+    session.committed_tokens().is_empty(),
+    "the huge threshold must have committed nothing"
+  );
+
+  // The fourth push would push the uncommitted tail past the window → rejected,
+  // buffer unchanged (no earlier audio dropped).
+  let before = session.buffered_samples();
+  let err = session.push_audio(&ten_s).unwrap_err();
+  assert!(
+    matches!(err, crate::Error::CapExceeded(_)),
+    "an over-30s uncommitted accumulation must backpressure, got {err:?}"
+  );
+  assert_eq!(
+    session.buffered_samples(),
+    before,
+    "the rejected push must not drop any buffered (uncommitted) audio"
+  );
+}
+
+#[test]
+fn streaming_push_exactly_one_window_is_accepted() {
+  // A push to exactly N_SAMPLES (the window boundary) is accepted — the cap is on
+  // EXCEEDING the window, not reaching it.
+  let dir = fresh_dir("backpressure_boundary");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+  let exact: Vec<f32> = vec![0.1; N_SAMPLES];
+  session.push_audio(&exact).unwrap();
+  assert_eq!(session.buffered_samples(), N_SAMPLES);
+}
+
+// ───────────────────────── 6. degenerate buffers ──────────────────────────
+
+#[test]
+fn streaming_empty_audio_step_is_noop() {
+  // `step` on an empty buffer (no audio pushed) commits nothing and errors not —
+  // on both a non-final and a final call.
+  let dir = fresh_dir("empty_step");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  let s_mid = session.step(false).unwrap();
+  assert!(
+    s_mid.is_empty(),
+    "non-final step on empty audio commits nothing"
+  );
+  let s_last = session.step(true).unwrap();
+  assert!(
+    s_last.is_empty(),
+    "final step on empty audio commits nothing"
+  );
+  assert!(session.committed_tokens().is_empty());
+}
+
+#[test]
+fn streaming_is_last_subwindow_buffer_flushes_or_empty() {
+  // `is_last` on a tiny (sub-window) buffer must not panic: it either flushes the
+  // short tail or commits nothing, and never re-emits on a follow-up final step.
+  let dir = fresh_dir("last_subwindow");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  // A sub-window buffer (well under 30 s).
+  let small: Vec<f32> = (0..4_000).map(|i| ((i % 23) as f32 / 23.0) - 0.5).collect();
+  session.push_audio(&small).unwrap();
+  let s1 = session.step(true).unwrap();
+  let after = session.committed_tokens().to_vec();
+  assert_eq!(
+    s1.tokens().len(),
+    after.len(),
+    "a final sub-window step emits exactly what it commits"
+  );
+  // A second final step over the same buffer is append-only — the prior committed
+  // prefix is preserved verbatim (no re-emission / rollback of the committed span).
+  let _ = session.step(true).unwrap();
+  let after2 = session.committed_tokens().to_vec();
+  assert!(
+    after2.len() >= after.len(),
+    "a repeated final step must not shrink the committed history"
+  );
+  assert_eq!(
+    &after2[..after.len()],
+    after.as_slice(),
+    "a repeated final step must preserve the prior committed prefix verbatim"
+  );
+}
+
+// ───────────────────────── 7. watermark monotonicity ──────────────────────
+
+#[test]
+fn streaming_committed_watermark_never_regresses_or_overruns() {
+  // Across many incremental steps the committed-audio watermark is monotonic
+  // non-decreasing and never exceeds the absolute buffered end (origin + buffered)
+  // — no off-by-one in the frame→sample mapping, no regress on a re-step.
+  let dir = fresh_dir("watermark_mono");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  let mut prev_watermark = 0usize;
+  for round in 0..5usize {
+    let chunk: Vec<f32> = (0..5_000)
+      .map(|i| (((i + round * 17) % 41) as f32 / 41.0) - 0.5)
+      .collect();
+    session.push_audio(&chunk).unwrap();
+    // Two steps per round, including a re-step on the same buffer.
+    let _ = session.step(false).unwrap();
+    let _ = session.step(false).unwrap();
+    let w = session.committed_samples;
+    assert!(
+      w >= prev_watermark,
+      "round {round}: watermark regressed {prev_watermark} -> {w}"
+    );
+    let buffered_end = session.window_origin_samples + session.buffered_samples();
+    assert!(
+      w <= buffered_end,
+      "round {round}: watermark {w} exceeds buffered end {buffered_end}"
+    );
+    prev_watermark = w;
+  }
+}
+
+// ───────────────────────── 8. multi-slide monotonicity ────────────────────
+
+#[test]
+fn streaming_consecutive_slides_keep_timings_monotonic_no_dup() {
+  // Several consecutive lossless slides (each driven by committing one frame of
+  // audio then pushing that committed lead back) must keep absolute per-token
+  // timings strictly forward with no duplication, and the window origin strictly
+  // increasing across every slide.
+  let dir = fresh_dir("multi_slide");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let mut session = dedup_session(&model, &tok, true, 223);
+
+  let fill: Vec<f32> = (0..N_SAMPLES)
+    .map(|i| ((i % 43) as f32 / 43.0) - 0.5)
+    .collect();
+  session.push_audio(&fill).unwrap();
+
+  let mut all_starts: Vec<f64> = Vec::new();
+  let mut all_ends: Vec<f64> = Vec::new();
+  let mut prev_origin = session.window_origin_samples;
+  let mut slides = 0usize;
+
+  for _ in 0..3usize {
+    let step = session.step(false).unwrap();
+    for t in step.tokens() {
+      all_starts.push(t.start());
+      all_ends.push(t.end());
+    }
+    let lead = session
+      .committed_samples
+      .saturating_sub(session.window_origin_samples);
+    if lead == 0 {
+      break; // nothing committable to slide on (defensive)
+    }
+    let extra: Vec<f32> = (0..lead).map(|i| ((i % 41) as f32 / 41.0) - 0.5).collect();
+    session.push_audio(&extra).unwrap();
+    if session.window_origin_samples > prev_origin {
+      slides += 1;
+      prev_origin = session.window_origin_samples;
+    }
+  }
+
+  assert!(
+    slides >= 2,
+    "must perform multiple consecutive slides (got {slides})"
+  );
+  assert!(
+    session.committed_tokens().iter().all(|&id| id == 13),
+    "all committed ids are the biased target"
+  );
+  let mut max_end = f64::NEG_INFINITY;
+  for i in 0..all_starts.len() {
+    if i > 0 {
+      assert!(
+        all_starts[i] >= all_starts[i - 1] - 1e-9,
+        "absolute starts must not jump backward across slides (token {i})"
+      );
+    }
+    assert!(
+      all_starts[i] >= max_end - frame_to_seconds(1) - 1e-9,
+      "token {i} start {} regresses into already-committed time (max end {max_end})",
+      all_starts[i]
+    );
+    max_end = max_end.max(all_ends[i]);
+  }
+}
+
+// ───────────────────────── 9. prefix-cap × watermark ──────────────────────
+
+#[test]
+fn streaming_prefix_cap_interacts_with_watermark() {
+  // The forced-prefix cap (`max_prompt_tokens`) shorter than the committed
+  // history must still leave dedup correct: with conditioning ON but a SMALL cap,
+  // `decode_aligned` forces only the recent committed tail, yet the continuation
+  // is appended without duplicating the (uncapped) earlier committed tokens, and
+  // the history stays append-only — including on a re-step.
+  let dir = fresh_dir("prefix_cap");
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  // A tiny prompt cap (2 tokens) far below what the window commits.
+  let mut session = dedup_session(&model, &tok, true, 2);
+
+  let mut prev: Vec<u32> = Vec::new();
+  for round in 0..3usize {
+    let chunk: Vec<f32> = (0..6_000)
+      .map(|i| (((i + round * 9) % 41) as f32 / 41.0) - 0.5)
+      .collect();
+    session.push_audio(&chunk).unwrap();
+    let _ = session.step(false).unwrap();
+    let now = session.committed_tokens().to_vec();
+    assert!(
+      now.len() >= prev.len(),
+      "history must not shrink under a small cap"
+    );
+    assert_eq!(
+      &now[..prev.len()],
+      prev.as_slice(),
+      "earlier committed tokens preserved verbatim under a small prefix cap"
+    );
+    // A re-step on the same buffer with the small cap is still a no-op for the
+    // already-committed positions (append-only).
+    let before_restep = session.committed_tokens().to_vec();
+    let _ = session.step(false).unwrap();
+    let after_restep = session.committed_tokens().to_vec();
+    assert_eq!(
+      &after_restep[..before_restep.len()],
+      before_restep.as_slice(),
+      "a re-step must preserve the prior committed prefix under a small cap"
+    );
+    prev = after_restep;
+  }
 }
 
 // ───────────────────────── fixtures ───────────────────────────────────────

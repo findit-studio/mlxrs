@@ -53,8 +53,9 @@
 //! committed tokens grow **monotonically** — the policy only ever appends.
 
 use crate::{
-  Array, Result,
+  Array, Error, Result,
   audio::stt::model::{AutoregressiveStt, Task},
+  error::CapExceededPayload,
 };
 
 use super::{
@@ -366,13 +367,24 @@ impl StreamingStep {
 /// history.
 ///
 /// The buffer is bounded by Whisper's 30-second window. When a stream grows past
-/// `N_SAMPLES` the window slides forward: the already-committed audio is dropped
-/// (the seek advances PAST the committed-audio watermark, so the overlap is
-/// never re-decoded) and the uncommitted tail is retained. The already-committed
-/// tokens are carried as the next decode's conditioning prefix (the Simul-Whisper
-/// `current_tokens` continuation), so the committed transcript and its absolute
-/// timings stay strictly monotonic across slides — no token or timing is
-/// re-emitted from the retained overlap. The per-token timings live in the
+/// `N_SAMPLES` the window slides forward by dropping ONLY the already-committed
+/// leading audio (the origin advances UP TO — never past — the committed-audio
+/// watermark, so the overlap is not re-decoded and no UNcommitted audio is ever
+/// discarded); the uncommitted tail is retained. A push that would grow the
+/// uncommitted tail past one window is rejected as backpressure
+/// ([`WhisperStreaming::push_audio`]) rather than silently trimmed.
+///
+/// Dedup is a FIRST-CLASS invariant, independent of conditioning: an absolute
+/// committed-token watermark makes every [`Self::step`] drop the tokens it has
+/// already emitted for the current window before appending, so a repeated decode
+/// of the same buffer — or a decode with the conditioning prefix turned OFF —
+/// never re-emits a committed token. The
+/// already-committed tokens are ALSO carried as the next decode's conditioning
+/// prefix (the Simul-Whisper `current_tokens` continuation), but that prefix is a
+/// quality/continuation feature; the watermark, not the prefix, is what
+/// guarantees no re-emission. The committed transcript and its absolute timings
+/// therefore stay strictly monotonic across slides AND across repeated decodes,
+/// whether or not the prefix is enabled. The per-token timings live in the
 /// absolute stream timeline (anchored by the window origin), not reset per
 /// window.
 pub struct WhisperStreaming<'a> {
@@ -385,10 +397,23 @@ pub struct WhisperStreaming<'a> {
   /// recent [`N_SAMPLES`] for encoding).
   audio: Vec<f32>,
   /// Every token committed so far (sampled ids only, no sot/eot), in order —
-  /// the running transcript across every window. Append-only: the prefix
-  /// continuation means each decode appends ONLY the new tokens past the carried
-  /// committed prefix, so already-emitted tokens are never re-appended.
+  /// the running transcript across every window. Append-only: each [`Self::step`]
+  /// appends ONLY the genuinely-new suffix of the decode (the tokens past the
+  /// [`Self::window_emitted`] dedup watermark), so already-emitted tokens are
+  /// never re-appended — independent of the conditioning prefix.
   committed: Vec<u32>,
+  /// The dedup watermark: the count of committed tokens whose audio lies in the
+  /// CURRENT window (committed since the window origin last advanced) — the
+  /// reference's cumulative emitted-token count scoped to the live window
+  /// (Simul-Whisper's `current_tokens` continuation; mlx-audio's
+  /// `new_tokens = text_tokens[len(self._emitted_tokens):]`). [`Self::step`]
+  /// slices each decode to only the suffix PAST this watermark, so a repeated
+  /// decode over the same buffer — or a decode with the conditioning prefix off —
+  /// cannot re-append already-committed tokens. This is the dedup INVARIANT,
+  /// decoupled from the prefix (the prefix is a separate quality feature). Reset
+  /// to `0` whenever a window slide advances the origin (the slide drops every
+  /// committed sample, so no committed token's audio remains in the window).
+  window_emitted: usize,
   /// The committed-audio watermark: the number of leading stream samples
   /// (absolute, across every window) whose audio has already been transcribed —
   /// the furthest-attended committed encoder frame mapped to samples. Monotonic
@@ -425,6 +450,7 @@ impl<'a> WhisperStreaming<'a> {
       options,
       audio: Vec::new(),
       committed: Vec::new(),
+      window_emitted: 0,
       committed_samples: 0,
       window_origin_samples: 0,
     }
@@ -451,45 +477,82 @@ impl<'a> WhisperStreaming<'a> {
 
   /// Append `samples` (mono `f32` at [`SAMPLE_RATE`] Hz) to the audio buffer.
   ///
-  /// When the buffer grows past [`N_SAMPLES`] (30 s) the window slides forward.
-  /// The slide advances the window origin to at least the committed-audio
-  /// watermark (`committed_samples`), so the already-transcribed leading audio is
-  /// DROPPED rather than retained-and-re-decoded — the standard Whisper seek
-  /// advance. The committed tokens are carried as the next decode's prefix
-  /// (the Simul-Whisper continuation), so the retained-overlap text is never
-  /// re-emitted and the committed transcript stays strictly monotonic. The
-  /// window origin only grows, anchoring absolute token times.
+  /// When the buffer grows past [`N_SAMPLES`] (30 s) the window slides forward by
+  /// dropping ONLY the already-committed leading audio (the origin advances to the
+  /// committed-audio watermark `committed_samples`) — the standard Whisper seek
+  /// advance. The committed tokens are carried as the next decode's prefix (the
+  /// Simul-Whisper continuation), so the retained-overlap text is never re-emitted
+  /// and the committed transcript stays strictly monotonic. The slide NEVER drains
+  /// past `committed_samples`, so no UNcommitted audio is ever silently discarded.
+  /// The window origin only grows, anchoring absolute token times.
   ///
-  /// If the still-uncommitted tail alone exceeds the window (only when a single
-  /// push adds far more than 30 s of un-committable audio at once), the slide
-  /// falls back to the most-recent [`N_SAMPLES`] live edge; even then no
-  /// committed token is re-emitted (the committed audio is always dropped first).
+  /// # Backpressure
+  /// The decode window is one 30 s segment, so the still-UNcommitted tail
+  /// (everything past `committed_samples`) must fit in [`N_SAMPLES`]. The
+  /// Simul-Whisper reference feeds `<= 30 s` windows and commits as it goes
+  /// (`backspacetg/simul_whisper`, `transcriber/simul_whisper.py`); a single push
+  /// adding more than one window of un-committable audio at once — or the policy
+  /// committing nothing for over 30 s — would force the next decode to drop the
+  /// OLDEST uncommitted audio (silently losing earlier speech). Rather than lose
+  /// it, this rejects the push with [`Error::CapExceeded`] and leaves the buffer
+  /// UNCHANGED (so the caller keeps the rejected samples); the caller must commit
+  /// or flush ([`Self::step`]) before pushing more. No audio is lost on either
+  /// path — the slide drops only committed audio, and an over-large uncommitted
+  /// tail is surfaced as caller misuse, never trimmed.
   ///
   /// # Errors
-  /// [`Error::AllocFailure`](crate::Error::AllocFailure) if the buffer cannot be
-  /// grown to hold the new samples.
+  /// - [`Error::CapExceeded`] if appending `samples` would grow the uncommitted
+  ///   tail past one 30 s window ([`N_SAMPLES`]) — see Backpressure;
+  /// - [`Error::AllocFailure`] if the buffer cannot be grown to hold the new
+  ///   samples.
   pub fn push_audio(&mut self, samples: &[f32]) -> Result<()> {
+    // The leading committed (drainable) portion of the current buffer. The
+    // watermark is monotonic and clamped to the buffered end, and a slide advances
+    // the origin only up to it, so `committed_samples >= window_origin_samples`
+    // and this is `<= audio.len()`; the remainder is the never-committed tail.
+    let committed_in_window = self
+      .committed_samples
+      .saturating_sub(self.window_origin_samples)
+      .min(self.audio.len());
+
+    // Backpressure, checked BEFORE mutating the buffer so a rejected push leaves
+    // the buffer unchanged and the caller keeps its samples: the uncommitted tail
+    // after this push must fit one 30 s window. A drainable committed lead is
+    // subtracted (it will be dropped by the slide below); what remains is the
+    // audio the next decode MUST still see, and it cannot exceed N_SAMPLES without
+    // forcing a silent drop of the oldest uncommitted speech.
+    let prospective_len = self.audio.len().saturating_add(samples.len());
+    let prospective_uncommitted = prospective_len.saturating_sub(committed_in_window);
+    if prospective_uncommitted > N_SAMPLES {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "WhisperStreaming::push_audio: uncommitted audio tail",
+        "N_SAMPLES",
+        N_SAMPLES as u64,
+        prospective_uncommitted as u64,
+      )));
+    }
+
     crate::model_validation::reserve_or_error(
       &mut self.audio,
       "WhisperStreaming: audio buffer",
       samples.len(),
     )?;
     self.audio.extend_from_slice(samples);
-    // Slide the window once the buffer exceeds N_SAMPLES. Advance the origin
-    // (absolute) to drop the committed audio (`committed_samples`) so the overlap
-    // is not re-decoded, and at least far enough to keep the window within
-    // N_SAMPLES. Clamp to the samples actually buffered so the drain stays in
-    // bounds. The committed tokens are carried as the next decode's prefix
-    // (`window_prefix`), so dropping their audio does not lose the continuation.
-    if self.audio.len() > N_SAMPLES {
-      let fit_origin = self.window_origin_samples + (self.audio.len() - N_SAMPLES);
-      let max_origin = self.window_origin_samples + self.audio.len();
-      let new_origin = fit_origin.max(self.committed_samples).min(max_origin);
-      let drop = new_origin - self.window_origin_samples;
-      if drop > 0 {
-        self.audio.drain(..drop);
-        self.window_origin_samples = new_origin;
-      }
+
+    // Slide once the buffer exceeds N_SAMPLES by dropping ONLY the committed
+    // leading audio (origin advances to `committed_samples`). The backpressure
+    // check above guarantees the uncommitted tail already fits one window, so
+    // dropping the committed lead leaves the buffer within N_SAMPLES; no
+    // uncommitted audio is ever discarded. The committed tokens are carried as the
+    // next decode's prefix (`window_prefix`), so dropping their audio does not lose
+    // the continuation. The slide drops every committed sample of this window, so
+    // no committed token's audio remains: reset the dedup watermark.
+    if self.audio.len() > N_SAMPLES && committed_in_window > 0 {
+      self.audio.drain(..committed_in_window);
+      self.window_origin_samples = self
+        .window_origin_samples
+        .saturating_add(committed_in_window);
+      self.window_emitted = 0;
     }
     Ok(())
   }
@@ -560,6 +623,16 @@ impl<'a> WhisperStreaming<'a> {
     let half_ctx = (self.model.dims().n_text_ctx() / 2).max(1);
     let max_prefix = half_ctx.saturating_sub(MIN_SAMPLE_BUDGET);
     let prefix = self.window_prefix(max_prefix);
+    // Whether the decode is forced to CONTINUE from a committed prefix. When a
+    // prefix is forced, `decode_aligned` strips it (via `sample_begin`) and
+    // `aligned.tokens` is the pure continuation PAST the forced prefix — so the
+    // window's already-committed tokens are absent from the decode and the dedup
+    // skip is 0. When the prefix is EMPTY (conditioning off, `max_prompt_tokens`
+    // is 0, or nothing committed yet), the decode restarts from the sot sequence
+    // and re-decodes the whole window, so `aligned.tokens` REPEATS the window's
+    // already-committed tokens, which the [`Self::window_emitted`] watermark drops
+    // below. Dedup therefore holds whether or not the prefix is on.
+    let prefix_forced_continuation = !prefix.is_empty();
     let sample_len = half_ctx.saturating_sub(prefix.len()).max(1);
     let decode = DecodingOptions {
       task: task_to_whisper(self.options.task),
@@ -587,6 +660,30 @@ impl<'a> WhisperStreaming<'a> {
     };
     let aligned = task.decode_aligned(&enc, content_frames, frame_threshold)?;
 
+    // Dedup against the running transcript via the window watermark — the
+    // FIRST-CLASS invariant that keeps `step` append-only regardless of the
+    // conditioning prefix. When a prefix forced the decode to continue,
+    // `decode_aligned` already stripped it, so `aligned.tokens` is the genuine
+    // continuation (skip 0). When the prefix was empty, the decode re-emitted the
+    // window's already-committed tokens, so drop exactly those `window_emitted`
+    // leading tokens. Clamping to `aligned.tokens.len()` means a decode that
+    // committed FEWER tokens than already emitted (e.g. a non-final step after a
+    // looser final step, or a shorter re-decode) yields an empty suffix rather
+    // than slicing out of bounds — never a re-emission. Mirrors the reference's
+    // `new_tokens = text_tokens[len(self._emitted_tokens):]`, decoupled from the
+    // prefix.
+    let skip = if prefix_forced_continuation {
+      0
+    } else {
+      self.window_emitted.min(aligned.tokens.len())
+    };
+    let new_ids = &aligned.tokens[skip..];
+    // `decode_aligned` keeps `frames` parallel to `tokens` (defensively truncated
+    // to the same length); clamp the frame skip to the frame length in case it is
+    // the shorter of the two — the per-token `new_frames.get(i)` lookup below then
+    // falls back to frame 0 for any missing tail entry.
+    let new_frames = &aligned.frames[skip.min(aligned.frames.len())..];
+
     // The encoder frame origin (in seconds) of the current window. Tokens are
     // timed by their argmax encoder frame within the window plus this offset.
     let window_offset_s = self.window_origin_samples as f64 / SAMPLE_RATE as f64;
@@ -594,33 +691,36 @@ impl<'a> WhisperStreaming<'a> {
     crate::model_validation::reserve_or_error(
       &mut tokens,
       "WhisperStreaming: committed tokens",
-      aligned.tokens.len(),
+      new_ids.len(),
     )?;
-    for (i, &id) in aligned.tokens.iter().enumerate() {
+    for (i, &id) in new_ids.iter().enumerate() {
       // One encoder frame ≈ 1 / TOKENS_PER_SECOND seconds (≈ 0.02 s).
-      let frame = aligned.frames.get(i).copied().unwrap_or(0);
+      let frame = new_frames.get(i).copied().unwrap_or(0);
       let start = window_offset_s + frame as f64 / TOKENS_PER_SECOND as f64;
       let end = window_offset_s + (frame + 1) as f64 / TOKENS_PER_SECOND as f64;
       tokens.push(CommittedToken::new(id, start, end));
     }
 
-    // Decode the committed text and append the new ids to the running
-    // transcript. This is append-only: the carried committed prefix means
-    // `decode_aligned` already stripped it from `aligned.tokens`, so only the
-    // NEW tokens past the prefix are appended (no re-emission of the overlap).
-    let text = self.tokenizer.decode(&aligned.tokens, false)?;
+    // Decode the genuinely-new text and append only the new ids to the running
+    // transcript. Append-only: the watermark slice above guarantees only tokens
+    // past the already-committed window prefix are appended (no re-emission), and
+    // `window_emitted` advances by the same count so a repeated `step` over the
+    // same buffer adds nothing.
+    let text = self.tokenizer.decode(new_ids, false)?;
     crate::model_validation::reserve_or_error(
       &mut self.committed,
       "WhisperStreaming: committed history",
-      aligned.tokens.len(),
+      new_ids.len(),
     )?;
-    self.committed.extend_from_slice(&aligned.tokens);
+    self.committed.extend_from_slice(new_ids);
+    self.window_emitted = self.window_emitted.saturating_add(new_ids.len());
 
     // Advance the committed-audio watermark to the furthest-attended committed
     // encoder frame (mapped to absolute samples), so the next window slide drops
-    // this audio rather than re-decoding it. Monotonic (`max`) and clamped to the
-    // samples buffered in this window, so the watermark never runs past the
-    // audio actually seen.
+    // this audio rather than re-decoding it. Uses the FULL `aligned.frames` — the
+    // skipped leading tokens are committed too, so their audio counts. Monotonic
+    // (`max`) and clamped to the samples buffered in this window, so the watermark
+    // never runs past the audio actually seen.
     if let Some(&max_frame) = aligned.frames.iter().max() {
       let committed_end =
         self.window_origin_samples + (max_frame + 1).saturating_mul(N_SAMPLES_PER_TOKEN);
