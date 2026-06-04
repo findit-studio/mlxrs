@@ -437,6 +437,70 @@ fn with_tiling_rejects_invalid_params() {
       .unwrap_err(),
     Error::OutOfRange(_)
   ));
+  // max_tiles above the cardinality cap (1024) — bound at load so the
+  // `max_tiles^2` candidate reservation / loop cannot blow up.
+  assert!(matches!(
+    base
+      .with_tiling(true, 2, 1025, false, 64, 256, 16, 512, 2.0)
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  // The cap value itself is accepted (it is a faithful in-bound config).
+  base
+    .with_tiling(true, 2, 1024, false, 64, 256, 16, 512, 2.0)
+    .expect("max_tiles == cap is in-bound");
+}
+
+#[test]
+fn with_tiling_max_tiles_cap_matches_config_constant() {
+  // `with_tiling` and `ModelConfig::validate` enforce the SAME cap; pin the
+  // boundary against the shared constant so the two cannot drift apart.
+  let base = Lfm2VlProcessorConfig::new(396, 2, 16, 1024).unwrap();
+  let cap = super::super::config::MAX_TILES as u32;
+  base
+    .with_tiling(true, 2, cap, false, 64, 256, 16, 512, 2.0)
+    .expect("max_tiles == cap is in-bound");
+  assert!(matches!(
+    base
+      .with_tiling(true, 2, cap + 1, false, 64, 256, 16, 512, 2.0)
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+}
+
+#[test]
+fn target_ratios_at_cap_is_bounded_and_nonempty() {
+  // The candidate builder runs over `1..=max_tiles` x `1..=max_tiles`; at the
+  // cap it must complete (no panic / overflow / unbounded reservation) and
+  // return a non-empty, tile-count-sorted set. The product math is widened to
+  // `u64`, so even the cap-sized grid cannot wrap.
+  let cap = super::super::config::MAX_TILES as u32;
+  let ratios = target_ratios(2, cap).expect("cap-sized candidate set builds");
+  assert!(!ratios.is_empty());
+  // `(1, 2)` (product 2 == min_tiles) is the smallest candidate and must lead.
+  assert_eq!(ratios.first().copied(), Some((1, 2)));
+  // Every candidate satisfies `min_tiles <= w*h <= max_tiles` (no wrap admitted
+  // a bogus pair), and the keys are non-decreasing.
+  let mut prev = 0u64;
+  for &(w, h) in &ratios {
+    let prod = u64::from(w) * u64::from(h);
+    assert!(
+      (2..=u64::from(cap)).contains(&prod),
+      "bad product for ({w},{h})"
+    );
+    assert!(prod >= prev, "candidates must be sorted by tile count");
+    prev = prod;
+  }
+}
+
+#[test]
+fn get_grid_layout_overflowing_tile_size_is_typed_error() {
+  // `target_width = tile_size * grid_width` is `checked_mul`: a `tile_size` near
+  // `u32::MAX` with a `> 1` grid overflows and must surface a typed
+  // ArithmeticOverflow, never a debug panic or a release wrap. `find_closest`
+  // picks a wide grid for a very wide image, so `grid_width >= 2`.
+  let err = get_grid_layout(16, 4096, 2, 10, u32::MAX).unwrap_err();
+  assert!(matches!(err, Error::ArithmeticOverflow(_)), "got {err}");
 }
 
 #[test]

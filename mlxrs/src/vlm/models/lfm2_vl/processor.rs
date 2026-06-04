@@ -262,6 +262,8 @@ impl Lfm2VlProcessorConfig {
   /// [`Error::OutOfRange`] if any cardinality field
   /// (`min_tiles` / `max_tiles` / `min_image_tokens` / `max_image_tokens` /
   /// `encoder_patch_size` / `tile_size`) is `0`, [`Error::OutOfRange`] if
+  /// `max_tiles` exceeds the tile-grid cardinality cap
+  /// ([`MAX_TILES`](super::config::MAX_TILES)), [`Error::OutOfRange`] if
   /// `min_tiles > max_tiles` or `min_image_tokens > max_image_tokens`,
   /// [`Error::NonFiniteScalar`] / [`Error::OutOfRange`] if
   /// `max_pixels_tolerance` is non-finite / non-positive, and
@@ -289,6 +291,19 @@ impl Lfm2VlProcessorConfig {
       ("lfm2_vl tiling: tile_size", tile_size),
     ] {
       require_positive_u32(name, value)?;
+    }
+    // Bound `max_tiles` to the tile-grid cardinality cap before any tile-grid
+    // work: `target_ratios` reserves / iterates `max_tiles^2` candidates, so an
+    // oversized value (malformed checkpoint or caller) would otherwise drive a
+    // quadratic reservation before the pixel caps apply. Mirrors
+    // [`ModelConfig::validate`](super::config::ModelConfig::validate); see
+    // [`MAX_TILES`](super::config::MAX_TILES) for the chosen bound.
+    if max_tiles > super::config::MAX_TILES as u32 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "lfm2_vl tiling: max_tiles",
+        "must not exceed the tile-grid cardinality cap (1024)",
+        smol_str::format_smolstr!("{max_tiles}"),
+      )));
     }
     if min_tiles > max_tiles {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
@@ -1231,12 +1246,15 @@ fn find_closest_aspect_ratio(
 /// de-duplicated and sorted by tile count `w * h`. `n` ranges over
 /// `[min_tiles, max_tiles]` but the `w, h <= n` bound plus the product filter
 /// makes the set independent of the iteration bookkeeping; this builds it
-/// directly. Reserved fallibly (the count is bounded by `max_tiles^2`).
+/// directly. `max_tiles` is bounded at config load
+/// ([`MAX_TILES`](super::config::MAX_TILES)) so `max_tiles^2` stays a bounded
+/// reservation / loop; the count is still reserved fallibly.
 #[cfg(feature = "lfm2-vl")]
 fn target_ratios(min_tiles: u32, max_tiles: u32) -> Result<Vec<(u32, u32)>> {
-  // The candidate set is `{(w, h) : min_tiles <= w*h <= max_tiles}`. Its size is
-  // bounded by `max_tiles^2`; reserve that fallibly so a large (but in-range)
-  // `max_tiles` cannot abort on an infallible `with_capacity`.
+  // The candidate set is `{(w, h) : min_tiles <= w*h <= max_tiles}`, whose size
+  // is bounded by `max_tiles^2`. `max_tiles` is capped at load, so this is a
+  // bounded reservation; the `checked_mul` guards the arithmetic regardless, and
+  // the fallible reserve avoids aborting on an infallible `with_capacity`.
   let cap = (max_tiles as usize)
     .checked_mul(max_tiles as usize)
     .ok_or_else(|| {
@@ -1248,10 +1266,13 @@ fn target_ratios(min_tiles: u32, max_tiles: u32) -> Result<Vec<(u32, u32)>> {
     })?;
   let mut ratios: Vec<(u32, u32)> = Vec::new();
   reserve_or_error(&mut ratios, "lfm2_vl tiling: target ratio", cap)?;
+  let (min_prod, max_prod) = (u64::from(min_tiles), u64::from(max_tiles));
   for w in 1..=max_tiles {
     for h in 1..=max_tiles {
-      let prod = w * h; // <= max_tiles^2, fits u32 (max_tiles capped small)
-      if prod >= min_tiles && prod <= max_tiles {
+      // `w, h <= max_tiles <= u32::MAX`, so the product is exact in `u64` and
+      // cannot wrap (it never narrows back to `u32`; the comparands widen too).
+      let prod = u64::from(w) * u64::from(h);
+      if prod >= min_prod && prod <= max_prod {
         ratios.push((w, h));
       }
     }
@@ -1266,7 +1287,8 @@ fn target_ratios(min_tiles: u32, max_tiles: u32) -> Result<Vec<(u32, u32)>> {
   // regardless of the candidate order (verified to produce identical grids to
   // HF's order across the full source-dimension range). So this deterministic
   // stable order is outcome-equivalent to HF's set order.
-  ratios.sort_by_key(|&(w, h)| w * h);
+  // Sort key in `u64` — the product is exact and cannot wrap (`w, h <= max_tiles`).
+  ratios.sort_by_key(|&(w, h)| u64::from(w) * u64::from(h));
   Ok(ratios)
 }
 
@@ -1482,8 +1504,10 @@ pub fn plan_tiles(height: u32, width: u32, cfg: &Lfm2VlProcessorConfig) -> Resul
     let (grid_width, grid_height, target_width, target_height) =
       get_grid_layout(height, width, t.min_tiles, t.max_tiles, t.tile_size)?;
     // HF `crop_image_to_patches:317`: a thumbnail is appended only when
-    // `use_thumbnail` AND the grid has more than one tile.
-    let multi_tile = grid_width * grid_height != 1;
+    // `use_thumbnail` AND the grid has more than one tile. The grid sides are
+    // `>= 1`, so the product is `1` iff both are `1`; test that directly to
+    // avoid forming the product.
+    let multi_tile = !(grid_width == 1 && grid_height == 1);
     Ok(TilePlan {
       split: multi_tile,
       grid_width,
@@ -1602,11 +1626,26 @@ pub fn tile_image(
     let tile_w = plan.target_width / plan.grid_width; // == tile_size (exact)
     let grid_rows = tile_h / p; // patches per tile side
     let grid_cols = tile_w / p;
-    // Each tile, row-major (HF `split_to_tiles` orders tiles row-major).
+    // Each tile, row-major (HF `split_to_tiles` orders tiles row-major). The
+    // tile origins `gy * tile_h` / `gx * tile_w` are bounded by
+    // `target_height` / `target_width` (which `get_grid_layout` produced via a
+    // `checked_mul`), but guard the products too so no path multiplies unchecked.
     for gy in 0..plan.grid_height {
       for gx in 0..plan.grid_width {
-        let y0 = gy * tile_h;
-        let x0 = gx * tile_w;
+        let y0 = gy.checked_mul(tile_h).ok_or_else(|| {
+          Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+            "lfm2_vl tile_image: tile origin y (grid_row * tile_h)",
+            "u32",
+            [("grid_row", u64::from(gy)), ("tile_h", u64::from(tile_h))],
+          ))
+        })?;
+        let x0 = gx.checked_mul(tile_w).ok_or_else(|| {
+          Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+            "lfm2_vl tile_image: tile origin x (grid_col * tile_w)",
+            "u32",
+            [("grid_col", u64::from(gx)), ("tile_w", u64::from(tile_w))],
+          ))
+        })?;
         out.push(patchify_rgba_region(
           resized.buf(),
           resized.width(),

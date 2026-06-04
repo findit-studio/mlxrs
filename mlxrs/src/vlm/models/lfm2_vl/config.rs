@@ -451,6 +451,25 @@ fn default_max_image_tokens() -> i32 {
 fn default_min_image_tokens() -> i32 {
   64
 }
+/// Upper bound on `max_tiles` enforced at config load
+/// ([`ModelConfig::validate`] /
+/// [`Lfm2VlProcessorConfig::with_tiling`](crate::vlm::models::lfm2_vl::processor::Lfm2VlProcessorConfig::with_tiling)).
+///
+/// HuggingFace `image_processing_lfm2_vl.py` imposes no hard cap on `max_tiles`
+/// (its default is `10`), but the tile-grid candidate builder
+/// (`_target_ratios`) reserves and iterates a set bounded by `max_tiles^2`. An
+/// unbounded `max_tiles` from a malformed checkpoint would drive a quadratic
+/// reservation / loop before the pixel caps apply, so the cardinality is bound
+/// here — the same load-time discipline the other tile-grid fields follow.
+///
+/// `1024` is ~100x the realistic default of `10`, so it never rejects a sane
+/// checkpoint, while `max_tiles^2 = 2^20` keeps the candidate reservation
+/// (`(u32, u32)` pairs) at ~8 MiB worst case and every downstream
+/// `tile_size * grid` product within `u32` (the grid side is `<= max_tiles`).
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const MAX_TILES: i32 = 1024;
+
 #[cfg(feature = "lfm2-vl")]
 fn default_max_tiles() -> i32 {
   10
@@ -547,6 +566,7 @@ impl ModelConfig {
   /// `projector_hidden_size`, `max_num_patches`, `tile_size`) and the tile-grid
   /// cardinality fields (`encoder_patch_size`, `max_image_tokens`,
   /// `min_image_tokens`, `max_tiles`, `min_tiles`) strictly positive,
+  /// `max_tiles` within the [`MAX_TILES`] cardinality cap,
   /// `max_pixels_tolerance` positive-and-finite, the `min_* <= max_*` orderings,
   /// and `image_token_index` / `eos_token_id` non-negative; validates that
   /// `vision_feature_layer` resolves to an in-range kept-layer count; and
@@ -596,6 +616,17 @@ impl ModelConfig {
       ("lfm2_vl::ModelConfig: min_tiles", self.min_tiles),
     ] {
       require_positive(name, value)?;
+    }
+    // `max_tiles` is the cardinality of the tile-grid candidate set, whose
+    // builder (`processor::target_ratios`) reserves and iterates `max_tiles^2`
+    // pairs; bound it so a malformed checkpoint cannot drive a quadratic
+    // reservation / loop. HF imposes no hard cap, so the bound is generous.
+    if self.max_tiles > MAX_TILES {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "lfm2_vl::ModelConfig: max_tiles",
+        "must not exceed the tile-grid cardinality cap (1024)",
+        smol_str::format_smolstr!("{}", self.max_tiles),
+      )));
     }
     // The tile / token budgets are inclusive `[min, max]` bands; a `min` above
     // its `max` is structurally invalid (an empty band).

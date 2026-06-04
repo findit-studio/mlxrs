@@ -258,6 +258,28 @@ fn model_config_rejects_inverted_tiling_ranges() {
 }
 
 #[test]
+fn model_config_rejects_oversized_max_tiles() {
+  // `max_tiles` is the cardinality of the tile-grid candidate set, whose
+  // builder reserves / iterates `max_tiles^2`; a value above the cap is
+  // rejected at load so a malformed checkpoint cannot drive quadratic work.
+  let over = MAX_TILES + 1;
+  let bad = format!(r#"{{"text_config":{{}},"vision_config":{{}},"max_tiles":{over}}}"#);
+  let cfg = ModelConfig::from_json(&bad).unwrap();
+  assert!(
+    matches!(cfg.validate().unwrap_err(), Error::OutOfRange(_)),
+    "max_tiles above the cap must be OutOfRange"
+  );
+
+  // The cap value itself is in-bound (a faithful, if generous, config).
+  let at_cap =
+    format!(r#"{{"text_config":{{}},"vision_config":{{}},"min_tiles":2,"max_tiles":{MAX_TILES}}}"#);
+  ModelConfig::from_json(&at_cap)
+    .unwrap()
+    .validate()
+    .expect("max_tiles == cap validates");
+}
+
+#[test]
 fn model_config_rejects_nonfinite_pixels_tolerance() {
   // A non-positive tolerance is OutOfRange; a non-finite one is NonFiniteScalar.
   let zero = r#"{"text_config":{},"vision_config":{},"max_pixels_tolerance":0.0}"#;
