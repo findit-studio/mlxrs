@@ -250,13 +250,47 @@ pub struct TranscribeOptions {
   /// [`AutoregressiveStt::max_context`]. A caller-supplied limit larger than
   /// the model's remaining context is harmlessly clamped to the context.
   max_new_tokens: Option<usize>,
+  /// Compression-ratio fallback threshold: a window whose decoded text exceeds
+  /// this gzip ratio is retried at a higher temperature (Whisper's
+  /// `compression_ratio_threshold`, default `2.4`). `None` disables the check.
+  /// Autoregressive models with a temperature-fallback schedule honor it; CTC
+  /// models ignore it.
+  compression_ratio_threshold: Option<f64>,
+  /// Average-logprob fallback threshold: a window whose mean token log-prob is
+  /// below this is retried at a higher temperature (Whisper's
+  /// `logprob_threshold`, default `-1.0`). `None` disables the check.
+  logprob_threshold: Option<f64>,
+  /// No-speech (silence) threshold: a window whose no-speech probability
+  /// exceeds this is treated as silence and skipped (Whisper's
+  /// `no_speech_threshold`, default `0.6`). `None` disables the skip.
+  no_speech_threshold: Option<f64>,
+  /// Condition each window's decode on the previously-decoded text (Whisper's
+  /// `condition_on_previous_text`, default `true`). `false` resets the decode
+  /// prompt per window (more robust to repetition loops, less cross-window
+  /// consistency).
+  condition_on_previous_text: bool,
+  /// Optional text prompting the FIRST window — a custom vocabulary or proper
+  /// nouns to bias the decode (Whisper's `initial_prompt`). The text conditions
+  /// the decode but is never emitted as transcript. `None` for no prompt.
+  initial_prompt: Option<String>,
+  /// Attach per-unit timestamps to the result (Whisper's word-timestamp
+  /// cross-attention DTW, `word_timestamps`, default `false`). When set, a model
+  /// that supports it populates the richer per-word timing on its model-local
+  /// result; the universal [`Transcription`] still carries only segment spans.
+  word_timestamps: bool,
+  /// Seconds timestamps of the clips to process (Whisper's `clip_timestamps`):
+  /// the list pairs up as `(start, end, start, end, …)`, each pair restricting
+  /// decoding to `[start, end)`. Empty (the default) processes the whole audio.
+  clip_timestamps: Vec<f64>,
 }
 
 impl TranscribeOptions {
   /// A new options bundle with auto-detect language, [`Task::Transcribe`],
-  /// greedy (`temperature == 0.0`) decoding, timestamps enabled, and no
+  /// greedy (`temperature == 0.0`) decoding, timestamps enabled, no
   /// generated-token cap (the decode loop is bounded only by the model's
-  /// [`AutoregressiveStt::max_context`]).
+  /// [`AutoregressiveStt::max_context`]), and the standard Whisper quality-
+  /// control defaults (compression-ratio `2.4`, logprob `-1.0`, no-speech `0.6`,
+  /// condition-on-previous-text on, no word timestamps, no clip restriction).
   #[inline(always)]
   pub const fn new() -> Self {
     Self {
@@ -265,6 +299,13 @@ impl TranscribeOptions {
       temperature: 0.0,
       no_timestamps: false,
       max_new_tokens: None,
+      compression_ratio_threshold: Some(2.4),
+      logprob_threshold: Some(-1.0),
+      no_speech_threshold: Some(0.6),
+      condition_on_previous_text: true,
+      initial_prompt: None,
+      word_timestamps: false,
+      clip_timestamps: Vec::new(),
     }
   }
 
@@ -444,6 +485,120 @@ impl TranscribeOptions {
   #[inline(always)]
   pub const fn clear_max_new_tokens(&mut self) -> &mut Self {
     self.max_new_tokens = None;
+    self
+  }
+
+  /// The compression-ratio fallback threshold (`None` disables).
+  #[inline(always)]
+  pub const fn compression_ratio_threshold(&self) -> Option<f64> {
+    self.compression_ratio_threshold
+  }
+
+  /// Return `self` with the compression-ratio fallback threshold set (`None`
+  /// disables the check).
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_compression_ratio_threshold(mut self, threshold: Option<f64>) -> Self {
+    self.compression_ratio_threshold = threshold;
+    self
+  }
+
+  /// The average-logprob fallback threshold (`None` disables).
+  #[inline(always)]
+  pub const fn logprob_threshold(&self) -> Option<f64> {
+    self.logprob_threshold
+  }
+
+  /// Return `self` with the average-logprob fallback threshold set (`None`
+  /// disables the check).
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_logprob_threshold(mut self, threshold: Option<f64>) -> Self {
+    self.logprob_threshold = threshold;
+    self
+  }
+
+  /// The no-speech (silence) threshold (`None` disables the skip).
+  #[inline(always)]
+  pub const fn no_speech_threshold(&self) -> Option<f64> {
+    self.no_speech_threshold
+  }
+
+  /// Return `self` with the no-speech threshold set (`None` disables the
+  /// silence skip).
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_no_speech_threshold(mut self, threshold: Option<f64>) -> Self {
+    self.no_speech_threshold = threshold;
+    self
+  }
+
+  /// Whether each window's decode is conditioned on the prior decoded text.
+  #[inline(always)]
+  pub const fn condition_on_previous_text(&self) -> bool {
+    self.condition_on_previous_text
+  }
+
+  /// Return `self` with previous-text conditioning toggled.
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_condition_on_previous_text(mut self, on: bool) -> Self {
+    self.condition_on_previous_text = on;
+    self
+  }
+
+  /// The first-window prompt text, or `None`.
+  #[inline(always)]
+  pub fn initial_prompt(&self) -> Option<&str> {
+    self.initial_prompt.as_deref()
+  }
+
+  /// Return `self` with the first-window prompt text set.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_initial_prompt(mut self, prompt: impl Into<String>) -> Self {
+    self.initial_prompt = Some(prompt.into());
+    self
+  }
+
+  /// Return `self` with the raw first-window prompt wrapper assigned (`None`
+  /// for no prompt).
+  #[must_use]
+  #[inline(always)]
+  pub fn maybe_initial_prompt(mut self, prompt: Option<String>) -> Self {
+    self.initial_prompt = prompt;
+    self
+  }
+
+  /// Whether per-unit (word) timestamps are requested.
+  #[inline(always)]
+  pub const fn word_timestamps(&self) -> bool {
+    self.word_timestamps
+  }
+
+  /// Return `self` with per-unit (word) timestamps requested. A model that
+  /// supports it exposes the timing on its model-local result (the universal
+  /// [`Transcription`] carries only segment spans).
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_word_timestamps(mut self, on: bool) -> Self {
+    self.word_timestamps = on;
+    self
+  }
+
+  /// The clip-restriction seconds list (pairs of `(start, end)`); empty
+  /// processes the whole audio.
+  #[inline(always)]
+  pub fn clip_timestamps(&self) -> &[f64] {
+    &self.clip_timestamps
+  }
+
+  /// Return `self` with the clip-restriction seconds list set (pairs of
+  /// `(start, end)`; an odd-length list leaves the final clip open-ended).
+  #[must_use]
+  #[inline(always)]
+  pub fn with_clip_timestamps(mut self, clips: Vec<f64>) -> Self {
+    self.clip_timestamps = clips;
     self
   }
 }

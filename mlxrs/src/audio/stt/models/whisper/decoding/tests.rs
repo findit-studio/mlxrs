@@ -3281,3 +3281,167 @@ fn no_word_path_preserves_degenerate_segment_tokens() {
     "word-timestamp path still clears the degenerate segment"
   );
 }
+
+// ───────────────────── PR-E: universal knobs + rich result ─────────────────
+
+/// A short real waveform (deterministic) the universal `transcribe` /
+/// `transcribe_detailed` front-end frames into a log-mel.
+fn pr_e_waveform() -> Array {
+  let data: Vec<f32> = (0..16_000)
+    .map(|i| ((i % 41) as f32 / 41.0) - 0.5)
+    .collect();
+  Array::from_slice::<f32>(&data, &[data.len() as i32]).unwrap()
+}
+
+/// A `tiny_model(target)` with the fixture tokenizer attached, so the universal
+/// `Transcribe` / inherent `transcribe_detailed` entries (which require an
+/// attached tokenizer) can run.
+fn tiny_model_with_tokenizer(target: u32, dir: &Path) -> WhisperModel {
+  let tok = write_tokenizer(dir);
+  tiny_model(target).with_tokenizer(tok).unwrap()
+}
+
+#[test]
+fn transcribe_detailed_exposes_tokens_seek_and_stats() {
+  // The rich result surfaces the fields the universal `Transcription` cannot
+  // hold: per-segment token ids, seek-derived time offsets, and decode stats.
+  use crate::audio::stt::model::TranscribeOptions;
+  let dir = fresh_dir("pr_e_detailed");
+  let model = tiny_model_with_tokenizer(13, dir.as_path()); // biased to "d"
+  let audio = pr_e_waveform();
+
+  let opts = TranscribeOptions::new()
+    .with_language("en")
+    .with_no_speech_threshold(None) // don't skip the synthetic window as silence
+    .with_compression_ratio_threshold(None)
+    .with_logprob_threshold(None)
+    .with_max_new_tokens(4);
+  let rich = model.transcribe_detailed(&audio, &opts).unwrap();
+
+  assert_eq!(rich.language(), "en");
+  assert!(!rich.segments().is_empty(), "at least one segment");
+  let seg = &rich.segments()[0];
+  // Token ids are exposed; with timestamps on, a leading timestamp token may
+  // precede the biased text target — the point is the ids are surfaced verbatim
+  // and the biased text token appears among them.
+  assert!(!seg.tokens().is_empty(), "segment carries token ids");
+  assert!(
+    seg.tokens().contains(&13),
+    "biased text target must appear in the exposed token ids, got {:?}",
+    seg.tokens()
+  );
+  // Seek-derived time offsets are present and ordered.
+  assert!(seg.end() >= seg.start(), "segment end >= start");
+  assert!(seg.start() >= 0.0, "segment start non-negative");
+  // Decode statistics are surfaced.
+  assert!(seg.avg_logprob() <= 0.0, "avg_logprob is a log-prob (<= 0)");
+  assert!(
+    seg.compression_ratio() > 0.0,
+    "compression ratio is positive"
+  );
+}
+
+#[test]
+fn transcribe_detailed_word_timestamps_knob_flows_through() {
+  // The `word_timestamps` knob flows through to the decode: OFF → no words on
+  // the rich result; ON → the word-timestamp pass runs (the segments carry the
+  // per-word timing list). The biased model is deterministic, so this exercises
+  // the wiring, not the alignment quality.
+  use crate::audio::stt::model::TranscribeOptions;
+  let dir = fresh_dir("pr_e_words");
+  let model = tiny_model_with_tokenizer(13, dir.as_path());
+  let audio = pr_e_waveform();
+
+  let base = TranscribeOptions::new()
+    .with_language("en")
+    .with_no_speech_threshold(None)
+    .with_compression_ratio_threshold(None)
+    .with_logprob_threshold(None)
+    .with_max_new_tokens(4);
+
+  // OFF: the default no-word path leaves the words empty.
+  let off = model
+    .transcribe_detailed(&audio, &base.clone().with_word_timestamps(false))
+    .unwrap();
+  assert!(
+    off.segments().iter().all(|s| s.words().is_empty()),
+    "word_timestamps=false → no per-word timings"
+  );
+
+  // ON: the word-timestamp pass runs without error and the option is honored
+  // (the synthetic alignment may merge everything into few words, but the path
+  // is exercised and the result is well-formed).
+  let on = model
+    .transcribe_detailed(&audio, &base.with_word_timestamps(true))
+    .unwrap();
+  // Every word (if any) is well-formed: ordered times, in-range probability.
+  for seg in on.segments() {
+    for w in seg.words() {
+      assert!(w.end() >= w.start(), "word end >= start");
+      assert!(
+        (0.0..=1.0).contains(&w.probability()),
+        "word probability in [0,1], got {}",
+        w.probability()
+      );
+    }
+  }
+}
+
+#[test]
+fn universal_transcribe_options_thresholds_round_trip() {
+  // The new universal knobs round-trip through their accessors (the wiring the
+  // whisper mapping reads). An independent check that the option surface carries
+  // the values the decode consumes.
+  use crate::audio::stt::model::TranscribeOptions;
+  let opts = TranscribeOptions::new()
+    .with_compression_ratio_threshold(Some(3.0))
+    .with_logprob_threshold(Some(-0.5))
+    .with_no_speech_threshold(None)
+    .with_condition_on_previous_text(false)
+    .with_initial_prompt("custom vocab")
+    .with_word_timestamps(true)
+    .with_clip_timestamps(vec![0.0, 5.0, 10.0, 15.0]);
+
+  assert_eq!(opts.compression_ratio_threshold(), Some(3.0));
+  assert_eq!(opts.logprob_threshold(), Some(-0.5));
+  assert_eq!(opts.no_speech_threshold(), None);
+  assert!(!opts.condition_on_previous_text());
+  assert_eq!(opts.initial_prompt(), Some("custom vocab"));
+  assert!(opts.word_timestamps());
+  assert_eq!(opts.clip_timestamps(), &[0.0, 5.0, 10.0, 15.0]);
+
+  // The defaults preserve the prior whisper behavior (the thresholds the old
+  // `transcribe` hardcoded).
+  let def = TranscribeOptions::new();
+  assert_eq!(def.compression_ratio_threshold(), Some(2.4));
+  assert_eq!(def.logprob_threshold(), Some(-1.0));
+  assert_eq!(def.no_speech_threshold(), Some(0.6));
+  assert!(def.condition_on_previous_text());
+  assert!(!def.word_timestamps());
+  assert!(def.clip_timestamps().is_empty());
+  assert_eq!(def.initial_prompt(), None);
+}
+
+#[test]
+fn universal_transcribe_returns_standard_transcription() {
+  // The universal `Transcribe::transcribe` still returns the lossy standard
+  // `Transcription` (text + language + segment spans), honoring the new options
+  // without exposing the rich fields — the rich data is `transcribe_detailed`'s.
+  use crate::audio::stt::model::{Transcribe as _, TranscribeOptions};
+  let dir = fresh_dir("pr_e_universal");
+  let model = tiny_model_with_tokenizer(13, dir.as_path());
+  let audio = pr_e_waveform();
+
+  let opts = TranscribeOptions::new()
+    .with_language("en")
+    .with_no_speech_threshold(None)
+    .with_compression_ratio_threshold(None)
+    .with_logprob_threshold(None)
+    .with_max_new_tokens(4);
+  let std = model.transcribe(&audio, &opts).unwrap();
+  assert_eq!(std.language(), Some("en"));
+  // The standard segments carry text + spans (the universal contract).
+  for s in std.segments_slice() {
+    assert!(s.end() >= s.start());
+  }
+}
