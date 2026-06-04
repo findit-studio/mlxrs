@@ -240,6 +240,13 @@ fn full_checkpoint() -> HashMap<String, Array> {
   for i in 0..T_LAYERS {
     put_text_layer(&mut w, i);
   }
+  // RoBERTa pooler (dense `Linear(hidden, hidden)` + tanh on the CLS token);
+  // `ClapModel.text_model` enables it (`add_pooling_layer = True`).
+  w.insert(
+    "text_model.pooler.dense.weight".to_string(),
+    mat(T_HIDDEN, T_HIDDEN),
+  );
+  w.insert("text_model.pooler.dense.bias".to_string(), vec1(T_HIDDEN));
   // A non-parameter position_ids buffer HF ships (dropped by sanitize).
   w.insert(
     "text_model.embeddings.position_ids".to_string(),
@@ -577,6 +584,9 @@ fn sanitize_keeps_tower_prefixes_verbatim() {
     "audio_model.audio_encoder.norm.weight",
     "text_model.embeddings.word_embeddings.weight",
     "text_model.encoder.layer.0.attention.self.query.weight",
+    // The RoBERTa pooler is a real parameter (consumed by the text tower), so
+    // sanitize keeps it (unlike the dropped position_ids buffer).
+    "text_model.pooler.dense.weight",
     "audio_projection.linear1.weight",
     "text_projection.linear1.weight",
     "logit_scale_a",
@@ -640,6 +650,8 @@ fn quantize_all_linears(w: &mut HashMap<String, Array>) {
     quantize_weight_in_place(w, &format!("{l}.intermediate.dense"));
     quantize_weight_in_place(w, &format!("{l}.output.dense"));
   }
+  // The RoBERTa pooler dense.
+  quantize_weight_in_place(w, "text_model.pooler.dense");
   // Both projections.
   for proj in ["text_projection", "audio_projection"] {
     quantize_weight_in_place(w, &format!("{proj}.linear1"));
