@@ -401,6 +401,8 @@ impl EmbeddingModelTypeRegistry {
   /// - `"gemma3_text"` →
   ///   [`crate::embeddings::embeddinggemma::EmbeddingGemmaModel`] (when the
   ///   `embeddinggemma` feature is on).
+  /// - `"clap"` → [`crate::embeddings::clap::ClapModel`] (when the `clap`
+  ///   feature is on).
   ///
   /// With no model features enabled this is a no-op (equivalent to
   /// [`new`](Self::new)). A caller that wants only its own architectures can
@@ -418,6 +420,8 @@ impl EmbeddingModelTypeRegistry {
     crate::embeddings::siglip2_naflex::register(&mut this);
     #[cfg(feature = "embeddinggemma")]
     crate::embeddings::embeddinggemma::register(&mut this);
+    #[cfg(feature = "clap")]
+    crate::embeddings::clap::register(&mut this);
     this
   }
 

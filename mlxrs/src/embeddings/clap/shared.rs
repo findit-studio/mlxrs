@@ -624,6 +624,170 @@ pub(crate) fn build_layer_norm(
   Ok(LayerNorm::new(Some(weight), Some(bias), eps))
 }
 
+// ════════════════════════════ ClapProjectionLayer ══════════════════════════
+
+/// The CLAP projection head (HF `ClapProjectionLayer`):
+/// `linear2(relu(linear1(x)))`, with a biased `Linear(hidden → projection_dim)`,
+/// then a **ReLU**, then `Linear(projection_dim → projection_dim)` (CLAP uses
+/// ReLU, not the towers' GELU — `projection_hidden_act = "relu"`).
+///
+/// Both towers project through this same head (`text_projection` over the
+/// RoBERTa CLS feature, `audio_projection` over the HTSAT pooled feature), so it
+/// lives here rather than on either tower; the `(B, hidden) → (B, projection_dim)`
+/// shape is identical for both (`hidden = 768`, `projection_dim = 512`).
+#[cfg(feature = "clap")]
+pub(crate) struct ClapProjectionLayer {
+  linear1: QuantLinear,
+  linear2: QuantLinear,
+}
+
+#[cfg(feature = "clap")]
+impl ClapProjectionLayer {
+  /// Build from `{prefix}.linear1.*` + `{prefix}.linear2.*`, pinning `linear1` to
+  /// `(projection_dim, hidden)` and `linear2` to `(projection_dim, projection_dim)`
+  /// (both biased). Each Linear auto-picks the dense or quantized variant by its
+  /// `.scales` sibling.
+  pub(crate) fn from_weights(
+    prefix: &str,
+    weights: &mut HashMap<String, Array>,
+    hidden: i32,
+    projection_dim: i32,
+    quant: Option<&PerLayerQuantization>,
+  ) -> Result<Self> {
+    let linear1 = QuantLinear::from_weights(
+      weights,
+      &format!("{prefix}.linear1"),
+      projection_dim,
+      hidden,
+      true,
+      quant,
+    )?;
+    let linear2 = QuantLinear::from_weights(
+      weights,
+      &format!("{prefix}.linear2"),
+      projection_dim,
+      projection_dim,
+      true,
+      quant,
+    )?;
+    Ok(Self { linear1, linear2 })
+  }
+
+  /// `linear2(relu(linear1(x)))`.
+  pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
+    let h = self.linear1.forward(x)?;
+    let h = relu(&h)?;
+    self.linear2.forward(&h)
+  }
+
+  /// `true` if both projection layers loaded the quantized variant (test-only).
+  #[cfg(test)]
+  pub(crate) fn all_quantized(&self) -> bool {
+    self.linear1.is_quantized() && self.linear2.is_quantized()
+  }
+}
+
+/// ReLU (`max(x, 0)`), the CLAP projection activation
+/// (`projection_hidden_act = "relu"`). Built with a dtype-matched rank-0 `0`
+/// constant so an f16/bf16 activation is not promoted to f32.
+#[cfg(feature = "clap")]
+pub(crate) fn relu(x: &Array) -> Result<Array> {
+  let zero = cast_like(&Array::full::<f32>(&[0i32; 0], 0.0)?, x)?;
+  ops::arithmetic::maximum(x, &zero)
+}
+
+/// Cast `a` to `like`'s dtype (a no-op when they already match) — the uniform
+/// stand-in for MLX weak-scalar / `astype(x.dtype)` semantics, so a tensor built
+/// in f32 (a scalar floor, a gathered position/bias row) that meets an f16/bf16
+/// activation is cast back rather than promoting the activation to f32.
+#[cfg(feature = "clap")]
+pub(crate) fn cast_like(a: &Array, like: &Array) -> Result<Array> {
+  ops::misc::astype(a, like.dtype()?)
+}
+
+// ═══════════════════════ sanitize-time key + weight helpers ════════════════
+
+/// Fallibly build the concatenation of `parts` into a freshly-reserved
+/// [`String`], turning an allocator failure into a typed [`Error::AllocFailure`]
+/// instead of the abort `String::push_str` / `format!` would raise on growth —
+/// the SigLIP2 `fallible_concat` precedent. Each `sanitize` / split key rewrite
+/// is sized by a **checkpoint-controlled** key, so a hostile checkpoint with
+/// enormous keys surfaces a recoverable error instead of aborting.
+#[cfg(feature = "clap")]
+pub(crate) fn fallible_concat(context: &'static str, parts: &[&str]) -> Result<String> {
+  let total = parts
+    .iter()
+    .fold(0usize, |acc, p| acc.saturating_add(p.len()));
+  let mut out = String::new();
+  out.try_reserve_exact(total).map_err(|e| {
+    Error::AllocFailure(crate::error::AllocFailurePayload::new(
+      "clap key rewrite",
+      context,
+      total as u64,
+      e,
+    ))
+  })?;
+  for p in parts {
+    out.push_str(p);
+  }
+  Ok(out)
+}
+
+/// Fallibly clone `s` into an owned [`String`] (the single-part
+/// [`fallible_concat`]), surfacing a typed [`Error::AllocFailure`] on allocator
+/// failure rather than the abort `str::to_string` would raise.
+#[cfg(feature = "clap")]
+pub(crate) fn fallible_clone_str(context: &'static str, s: &str) -> Result<String> {
+  fallible_concat(context, &[s])
+}
+
+/// Transpose the patch-embed Conv2d weight to mlxrs's channels-last NHWC layout
+/// (the SigLIP2 `reshape_patch_weight` precedent), keyed only on the tensor's
+/// shape so `sanitize` needs no config.
+///
+/// mlxrs [`conv2d`](crate::ops::conv::conv2d) is NHWC (weight
+/// `(C_out, KH, KW, C_in)`) while HF's `Conv2d` weight is the channels-first
+/// `(C_out, C_in, KH, KW)`. For the CLAP patch embed (`C_in = 1`, `KH = KW = 4`)
+/// the two layouts are `(96, 1, 4, 4)` (HF NCHW) vs `(96, 4, 4, 1)` (NHWC), so the
+/// channel axis is the smallest of the trailing three. This:
+///
+/// - rank-4 with the channel axis **last** (`shape[3] <= shape[1]` and
+///   `shape[3] <= shape[2]`) is already NHWC → left unchanged (so `sanitize` is
+///   idempotent and an MLX-native checkpoint passes through);
+/// - rank-4 with the channel axis at **index 1** (the HF NCHW signature) →
+///   transposed `[0, 2, 3, 1]` to NHWC;
+/// - any other rank is a typed [`Error::RankMismatch`].
+///
+/// The audio tower's `PatchEmbed::from_weights` then shape-pins the result to the
+/// exact `(hidden, patch, patch, in_channels)` NHWC extents, so a wrong layout
+/// that slips through is caught at load, not at first forward.
+#[cfg(feature = "clap")]
+pub(crate) fn reshape_patch_weight(raw: &Array, key: &str) -> Result<Array> {
+  let shape = raw.shape();
+  if shape.len() != 4 {
+    let rank = shape.len() as u32;
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      key,
+      Error::RankMismatch(RankMismatchPayload::new(
+        "clap patch-embed conv weight must be rank-4 (C_out, C_in, KH, KW) NCHW or (C_out, KH, KW, C_in) NHWC",
+        rank,
+        shape,
+      )),
+    )));
+  }
+  // The channel axis is the smallest of the trailing three (for CLAP it is `1`).
+  // If it is already last (axis 3) the weight is NHWC — leave it. If it is at
+  // axis 1 the weight is the HF NCHW form — transpose `[0, 2, 3, 1]`.
+  let (c1, c2, c3) = (shape[1], shape[2], shape[3]);
+  if c3 <= c1 && c3 <= c2 {
+    // Already channels-last NHWC.
+    raw.try_clone()
+  } else {
+    // HF channels-first NCHW `(C_out, C_in, KH, KW)` → NHWC `(C_out, KH, KW, C_in)`.
+    ops::shape::transpose_axes(raw, &[0, 2, 3, 1])
+  }
+}
+
 /// Resolve the per-layer `(group_size, bits, mode)` scheme parameters for an
 /// embedding `prefix` from the parsed quantization config, for
 /// [`MaybeQuantizedEmbedding::from_weights`].

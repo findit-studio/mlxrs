@@ -52,11 +52,11 @@
 //!
 //! ## Scope
 //!
-//! This is **phase 2** of the CLAP port (the text tower). The HTSAT Swin audio
-//! tower (phase 3), the full dual-tower `ClapModel` assembly + `classify` +
-//! the factory registration (phase 4), and the end-to-end checkpoint-parity test
-//! (phase 5) are out of scope; [`ClapTextModel`] exposes a clean
-//! [`embed_text`](ClapTextModel::embed_text) the assembly layer consumes.
+//! This is the CLAP **text tower**. The full dual-tower
+//! [`ClapModel`](super::ClapModel) wraps it as the text seam (and reaches its
+//! [`embed_text`](ClapTextModel::embed_text) through the
+//! [`crate::embeddings::TextEmbedder`] impl); the end-to-end
+//! checkpoint-parity test lands in a separate PR.
 
 use std::collections::HashMap;
 
@@ -68,8 +68,8 @@ use crate::{
     clap::{
       config::ClapConfig,
       shared::{
-        LayerDims, RobertaLayer, build_layer_norm, dim_i32, expect_logical_shape, expect_shape,
-        resolve_quant,
+        ClapProjectionLayer, LayerDims, RobertaLayer, build_layer_norm, cast_like, dim_i32,
+        expect_logical_shape, expect_shape, resolve_quant,
       },
     },
     l2_normalize,
@@ -305,63 +305,6 @@ impl RobertaEncoder {
   #[cfg(test)]
   fn all_quantized(&self) -> bool {
     self.layers.iter().all(|l| l.all_quantized())
-  }
-}
-
-// ════════════════════════════ ClapProjectionLayer ══════════════════════════
-
-/// The CLAP text projection (HF `ClapProjectionLayer`):
-/// `linear2(relu(linear1(x)))`, with biased `Linear(hidden → projection_dim)`
-/// then `Linear(projection_dim → projection_dim)` and a **ReLU** between (CLAP
-/// uses ReLU, not the towers' GELU — `projection_hidden_act = "relu"`).
-#[cfg(feature = "clap")]
-struct ClapProjectionLayer {
-  linear1: super::shared::QuantLinear,
-  linear2: super::shared::QuantLinear,
-}
-
-#[cfg(feature = "clap")]
-impl ClapProjectionLayer {
-  /// Build from `text_projection.linear1.*` + `text_projection.linear2.*`,
-  /// pinning `linear1` to `(projection_dim, hidden)` and `linear2` to
-  /// `(projection_dim, projection_dim)` (both biased).
-  fn from_weights(
-    prefix: &str,
-    weights: &mut HashMap<String, Array>,
-    hidden: i32,
-    projection_dim: i32,
-    quant: Option<&PerLayerQuantization>,
-  ) -> Result<Self> {
-    let linear1 = super::shared::QuantLinear::from_weights(
-      weights,
-      &format!("{prefix}.linear1"),
-      projection_dim,
-      hidden,
-      true,
-      quant,
-    )?;
-    let linear2 = super::shared::QuantLinear::from_weights(
-      weights,
-      &format!("{prefix}.linear2"),
-      projection_dim,
-      projection_dim,
-      true,
-      quant,
-    )?;
-    Ok(Self { linear1, linear2 })
-  }
-
-  /// `linear2(relu(linear1(x)))`.
-  fn forward(&self, x: &Array) -> Result<Array> {
-    let h = self.linear1.forward(x)?;
-    let h = relu(&h)?;
-    self.linear2.forward(&h)
-  }
-
-  /// `true` if both projection layers loaded quantized (test-only).
-  #[cfg(test)]
-  fn all_quantized(&self) -> bool {
-    self.linear1.is_quantized() && self.linear2.is_quantized()
   }
 }
 
@@ -626,24 +569,6 @@ fn pool_cls(hidden: &Array) -> Result<Array> {
   let idx0 = Array::from_slice::<i32>(&[0], &(1usize,))?;
   let first = ops::indexing::take_axis(hidden, &idx0, 1)?; // (B, 1, hidden)
   ops::shape::squeeze_axes(&first, &[1]) // (B, hidden)
-}
-
-/// ReLU (`max(x, 0)`), the CLAP projection activation
-/// (`projection_hidden_act = "relu"`). Built with a dtype-matched rank-0 `0`
-/// constant so an f16/bf16 activation is not promoted to f32.
-#[cfg(feature = "clap")]
-fn relu(x: &Array) -> Result<Array> {
-  let zero = cast_like(&Array::full::<f32>(&[0i32; 0], 0.0)?, x)?;
-  ops::arithmetic::maximum(x, &zero)
-}
-
-/// Cast `a` to `like`'s dtype (a no-op when they already match) — the uniform
-/// stand-in for MLX weak-scalar / `astype(x.dtype)` semantics, so a tensor built
-/// in f32 (a position-row gather, a scalar floor) that meets an f16/bf16
-/// activation is cast back rather than promoting the activation to f32.
-#[cfg(feature = "clap")]
-fn cast_like(a: &Array, like: &Array) -> Result<Array> {
-  ops::misc::astype(a, like.dtype()?)
 }
 
 #[cfg(all(test, feature = "clap"))]

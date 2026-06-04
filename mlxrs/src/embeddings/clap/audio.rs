@@ -76,12 +76,11 @@
 //!
 //! ## Scope
 //!
-//! This is **phase 3** of the CLAP port (the audio tower). The audio projection,
-//! the full dual-tower `ClapModel` assembly + `classify` + the factory
-//! registration (phase 4), and the end-to-end checkpoint-parity test (phase 5)
-//! are out of scope; [`HtsatAudioTower`] exposes a clean
-//! [`forward`](HtsatAudioTower::forward) the assembly layer consumes as the audio
-//! tower (mirroring [`super::text::ClapTextModel`]'s `embed_text`).
+//! This is the CLAP HTSAT **audio tower**. The full dual-tower
+//! [`ClapModel`](super::ClapModel) wraps it, feeding its
+//! [`forward`](HtsatAudioTower::forward) pooled `(B, 768)` feature to the audio
+//! projection + L2-normalize (mirroring [`super::text::ClapTextModel`]'s
+//! `embed_text`); the end-to-end checkpoint-parity test lands in a separate PR.
 
 use std::collections::HashMap;
 
