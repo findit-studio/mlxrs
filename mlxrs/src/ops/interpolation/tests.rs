@@ -643,3 +643,173 @@ fn bicubic_rejects_integer_input_dtype() {
   let err = bicubic_interpolate(&g, 4, 4).unwrap_err();
   assert!(matches!(err, Error::UnsupportedDtype(_)), "got {err}");
 }
+
+// ─────────────────────── bicubic align_corners = True ───────────────────────
+//
+// The HF CLAP `reshape_mel2img` upsamples with `align_corners=True`. The only
+// delta from the `align_corners=False` reference above is the source-coordinate
+// map: `c = i * (in - 1) / (out - 1)` (endpoints aligned, no half-pixel shift),
+// `c = 0` when `out == 1`. The tap window / kernel / clamp / renormalization are
+// shared, so the independent f64 oracle re-uses `ref_cubic` and differs only in
+// `center`.
+
+/// Independent f64 reference for one `align_corners=True` bicubic axis. Same as
+/// [`ref_bicubic_axis`] but with the aligned-endpoint source center.
+fn ref_bicubic_axis_aligned(in_d: usize, out_d: usize) -> Vec<Vec<(usize, f64)>> {
+  let in_i = in_d as i64;
+  let scale = if out_d > 1 {
+    (in_d as f64 - 1.0) / (out_d as f64 - 1.0)
+  } else {
+    0.0
+  };
+  let mut rows = Vec::with_capacity(out_d);
+  for i in 0..out_d {
+    let center = i as f64 * scale;
+    let start = (center - 2.0).floor() as i64 + 1;
+    let mut taps: Vec<(i64, f64)> = Vec::new();
+    let mut tot = 0.0;
+    for k in 0..5i64 {
+      let p = start + k;
+      if p >= 0 && p < in_i {
+        let w = ref_cubic(center - p as f64);
+        taps.push((p, w));
+        tot += w;
+      }
+    }
+    let inv = 1.0 / (tot + 1e-8);
+    rows.push(
+      taps
+        .into_iter()
+        .map(|(p, w)| (p as usize, w * inv))
+        .collect(),
+    );
+  }
+  rows
+}
+
+/// Independent f64 `align_corners=True` bicubic resize of a single-channel grid.
+fn ref_bicubic_resize_aligned(grid: &[Vec<f64>], out_h: usize, out_w: usize) -> Vec<Vec<f64>> {
+  let h_in = grid.len();
+  let w_in = grid[0].len();
+  let wy = ref_bicubic_axis_aligned(h_in, out_h);
+  let wx = ref_bicubic_axis_aligned(w_in, out_w);
+  let mut tmp = vec![vec![0.0f64; w_in]; out_h];
+  for (i, trow) in tmp.iter_mut().enumerate() {
+    for (x, cell) in trow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wy[i] {
+        s += w * grid[p][x];
+      }
+      *cell = s;
+    }
+  }
+  let mut out = vec![vec![0.0f64; out_w]; out_h];
+  for (i, orow) in out.iter_mut().enumerate() {
+    for (j, cell) in orow.iter_mut().enumerate() {
+      let mut s = 0.0;
+      for &(p, w) in &wx[j] {
+        s += w * tmp[i][p];
+      }
+      *cell = s;
+    }
+  }
+  out
+}
+
+#[test]
+fn bicubic_aligned_identity_same_size_is_exact_passthrough() {
+  // out == in: `scale = (n-1)/(n-1) = 1`, so center i maps to source i exactly →
+  // one unit tap per row → the resize is the input unchanged.
+  let flat: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 3, 3)).unwrap();
+  let out = bicubic_interpolate_align_corners(&x, 3, 3).unwrap();
+  let got = to_vec(&out);
+  for (a, b) in got.iter().zip(flat.iter()) {
+    assert!((a - b).abs() < EPS, "aligned identity differs: {a} vs {b}");
+  }
+}
+
+#[test]
+fn bicubic_aligned_preserves_corner_values_on_upsample() {
+  // The defining property of align_corners=True: the four corner output pixels
+  // equal the four corner input pixels EXACTLY (endpoints map to endpoints), so
+  // upsampling a grid leaves its corners pinned (unlike align_corners=False).
+  let flat: [f32; 9] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0];
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 3, 3)).unwrap();
+  let (oh, ow) = (7usize, 5usize);
+  let out = bicubic_interpolate_align_corners(&x, oh, ow).unwrap();
+  let v = to_vec(&out);
+  let at = |r: usize, c: usize| v[r * ow + c];
+  assert!(
+    (at(0, 0) - 10.0).abs() < 1e-3,
+    "top-left corner not pinned: {}",
+    at(0, 0)
+  );
+  assert!(
+    (at(0, ow - 1) - 30.0).abs() < 1e-3,
+    "top-right corner not pinned: {}",
+    at(0, ow - 1)
+  );
+  assert!(
+    (at(oh - 1, 0) - 70.0).abs() < 1e-3,
+    "bottom-left corner not pinned: {}",
+    at(oh - 1, 0)
+  );
+  assert!(
+    (at(oh - 1, ow - 1) - 90.0).abs() < 1e-3,
+    "bottom-right corner not pinned: {}",
+    at(oh - 1, ow - 1)
+  );
+}
+
+#[test]
+fn bicubic_aligned_matches_independent_f64_reference_on_4x4_to_7x7_upsample() {
+  let mut g = vec![vec![0.0f64; 4]; 4];
+  for (r, row) in g.iter_mut().enumerate() {
+    for (c, cell) in row.iter_mut().enumerate() {
+      *cell = ((r * 4 + c) as f64) * 0.3 - 1.1; // deterministic, signed
+    }
+  }
+  let flat: Vec<f32> = g.iter().flatten().map(|&v| v as f32).collect();
+  let x = Array::from_slice::<f32>(&flat, &(1, 1, 4, 4)).unwrap();
+  let got = to_vec(&bicubic_interpolate_align_corners(&x, 7, 7).unwrap());
+  let want = ref_bicubic_resize_aligned(&g, 7, 7);
+  for (i, wrow) in want.iter().enumerate() {
+    for (j, &w) in wrow.iter().enumerate() {
+      let g = got[i * 7 + j];
+      assert!((g as f64 - w).abs() < 1e-4, "aligned ({i},{j}) {g} vs {w}");
+    }
+  }
+}
+
+#[test]
+fn bicubic_aligned_differs_from_unaligned_on_upsample() {
+  // align_corners True vs False must NOT be the same resampling (the CLAP
+  // faithfulness point): upsampling a non-constant grid gives different
+  // interiors under the two coordinate maps.
+  let x = Array::from_slice::<f32>(&[1.0f32, 5.0, 2.0, 8.0], &(1, 1, 1, 4)).unwrap();
+  let aligned = to_vec(&bicubic_interpolate_align_corners(&x, 1, 9).unwrap());
+  let unaligned = to_vec(&bicubic_interpolate(&x, 1, 9).unwrap());
+  let differs = aligned
+    .iter()
+    .zip(unaligned.iter())
+    .any(|(a, b)| (a - b).abs() > 1e-3);
+  assert!(
+    differs,
+    "align_corners True and False produced identical upsamples"
+  );
+}
+
+#[test]
+fn bicubic_aligned_rejects_non_rank4_input() {
+  let g3 = Array::from_slice::<f32>(&[1.0f32; 8], &(2, 2, 2)).unwrap();
+  let err = bicubic_interpolate_align_corners(&g3, 4, 4).unwrap_err();
+  assert!(matches!(err, Error::RankMismatch(_)), "got {err}");
+}
+
+#[test]
+fn bicubic_aligned_rejects_zero_dims() {
+  let x = Array::from_slice::<f32>(&[1.0f32; 4], &(1, 1, 2, 2)).unwrap();
+  let err = bicubic_interpolate_align_corners(&x, 4, 0).unwrap_err();
+  assert!(matches!(err, Error::OutOfRange(_)), "out_w=0: got {err}");
+}

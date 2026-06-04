@@ -89,6 +89,7 @@ use crate::{
     shape::{contiguous, reshape, transpose_axes},
   },
 };
+use smol_str::format_smolstr;
 
 /// Upper bound on either output spatial dimension. The bilinear weight
 /// matrices are dense (`out * in` `f32`), built on the host before the
@@ -427,18 +428,63 @@ fn cubic_weight(t: f64) -> f64 {
 /// reads a valid row), then the surviving weights are renormalized to sum to 1
 /// (matching `_weights_1d`'s `w / (sum(w) + 1e-8)`). `in_dim`, `out_dim >= 1`.
 fn build_bicubic_axis(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
+  let scale_in = in_dim as f64;
+  let scale_out = out_dim as f64;
+  // `(arange(out) + 0.5) / out * in - 0.5` — the half-pixel source center.
+  build_bicubic_axis_with(in_dim, out_dim, |i| {
+    (i as f64 + 0.5) / scale_out * scale_in - 0.5
+  })
+}
+
+/// Build the `(out_dim, BICUBIC_TAPS)` per-axis resampling tables for the
+/// bicubic **`align_corners=True`**, `antialias=False` path — PyTorch
+/// `nn.functional.interpolate(mode="bicubic", align_corners=True)` (the variant
+/// HF CLAP's `reshape_mel2img` uses to stretch the mel spectrogram's time axis).
+///
+/// The only difference from [`build_bicubic_axis`] is the source-coordinate map:
+/// `align_corners=True` aligns the input/output endpoints exactly, so for an
+/// output axis of length `out > 1` the source center is `c = i · (in − 1) /
+/// (out − 1)` (`i = 0 → 0`, `i = out − 1 → in − 1`), with NO half-pixel `−0.5`
+/// shift. For `out == 1` PyTorch maps to the single source coordinate `0` (it
+/// avoids the `out − 1 == 0` division). The Keys' cubic kernel (`a = −0.5`), the
+/// 5-tap window starting at `floor(c) − 1`, the `[0, in_dim)` index clamp, and
+/// the sum-to-1 renormalization are identical.
+///
+/// (The boundary handling is a faithful approximation: PyTorch's native bicubic
+/// replicates the edge sample at out-of-range taps, whereas this clamps the tap
+/// index and renormalizes the surviving weights — the same edge convention the
+/// `align_corners=False` path uses. For an UPSAMPLE such as CLAP's `1001 → 1024`
+/// time fold this differs only on the two boundary output columns; the interior
+/// is exact. `in_dim`, `out_dim >= 1`.)
+fn build_bicubic_axis_aligned(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
+  let scale = if out_dim > 1 {
+    (in_dim as f64 - 1.0) / (out_dim as f64 - 1.0)
+  } else {
+    0.0
+  };
+  build_bicubic_axis_with(in_dim, out_dim, |i| i as f64 * scale)
+}
+
+/// Shared core for the two bicubic axis builders: given a `center(i)` that maps
+/// an output index to its (fractional) source coordinate, build the
+/// `(out_dim, BICUBIC_TAPS)` clamped-index + renormalized-cubic-weight tables.
+/// The two callers differ ONLY in `center` (the `align_corners` coordinate map);
+/// everything else — the tap window, the kernel, the clamp, the renormalization —
+/// is identical.
+fn build_bicubic_axis_with(
+  in_dim: usize,
+  out_dim: usize,
+  center: impl Fn(usize) -> f64,
+) -> (Vec<i32>, Vec<f32>) {
   // `support = 2.0`, `fs = 1.0` (antialias off). Both factors are small, and
   // the caller has bounded `in_dim` / `out_dim` to representable spatial dims,
   // so `out_dim * TAPS` cannot overflow `usize` on any supported platform.
   let total = out_dim * BICUBIC_TAPS;
   let mut pix = vec![0i32; total];
   let mut weights = vec![0.0f32; total];
-  let scale_in = in_dim as f64;
-  let scale_out = out_dim as f64;
   let in_i = in_dim as i64;
   for i in 0..out_dim {
-    // `(arange(out) + 0.5) / out * in - 0.5` — the half-pixel source center.
-    let center = (i as f64 + 0.5) / scale_out * scale_in - 0.5;
+    let center = center(i);
     // `start = floor(center - support) + 1` (support = 2).
     let start = (center - 2.0).floor() as i64 + 1;
     let row = i * BICUBIC_TAPS;
@@ -496,6 +542,53 @@ fn build_bicubic_axis(in_dim: usize, out_dim: usize) -> (Vec<i32>, Vec<f32>) {
 ///   non-finite grid value flows through unchanged — interpolation is linear in
 ///   the samples).
 pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+  bicubic_resample(x, out_h, out_w, "bicubic_interpolate", build_bicubic_axis)
+}
+
+/// Bicubic-resize a batched `(B, C, H_in, W_in)` grid to `(B, C, out_h, out_w)`
+/// with **`align_corners=True`** — PyTorch
+/// `nn.functional.interpolate(mode="bicubic", align_corners=True)`.
+///
+/// This is the resize HF CLAP's `ClapAudioEncoder.reshape_mel2img` applies to
+/// the log-mel spectrogram before the patch-embed (it upsamples the time axis
+/// from the mel frame count to `spec_size · freq_ratio` with `align_corners=True`
+/// bicubic). It differs from [`bicubic_interpolate`] only in the source-coordinate
+/// map (endpoints aligned, no half-pixel shift — see the private
+/// `build_bicubic_axis_aligned`); the separable gather + cubic-weight contract,
+/// the dtype handling, the bounds, and the errors are identical.
+///
+/// `x` is a rank-4 `(B, C, H_in, W_in)` float array; the output is
+/// `(B, C, out_h, out_w)` in the **same dtype** as `x` (computed in `f32` and
+/// cast back). The channel and batch axes pass through untouched.
+///
+/// ## Errors
+/// Identical to [`bicubic_interpolate`]: rank ≠ 4 → [`Error::RankMismatch`]; a
+/// zero spatial dim → [`Error::OutOfRange`]; a non-floating dtype →
+/// [`Error::UnsupportedDtype`]; underlying gather / reshape / reduce / cast
+/// errors propagate.
+pub fn bicubic_interpolate_align_corners(x: &Array, out_h: usize, out_w: usize) -> Result<Array> {
+  bicubic_resample(
+    x,
+    out_h,
+    out_w,
+    "bicubic_interpolate_align_corners",
+    build_bicubic_axis_aligned,
+  )
+}
+
+/// The shared separable-bicubic resample, parameterized by the per-axis weight
+/// builder (`align_corners` false vs true). Validates the rank / spatial dims /
+/// dtype, then resamples height (axis 2) and width (axis 3) via a `gather +
+/// weighted sum` over the `BICUBIC_TAPS` candidate taps — the two-stage
+/// reference path mlx-vlm's `_bicubic_interpolate_mlx` uses. `context` names the
+/// public entry point in any error.
+fn bicubic_resample(
+  x: &Array,
+  out_h: usize,
+  out_w: usize,
+  context: &'static str,
+  build_axis: impl Fn(usize, usize) -> (Vec<i32>, Vec<f32>),
+) -> Result<Array> {
   let shape = x.shape();
   if shape.len() != 4 {
     return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
@@ -505,17 +598,17 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
     )));
   }
   let (b, c, in_h, in_w) = (shape[0], shape[1], shape[2], shape[3]);
-  for (name, v) in [
-    ("bicubic_interpolate: H_in", in_h),
-    ("bicubic_interpolate: W_in", in_w),
-    ("bicubic_interpolate: out_h", out_h),
-    ("bicubic_interpolate: out_w", out_w),
+  for (label, v) in [
+    ("H_in", in_h),
+    ("W_in", in_w),
+    ("out_h", out_h),
+    ("out_w", out_w),
   ] {
     if v == 0 {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
-        name,
-        "must be a positive spatial dimension (>= 1)",
-        "0",
+        context,
+        "spatial dimension must be positive (>= 1)",
+        format_smolstr!("{label} = 0"),
       )));
     }
   }
@@ -540,7 +633,7 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
   let xf = astype(x, Dtype::F32)?;
 
   // ── height resample: gather TAPS rows along axis 2, contract over taps ──
-  let (pix_y, wy) = build_bicubic_axis(in_h, out_h);
+  let (pix_y, wy) = build_axis(in_h, out_h);
   // `x[:, :, pix_y.reshape(-1), :]` → (B, C, out_h * TAPS, W_in).
   let pix_y_arr = Array::from_slice::<i32>(&pix_y, &(out_h * BICUBIC_TAPS,))?;
   let gathered_y = take_axis(&xf, &pix_y_arr, 2)?;
@@ -555,7 +648,7 @@ pub fn bicubic_interpolate(x: &Array, out_h: usize, out_w: usize) -> Result<Arra
   let tmp = sum_axes(&gathered_y.multiply(&wy_arr)?, &[3], false)?;
 
   // ── width resample: gather TAPS columns along axis 3, contract over taps ──
-  let (pix_x, wx) = build_bicubic_axis(in_w, out_w);
+  let (pix_x, wx) = build_axis(in_w, out_w);
   // `tmp[:, :, :, pix_x.reshape(-1)]` → (B, C, out_h, out_w * TAPS).
   let pix_x_arr = Array::from_slice::<i32>(&pix_x, &(out_w * BICUBIC_TAPS,))?;
   let gathered_x = take_axis(&tmp, &pix_x_arr, 3)?;

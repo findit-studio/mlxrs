@@ -18,17 +18,21 @@
 //!   [`mel`] oracle).
 //!
 //! ## Phase status
-//! This module currently ships **phases 1–2**: the configuration
+//! This module currently ships **phases 1–3**: the configuration
 //! ([`config::ClapConfig`] = [`config::ClapAudioConfig`] +
 //! [`config::ClapTextConfig`] + projection dims), the mel / spectrogram
-//! front-end ([`mel`]), and the RoBERTa **text tower** ([`text::ClapTextModel`]
-//! — the `ClapTextModel` embeddings + post-norm encoder + CLS pooling + the
-//! text projection + L2-normalize, with the [`text::ClapTextModel`]
-//! [`crate::embeddings::TextEmbedder`] impl). The HTSAT Swin **audio** tower
-//! (phase 3), the full dual-tower `ClapModel` assembly + `classify` + the
-//! factory registration (phase 4), and the end-to-end checkpoint-parity test
-//! (phase 5) land in later phases; [`text::ClapTextModel`] exposes a clean
-//! `embed_text` the phase-4 assembly consumes as the text tower.
+//! front-end ([`mel`]), the RoBERTa **text tower** ([`text::ClapTextModel`] —
+//! the `ClapTextModel` embeddings + post-norm encoder + CLS pooling + the text
+//! projection + L2-normalize, with the [`crate::embeddings::TextEmbedder`]
+//! impl), and the HTSAT Swin **audio tower** ([`audio::HtsatAudioTower`] — the
+//! `reshape_mel2img` mel→image fold, the patch-embed stem, the four Swin
+//! stages, and the token-semantic mean-pool producing the `(B, 768)` pooled
+//! audio feature). The full dual-tower `ClapModel` assembly + the audio/text
+//! projections + `classify` + the factory registration (phase 4), and the
+//! end-to-end checkpoint-parity test (phase 5) land in later phases;
+//! [`text::ClapTextModel`] exposes a clean `embed_text` and
+//! [`audio::HtsatAudioTower`] a clean `forward` the phase-4 assembly consumes as
+//! the two towers.
 //!
 //! ## Reuse
 //! The mel front-end reuses [`crate::audio::dsp`] —
@@ -38,6 +42,10 @@
 //! configuration mirrors the [`crate::embeddings::siglip2_naflex`] dual-tower
 //! config precedent (serde `#[serde(default)]` + a `validate()` that pins
 //! every architecture-defining field before any tensor is built).
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub mod audio;
 
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
@@ -53,6 +61,10 @@ mod shared;
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub mod text;
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub use audio::HtsatAudioTower;
 
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]

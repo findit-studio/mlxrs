@@ -759,12 +759,11 @@ pub(crate) fn take_shaped(
 // residual block), and `ClapAudioPatchMerging` (~L743-778, the 2×2 downsample).
 //
 // These blocks are the audio-tower building primitives: the HTSAT tower
-// (`window_partition` → shift → window SDPA → `window_reverse` per stage, with
-// `PatchMerging` between stages) composes them, and the oracle tests below pin
-// each one. The `dead_code` allow covers the primitives the tower assembles
-// (the tower is wired separately) so the crate builds without it.
+// ([`super::super::audio::HtsatAudioTower`]) composes `SwinBlock` stacks +
+// `PatchMerging` downsamples into the four stages (`window_partition` → shift →
+// window SDPA → `window_reverse` per block, with `PatchMerging` between stages),
+// and the oracle tests pin each primitive.
 #[cfg(feature = "clap")]
-#[allow(dead_code)]
 mod swin {
   use super::*;
 
@@ -1642,15 +1641,19 @@ mod swin {
   }
 }
 
-// Re-exported for the audio tower (the `swin`-module consumer) and the oracle
-// tests, which reach them through the parent module. The `unused_imports` allow
-// matches the module's `dead_code` allow: the tower that consumes these is wired
-// separately, so the crate builds without a consumer here.
+// Re-exported for the audio tower ([`super::audio::HtsatAudioTower`], the
+// `swin`-module consumer): it assembles `SwinBlock` stacks + `PatchMerging`
+// downsamples into the four HTSAT stages.
 #[cfg(feature = "clap")]
-#[allow(unused_imports)]
+pub(crate) use swin::{PatchMerging, SwinBlock};
+
+// The remaining window/relative-bias/mask primitives are consumed only by the
+// oracle tests (the tower composes them transitively through `SwinBlock`), so
+// they are re-exported under `cfg(test)` to keep the non-test build free of
+// unused re-exports.
+#[cfg(all(test, feature = "clap"))]
 pub(crate) use swin::{
-  PatchMerging, SwinBlock, WindowAttention, relative_position_index, shifted_window_mask,
-  window_partition, window_reverse,
+  WindowAttention, relative_position_index, shifted_window_mask, window_partition, window_reverse,
 };
 
 #[cfg(all(test, feature = "clap"))]
