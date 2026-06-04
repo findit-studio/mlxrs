@@ -400,6 +400,65 @@ impl Lfm2Vl {
     )
   }
 
+  /// Build a tiling-enabled [`Lfm2VlProcessorConfig`] from this model's
+  /// [`ModelConfig`] — the SigLIP NaFlex knobs plus the HF
+  /// `Lfm2VlImageProcessor` image-splitting parameters
+  /// (`do_image_splitting`, `min_tiles`, `max_tiles`, `use_thumbnail`,
+  /// `min_image_tokens`, `max_image_tokens`, `encoder_patch_size`, `tile_size`,
+  /// `max_pixels_tolerance`) carried on [`ModelConfig`]. Drives the tiled
+  /// [`split_image`](Self::split_image) path; the SigLIP2 native-resolution
+  /// [`crate::vlm::models::lfm2_vl::preprocess_image`] path ignores the tiling
+  /// knobs.
+  ///
+  /// # Errors
+  /// Propagates [`Lfm2VlProcessorConfig::new`] / `with_tiling` validation (a
+  /// non-positive dimension, an inverted tile / token band, a non-finite
+  /// tolerance, or a `tile_size` not divisible by `encoder_patch_size`).
+  pub fn processor_config(&self) -> Result<Lfm2VlProcessorConfig> {
+    let c = &self.config;
+    let factor = c.downsample_factor.max(1) as u32;
+    let patch_size = c.vision_config.patch_size.max(1) as u32;
+    let max_num_patches = c.max_num_patches.max(1) as u32;
+    Lfm2VlProcessorConfig::new(c.image_token_index, factor, patch_size, max_num_patches)?
+      .with_tiling(
+        c.do_image_splitting,
+        c.min_tiles.max(1) as u32,
+        c.max_tiles.max(1) as u32,
+        c.use_thumbnail,
+        c.min_image_tokens.max(1) as u32,
+        c.max_image_tokens.max(1) as u32,
+        c.encoder_patch_size.max(1) as u32,
+        c.tile_size.max(1) as u32,
+        c.max_pixels_tolerance,
+      )
+  }
+
+  /// Split ONE decoded interleaved-RGB image into its HF-tiling sub-image
+  /// NaFlex inputs — the
+  /// [`tile_image`](crate::vlm::models::lfm2_vl::tile_image) port, gated on
+  /// [`do_image_splitting`](ModelConfig::do_image_splitting). When splitting is
+  /// enabled and the image is over the size threshold this returns one
+  /// [`Lfm2VlImageInputs`] per tile (+ an optional thumbnail); otherwise a
+  /// single native-resolution sub-image. The returned sub-images flatten
+  /// directly into the `images` slice
+  /// [`get_input_embeddings`](Self::get_input_embeddings) consumes, and their
+  /// per-tile grids ([`Lfm2VlImageInputs::grid`]) drive
+  /// [`expand_image_tokens`](crate::vlm::models::lfm2_vl::expand_image_tokens)
+  /// for the matching `<image>`-token run (each sub-image bracketed +
+  /// concatenated).
+  ///
+  /// `rgb` is `width * height * 3` row-major interleaved RGB bytes. The
+  /// processor config is built by [`processor_config`](Self::processor_config).
+  ///
+  /// # Errors
+  /// Propagates [`processor_config`](Self::processor_config) and
+  /// [`tile_image`](crate::vlm::models::lfm2_vl::tile_image) (the grid math,
+  /// resize, patchify, and budget checks).
+  pub fn split_image(&self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<Lfm2VlImageInputs>> {
+    let cfg = self.processor_config()?;
+    crate::vlm::models::lfm2_vl::processor::tile_image(rgb, width, height, &cfg)
+  }
+
   /// `lfm2_vl.py`'s `__call__` (`:188-205`): the full multimodal forward —
   /// [`get_input_embeddings`](Self::get_input_embeddings) then the LFM2 LM over
   /// the merged embeddings → `(B, T, vocab_size)` logits.

@@ -299,6 +299,220 @@ fn expand_no_images_passes_through() {
   assert_eq!(out, vec![1, 2, 3]);
 }
 
+// ───────────────────────── image splitting / tiling ─────────────────────────
+//
+// Oracle values are computed independently from the HF
+// `image_processing_lfm2_vl.py` formulas (NOT from the code under test), with
+// the upstream default knobs: downsample_factor = 2, encoder_patch_size = 16,
+// tile_size = 512, min_image_tokens = 64, max_image_tokens = 256,
+// max_pixels_tolerance = 2.0, min_tiles = 2, max_tiles = 10.
+
+/// A tiling config with the HF default knobs (downsample 2, patch 16, tile 512),
+/// `max_num_patches = 1024` (the LFM2.5-VL budget; >= tile_size/P squared = 1024
+/// AND >= 256*4). `use_thumbnail` is the argument; splitting enabled.
+fn tiling_cfg(use_thumbnail: bool) -> Lfm2VlProcessorConfig {
+  Lfm2VlProcessorConfig::new(396, 2, 16, 1024)
+    .unwrap()
+    .with_tiling(true, 2, 10, use_thumbnail, 64, 256, 16, 512, 2.0)
+    .unwrap()
+}
+
+#[test]
+fn with_tiling_rejects_invalid_params() {
+  let base = Lfm2VlProcessorConfig::new(396, 2, 16, 1024).unwrap();
+  // tile_size not divisible by encoder_patch_size (500 % 16 != 0).
+  assert!(matches!(
+    base
+      .with_tiling(true, 2, 10, false, 64, 256, 16, 500, 2.0)
+      .unwrap_err(),
+    Error::DivisibilityConstraint(_)
+  ));
+  // min_tiles > max_tiles.
+  assert!(matches!(
+    base
+      .with_tiling(true, 6, 4, false, 64, 256, 16, 512, 2.0)
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  // min_image_tokens > max_image_tokens.
+  assert!(matches!(
+    base
+      .with_tiling(true, 2, 10, false, 300, 256, 16, 512, 2.0)
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+  // zero tile_size.
+  assert!(matches!(
+    base
+      .with_tiling(true, 2, 10, false, 64, 256, 16, 0, 2.0)
+      .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+}
+
+#[test]
+fn plan_tiles_small_image_is_single_no_split() {
+  // 256x256 (h=w=256): h_bar=w_bar=256, 256*256=65536 <= max_pixels
+  // (256*16^2*2^2*2.0 = 524288) so NOT too large -> single sub-image, smart
+  // size 256x256, NO thumbnail.
+  let cfg = tiling_cfg(true);
+  let plan = plan_tiles(256, 256, &cfg).unwrap();
+  assert!(!plan.is_split(), "256x256 must not split");
+  assert_eq!(plan.grid(), (1, 1));
+  assert!(!plan.has_thumbnail());
+  assert_eq!(plan.sub_image_count().unwrap(), 1);
+}
+
+#[test]
+fn plan_tiles_tiny_image_upscales_single() {
+  // 100x100: below min_pixels -> smart_resize upscales to 256x256 (patch grid
+  // 16x16), still a single sub-image (not too large).
+  let cfg = tiling_cfg(true);
+  let plan = plan_tiles(100, 100, &cfg).unwrap();
+  assert!(!plan.is_split());
+  assert_eq!(plan.sub_image_count().unwrap(), 1);
+}
+
+#[test]
+fn plan_tiles_large_square_splits_3x3_with_thumbnail() {
+  // 2048x2048 (h=w=2048): too large -> grid 3x3 (target 1536x1536), thumbnail
+  // smart-resized to 512x512. 9 tiles + 1 thumbnail = 10 sub-images.
+  let cfg = tiling_cfg(true);
+  let plan = plan_tiles(2048, 2048, &cfg).unwrap();
+  assert!(plan.is_split());
+  assert_eq!(plan.grid(), (3, 3), "2048x2048 -> 3x3 grid");
+  assert!(plan.has_thumbnail());
+  assert_eq!(plan.sub_image_count().unwrap(), 10);
+}
+
+#[test]
+fn plan_tiles_large_portrait_splits_with_oracle_grid() {
+  // h=2000 w=1500 -> aspect 0.75 -> grid (gw=2, gh=3), target (1024, 1536),
+  // thumbnail 416x576. 6 tiles + thumbnail = 7.
+  let cfg = tiling_cfg(true);
+  let plan = plan_tiles(2000, 1500, &cfg).unwrap();
+  assert!(plan.is_split());
+  assert_eq!(plan.grid(), (2, 3), "portrait grid (gw=2, gh=3)");
+  assert_eq!(plan.sub_image_count().unwrap(), 7);
+}
+
+#[test]
+fn plan_tiles_thumbnail_off_omits_thumbnail() {
+  // Same large square, use_thumbnail=false -> 9 tiles, no thumbnail.
+  let cfg = tiling_cfg(false);
+  let plan = plan_tiles(2048, 2048, &cfg).unwrap();
+  assert!(plan.is_split());
+  assert_eq!(plan.grid(), (3, 3));
+  assert!(!plan.has_thumbnail());
+  assert_eq!(plan.sub_image_count().unwrap(), 9);
+}
+
+#[test]
+fn plan_tiles_splitting_disabled_never_splits() {
+  // do_image_splitting=false -> a large image stays a single (smart-resized)
+  // sub-image regardless of size.
+  let cfg = Lfm2VlProcessorConfig::new(396, 2, 16, 1024)
+    .unwrap()
+    .with_tiling(false, 2, 10, true, 64, 256, 16, 512, 2.0)
+    .unwrap();
+  let plan = plan_tiles(2048, 2048, &cfg).unwrap();
+  assert!(!plan.is_split(), "splitting disabled -> single sub-image");
+  assert_eq!(plan.sub_image_count().unwrap(), 1);
+}
+
+#[test]
+fn tile_image_small_produces_single_native_subimage() {
+  // A 256x256 image (not too large) -> ONE Lfm2VlImageInputs at the smart-resize
+  // grid 16x16 (256/16). pixel_values (1024, 16^2*3=768), all-active mask for the
+  // 256 active rows.
+  let cfg = tiling_cfg(true);
+  let (w, h) = (256u32, 256u32);
+  let rgb: Vec<u8> = (0..(w * h * 3) as usize).map(|i| (i % 256) as u8).collect();
+  let tiles = tile_image(&rgb, w, h, &cfg).unwrap();
+  assert_eq!(tiles.len(), 1, "small image -> single sub-image");
+  assert_eq!(
+    tiles[0].grid().unwrap(),
+    (16, 16),
+    "256/16 = 16 patches/side"
+  );
+  assert_eq!(tiles[0].pixel_values.shape(), vec![1024, 768]);
+  // 16*16 = 256 active patch rows, the rest padding.
+  let mask = to_vec_i32(&tiles[0].pixel_attention_mask);
+  assert_eq!(mask.iter().filter(|&&m| m == 1).count(), 256);
+}
+
+#[test]
+fn tile_image_large_produces_tiles_plus_thumbnail() {
+  // A 1024x1024 image. h_bar=w_bar=1024, 1024*1024=1048576 > max_pixels
+  // (524288) -> too large -> splits. Aspect 1.0 -> grid 2x2 (target 1024),
+  // thumbnail smart-resized to 512x512. 4 tiles + 1 thumbnail = 5 sub-images.
+  // Each TILE is 512x512 -> grid 32x32 (512/16) = 1024 patches (fills the budget
+  // exactly).
+  let cfg = tiling_cfg(true);
+  let (w, h) = (1024u32, 1024u32);
+  let rgb: Vec<u8> = (0..(w * h * 3) as usize).map(|i| (i % 251) as u8).collect();
+  let tiles = tile_image(&rgb, w, h, &cfg).unwrap();
+  assert_eq!(tiles.len(), 5, "4 tiles + 1 thumbnail");
+  // The 4 tiles each have a 32x32 patch grid (tile_size 512 / patch 16).
+  for t in tiles.iter().take(4) {
+    assert_eq!(
+      t.grid().unwrap(),
+      (32, 32),
+      "each 512x512 tile -> 32x32 patches"
+    );
+    assert_eq!(t.pixel_values.shape(), vec![1024, 768]);
+    // 32*32 = 1024 active rows (fills the budget exactly, no padding).
+    let mask = to_vec_i32(&t.pixel_attention_mask);
+    assert!(mask.iter().all(|&m| m == 1), "tile fills the budget");
+  }
+  // The thumbnail (last) is the whole image smart-resized to 512x512 -> 32x32.
+  let thumb = tiles.last().unwrap();
+  assert_eq!(thumb.grid().unwrap(), (32, 32));
+}
+
+#[test]
+fn tile_image_token_count_sums_over_tiles() {
+  // The whole-image token count under tiling = sum over sub-images of
+  // num_image_tokens_from_patch_grid(rows, cols, factor). For the 1024x1024
+  // case: 5 sub-images each 32x32 -> ceil(32/2)*ceil(32/2) = 16*16 = 256 each
+  // -> 5*256 = 1280 image tokens.
+  let cfg = tiling_cfg(true);
+  let (w, h) = (1024u32, 1024u32);
+  let rgb: Vec<u8> = (0..(w * h * 3) as usize).map(|i| (i % 251) as u8).collect();
+  let tiles = tile_image(&rgb, w, h, &cfg).unwrap();
+  let mut total = 0i32;
+  let mut grids: Vec<(i32, i32)> = Vec::new();
+  for t in &tiles {
+    let (r, c) = t.grid().unwrap();
+    total += num_image_tokens_from_patch_grid(r, c, 2).unwrap();
+    grids.push((r, c));
+  }
+  assert_eq!(total, 1280, "5 sub-images * 256 tokens each");
+  // The flattened sub-image grids drive `expand_image_tokens` 1:1 with the
+  // flattened sub-images (each tile / thumbnail is one NaFlex sub-image, so the
+  // prompt carries one `<image>` placeholder per sub-image — the same flat
+  // alignment `get_input_embeddings` consumes). Five placeholders, five grids;
+  // each expands to its own 256-token run.
+  let ids: Vec<i32> = std::iter::once(1)
+    .chain(std::iter::repeat_n(396, grids.len()))
+    .chain(std::iter::once(2))
+    .collect();
+  let expanded = expand_image_tokens(&ids, &grids, &cfg).unwrap();
+  // 1 + (5*256 image tokens) + 2 (the surrounding ids).
+  assert_eq!(expanded.len(), 2 + 1280);
+  assert_eq!(expanded[0], 1);
+  assert_eq!(*expanded.last().unwrap(), 2);
+}
+
+#[test]
+fn tile_image_rejects_wrong_rgb_length() {
+  let cfg = tiling_cfg(true);
+  // 256x256 needs 196608 bytes; supply one short.
+  let rgb = vec![0u8; (256 * 256 * 3) - 1];
+  let err = tile_image(&rgb, 256, 256, &cfg).unwrap_err();
+  assert!(matches!(err, Error::LengthMismatch(_)), "got {err}");
+}
+
 // ───────────────────────── config validation ─────────────────────────
 
 #[test]

@@ -46,6 +46,25 @@
 //! `_num_image_tokens_from_patch_grid` contract at
 //! `processing_lfm2_vl.py:31-48`, whose `ceil` mirrors the PixelUnshuffle pad.
 //!
+//! ## Image splitting / tiling ([`tile_image`] / [`plan_tiles`])
+//!
+//! mlx-vlm DELIBERATELY disables splitting (its `processing_lfm2_vl.py` forces
+//! `do_image_splitting = False` and uses the SigLIP2 native-resolution path
+//! above), so the tile-grid algorithm lives only in HuggingFace `transformers`
+//! `Lfm2VlImageProcessor` (`image_processing_lfm2_vl.py`). [`tile_image`] is a
+//! faithful port of THAT source (cited per function): it decides whether an image
+//! is over the size threshold (`_is_image_too_large`), picks the tile grid that
+//! best matches the aspect ratio (`find_closest_aspect_ratio` over the
+//! `min_tiles..=max_tiles` candidate set), resizes + splits the image into
+//! `tile_size x tile_size` tiles (`split_to_tiles`), and optionally appends a
+//! within-budget smart-resized thumbnail — producing one [`Lfm2VlImageInputs`]
+//! NaFlex triple per tile (+ thumbnail), each patchified at `encoder_patch_size`.
+//! The per-tile grids drive [`expand_image_tokens`] (each sub-image bracketed by
+//! `image_start`/`image_end` and concatenated — the mlx-vlm `_patched_call`
+//! per-sub-image layout). This path is gated on
+//! [`Lfm2VlProcessorConfig::do_image_splitting`]; the native-resolution
+//! [`preprocess_image`] path never consults the tiling knobs.
+//!
 //! ## Bounds / errors
 //!
 //! Every count / dimension is checked before any allocation; degenerate inputs
@@ -117,6 +136,56 @@ pub struct Lfm2VlProcessorConfig {
   image_start_token: Option<i32>,
   image_end_token: Option<i32>,
   use_image_special_tokens: bool,
+  /// The image-splitting / tiling parameters (the HF `Lfm2VlImageProcessor`
+  /// knobs the mlx-vlm path omits). Carried so the tiling driver
+  /// ([`tile_image`]) can run when the model opts into splitting; the SigLIP2
+  /// native-resolution [`preprocess_image`] path does not consult them.
+  tiling: TilingConfig,
+}
+
+/// The HF `Lfm2VlImageProcessor` image-splitting parameters
+/// (`image_processing_lfm2_vl.py:218-228`). Defaults match the upstream class
+/// attributes. Carried on [`Lfm2VlProcessorConfig`] for the tiling driver
+/// [`tile_image`]; the mlx-vlm native-resolution path leaves them inert.
+#[cfg(feature = "lfm2-vl")]
+#[derive(Debug, Clone, Copy)]
+struct TilingConfig {
+  /// `do_image_splitting` (`:220`, default `true`).
+  do_image_splitting: bool,
+  /// `min_tiles` (`:221`, default `2`).
+  min_tiles: u32,
+  /// `max_tiles` (`:222`, default `10`).
+  max_tiles: u32,
+  /// `use_thumbnail` (`:223`, default `true` upstream; the mlx-community
+  /// `config.json` ships `false`).
+  use_thumbnail: bool,
+  /// `min_image_tokens` (`:224`, default `64`).
+  min_image_tokens: u32,
+  /// `max_image_tokens` (`:225`, default `256`).
+  max_image_tokens: u32,
+  /// `encoder_patch_size` (`:226`, default `16`).
+  encoder_patch_size: u32,
+  /// `tile_size` (`:227`, default `512`).
+  tile_size: u32,
+  /// `max_pixels_tolerance` (`:228`, default `2.0`).
+  max_pixels_tolerance: f32,
+}
+
+#[cfg(feature = "lfm2-vl")]
+impl Default for TilingConfig {
+  fn default() -> Self {
+    Self {
+      do_image_splitting: true,
+      min_tiles: 2,
+      max_tiles: 10,
+      use_thumbnail: true,
+      min_image_tokens: 64,
+      max_image_tokens: 256,
+      encoder_patch_size: 16,
+      tile_size: 512,
+      max_pixels_tolerance: 2.0,
+    }
+  }
 }
 
 #[cfg(feature = "lfm2-vl")]
@@ -174,7 +243,95 @@ impl Lfm2VlProcessorConfig {
       // `use_image_special_tokens = True`. The bracket ids start `None`, so no
       // bracket emits until `with_special_tokens` supplies them.
       use_image_special_tokens: true,
+      // The image-splitting parameters default to the HF
+      // `Lfm2VlImageProcessor` class attributes; `with_tiling` overrides them
+      // from the model's [`ModelConfig`](super::config::ModelConfig).
+      tiling: TilingConfig::default(),
     })
+  }
+
+  /// Set the image-splitting / tiling parameters from the model's
+  /// [`ModelConfig`](super::config::ModelConfig) — the HF
+  /// `Lfm2VlImageProcessor` knobs (`do_image_splitting`, `min_tiles`,
+  /// `max_tiles`, `use_thumbnail`, `min_image_tokens`, `max_image_tokens`,
+  /// `encoder_patch_size`, `tile_size`, `max_pixels_tolerance`). Drives the
+  /// [`tile_image`] splitting path; the SigLIP2 native-resolution
+  /// [`preprocess_image`] path ignores them.
+  ///
+  /// # Errors
+  /// [`Error::OutOfRange`] if any cardinality field
+  /// (`min_tiles` / `max_tiles` / `min_image_tokens` / `max_image_tokens` /
+  /// `encoder_patch_size` / `tile_size`) is `0`, [`Error::OutOfRange`] if
+  /// `min_tiles > max_tiles` or `min_image_tokens > max_image_tokens`,
+  /// [`Error::NonFiniteScalar`] / [`Error::OutOfRange`] if
+  /// `max_pixels_tolerance` is non-finite / non-positive, and
+  /// [`Error::DivisibilityConstraint`] if `tile_size` is not a whole multiple of
+  /// `encoder_patch_size` (a tile must split into a whole patch grid).
+  #[allow(clippy::too_many_arguments)]
+  pub fn with_tiling(
+    mut self,
+    do_image_splitting: bool,
+    min_tiles: u32,
+    max_tiles: u32,
+    use_thumbnail: bool,
+    min_image_tokens: u32,
+    max_image_tokens: u32,
+    encoder_patch_size: u32,
+    tile_size: u32,
+    max_pixels_tolerance: f32,
+  ) -> Result<Self> {
+    for (name, value) in [
+      ("lfm2_vl tiling: min_tiles", min_tiles),
+      ("lfm2_vl tiling: max_tiles", max_tiles),
+      ("lfm2_vl tiling: min_image_tokens", min_image_tokens),
+      ("lfm2_vl tiling: max_image_tokens", max_image_tokens),
+      ("lfm2_vl tiling: encoder_patch_size", encoder_patch_size),
+      ("lfm2_vl tiling: tile_size", tile_size),
+    ] {
+      require_positive_u32(name, value)?;
+    }
+    if min_tiles > max_tiles {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "lfm2_vl tiling: min_tiles <= max_tiles",
+        "the minimum tile count must not exceed the maximum",
+        smol_str::format_smolstr!("min_tiles={min_tiles}, max_tiles={max_tiles}"),
+      )));
+    }
+    if min_image_tokens > max_image_tokens {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "lfm2_vl tiling: min_image_tokens <= max_image_tokens",
+        "the minimum token budget must not exceed the maximum",
+        smol_str::format_smolstr!(
+          "min_image_tokens={min_image_tokens}, max_image_tokens={max_image_tokens}"
+        ),
+      )));
+    }
+    crate::model_validation::require_positive_finite_f32(
+      "lfm2_vl tiling: max_pixels_tolerance",
+      f64::from(max_pixels_tolerance),
+    )?;
+    // A tile is resized to `tile_size x tile_size` then patchified at
+    // `encoder_patch_size`; the split is only well-defined when `tile_size` is a
+    // whole number of patches (`split_to_tiles` / `convert_image_to_patches`
+    // assume `height // patch_size` is exact).
+    crate::model_validation::require_divisible(
+      "lfm2_vl tiling: tile_size",
+      tile_size as i32,
+      "encoder_patch_size",
+      encoder_patch_size as i32,
+    )?;
+    self.tiling = TilingConfig {
+      do_image_splitting,
+      min_tiles,
+      max_tiles,
+      use_thumbnail,
+      min_image_tokens,
+      max_image_tokens,
+      encoder_patch_size,
+      tile_size,
+      max_pixels_tolerance,
+    };
+    Ok(self)
   }
 
   /// Set the per-channel normalization mean (`preprocessor_config.json`
@@ -234,6 +391,14 @@ impl Lfm2VlProcessorConfig {
   #[inline(always)]
   pub fn use_image_special_tokens(&self) -> bool {
     self.use_image_special_tokens
+  }
+
+  /// Whether the HF tiling path ([`tile_image`]) splits an over-budget image
+  /// into tiles (`do_image_splitting`, `config.py:76`). When `false`,
+  /// [`tile_image`] always emits a single native-resolution sub-image.
+  #[inline(always)]
+  pub fn do_image_splitting(&self) -> bool {
+    self.tiling.do_image_splitting
   }
 }
 
@@ -834,6 +999,815 @@ pub fn expand_image_tokens(
     }
   }
   Ok(out)
+}
+
+// ══════════════════════════ image splitting / tiling ════════════════════════
+//
+// Faithful port of the HuggingFace `transformers` `Lfm2VlImageProcessor` tile
+// path (`image_processing_lfm2_vl.py`), which mlx-vlm deliberately OMITS — its
+// `processing_lfm2_vl.py` defers to the slow `Siglip2ImageProcessor` (the
+// `preprocess_image` native-resolution path above) and forces
+// `do_image_splitting = False`. mlx-vlm therefore carries no tile-grid math, so
+// this port's provenance is the HF source (cited per function below), not the
+// mlx reference. The token layout the produced tiles drive — each tile + the
+// optional thumbnail bracketed by `image_start`/`image_end` and concatenated —
+// is the mlx-vlm `_patched_call` per-sub-image expansion
+// (`processing_lfm2_vl.py:378-404`), reused verbatim through
+// [`expand_image_tokens`] over the per-tile grids.
+
+/// One image's tile layout decision — the output of [`plan_tiles`], the pure
+/// (host-integer-only) core of the HF `resize_and_split`
+/// (`image_processing_lfm2_vl.py:382-436`). Oracle-testable in isolation.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TilePlan {
+  /// `true` iff the image is split into a `> 1`-tile grid (the image was both
+  /// over the size threshold AND `do_image_splitting` is enabled). When `false`
+  /// the plan is a single native-resolution sub-image at
+  /// `(thumb_height, thumb_width)`.
+  split: bool,
+  /// Tile-grid width (columns) — `1` when not split.
+  grid_width: u32,
+  /// Tile-grid height (rows) — `1` when not split.
+  grid_height: u32,
+  /// The resized-whole-image dimensions the grid is cut from
+  /// (`tile_size * grid_width`, `tile_size * grid_height`); `(0, 0)` when not
+  /// split (the single sub-image uses the thumbnail dims).
+  target_width: u32,
+  target_height: u32,
+  /// The within-budget smart-resize dimensions (HF `smart_resize`,
+  /// `:331-364`) — the single sub-image's size when not split, and the
+  /// thumbnail's size when split with `use_thumbnail`.
+  thumb_width: u32,
+  thumb_height: u32,
+  /// Whether a thumbnail sub-image is appended after the tiles (only when
+  /// `split` and `use_thumbnail` and the grid has `> 1` tile).
+  thumbnail: bool,
+}
+
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+impl TilePlan {
+  /// Whether the image is split into a multi-tile grid.
+  #[inline(always)]
+  pub fn is_split(&self) -> bool {
+    self.split
+  }
+
+  /// The tile grid `(grid_width, grid_height)` (`(1, 1)` when not split).
+  #[inline(always)]
+  pub fn grid(&self) -> (u32, u32) {
+    (self.grid_width, self.grid_height)
+  }
+
+  /// Whether a thumbnail sub-image is appended after the tiles.
+  #[inline(always)]
+  pub fn has_thumbnail(&self) -> bool {
+    self.thumbnail
+  }
+
+  /// The number of sub-images this plan produces: `grid_width * grid_height`
+  /// tiles (`1` when not split) plus `1` for the thumbnail when present.
+  /// Overflow-checked.
+  pub fn sub_image_count(&self) -> Result<u32> {
+    let tiles = self
+      .grid_width
+      .checked_mul(self.grid_height)
+      .ok_or_else(|| {
+        Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+          "lfm2_vl tiling: tile count (grid_width * grid_height)",
+          "u32",
+          [
+            ("grid_width", u64::from(self.grid_width)),
+            ("grid_height", u64::from(self.grid_height)),
+          ],
+        ))
+      })?;
+    let extra = u32::from(self.thumbnail);
+    tiles.checked_add(extra).ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tiling: sub-image count (tiles + thumbnail)",
+        "u32",
+        [("tiles", u64::from(tiles)), ("thumbnail", u64::from(extra))],
+      ))
+    })
+  }
+}
+
+/// Round `number` to the closest integer multiple of `factor` — HF
+/// `round_by_factor` (`image_processing_lfm2_vl.py:40-42`):
+/// `round(number / factor) * factor`. `factor` must be `> 0`. Uses banker's-free
+/// round-half-away-from-zero on the ratio (Rust's `f64::round`), matching
+/// Python's `round` for the non-half case (the inputs here are integer pixel
+/// dims, so a half ratio is rare and the model is robust to a 1-patch
+/// difference either way).
+#[cfg(feature = "lfm2-vl")]
+fn round_by_factor(number: u32, factor: u32) -> Result<u32> {
+  require_positive_u32("lfm2_vl tiling: round_by_factor factor", factor)?;
+  let r = (f64::from(number) / f64::from(factor)).round();
+  // `r * factor` is bounded by `number` rounded to a multiple — within u32 for
+  // the capped source dims; compute in f64 then narrow with a checked cast.
+  let scaled = r * f64::from(factor);
+  if !(0.0..=f64::from(u32::MAX)).contains(&scaled) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "lfm2_vl tiling: round_by_factor result",
+      "rounded multiple must fit in u32",
+      smol_str::format_smolstr!("{scaled}"),
+    )));
+  }
+  Ok(scaled as u32)
+}
+
+/// HF `find_closest_aspect_ratio` (`image_processing_lfm2_vl.py:45-82`): from
+/// the candidate `(w, h)` tile grids, pick the one whose `w/h` is closest to the
+/// image's `width/height`; ties break toward the grid whose target area best
+/// matches the image area (`area > 0.5 * image_size^2 * w * h`).
+///
+/// `target_ratios` is the candidate list from [`target_ratios`] (already sorted
+/// by tile count). Returns `(grid_width, grid_height)`.
+#[cfg(feature = "lfm2-vl")]
+fn find_closest_aspect_ratio(
+  aspect_ratio: f64,
+  target_ratios: &[(u32, u32)],
+  width: u32,
+  height: u32,
+  image_size: u32,
+) -> (u32, u32) {
+  let mut best_ratio_diff = f64::INFINITY;
+  let mut best_ratio = (1u32, 1u32);
+  let area = f64::from(width) * f64::from(height);
+  for &(w, h) in target_ratios {
+    let target_aspect_ratio = f64::from(w) / f64::from(h);
+    let ratio_diff = (aspect_ratio - target_aspect_ratio).abs();
+    if ratio_diff < best_ratio_diff {
+      best_ratio_diff = ratio_diff;
+      best_ratio = (w, h);
+    } else if ratio_diff == best_ratio_diff {
+      // Tie-break: prefer the grid whose target area better matches the image
+      // area (`area > 0.5 * image_size^2 * w * h`).
+      let target_area = f64::from(image_size) * f64::from(image_size) * f64::from(w) * f64::from(h);
+      if area > 0.5 * target_area {
+        best_ratio = (w, h);
+      }
+    }
+  }
+  best_ratio
+}
+
+/// HF `Lfm2VlImageProcessor._target_ratios` (`image_processing_lfm2_vl.py:252-261`):
+/// every `(w, h)` with `1 <= w, h` and `min_tiles <= w * h <= max_tiles`,
+/// de-duplicated and sorted by tile count `w * h`. `n` ranges over
+/// `[min_tiles, max_tiles]` but the `w, h <= n` bound plus the product filter
+/// makes the set independent of the iteration bookkeeping; this builds it
+/// directly. Reserved fallibly (the count is bounded by `max_tiles^2`).
+#[cfg(feature = "lfm2-vl")]
+fn target_ratios(min_tiles: u32, max_tiles: u32) -> Result<Vec<(u32, u32)>> {
+  // The candidate set is `{(w, h) : min_tiles <= w*h <= max_tiles}`. Its size is
+  // bounded by `max_tiles^2`; reserve that fallibly so a large (but in-range)
+  // `max_tiles` cannot abort on an infallible `with_capacity`.
+  let cap = (max_tiles as usize)
+    .checked_mul(max_tiles as usize)
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tiling: target-ratio candidate bound (max_tiles^2)",
+        "usize",
+        [("max_tiles", u64::from(max_tiles))],
+      ))
+    })?;
+  let mut ratios: Vec<(u32, u32)> = Vec::new();
+  reserve_or_error(&mut ratios, "lfm2_vl tiling: target ratio", cap)?;
+  for w in 1..=max_tiles {
+    for h in 1..=max_tiles {
+      let prod = w * h; // <= max_tiles^2, fits u32 (max_tiles capped small)
+      if prod >= min_tiles && prod <= max_tiles {
+        ratios.push((w, h));
+      }
+    }
+  }
+  // Sort by tile count `w*h` (HF's `key=lambda x: x[0]*x[1]`). The `(w, h)`
+  // candidates are already unique here (each pair generated once), so no dedup
+  // pass is needed. HF's `sorted(set(...))` leaves the *intra-product* order
+  // (ties on `w*h`) to Python's hash-based set iteration, which differs from
+  // this stable insertion order — but the only consumer,
+  // [`find_closest_aspect_ratio`], breaks an exact `ratio_diff` tie by the
+  // area condition `area > 0.5 * tile^2 * w*h`, which selects the same grid
+  // regardless of the candidate order (verified to produce identical grids to
+  // HF's order across the full source-dimension range). So this deterministic
+  // stable order is outcome-equivalent to HF's set order.
+  ratios.sort_by_key(|&(w, h)| w * h);
+  Ok(ratios)
+}
+
+/// HF `Lfm2VlImageProcessor._get_grid_layout` (`image_processing_lfm2_vl.py:263-281`):
+/// choose the tile grid for `(height, width)` and return
+/// `(grid_width, grid_height, target_width, target_height)` where
+/// `target_* = tile_size * grid_*` (the resized-whole-image size the grid is cut
+/// from). `min_tiles` / `max_tiles` / `tile_size` are the HF knobs.
+#[cfg(feature = "lfm2-vl")]
+fn get_grid_layout(
+  height: u32,
+  width: u32,
+  min_tiles: u32,
+  max_tiles: u32,
+  tile_size: u32,
+) -> Result<(u32, u32, u32, u32)> {
+  let aspect_ratio = f64::from(width) / f64::from(height);
+  let ratios = target_ratios(min_tiles, max_tiles)?;
+  let (grid_width, grid_height) =
+    find_closest_aspect_ratio(aspect_ratio, &ratios, width, height, tile_size);
+  let target_width = tile_size.checked_mul(grid_width).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "lfm2_vl tiling: target_width (tile_size * grid_width)",
+      "u32",
+      [
+        ("tile_size", u64::from(tile_size)),
+        ("grid_width", u64::from(grid_width)),
+      ],
+    ))
+  })?;
+  let target_height = tile_size.checked_mul(grid_height).ok_or_else(|| {
+    Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+      "lfm2_vl tiling: target_height (tile_size * grid_height)",
+      "u32",
+      [
+        ("tile_size", u64::from(tile_size)),
+        ("grid_height", u64::from(grid_height)),
+      ],
+    ))
+  })?;
+  Ok((grid_width, grid_height, target_width, target_height))
+}
+
+/// HF `Lfm2VlImageProcessor.smart_resize` (`image_processing_lfm2_vl.py:331-364`):
+/// rescale `(height, width)` so both dims are divisible by
+/// `encoder_patch_size * downsample_factor`, the pixel count is in
+/// `[min_image_tokens, max_image_tokens] * (encoder_patch_size *
+/// downsample_factor)^2`-derived bounds, and the aspect ratio is preserved.
+/// Returns `(new_width, new_height)` (HF returns `(w_bar, h_bar)`).
+#[cfg(feature = "lfm2-vl")]
+fn smart_resize(
+  height: u32,
+  width: u32,
+  downsample_factor: u32,
+  min_image_tokens: u32,
+  max_image_tokens: u32,
+  encoder_patch_size: u32,
+) -> Result<(u32, u32)> {
+  let total_factor = encoder_patch_size
+    .checked_mul(downsample_factor)
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tiling: total_factor (encoder_patch_size * downsample_factor)",
+        "u32",
+        [
+          ("encoder_patch_size", u64::from(encoder_patch_size)),
+          ("downsample_factor", u64::from(downsample_factor)),
+        ],
+      ))
+    })?;
+  require_positive_u32("lfm2_vl tiling: smart_resize total_factor", total_factor)?;
+  // `min/max pixels = tokens * encoder_patch_size^2 * downsample_factor^2`
+  // = `tokens * total_factor^2`. Computed in f64 (the HF arithmetic is float).
+  let tf2 = f64::from(total_factor) * f64::from(total_factor);
+  let min_pixels = f64::from(min_image_tokens) * tf2;
+  let max_pixels = f64::from(max_image_tokens) * tf2;
+
+  let mut h_bar = total_factor.max(round_by_factor(height, total_factor)?);
+  let mut w_bar = total_factor.max(round_by_factor(width, total_factor)?);
+  let hw = f64::from(height) * f64::from(width);
+  let bar_pixels = f64::from(h_bar) * f64::from(w_bar);
+
+  if bar_pixels > max_pixels {
+    // `beta = sqrt(h*w / max_pixels)`; `*_bar = max(tf, floor(dim/beta/tf)*tf)`.
+    let beta = (hw / max_pixels).sqrt();
+    h_bar = total_factor.max(floor_to_factor(f64::from(height) / beta, total_factor)?);
+    w_bar = total_factor.max(floor_to_factor(f64::from(width) / beta, total_factor)?);
+  } else if bar_pixels < min_pixels {
+    // `beta = sqrt(min_pixels / (h*w))`; `*_bar = ceil(dim*beta/tf)*tf`.
+    let beta = (min_pixels / hw).sqrt();
+    h_bar = ceil_to_factor(f64::from(height) * beta, total_factor)?;
+    w_bar = ceil_to_factor(f64::from(width) * beta, total_factor)?;
+  }
+  Ok((w_bar, h_bar))
+}
+
+/// `floor(value / factor) * factor` (HF `math.floor(dim/beta/tf)*tf`) as `u32`,
+/// with a checked narrowing cast. `value >= 0`.
+#[cfg(feature = "lfm2-vl")]
+fn floor_to_factor(value: f64, factor: u32) -> Result<u32> {
+  let q = (value / f64::from(factor)).floor() * f64::from(factor);
+  narrow_dim("lfm2_vl tiling: floor_to_factor", q)
+}
+
+/// `ceil(value / factor) * factor` (HF `math.ceil(dim*beta/tf)*tf`) as `u32`,
+/// with a checked narrowing cast. `value >= 0`.
+#[cfg(feature = "lfm2-vl")]
+fn ceil_to_factor(value: f64, factor: u32) -> Result<u32> {
+  let q = (value / f64::from(factor)).ceil() * f64::from(factor);
+  narrow_dim("lfm2_vl tiling: ceil_to_factor", q)
+}
+
+/// Narrow a non-negative f64 pixel dimension to `u32`, erroring on overflow /
+/// non-finiteness rather than saturating the `as` cast.
+#[cfg(feature = "lfm2-vl")]
+fn narrow_dim(context: &'static str, value: f64) -> Result<u32> {
+  if !(value.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&value)) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      context,
+      "resized dimension must be a finite non-negative value within u32",
+      smol_str::format_smolstr!("{value}"),
+    )));
+  }
+  Ok(value as u32)
+}
+
+/// HF `Lfm2VlImageProcessor._is_image_too_large` (`image_processing_lfm2_vl.py:366-380`):
+/// `true` if `round_by_factor(height) * round_by_factor(width) >
+/// max_image_tokens * encoder_patch_size^2 * downsample_factor^2 *
+/// max_pixels_tolerance`, where the round floors to `encoder_patch_size` (HF
+/// uses `max(encoder_patch_size, round_by_factor(dim, total_factor))`).
+#[cfg(feature = "lfm2-vl")]
+fn is_image_too_large(
+  height: u32,
+  width: u32,
+  max_image_tokens: u32,
+  encoder_patch_size: u32,
+  downsample_factor: u32,
+  max_pixels_tolerance: f32,
+) -> Result<bool> {
+  let total_factor = encoder_patch_size
+    .checked_mul(downsample_factor)
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tiling: too_large total_factor",
+        "u32",
+        [
+          ("encoder_patch_size", u64::from(encoder_patch_size)),
+          ("downsample_factor", u64::from(downsample_factor)),
+        ],
+      ))
+    })?;
+  let h_bar = encoder_patch_size.max(round_by_factor(height, total_factor)?);
+  let w_bar = encoder_patch_size.max(round_by_factor(width, total_factor)?);
+  let lhs = f64::from(h_bar) * f64::from(w_bar);
+  // `max_image_tokens * encoder_patch_size^2 * downsample_factor^2 * tol`
+  // = `max_image_tokens * total_factor^2 * tol`.
+  let tf2 = f64::from(total_factor) * f64::from(total_factor);
+  let rhs = f64::from(max_image_tokens) * tf2 * f64::from(max_pixels_tolerance);
+  Ok(lhs > rhs)
+}
+
+/// Compute the tile-layout [`TilePlan`] for an image of `(height, width)` under
+/// `cfg`'s tiling parameters — the pure host-integer core of the HF
+/// `resize_and_split` (`image_processing_lfm2_vl.py:382-436`), separated from
+/// the pixel work so the grid math is oracle-testable.
+///
+/// Mirrors `resize_and_split`'s `do_image_splitting = not min_tiles == max_tiles
+/// == 1` shortcut and the `is_image_large and do_image_splitting` branch: a
+/// large image with splitting enabled gets the multi-tile grid (+ a thumbnail
+/// when `use_thumbnail` and the grid has `> 1` tile); otherwise a single
+/// smart-resized sub-image.
+///
+/// # Errors
+/// - [`Error::OutOfRange`] if `width`/`height` is `0`;
+/// - propagates the grid-math / smart-resize overflow + narrowing errors.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub fn plan_tiles(height: u32, width: u32, cfg: &Lfm2VlProcessorConfig) -> Result<TilePlan> {
+  require_positive_u32("lfm2_vl tiling: height", height)?;
+  require_positive_u32("lfm2_vl tiling: width", width)?;
+  let t = &cfg.tiling;
+  // HF `resize_and_split` (`:397`): splitting also requires a non-degenerate
+  // `[min_tiles, max_tiles]` band (`not min_tiles == max_tiles == 1`), AND the
+  // model's `do_image_splitting` flag (HF `_preprocess:464-469` forces
+  // `min_tiles = max_tiles = 1` when the flag is off — equivalent to disabling).
+  let splitting_enabled = t.do_image_splitting && !(t.min_tiles == 1 && t.max_tiles == 1);
+  // `downsample_factor` lives on the parent config (a single model-wide knob),
+  // not the tiling block (HF carries it as a separate processor kwarg).
+  let downsample_factor = cfg.downsample_factor;
+
+  let too_large = is_image_too_large(
+    height,
+    width,
+    t.max_image_tokens,
+    t.encoder_patch_size,
+    downsample_factor,
+    t.max_pixels_tolerance,
+  )?;
+
+  // The within-budget smart-resize size (the single sub-image's dims, and the
+  // thumbnail's dims when split).
+  let (thumb_width, thumb_height) = smart_resize(
+    height,
+    width,
+    downsample_factor,
+    t.min_image_tokens,
+    t.max_image_tokens,
+    t.encoder_patch_size,
+  )?;
+
+  if too_large && splitting_enabled {
+    let (grid_width, grid_height, target_width, target_height) =
+      get_grid_layout(height, width, t.min_tiles, t.max_tiles, t.tile_size)?;
+    // HF `crop_image_to_patches:317`: a thumbnail is appended only when
+    // `use_thumbnail` AND the grid has more than one tile.
+    let multi_tile = grid_width * grid_height != 1;
+    Ok(TilePlan {
+      split: multi_tile,
+      grid_width,
+      grid_height,
+      target_width,
+      target_height,
+      thumb_width,
+      thumb_height,
+      thumbnail: t.use_thumbnail && multi_tile,
+    })
+  } else {
+    // Single native-resolution sub-image at the smart-resize size.
+    Ok(TilePlan {
+      split: false,
+      grid_width: 1,
+      grid_height: 1,
+      target_width: 0,
+      target_height: 0,
+      thumb_width,
+      thumb_height,
+      thumbnail: false,
+    })
+  }
+}
+
+/// Split one interleaved RGB image into the HF `Lfm2VlImageProcessor` tile
+/// sequence: a [`Lfm2VlImageInputs`] per tile (+ an optional thumbnail), each
+/// the patchified NaFlex triple the vision tower consumes.
+///
+/// Faithful port of the HF `resize_and_split` + `crop_image_to_patches` +
+/// `_preprocess` patchify (`image_processing_lfm2_vl.py:382-558`), which mlx-vlm
+/// omits (it forces `do_image_splitting = False`). The plan is computed by
+/// [`plan_tiles`]; this executes it:
+///
+/// - **split** (a large image, splitting enabled, `> 1`-tile grid): the whole
+///   image is bilinear-resized to `(target_height, target_width)` and cut into a
+///   `grid_height x grid_width` grid of `tile_size x tile_size` tiles (HF
+///   `split_to_tiles`, `:310`). Each tile patchifies at `encoder_patch_size`
+///   into a `(tile_size/P, tile_size/P)` patch grid. When `use_thumbnail`, the
+///   whole image (smart-resized to the within-budget `(thumb_height,
+///   thumb_width)`) is appended as a final sub-image (HF `:317-326`).
+/// - **single** (small image or splitting disabled): the whole image is
+///   smart-resized to `(thumb_height, thumb_width)` and patchified as ONE
+///   sub-image (HF `:427-431`).
+///
+/// The returned sub-images are in HF batch order (tiles row-major, then the
+/// thumbnail). Their per-tile grids drive [`expand_image_tokens`] (each
+/// bracketed by `image_start`/`image_end` and concatenated — the mlx-vlm
+/// `_patched_call:378-404` per-sub-image layout), and each is encoded by
+/// [`Lfm2Vl::encode_image_inputs`](super::model::Lfm2Vl::encode_image_inputs).
+///
+/// `tile_size` must be a whole multiple of `encoder_patch_size` (enforced by
+/// [`Lfm2VlProcessorConfig::with_tiling`]), and the produced patch grids
+/// (`tile_size/P` per side, and `thumb_*/P`) must fit `max_num_patches`.
+///
+/// # Errors
+/// - [`Error::OutOfRange`] for a zero dimension;
+/// - [`Error::LengthMismatch`] if `rgb.len()` disagrees with `width*height*3`;
+/// - [`Error::CapExceeded`] if a tile / thumbnail patch grid exceeds
+///   `max_num_patches`;
+/// - propagates the [`plan_tiles`] grid-math, the [`resize`], and the
+///   [`Array::from_slice`] errors.
+#[cfg(feature = "lfm2-vl")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub fn tile_image(
+  rgb: &[u8],
+  width: u32,
+  height: u32,
+  cfg: &Lfm2VlProcessorConfig,
+) -> Result<Vec<Lfm2VlImageInputs>> {
+  require_positive_u32("lfm2_vl tile_image: width", width)?;
+  require_positive_u32("lfm2_vl tile_image: height", height)?;
+  // Validate the RGB byte count up front (the same capped-extent product the
+  // native path uses) so a wrong-length slice is a typed error before any
+  // resize. The per-axis caps also bound the source-clone sizing below.
+  let channels = RGB_CHANNELS as usize;
+  let expected_rgb_len = elem_count(
+    "lfm2_vl tile_image: rgb byte count (width * height * channels)",
+    &[
+      Extent::new("lfm2_vl tile_image: width", width as usize, MAX_SOURCE_DIM)?,
+      Extent::new(
+        "lfm2_vl tile_image: height",
+        height as usize,
+        MAX_SOURCE_DIM,
+      )?,
+      Extent::new(
+        "lfm2_vl tile_image: channels",
+        channels,
+        RGB_CHANNELS as usize,
+      )?,
+    ],
+    MAX_SOURCE_PIXELS,
+  )?;
+  if rgb.len() != expected_rgb_len {
+    return Err(Error::LengthMismatch(LengthMismatchPayload::new(
+      "lfm2_vl tile_image: rgb slice length vs width*height*channels",
+      expected_rgb_len,
+      rgb.len(),
+    )));
+  }
+
+  let plan = plan_tiles(height, width, cfg)?;
+  let p = cfg.tiling.encoder_patch_size;
+  let mut out: Vec<Lfm2VlImageInputs> = Vec::new();
+  reserve_or_error(
+    &mut out,
+    "lfm2_vl tile_image: sub-image",
+    plan.sub_image_count()? as usize,
+  )?;
+
+  if plan.split {
+    // Resize the whole image to (target_height, target_width) — the grid is cut
+    // from this. `vlm::resize` takes (height, width) and returns RGBA8.
+    let resized = resize_rgb_to_rgba(rgb, width, height, plan.target_height, plan.target_width)?;
+    let tile_h = plan.target_height / plan.grid_height; // == tile_size (exact)
+    let tile_w = plan.target_width / plan.grid_width; // == tile_size (exact)
+    let grid_rows = tile_h / p; // patches per tile side
+    let grid_cols = tile_w / p;
+    // Each tile, row-major (HF `split_to_tiles` orders tiles row-major).
+    for gy in 0..plan.grid_height {
+      for gx in 0..plan.grid_width {
+        let y0 = gy * tile_h;
+        let x0 = gx * tile_w;
+        out.push(patchify_rgba_region(
+          resized.buf(),
+          resized.width(),
+          x0,
+          y0,
+          tile_w,
+          tile_h,
+          grid_rows,
+          grid_cols,
+          p,
+          cfg,
+        )?);
+      }
+    }
+    if plan.thumbnail {
+      // The thumbnail is the WHOLE image smart-resized to (thumb_h, thumb_w).
+      let thumb = resize_rgb_to_rgba(rgb, width, height, plan.thumb_height, plan.thumb_width)?;
+      let t_rows = plan.thumb_height / p;
+      let t_cols = plan.thumb_width / p;
+      out.push(patchify_rgba_region(
+        thumb.buf(),
+        thumb.width(),
+        0,
+        0,
+        plan.thumb_width,
+        plan.thumb_height,
+        t_rows,
+        t_cols,
+        p,
+        cfg,
+      )?);
+    }
+  } else {
+    // Single sub-image: smart-resize the whole image to (thumb_h, thumb_w).
+    let resized = resize_rgb_to_rgba(rgb, width, height, plan.thumb_height, plan.thumb_width)?;
+    let s_rows = plan.thumb_height / p;
+    let s_cols = plan.thumb_width / p;
+    out.push(patchify_rgba_region(
+      resized.buf(),
+      resized.width(),
+      0,
+      0,
+      plan.thumb_width,
+      plan.thumb_height,
+      s_rows,
+      s_cols,
+      p,
+      cfg,
+    )?);
+  }
+  Ok(out)
+}
+
+/// An owned RGBA8 resized buffer + its dimensions — the resize output the tile
+/// patchify reads regions from.
+#[cfg(feature = "lfm2-vl")]
+struct ResizedRgba {
+  buf: Vec<u8>,
+  width: u32,
+}
+
+#[cfg(feature = "lfm2-vl")]
+impl ResizedRgba {
+  #[inline(always)]
+  fn buf(&self) -> &[u8] {
+    &self.buf
+  }
+  #[inline(always)]
+  fn width(&self) -> u32 {
+    self.width
+  }
+}
+
+/// Bilinear-resize an interleaved RGB image to `(target_height, target_width)`,
+/// returning the owned RGBA8 buffer (the PIL-bit-exact resample the SigLIP2 path
+/// uses). The caller has already validated `rgb.len()` and the source dims.
+#[cfg(feature = "lfm2-vl")]
+fn resize_rgb_to_rgba(
+  rgb: &[u8],
+  width: u32,
+  height: u32,
+  target_height: u32,
+  target_width: u32,
+) -> Result<ResizedRgba> {
+  require_positive_u32("lfm2_vl tile resize: target_height", target_height)?;
+  require_positive_u32("lfm2_vl tile resize: target_width", target_width)?;
+  // Build an owned RgbImage over the caller's bytes (image's `from_raw` needs an
+  // owned container), reserving the already-capped exact length fallibly.
+  let mut src_buf: Vec<u8> = Vec::new();
+  reserve_or_error(
+    &mut src_buf,
+    "lfm2_vl tile resize: source RGB clone",
+    rgb.len(),
+  )?;
+  src_buf.extend_from_slice(rgb);
+  let src_img: ::image::RgbImage = ::image::ImageBuffer::from_raw(width, height, src_buf)
+    .ok_or_else(|| {
+      Error::LengthMismatch(LengthMismatchPayload::new(
+        "lfm2_vl tile resize: RgbImage::from_raw length",
+        rgb.len(),
+        rgb.len(),
+      ))
+    })?;
+  let src_dyn = ::image::DynamicImage::ImageRgb8(src_img);
+  let resized_dyn = resize(
+    &src_dyn,
+    (target_height, target_width),
+    ResizeFilter::Bilinear,
+  )?;
+  let resized = resized_dyn.as_rgba8().ok_or_else(|| {
+    Error::InvariantViolation(InvariantViolationPayload::new(
+      "lfm2_vl tile resize: resized image format",
+      "vlm::image::resize must return an RGBA8 image",
+    ))
+  })?;
+  let buf = resized.as_raw();
+  let mut owned: Vec<u8> = Vec::new();
+  reserve_or_error(&mut owned, "lfm2_vl tile resize: RGBA clone", buf.len())?;
+  owned.extend_from_slice(buf);
+  Ok(ResizedRgba {
+    buf: owned,
+    width: target_width,
+  })
+}
+
+/// Patchify a `(region_h, region_w)` rectangular region (top-left at
+/// `(x0, y0)`) of an RGBA8 buffer of row width `buf_width` into a
+/// [`Lfm2VlImageInputs`] at the fixed `(grid_rows, grid_cols)` patch grid,
+/// `patch_size = p` — the HF `convert_image_to_patches` + `pad_along_first_dim`
+/// (`image_processing_lfm2_vl.py:134-163, 527-535`) over a sub-image, reusing
+/// the SigLIP per-channel affine the native path uses.
+///
+/// The region must be exactly `(grid_rows * p, grid_cols * p)` and its patch
+/// grid must fit `max_num_patches` (the pad target). Pixels past the active
+/// `grid_rows * grid_cols` rows are zero-padded; the `pixel_attention_mask` is
+/// `1` for the active rows and `0` for the padding; `spatial_shapes` is
+/// `(grid_rows, grid_cols)`.
+#[cfg(feature = "lfm2-vl")]
+#[allow(clippy::too_many_arguments)]
+fn patchify_rgba_region(
+  buf: &[u8],
+  buf_width: u32,
+  x0: u32,
+  y0: u32,
+  region_w: u32,
+  region_h: u32,
+  grid_rows: u32,
+  grid_cols: u32,
+  p: u32,
+  cfg: &Lfm2VlProcessorConfig,
+) -> Result<Lfm2VlImageInputs> {
+  let max_num_patches = cfg.max_num_patches;
+  // The region must tile exactly into `(grid_rows, grid_cols)` patches.
+  if grid_rows.checked_mul(p) != Some(region_h) || grid_cols.checked_mul(p) != Some(region_w) {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "lfm2_vl tile patchify: region must be (grid_rows * p, grid_cols * p)",
+      "the tile / thumbnail dimensions must be a whole multiple of encoder_patch_size",
+    )));
+  }
+  // Active patch count `grid_rows * grid_cols` must fit the pad budget.
+  let active = u64::from(grid_rows)
+    .checked_mul(u64::from(grid_cols))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tile patchify: active patch count (grid_rows * grid_cols)",
+        "u64",
+        [
+          ("grid_rows", u64::from(grid_rows)),
+          ("grid_cols", u64::from(grid_cols)),
+        ],
+      ))
+    })?;
+  if active > u64::from(max_num_patches) {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "lfm2_vl tile patchify: sub-image patch grid",
+      "max_num_patches",
+      u64::from(max_num_patches),
+      active,
+    )));
+  }
+
+  // Per-patch flattened width = C * p^2; the pixel buffer is
+  // `max_num_patches * per_patch` (overflow-checked).
+  let pu = p as usize;
+  let channels = RGB_CHANNELS as usize;
+  let per_patch = pu
+    .checked_mul(pu)
+    .and_then(|pp| pp.checked_mul(channels))
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tile patchify: per-patch width (p^2 * channels)",
+        "usize",
+        [("p", u64::from(p)), ("channels", RGB_CHANNELS as u64)],
+      ))
+    })?;
+  let total_floats = (max_num_patches as usize)
+    .checked_mul(per_patch)
+    .ok_or_else(|| {
+      Error::ArithmeticOverflow(ArithmeticOverflowPayload::with_operands(
+        "lfm2_vl tile patchify: pixel_values size (max_num_patches * per_patch)",
+        "usize",
+        [
+          ("max_num_patches", u64::from(max_num_patches)),
+          ("per_patch", per_patch as u64),
+        ],
+      ))
+    })?;
+
+  let mut pixel_values: Vec<f32> = Vec::new();
+  reserve_or_error(
+    &mut pixel_values,
+    "lfm2_vl tile patchify: pixel_values f32",
+    total_floats,
+  )?;
+  pixel_values.resize(total_floats, 0.0f32);
+
+  let src_c = RGBA_CHANNELS as usize;
+  let src_row_stride = (buf_width as usize) * src_c;
+  let row_bytes = pu * channels;
+  let scale = [
+    (1.0 / 255.0) / cfg.image_std[0],
+    (1.0 / 255.0) / cfg.image_std[1],
+    (1.0 / 255.0) / cfg.image_std[2],
+  ];
+  let bias = [
+    -cfg.image_mean[0] / cfg.image_std[0],
+    -cfg.image_mean[1] / cfg.image_std[1],
+    -cfg.image_mean[2] / cfg.image_std[2],
+  ];
+  let (gr, gc) = (grid_rows as usize, grid_cols as usize);
+  let (x0u, y0u) = (x0 as usize, y0 as usize);
+  for py in 0..gr {
+    for px in 0..gc {
+      let patch_idx = py * gc + px;
+      let out_offset = patch_idx * per_patch;
+      for r in 0..pu {
+        let src_y = y0u + py * pu + r;
+        let src_x = x0u + px * pu;
+        let src_off = src_y * src_row_stride + src_x * src_c;
+        let dst_off = out_offset + r * row_bytes;
+        normalize_row_rgba(
+          &buf[src_off..src_off + pu * src_c],
+          &mut pixel_values[dst_off..dst_off + row_bytes],
+          scale,
+          bias,
+        );
+      }
+    }
+  }
+
+  let n_active = active as usize;
+  let mut mask: Vec<i32> = Vec::new();
+  reserve_or_error(
+    &mut mask,
+    "lfm2_vl tile patchify: pixel_attention_mask i32",
+    max_num_patches as usize,
+  )?;
+  mask.resize(max_num_patches as usize, 0i32);
+  for slot in mask.iter_mut().take(n_active) {
+    *slot = 1;
+  }
+  let spatial = [grid_rows as i32, grid_cols as i32];
+
+  let pixel_values =
+    Array::from_slice::<f32>(&pixel_values, &(max_num_patches as usize, per_patch))?;
+  let pixel_attention_mask = Array::from_slice::<i32>(&mask, &(max_num_patches as usize,))?;
+  let spatial_shapes = Array::from_slice::<i32>(&spatial, &(2usize,))?;
+  Ok(Lfm2VlImageInputs {
+    pixel_values,
+    pixel_attention_mask,
+    spatial_shapes,
+  })
 }
 
 #[cfg(all(test, feature = "lfm2-vl"))]

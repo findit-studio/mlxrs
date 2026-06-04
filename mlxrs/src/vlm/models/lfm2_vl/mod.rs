@@ -65,8 +65,8 @@ pub use model::{Lfm2Vl, constructor, register};
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 pub use processor::{
-  Lfm2VlImageInputs, Lfm2VlProcessorConfig, expand_image_tokens, num_image_tokens_from_patch_grid,
-  preprocess_image,
+  Lfm2VlImageInputs, Lfm2VlProcessorConfig, TilePlan, expand_image_tokens,
+  num_image_tokens_from_patch_grid, plan_tiles, preprocess_image, tile_image,
 };
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
