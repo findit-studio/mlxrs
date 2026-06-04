@@ -76,13 +76,17 @@ pub use super::tokenizer::Task;
 
 /// Options controlling a single 30-second-segment decode — `DecodingOptions`
 /// (`decoding.py:115-149`), restricted to the fields the shipped
-/// single-utterance greedy decode honors.
+/// single-utterance decode honors.
 ///
-/// Beam search (`beam_size` / `patience`) and best-of-N sampling (`best_of`)
-/// are not shipped (the reference raises `NotImplementedError` for beam
-/// search), so those fields are omitted rather than carried-and-ignored. The
-/// `prompt` / `prefix` conditioning, the timestamp options, and the
-/// suppress-token controls are all honored.
+/// Beam search (`beam_size` / `patience`) is not shipped (the reference raises
+/// `NotImplementedError`); [`Self::beam_size`] is carried only so the
+/// mutually-exclusive `best_of` + `beam_size` misuse is rejected with a typed
+/// error, matching the reference's `_verify_options` (`decoding.py:511-512`).
+/// Best-of-N sampling ([`Self::best_of`]) is shipped: at `temperature > 0` it
+/// decodes `best_of` independent candidate trajectories and the
+/// [`MaximumLikelihoodRanker`] selects the best. The `prompt` / `prefix`
+/// conditioning, the timestamp options, and the suppress-token controls are all
+/// honored.
 #[derive(Debug, Clone)]
 pub struct DecodingOptions {
   /// `"transcribe"` (X→X) or `"translate"` (X→English).
@@ -93,6 +97,26 @@ pub struct DecodingOptions {
   /// Sampling temperature. `0.0` ⇒ greedy argmax; `> 0.0` ⇒ a categorical
   /// draw (`GreedyDecoder`).
   pub temperature: f32,
+  /// Number of independent sample trajectories to decode and rank at
+  /// `temperature > 0` — `best_of` (`decoding.py:126`). `None` (the default) ⇒
+  /// a single greedy/categorical decode. `Some(n)` decodes `n` candidate rows
+  /// in one batched forward and the [`MaximumLikelihoodRanker`] keeps the
+  /// highest-scored. Mutually exclusive with [`Self::beam_size`]; combining with
+  /// `temperature == 0` is the reference's `best_of with greedy sampling`
+  /// misuse, surfaced as a typed error at [`DecodingTask::new`].
+  pub best_of: Option<usize>,
+  /// Number of beams for beam search — `beam_size` (`decoding.py:127`). Beam
+  /// search itself is **not** implemented (the reference raises
+  /// `NotImplementedError`); this is carried only to reject the mutually-
+  /// exclusive `best_of` + `beam_size` combination with a typed error
+  /// ([`DecodingTask::new`]). Setting it alone is likewise rejected as
+  /// unsupported.
+  pub beam_size: Option<usize>,
+  /// The Google NMT length-penalty exponent α — `length_penalty`
+  /// (`decoding.py:132`). `None` ⇒ plain length normalization in the
+  /// [`MaximumLikelihoodRanker`]; `Some(alpha)` (must be in `[0, 1]`, the
+  /// reference's `_verify_options` bound) uses `((5 + len) / 6) ** alpha`.
+  pub length_penalty: Option<f32>,
   /// Maximum tokens to sample; `None` ⇒ `n_text_ctx / 2`
   /// (`decoding.py:461`). `Some(0)` emits no sampled tokens (matching the stt
   /// driver's `max_new_tokens == 0` semantics).
@@ -129,6 +153,9 @@ impl Default for DecodingOptions {
       task: Task::Transcribe,
       language: None,
       temperature: 0.0,
+      best_of: None,
+      beam_size: None,
+      length_penalty: None,
       sample_len: None,
       prompt: Vec::new(),
       prefix: Vec::new(),
@@ -155,6 +182,9 @@ impl DecodingOptions {
       task: self.task,
       language: self.language.clone(),
       temperature: self.temperature,
+      best_of: self.best_of,
+      beam_size: self.beam_size,
+      length_penalty: self.length_penalty,
       sample_len: self.sample_len,
       prompt: Vec::new(),
       prefix: self.prefix.clone(),
@@ -713,14 +743,371 @@ impl GreedyDecoder {
   }
 }
 
+// ──────────────────────── batched greedy decoder ──────────────────────────
+
+/// The `n_group`-parallel token decoder — the batched form of
+/// [`GreedyDecoder`] (`GreedyDecoder.update`, `decoding.py:307-325`) that drives
+/// best-of-N sampling.
+///
+/// Selects each candidate row's next token **on device** (per-row `argmax` for
+/// `temperature == 0`, else an independent categorical draw per row), keeps a
+/// per-row cumulative `sum_logprob`, and tracks per-row completion. A row that
+/// has emitted eot **sticks** (it re-emits eot and stops accumulating logprob),
+/// exactly as the reference's `sum_logprobs += current_logprobs * (tokens[:, -1]
+/// != eot)` + `next_tokens * (1 - eot_mask) + eot * eot_mask`. The decode of the
+/// whole group stops only when **every** row has completed (`mx.all(tokens[:,
+/// -1] == eot)`).
+///
+/// Per step only two small host reads happen — the `(n_group,)` chosen-token row
+/// (needed for the host-side logit filters / token history) and the
+/// `(n_group,)` chosen-logprob row — never the `(n_group, n_vocab)` logits
+/// matrix. `sum_logprob` is accumulated on the host in `f64`, the same width and
+/// per-row formula (`logits[row, next] - logsumexp(logits[row])`) the
+/// single-sequence [`GreedyDecoder`] uses, so a one-row group is bit-identical
+/// to it.
+struct BatchedGreedyDecoder {
+  temperature: f32,
+  eot: u32,
+  n_group: usize,
+  /// Per-row accumulated `sum_logprobs` (`decoding.py:316-318`).
+  sum_logprob: Vec<f64>,
+  /// Per-row completion flag — `true` once a row has emitted eot (sticky).
+  completed: Vec<bool>,
+  /// The PRNG key, advanced per batched categorical draw (`temperature > 0`).
+  key: Array,
+}
+
+impl BatchedGreedyDecoder {
+  fn new(temperature: f32, eot: u32, n_group: usize, seed: u64) -> Result<Self> {
+    // The per-row accumulators scale with `n_group` (the consumer's `best_of`);
+    // reserve them fallibly so a within-i32 but heavyweight group degrades to a
+    // typed [`Error::AllocFailure`] rather than aborting in `vec![…; n_group]`.
+    let mut sum_logprob: Vec<f64> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut sum_logprob,
+      "BatchedGreedyDecoder: per-row sum_logprob",
+      n_group,
+    )?;
+    sum_logprob.resize(n_group, 0.0);
+    let mut completed: Vec<bool> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut completed,
+      "BatchedGreedyDecoder: per-row completed flags",
+      n_group,
+    )?;
+    completed.resize(n_group, false);
+    Ok(Self {
+      temperature,
+      eot,
+      n_group,
+      sum_logprob,
+      completed,
+      key: ops::random::key(seed)?,
+    })
+  }
+
+  /// Whether every candidate row has emitted eot — the reference's `completed =
+  /// mx.all(tokens[:, -1] == eot)` (`decoding.py:324`).
+  fn all_completed(&self) -> bool {
+    self.completed.iter().all(|&c| c)
+  }
+
+  /// Select each row's next token from the `(n_group, n_vocab)` logits matrix
+  /// and update the per-row `sum_logprob` / `completed` — the batched
+  /// `GreedyDecoder.update` (`decoding.py:307-325`).
+  ///
+  /// - `logits`: the (already per-row logit-filtered) `(n_group, n_vocab)`
+  ///   matrix on device.
+  /// - `last_tokens`: each row's previously-emitted token (`tokens[:, -1]`) —
+  ///   gates the per-row logprob accumulation and the eot stick.
+  ///
+  /// Returns the per-row next tokens (`(n_group,)` host vector).
+  fn update(&mut self, logits: &Array, last_tokens: &[u32]) -> Result<Vec<u32>> {
+    let shape = logits.shape();
+    if shape.len() != 2 || shape[0] != self.n_group {
+      return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
+        "BatchedGreedyDecoder: logits must be (n_group, n_vocab)",
+        shape.len() as u32,
+        shape,
+      )));
+    }
+    if last_tokens.len() != self.n_group {
+      return Err(Error::LengthMismatch(
+        crate::error::LengthMismatchPayload::new(
+          "BatchedGreedyDecoder: last_tokens length must equal n_group",
+          self.n_group,
+          last_tokens.len(),
+        ),
+      ));
+    }
+    let v = shape[1];
+
+    // Per-row next token: `argmax(axis=-1)` (temperature 0) or an independent
+    // per-row categorical draw, both on device. argmax ties to the lowest index
+    // (matching mlx + the single-sequence path).
+    let next: Vec<u32> = if self.temperature == 0.0 {
+      let mut idx = ops::misc::argmax(logits, Some(-1), false)?; // (n_group,)
+      idx.to_vec::<u32>()?
+    } else {
+      self.categorical(logits)?
+    };
+
+    // Per-row chosen logprob `logits[row, next] - logsumexp(logits[row])`,
+    // computed on device and read back as a `(n_group,)` row. This mirrors the
+    // single-sequence `chosen_logprob` per row: the `(1, n_vocab)` slice's
+    // logsumexp equals the `(n_vocab,)` row's logsumexp bit-for-bit, so a
+    // one-row group accumulates the identical f64 sum.
+    let chosen = self.chosen_logprobs(logits, &next, v)?;
+    for (g, &lp) in chosen.iter().enumerate() {
+      // Accumulate only while the row had not already emitted eot
+      // (`* (tokens[:, -1] != eot)`).
+      if last_tokens[g] != self.eot {
+        self.sum_logprob[g] += lp;
+      }
+    }
+
+    // Eot stick + completion (`decoding.py:320-324`): once a row's previous
+    // token was eot it re-emits eot and is marked complete (it stays complete —
+    // `completed` is only ever set, never cleared).
+    let mut out = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut out,
+      "BatchedGreedyDecoder: next tokens",
+      self.n_group,
+    )?;
+    for (g, &n) in next.iter().enumerate() {
+      let tok = if last_tokens[g] == self.eot {
+        self.eot
+      } else {
+        n
+      };
+      if tok == self.eot {
+        self.completed[g] = true;
+      }
+      out.push(tok);
+    }
+    Ok(out)
+  }
+
+  /// Per-row `logits[row, next_row] - logsumexp(logits[row])` for the whole
+  /// group, computed on device and returned as a `(n_group,)` host `f64` row. A
+  /// `next` index `>= n_vocab` resolves to `-inf` (the single-sequence path's
+  /// out-of-range fallback); in practice every index is an in-range `argmax` /
+  /// categorical draw.
+  fn chosen_logprobs(&self, logits: &Array, next: &[u32], v: usize) -> Result<Vec<f64>> {
+    // logsumexp over the vocab axis, keepdims → (n_group, 1); subtract to form
+    // the full per-row logprob matrix, then gather each row's chosen column.
+    let lse = ops::reduction::logsumexp_axes(logits, &[-1], true)?; // (n_group, 1)
+    let logprobs = ops::arithmetic::subtract(logits, &lse)?; // (n_group, n_vocab)
+
+    // Build the `(n_group, 1)` per-row chosen index, clamped to a valid column
+    // so the gather never indexes out of bounds; an originally-out-of-range
+    // index is reported as `-inf` after the read (mirroring the single path).
+    let mut idx_buf = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut idx_buf,
+      "BatchedGreedyDecoder: chosen indices",
+      self.n_group,
+    )?;
+    for &n in next {
+      // Clamp for the gather; the original (possibly out-of-range) value drives
+      // the `-inf` fallback below.
+      let clamped = if (n as usize) < v { n as i32 } else { 0 };
+      idx_buf.push(clamped);
+    }
+    let g = i32::try_from(self.n_group).map_err(|_| dim_overflow("n_group"))?;
+    let idx = Array::from_slice::<i32>(&idx_buf, &[g, 1])?;
+    let gathered = ops::indexing::take_along_axis(&logprobs, &idx, 1)?; // (n_group, 1)
+    let mut gathered_row = gathered.reshape(&[g])?;
+    let host = gathered_row.to_vec::<f32>()?;
+    // Reserve the per-row logprob vector fallibly (scales with `n_group`, like
+    // the chosen-index buffer above) instead of an infallible `.collect()`.
+    let mut out = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut out,
+      "BatchedGreedyDecoder: chosen logprobs",
+      self.n_group,
+    )?;
+    for (&lp, &n) in host.iter().zip(next) {
+      out.push(if (n as usize) < v {
+        lp as f64
+      } else {
+        f64::NEG_INFINITY
+      });
+    }
+    Ok(out)
+  }
+
+  /// The `n_group` row index width and the `n_group + 1` RNG split count as
+  /// `i32`, both checked: `n_group` must fit in `i32` ([`dim_overflow`]) and the
+  /// `+ 1` carry must not wrap it ([`Error::ArithmeticOverflow`]). A wrap would
+  /// be UB-adjacent — a negative / truncated `num` would feed `split_num` and
+  /// the carry-row slice bound.
+  fn split_count(&self) -> Result<(i32, i32)> {
+    let g = i32::try_from(self.n_group).map_err(|_| dim_overflow("n_group"))?;
+    let split = crate::model_validation::checked_add(
+      "BatchedGreedyDecoder: RNG subkey split count",
+      "n_group",
+      g,
+      "carry",
+      1,
+    )?;
+    Ok((g, split))
+  }
+
+  /// An independent per-row temperature-scaled categorical draw, advancing the
+  /// PRNG key — the batched `random.categorical(logits / temp)`
+  /// (`decoding.py:297-299`). The running key is split into `n_group + 1`
+  /// subkeys: one per row (so each candidate draws independently → distinct
+  /// trajectories at `temperature > 0`) plus the carry that becomes the next
+  /// step's key. `logits` is `(n_group, n_vocab)` on device.
+  fn categorical(&mut self, logits: &Array) -> Result<Vec<u32>> {
+    // Split the running key into `n_group + 1` subkeys (the `(num, 2)` rows).
+    // Row 0 is the carry (the next step's key); rows `1..=n_group` are the
+    // per-row sampling keys. This mirrors the role split the single
+    // [`GreedyDecoder::categorical`] gives `random::split` — carry the FIRST
+    // returned key, sample with the SECOND — so a one-row group draws with the
+    // identical key as the single path: mlx's `random::split(k)` and
+    // `random::split_num(k, 2)` are the same `bits({2, 2}, 4, k)` rows in order
+    // (`random.cpp:75-82`), so `n_group == 1` is bit-identical.
+    let (_g, split) = self.split_count()?;
+    let subkeys = ops::random::split_num(&self.key, split)?;
+    // Carry the FIRST subkey (row 0) into the next step.
+    self.key = ops::indexing::slice(&subkeys, &[0, 0], &[1, 2], &[1, 1])?.reshape(&[2])?;
+
+    let mut out = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut out,
+      "BatchedGreedyDecoder: categorical draws",
+      self.n_group,
+    )?;
+    let v = i32::try_from(logits.shape()[1]).map_err(|_| dim_overflow("n_vocab"))?;
+    for row in 0..self.n_group {
+      let r = i32::try_from(row).map_err(|_| dim_overflow("row"))?;
+      // Row `row`'s logits `(n_vocab,)` and its sampling subkey — row `row` uses
+      // subkey row `row + 1` (row 0 is the carry). `r + 2 <= split`, which
+      // `split_count` already proved fits `i32`, so neither bound overflows.
+      let row_logits =
+        ops::indexing::slice(logits, &[r, 0], &[r + 1, v], &[1, 1])?.reshape(&[v])?;
+      let sub = ops::indexing::slice(&subkeys, &[r + 1, 0], &[r + 2, 2], &[1, 1])?.reshape(&[2])?;
+      let mut sampled =
+        crate::lm::sample::categorical_sampling(&row_logits, self.temperature, &sub)?;
+      out.push(sampled.item::<u32>()?);
+    }
+    Ok(out)
+  }
+}
+
+// ─────────────────────── maximum-likelihood ranker ────────────────────────
+
+/// Rank a group of candidate decodes and pick the best — `MaximumLikelihoodRanker`
+/// (`decoding.py:212-235`).
+///
+/// Scores each candidate by its cumulative log-probability normalized by a
+/// length penalty, and returns the argmax-score candidate index for the group:
+///
+/// ```text
+/// penalty = length                         if length_penalty is None
+///         = ((5 + length) / 6) ** alpha     otherwise  (Google NMT)
+/// score   = sum_logprob / penalty
+/// ```
+///
+/// `length` is the candidate's **sampled** token count — eot-excluded and
+/// forced-prefix-excluded — exactly the `len(t)` the reference takes after
+/// `tokens[..., sample_begin:]` (`:679`) and the `t[: t.index(eot)]` truncation
+/// (`:686`); `sum_logprob` is likewise the per-row accumulation that excludes
+/// the forced prefix (it only sums from the first sampled step, gated off after
+/// eot). Getting this length-normalization right is the locus of the upstream
+/// best-of bug (Blaizzy/mlx-audio#762): the score must divide by the GNMT-
+/// penalized **candidate** length, not the raw sequence length, and `sum_logprob`
+/// must not include the prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct MaximumLikelihoodRanker {
+  /// The GNMT length-penalty exponent α (`decoding.py:218-219`); `None` ⇒ plain
+  /// length normalization.
+  length_penalty: Option<f32>,
+}
+
+impl MaximumLikelihoodRanker {
+  /// Build a ranker with an optional GNMT length-penalty exponent.
+  #[inline]
+  pub const fn new(length_penalty: Option<f32>) -> Self {
+    Self { length_penalty }
+  }
+
+  /// The length penalty for a candidate of `length` sampled tokens
+  /// (`decoding.py:225-229`): the raw length, or the Google NMT
+  /// `((5 + length) / 6) ** alpha`.
+  fn penalty(&self, length: usize) -> f64 {
+    match self.length_penalty {
+      None => length as f64,
+      Some(alpha) => ((5.0 + length as f64) / 6.0).powf(alpha as f64),
+    }
+  }
+
+  /// The score of one candidate — `sum_logprob / penalty(length)`
+  /// (`decoding.py:230`). A zero-length candidate under plain normalization
+  /// divides by zero; the reference inherits numpy's `x / 0` (`±inf` / `nan`),
+  /// and `np.argmax` then resolves it. This reproduces that with IEEE `f64`
+  /// division (no panic): a positive / negative `sum_logprob` over a zero
+  /// penalty is `±inf`, a zero over zero is `NaN`. The selection is robust to it
+  /// (see [`Self::rank`]).
+  fn score(&self, sum_logprob: f64, length: usize) -> f64 {
+    sum_logprob / self.penalty(length)
+  }
+
+  /// Select the highest-scored candidate of a group — `rank`
+  /// (`decoding.py:221-235`), for a single utterance.
+  ///
+  /// `candidates` pairs each candidate's `sum_logprob` with its sampled-token
+  /// `length` (eot-/prefix-excluded). Returns the index of the argmax-score
+  /// candidate (ties → the lowest index, matching `np.argmax`). An empty group
+  /// has no candidate to pick; the caller (best-of always has `n_group >= 1`)
+  /// never passes one, so this returns `0` as a total-function default rather
+  /// than erroring.
+  ///
+  /// `NaN` scores (a `0 / 0` zero-length candidate) never win over a finite
+  /// score: the comparison only advances the best index on a strict `>` and a
+  /// `NaN` comparison is always false, so a finite candidate is preferred —
+  /// mirroring numpy's `argmax`, which skips `NaN` unless every entry is `NaN`.
+  pub fn rank(&self, candidates: &[(f64, usize)]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut seen_finite = false;
+    for (i, &(sum_logprob, length)) in candidates.iter().enumerate() {
+      let s = self.score(sum_logprob, length);
+      // Prefer the first finite score; once one is seen, only a strictly-greater
+      // finite score displaces it (a later `NaN` never wins).
+      if s.is_nan() {
+        continue;
+      }
+      if !seen_finite || s > best_score {
+        best_score = s;
+        best_idx = i;
+        seen_finite = true;
+      }
+    }
+    best_idx
+  }
+}
+
 // ───────────────────────── decoding task ──────────────────────────────────
 
+/// The single-vs-batched parity-gate result: `((single_tokens,
+/// single_sum_logprob), (batched_tokens, batched_sum_logprob))` from
+/// [`DecodingTask::run_both_for_parity`].
+#[cfg(test)]
+type ParityResult = ((Vec<u32>, f64), (Vec<u32>, f64));
+
 /// One 30-second-segment decode — `DecodingTask` (`decoding.py:445-723`),
-/// single-utterance greedy.
+/// single-utterance.
 ///
-/// Holds the resolved sot/initial-token sequence, the logit filters, and the
-/// greedy decoder; [`DecodingTask::run`] threads them against the model's
-/// `decode_tokens` to produce a [`DecodingResult`].
+/// Holds the resolved sot/initial-token sequence, the logit filters, the
+/// candidate-group count, and the sequence ranker; [`DecodingTask::run`] threads
+/// them against the model's `decode_tokens` to produce a [`DecodingResult`].
+/// With `best_of` set (at `temperature > 0`) it decodes `n_group` candidate rows
+/// in one batched forward and the [`MaximumLikelihoodRanker`] selects the best;
+/// otherwise it runs the single-sequence greedy/categorical path.
 pub struct DecodingTask<'a> {
   model: &'a WhisperModel,
   tokenizer: &'a HFTokenizerWrapper<'a>,
@@ -731,6 +1118,13 @@ pub struct DecodingTask<'a> {
   /// sampled tokens (the prefill / no_speech_prob still run); the main loop
   /// honors that cap rather than the reference's unconditional first step.
   sample_len: usize,
+  /// The candidate-group count — `n_group = beam_size or best_of or 1`
+  /// (`decoding.py:459`). `1` ⇒ the single-sequence path; `> 1` ⇒ a batched
+  /// best-of-N decode + rank.
+  n_group: usize,
+  /// The sequence ranker selecting the best of the `n_group` candidates
+  /// (`decoding.py:475`). Unused on the single-sequence path.
+  ranker: MaximumLikelihoodRanker,
   /// The full initial token prefix: `(prompt) + sot_sequence + (prefix)`
   /// (`decoding.py:525-551`).
   initial_tokens: Vec<u32>,
@@ -748,9 +1142,14 @@ impl<'a> DecodingTask<'a> {
   /// (`decoding.py:451-508`).
   ///
   /// # Errors
-  /// - [`Error::OutOfRange`] if the resolved sot sequence is absent
-  ///   (`sot` not in `initial_tokens`), or `max_initial_timestamp` rounds out
-  ///   of range;
+  /// - [`Error::InvariantViolation`] for an unsupported / contradictory option
+  ///   combination — `best_of` + `beam_size` together, `best_of` with
+  ///   `temperature == 0`, `beam_size` at all (beam search is not implemented),
+  ///   or a `best_of` / `beam_size` of `0` — mirroring the reference's
+  ///   `_verify_options` (`decoding.py:510-523`);
+  /// - [`Error::OutOfRange`] if `length_penalty` is outside `[0, 1]`, the
+  ///   resolved sot sequence is absent (`sot` not in `initial_tokens`), or
+  ///   `max_initial_timestamp` rounds out of range;
   /// - propagates the `SuppressBlank` encode error.
   pub fn new(
     model: &'a WhisperModel,
@@ -760,6 +1159,13 @@ impl<'a> DecodingTask<'a> {
     let dims = model.dims();
     let n_ctx = dims.n_text_ctx();
     let sample_len = options.sample_len.unwrap_or(n_ctx / 2);
+
+    // `_verify_options` (`decoding.py:510-523`) + the `n_group` resolution
+    // (`:459`). Beam search is not implemented, so `beam_size` is rejected
+    // outright (rather than carried-and-ignored); `best_of` is the shipped
+    // multi-trajectory path. Resolve the candidate-group count and the ranker.
+    let n_group = Self::verify_options_and_group(&options)?;
+    let ranker = MaximumLikelihoodRanker::new(options.length_penalty);
 
     // sot sequence (+ no_timestamps when `without_timestamps`).
     let sot_sequence = if options.without_timestamps {
@@ -836,6 +1242,8 @@ impl<'a> DecodingTask<'a> {
       options,
       n_ctx,
       sample_len,
+      n_group,
+      ranker,
       initial_tokens,
       sample_begin,
       sot_index,
@@ -843,9 +1251,92 @@ impl<'a> DecodingTask<'a> {
     })
   }
 
+  /// Verify the sampling options and resolve the candidate-group count `n_group
+  /// = beam_size or best_of or 1` — `_verify_options` (`decoding.py:510-523`)
+  /// plus the `n_group` assignment (`:459`).
+  ///
+  /// Beam search is not implemented, so a set `beam_size` is rejected as
+  /// unsupported (the reference reaches its `NotImplementedError` only when it
+  /// would build the beam decoder; mlxrs fails fast at task construction). The
+  /// other checks mirror the reference exactly: `best_of` and `beam_size` are
+  /// mutually exclusive; `best_of` with greedy sampling (`temperature == 0`) is
+  /// incompatible; `length_penalty` must be in `[0, 1]`. A `best_of` / `beam_size`
+  /// of `0` has no candidate rows and is rejected.
+  ///
+  /// # Errors
+  /// - [`Error::InvariantViolation`] for `best_of` + `beam_size` together,
+  ///   `best_of` with `temperature == 0`, any `beam_size` (unsupported), or a
+  ///   zero `best_of` / `beam_size`;
+  /// - [`Error::OutOfRange`] if `length_penalty` is outside `[0, 1]`, or if
+  ///   `best_of` exceeds `i32::MAX`; [`Error::ArithmeticOverflow`] if its
+  ///   `n_group + 1` RNG-split count would overflow `i32`.
+  fn verify_options_and_group(options: &DecodingOptions) -> Result<usize> {
+    if options.best_of.is_some() && options.beam_size.is_some() {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "DecodingTask: best_of and beam_size",
+        "can't be given together (mutually exclusive sampling strategies)",
+      )));
+    }
+    if options.temperature == 0.0 && options.best_of.is_some() {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "DecodingTask: best_of with greedy sampling (temperature == 0)",
+        "is not compatible — best_of needs temperature > 0 to draw distinct trajectories",
+      )));
+    }
+    if options.beam_size.is_some() {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "DecodingTask: beam_size",
+        "beam search is not implemented (use best_of for multi-trajectory sampling)",
+      )));
+    }
+    if let Some(alpha) = options.length_penalty
+      && !(0.0..=1.0).contains(&alpha)
+    {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "DecodingTask: length_penalty (alpha)",
+        "must be in [0, 1]",
+        format_smolstr!("{alpha}"),
+      )));
+    }
+    // `n_group = beam_size or best_of or 1` (`decoding.py:459`); beam_size is
+    // already rejected above, so this is `best_of or 1`. A zero best_of has no
+    // candidate rows.
+    let n_group = options.best_of.unwrap_or(1);
+    if n_group == 0 {
+      return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+        "DecodingTask: best_of",
+        "must be >= 1 (at least one candidate trajectory)",
+      )));
+    }
+    // `n_group` is a tensor batch dimension (the batched logits are
+    // `(n_group, n_vocab)`), and the categorical sampler splits the RNG key into
+    // `n_group + 1` subkeys — both must index an `i32`-shaped MLX tensor. Reject a
+    // `best_of` that cannot fit that bound HERE, before `main_loop_batched`
+    // reserves any per-row state, so an impossible value fails cheaply with a
+    // typed error instead of first attempting to allocate billions of rows. (A
+    // `best_of` that fits `i32` but is merely large is a fallible allocation and
+    // the consumer's concern, not a cap.) Same bound `split_count` enforces per
+    // step, hoisted to construction time.
+    let g = i32::try_from(n_group).map_err(|_| dim_overflow("best_of (n_group)"))?;
+    crate::model_validation::checked_add(
+      "DecodingTask: best_of RNG subkey split count",
+      "n_group",
+      g,
+      "carry",
+      1,
+    )?;
+    Ok(n_group)
+  }
+
   /// Decode one mel segment (`(N_FRAMES, n_mels)` or pre-encoded
   /// `(n_audio_ctx, n_audio_state)`) — `DecodingTask.run` + `_main_loop`
-  /// (`decoding.py:588-723`), single-utterance greedy.
+  /// (`decoding.py:588-723`), single-utterance.
+  ///
+  /// Dispatches on the candidate-group count: `n_group == 1` runs the
+  /// single-sequence greedy/categorical path (`main_loop`); `n_group > 1`
+  /// (a `best_of` decode at `temperature > 0`) runs the batched best-of-N loop
+  /// (`run_best_of`) and the [`MaximumLikelihoodRanker`] selects the winning
+  /// candidate.
   ///
   /// # Errors
   /// Propagates the encoder / decoder / sampling op errors.
@@ -853,24 +1344,69 @@ impl<'a> DecodingTask<'a> {
     // Encoder forward (or pass-through if already-encoded features).
     let audio_features = self.audio_features(mel)?;
 
-    // Run the main greedy loop.
-    let (tokens, sum_logprob, no_speech_prob) = self.main_loop(&audio_features)?;
+    if self.n_group == 1 {
+      // Single-sequence path — unchanged (the batching introduces no regression
+      // here; the `n_group == 1` batched path is proven bit-identical to it by
+      // the parity-gate test).
+      let (tokens, sum_logprob, no_speech_prob) = self.main_loop(&audio_features)?;
+      let sampled = self.truncate_sampled(&tokens)?;
+      self.assemble_result(sampled, sum_logprob, no_speech_prob, language)
+    } else {
+      self.run_best_of(&audio_features, language)
+    }
+  }
 
-    // `tokens[sample_begin:]`, truncated at the first eot (`decoding.py:679`,
-    // `:686`).
-    let sampled: Vec<u32> = {
-      let tail = tokens.get(self.sample_begin..).unwrap_or(&[]);
-      let end = tail
-        .iter()
-        .position(|&t| t == self.tokenizer.eot())
-        .unwrap_or(tail.len());
-      tail[..end].to_vec()
-    };
+  /// The length of `tokens[sample_begin:]` truncated at the first eot
+  /// (`decoding.py:679`, `:686`) — the sampled-tail length of one decode
+  /// trajectory, computed WITHOUT allocating so the best-of ranker can score
+  /// every candidate before any candidate's tokens are materialized.
+  fn truncated_len(&self, tokens: &[u32]) -> usize {
+    let tail = tokens.get(self.sample_begin..).unwrap_or(&[]);
+    tail
+      .iter()
+      .position(|&t| t == self.tokenizer.eot())
+      .unwrap_or(tail.len())
+  }
 
+  /// Materialize `tokens[sample_begin:][..len]` (the sampled tail) into an owned
+  /// `Vec`, reserving fallibly (typed [`Error::AllocFailure`], never an abort).
+  /// `len` is a [`Self::truncated_len`] result for the same `tokens`; it is
+  /// clamped to the tail length defensively so a stale length can never panic
+  /// the slice.
+  fn truncated_tokens(&self, tokens: &[u32], len: usize) -> Result<Vec<u32>> {
+    let tail = tokens.get(self.sample_begin..).unwrap_or(&[]);
+    let end = len.min(tail.len());
+    let mut out = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut out,
+      "DecodingTask: truncated sampled tokens",
+      end,
+    )?;
+    out.extend_from_slice(&tail[..end]);
+    Ok(out)
+  }
+
+  /// `tokens[sample_begin:]` truncated at the first eot — the sampled tail of a
+  /// single decode trajectory, materialized fallibly. Used by the single-decode
+  /// path; the best-of path scores via [`Self::truncated_len`] and materializes
+  /// only the winning row via [`Self::truncated_tokens`].
+  fn truncate_sampled(&self, tokens: &[u32]) -> Result<Vec<u32>> {
+    self.truncated_tokens(tokens, self.truncated_len(tokens))
+  }
+
+  /// Assemble a [`DecodingResult`] from one selected trajectory's sampled
+  /// tokens + cumulative logprob — the per-result fields of `run`
+  /// (`decoding.py:691-707`): decode the text, compute `avg_logprob =
+  /// sum_logprob / (len + 1)` (`:694-696`) and the compression ratio.
+  fn assemble_result(
+    &self,
+    sampled: Vec<u32>,
+    sum_logprob: f64,
+    no_speech_prob: f64,
+    language: &str,
+  ) -> Result<DecodingResult> {
     let text = self.tokenizer.decode(&sampled, false)?.trim().to_string();
-    // `avg_logprob = sum_logprob / (len + 1)` (`decoding.py:694-696`).
     let avg_logprob = sum_logprob / (sampled.len() as f64 + 1.0);
-
     Ok(DecodingResult {
       language: language.to_string(),
       compression_ratio: compression_ratio(&text),
@@ -959,6 +1495,184 @@ impl<'a> DecodingTask<'a> {
     Ok((tokens, decoder.sum_logprob, no_speech_prob))
   }
 
+  /// Decode `n_group` candidate trajectories in one batched forward, then select
+  /// the highest-scored — the `best_of` half of `run` (`decoding.py:656-707`)
+  /// driven by the batched `_main_loop` (`:588-632`).
+  ///
+  /// Every candidate shares the same initial prefix and audio features (the
+  /// encoder runs once and is broadcast across the rows); the rows diverge as
+  /// each draws its own categorical sample at `temperature > 0`. After the loop
+  /// each row is truncated at its first eot and the [`MaximumLikelihoodRanker`]
+  /// picks the winner by `sum_logprob / length_penalty(len)`.
+  ///
+  /// # Errors
+  /// Propagates the encoder-broadcast, batched decoder forward, filter, and
+  /// sampler op errors.
+  fn run_best_of(&self, audio_features: &Array, language: &str) -> Result<DecodingResult> {
+    // Broadcast the single-segment encoder states across the candidate rows so
+    // the cross-attention K/V batch matches the self-attention K/V batch
+    // (`n_group`). The features themselves are shared (the reference's
+    // `audio_features[::n_group]` regrouping).
+    let enc = self
+      .model
+      .broadcast_encoder_states(audio_features, self.n_group)?;
+
+    let (rows, sum_logprobs, no_speech_prob) = self.main_loop_batched(&enc)?;
+
+    // Score each candidate by its cumulative logprob and its truncated
+    // (eot-/prefix-excluded) length, then rank (`decoding.py:679-689`). The
+    // ranker length is the locus of the upstream best-of normalization bug
+    // (Blaizzy/mlx-audio#762). Compute the lengths WITHOUT materializing any
+    // token vector — only the winning row is allocated afterwards, so a losing
+    // candidate's tail is never cloned.
+    let mut candidates: Vec<(f64, usize)> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut candidates,
+      "DecodingTask: best-of candidates",
+      self.n_group,
+    )?;
+    for (g, row_tokens) in rows.iter().enumerate() {
+      candidates.push((sum_logprobs[g], self.truncated_len(row_tokens)));
+    }
+
+    let winner = self.ranker.rank(&candidates);
+    let (selected_sum_logprob, winner_len) = candidates[winner];
+    let selected = self.truncated_tokens(&rows[winner], winner_len)?;
+    self.assemble_result(selected, selected_sum_logprob, no_speech_prob, language)
+  }
+
+  /// The batched autoregressive loop over `n_group` candidate rows — the
+  /// `n_batch > 1` form of [`Self::main_loop`] (`_main_loop`,
+  /// `decoding.py:588-632`). `enc` is the encoder states already broadcast to
+  /// `(n_group, n_audio_ctx, n_audio_state)`.
+  ///
+  /// Returns `(per_row_tokens, per_row_sum_logprob, no_speech_prob)`: each row's
+  /// full token history (initial prefix + sampled tail), its cumulative logprob,
+  /// and the prefill no-speech probability (shared across rows — every candidate
+  /// has the same prefix and features, so the reference's
+  /// `no_speech_probs[::n_group]` is row 0's value).
+  ///
+  /// # Errors
+  /// Propagates the batched decoder forward, filter, and sampler op errors.
+  fn main_loop_batched(&self, enc: &Array) -> Result<(Vec<Vec<u32>>, Vec<f64>, f64)> {
+    let mut decoder = BatchedGreedyDecoder::new(
+      self.options.temperature,
+      self.tokenizer.eot(),
+      self.n_group,
+      0,
+    )?;
+
+    // Every row starts from the same initial prefix; lay the `(n_group,
+    // sample_begin)` prefill out row-major (each row a copy of the prefix). The
+    // rows diverge only once sampling begins. Reserve the outer per-row vector
+    // AND each prefix copy fallibly (both scale with `n_group` / the prefix
+    // length) so an outsized but within-i32 group surfaces a typed
+    // [`Error::AllocFailure`] instead of aborting in an infallible `clone`.
+    let mut rows: Vec<Vec<u32>> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut rows,
+      "main_loop_batched: per-row initial prefix",
+      self.n_group,
+    )?;
+    for _ in 0..self.n_group {
+      let mut row: Vec<u32> = Vec::new();
+      crate::model_validation::reserve_or_error(
+        &mut row,
+        "main_loop_batched: initial prefix copy",
+        self.initial_tokens.len(),
+      )?;
+      row.extend_from_slice(&self.initial_tokens);
+      rows.push(row);
+    }
+
+    // First forward: the whole initial prefix for every row. The no-speech
+    // probability is a property of this prefill's sot position (the same for
+    // every row), read off row 0.
+    let prefill_flat = flatten_rows(&rows)?;
+    let (logits3d, new_cache) =
+      self
+        .model
+        .decode_tokens_batched(&prefill_flat, self.n_group, enc, None)?;
+    let mut cache = Some(new_cache);
+    let no_speech_prob = self.no_speech_prob_batched(&logits3d)?;
+
+    // `sample_len == 0`: emit no token (matching `main_loop`'s cap handling).
+    if self.sample_len == 0 {
+      drop(cache);
+      // Move the per-row logprobs out of the soon-dropped decoder (no clone).
+      return Ok((
+        rows,
+        std::mem::take(&mut decoder.sum_logprob),
+        no_speech_prob,
+      ));
+    }
+
+    // First sampled token for every row.
+    let last_matrix = last_position_matrix(&logits3d, self.n_group)?;
+    let filtered = self.apply_filters_batched(&last_matrix, &rows)?;
+    let last_tokens = last_tokens_of(&rows, self.tokenizer.sot())?;
+    let mut next = decoder.update(&filtered, &last_tokens)?;
+    push_row_tokens(&mut rows, &next)?;
+
+    // Subsequent single-token steps. The loop runs until every row has completed
+    // (the reference's `completed = mx.all(...)`) or the context / sample-len cap
+    // is hit. `rows[0].len()` is the shared sequence length (all rows grow in
+    // lockstep, an eot-stuck row re-emitting eot).
+    for _ in 1..self.sample_len {
+      if decoder.all_completed() || rows[0].len() > self.n_ctx {
+        break;
+      }
+      // Each row forwards only its own last token — `next` is already the
+      // `(n_group, 1)` row-major slice of the previous step's selected tokens.
+      let cache_ref = cache.as_ref();
+      let (logits3d, new_cache) =
+        self
+          .model
+          .decode_tokens_batched(&next, self.n_group, enc, cache_ref)?;
+      cache = Some(new_cache);
+
+      let matrix = last_position_matrix(&logits3d, self.n_group)?;
+      let filtered = self.apply_filters_batched(&matrix, &rows)?;
+      let last_tokens = last_tokens_of(&rows, self.tokenizer.eot())?;
+      let next_step = decoder.update(&filtered, &last_tokens)?;
+      push_row_tokens(&mut rows, &next_step)?;
+      // Carry this step's tokens as the next step's per-row input.
+      next = next_step;
+    }
+
+    drop(cache);
+    // Move the per-row logprobs out of the soon-dropped decoder (no clone).
+    Ok((
+      rows,
+      std::mem::take(&mut decoder.sum_logprob),
+      no_speech_prob,
+    ))
+  }
+
+  /// Run BOTH the single-sequence ([`Self::main_loop`]) and the batched
+  /// ([`Self::main_loop_batched`]) decode on the same already-encoded
+  /// `audio_features`, returning `((single_tokens, single_sum_logprob),
+  /// (batched_tokens, batched_sum_logprob))` — the parity-gate hook proving the
+  /// batched path is bit-identical to the single path at `n_group == 1`.
+  ///
+  /// The task must have `n_group == 1` (the default / no-`best_of` construction):
+  /// the batched loop then decodes a one-row group, broadcasting `enc` to
+  /// `(1, …)` (a clone). A bit-identical token list AND sum-logprob across the
+  /// two paths shows the batching introduced no regression.
+  #[cfg(test)]
+  fn run_both_for_parity(&self, audio_features: &Array) -> Result<ParityResult> {
+    let (single_tokens, single_sum, _) = self.main_loop(audio_features)?;
+    let enc = self
+      .model
+      .broadcast_encoder_states(audio_features, self.n_group)?;
+    let (rows, sums, _) = self.main_loop_batched(&enc)?;
+    // n_group == 1 → exactly one row.
+    Ok((
+      (single_tokens, single_sum),
+      (rows.into_iter().next().unwrap_or_default(), sums[0]),
+    ))
+  }
+
   /// Apply every logit filter, in order, to the `(n_vocab,)` row on device,
   /// returning the masked row.
   ///
@@ -970,6 +1684,75 @@ impl<'a> DecodingTask<'a> {
       row = filter.apply(&row, tokens)?;
     }
     Ok(row)
+  }
+
+  /// Apply every logit filter to a `(n_group, n_vocab)` matrix **per row**,
+  /// each row masked against its OWN token history — the batched
+  /// `for logit_filter in self.logit_filters: logits = logit_filter.apply(logits,
+  /// tokens)` (`decoding.py:599-600`), where the reference's filters build a
+  /// `(n_batch, V)` mask iterating per row `k` over `tokens[k]`
+  /// (`ApplyTimestampRules`, `:391-415`). Each row is sliced to `(n_vocab,)`,
+  /// run through [`Self::apply_filters`] with that row's history, and the masked
+  /// rows are re-stacked to `(n_group, n_vocab)`.
+  ///
+  /// # Errors
+  /// Propagates the per-filter device op errors, or a dimension overflow.
+  fn apply_filters_batched(&self, matrix: &Array, rows: &[Vec<u32>]) -> Result<Array> {
+    // No filters → the matrix is unchanged (avoids the slice/stack round-trip).
+    if self.logit_filters.is_empty() {
+      return matrix.try_clone();
+    }
+    let shape = matrix.shape();
+    let v = i32::try_from(shape[1]).map_err(|_| dim_overflow("n_vocab"))?;
+    let mut masked_rows: Vec<Array> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut masked_rows,
+      "DecodingTask: batched filter rows",
+      self.n_group,
+    )?;
+    for (g, history) in rows.iter().enumerate() {
+      let r = i32::try_from(g).map_err(|_| dim_overflow("row"))?;
+      let row = ops::indexing::slice(matrix, &[r, 0], &[r + 1, v], &[1, 1])?.reshape(&[v])?;
+      let masked = self.apply_filters(&row, history)?;
+      // Restore the `(1, n_vocab)` row shape for the concatenate.
+      masked_rows.push(masked.reshape(&[1, v])?);
+    }
+    // Reserve the reference vector fallibly (scales with `n_group`) instead of
+    // an infallible `.collect()`; the post-reserve `extend` cannot reallocate.
+    let mut refs: Vec<&Array> = Vec::new();
+    crate::model_validation::reserve_or_error(
+      &mut refs,
+      "DecodingTask: batched filter refs",
+      masked_rows.len(),
+    )?;
+    refs.extend(masked_rows.iter());
+    ops::shape::concatenate(&refs, 0)
+  }
+
+  /// `P(<|nospeech|>)` from a batched prefill's `(n_group, T, n_vocab)` logits —
+  /// the batched analogue of [`Self::no_speech_prob`]. Every candidate row
+  /// shares the same prefix and audio features, so the no-speech probability is
+  /// identical across rows; read it off row 0 (the reference's
+  /// `no_speech_probs[::n_group]`).
+  fn no_speech_prob_batched(&self, logits3d: &Array) -> Result<f64> {
+    let shape = logits3d.shape();
+    if shape.len() != 3 {
+      return Ok(f64::NAN);
+    }
+    let (t, v) = (shape[1], shape[2]);
+    if self.sot_index >= t || self.tokenizer.no_speech() as usize >= v {
+      return Ok(f64::NAN);
+    }
+    let si = i32::try_from(self.sot_index).map_err(|_| dim_overflow("sot_index"))?;
+    let vi = i32::try_from(v).map_err(|_| dim_overflow("n_vocab"))?;
+    // logits3d[0, sot_index, :] → (n_vocab,).
+    let row =
+      ops::indexing::slice(logits3d, &[0, si, 0], &[1, si + 1, vi], &[1, 1, 1])?.reshape(&[vi])?;
+    let probs = ops::misc::softmax_axis(&row, -1, true)?;
+    let ns = i32::try_from(self.tokenizer.no_speech()).map_err(|_| dim_overflow("no_speech"))?;
+    let mut cell = ops::indexing::slice(&probs, &[ns], &[ns + 1], &[1])?;
+    let p = cell.item::<f32>()?;
+    Ok(p as f64)
   }
 
   /// `P(<|nospeech|>)` at the sot position from the first forward's
@@ -1361,6 +2144,111 @@ fn last_position_row(logits3d: &Array) -> Result<Array> {
   ops::shape::contiguous(&row, false)
 }
 
+/// Extract the last-position `(n_group, n_vocab)` matrix from a `(n_group, T,
+/// n_vocab)` batched decoder output — the batched `logits[:, -1]`
+/// (`decoding.py:596`), cast to `F32` to match `Inference.logits`.
+///
+/// The matrix stays on device. Every candidate row's last-position logits are
+/// sliced together, so the batched decoder update / filters operate on the whole
+/// group at once.
+fn last_position_matrix(logits3d: &Array, n_group: usize) -> Result<Array> {
+  let shape = logits3d.shape();
+  if shape.len() != 3 || shape[0] != n_group {
+    return Err(Error::RankMismatch(crate::error::RankMismatchPayload::new(
+      "DecodingTask: batched decoder logits must be rank 3 (n_group, T, V)",
+      shape.len() as u32,
+      shape,
+    )));
+  }
+  let (g, t, v) = (shape[0], shape[1], shape[2]);
+  let gi = i32::try_from(g).map_err(|_| dim_overflow("n_group"))?;
+  let last = i32::try_from(t.saturating_sub(1)).map_err(|_| dim_overflow("T"))?;
+  let vi = i32::try_from(v).map_err(|_| dim_overflow("n_vocab"))?;
+  // logits3d[:, T-1, :] → (n_group, n_vocab).
+  let matrix = ops::indexing::slice(logits3d, &[0, last, 0], &[gi, last + 1, vi], &[1, 1, 1])?
+    .reshape(&[gi, vi])?;
+  let matrix = ops::misc::astype(&matrix, Dtype::F32)?;
+  ops::shape::contiguous(&matrix, false)
+}
+
+/// The flattened `(n_group * T)` token count as a `usize`, computed with checked
+/// arithmetic: `n_group` and `row_len` must each fit in `i32` ([`dim_overflow`],
+/// since both become MLX array dims) and their product must not wrap
+/// ([`Error::ArithmeticOverflow`]). A wrapped count would mis-size the row-major
+/// prefill buffer and feed [`WhisperModel::decode_tokens_batched`] a length that
+/// disagrees with `(n_group, T)`. Factored out (mirroring
+/// [`BatchedGreedyDecoder::split_count`]) so the arithmetic guard is unit-testable
+/// without realizing the giant buffer.
+fn flat_token_count(n_group: usize, row_len: usize) -> Result<usize> {
+  let g = i32::try_from(n_group).map_err(|_| dim_overflow("n_group"))?;
+  let t = i32::try_from(row_len).map_err(|_| dim_overflow("T"))?;
+  let total = crate::model_validation::checked_mul(
+    "flatten_rows: n_group * T flat token count",
+    "n_group",
+    g,
+    "T",
+    t,
+  )?;
+  // `total` is a non-negative `i32` here, so the cast back to `usize` is exact.
+  Ok(total as usize)
+}
+
+/// Flatten per-row token histories into a single row-major `(n_group * T)`
+/// slice for [`WhisperModel::decode_tokens_batched`]. Every row must have the
+/// same length `T` (the batched decode keeps all rows in lockstep).
+///
+/// The flat length scales with `n_group` (the consumer's `best_of`); compute it
+/// with [`flat_token_count`]'s checked arithmetic and reserve it fallibly so a
+/// within-i32 but heavyweight group surfaces a typed [`Error::AllocFailure`] /
+/// [`Error::ArithmeticOverflow`] instead of aborting in `Vec::with_capacity` or
+/// wrapping the `usize` capacity.
+fn flatten_rows(rows: &[Vec<u32>]) -> Result<Vec<u32>> {
+  let row_len = rows.first().map(Vec::len).unwrap_or(0);
+  let total = flat_token_count(rows.len(), row_len)?;
+  let mut flat: Vec<u32> = Vec::new();
+  crate::model_validation::reserve_or_error(&mut flat, "flatten_rows: prefill tokens", total)?;
+  for row in rows {
+    flat.extend_from_slice(row);
+  }
+  Ok(flat)
+}
+
+/// Each row's last token (`tokens[:, -1]`), defaulting to `fallback` for an
+/// empty row (never reached in practice — every row starts with the non-empty
+/// initial prefix).
+///
+/// The output scales with `n_group`; reserve it fallibly (a typed
+/// [`Error::AllocFailure`] on an outsized group) rather than collecting into an
+/// infallible `Vec`.
+fn last_tokens_of(rows: &[Vec<u32>], fallback: u32) -> Result<Vec<u32>> {
+  let mut out: Vec<u32> = Vec::new();
+  crate::model_validation::reserve_or_error(
+    &mut out,
+    "last_tokens_of: per-row last token",
+    rows.len(),
+  )?;
+  for r in rows {
+    out.push(r.last().copied().unwrap_or(fallback));
+  }
+  Ok(out)
+}
+
+/// Append each row's selected next token (`tokens = mx.concatenate([tokens,
+/// next_tokens[:, None]], axis=-1)`, `decoding.py:322`). `next` is parallel to
+/// `rows`.
+///
+/// Each row grows by one token; reserve that single slot fallibly per row so a
+/// row at the edge of available memory degrades to a typed
+/// [`Error::AllocFailure`] rather than aborting in `Vec::push`'s infallible
+/// reallocation.
+fn push_row_tokens(rows: &mut [Vec<u32>], next: &[u32]) -> Result<()> {
+  for (row, &n) in rows.iter_mut().zip(next) {
+    crate::model_validation::reserve_or_error(row, "push_row_tokens: appended token", 1)?;
+    row.push(n);
+  }
+  Ok(())
+}
+
 /// A dimension exceeding `i32::MAX`.
 fn dim_overflow(which: &'static str) -> Error {
   Error::OutOfRange(OutOfRangePayload::new(
@@ -1659,6 +2547,18 @@ pub fn decode_with_fallback(
   for &t in temperatures {
     let mut options = base_options.clone();
     options.temperature = t;
+    // Per-temperature option sanitization (`whisper.py:944-952`): at the greedy
+    // temperature (`t == 0`) `best_of` is dropped so the attempt is plain greedy
+    // (`best_of` needs `t > 0` to draw distinct trajectories and is otherwise
+    // rejected by [`DecodingTask::verify_options_and_group`]); the positive
+    // temperatures keep it. Without this, a caller pairing `best_of` with the
+    // default schedule (which starts at `0.0`) would have the very first attempt
+    // rejected before any `best_of` retry could run. (The reference also pops
+    // `beam_size`/`patience` at `t > 0`; mlxrs rejects `beam_size` outright, so
+    // only the `best_of`-at-`t == 0` drop is meaningful here.)
+    if t == 0.0 {
+      options.best_of = None;
+    }
     let result = decode_resolved(model, tokenizer, &audio_features, options, language)?;
     let acceptable = result_is_acceptable(
       &result,

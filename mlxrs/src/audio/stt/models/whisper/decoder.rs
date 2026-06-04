@@ -158,7 +158,42 @@ impl TextDecoder {
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
-    let (logits, cache, _cross_qk) = self.run(tokens, xa, kv_cache, false)?;
+    let (logits, cache, _cross_qk) = self.run(tokens, 1, xa, kv_cache, false)?;
+    Ok((logits, cache))
+  }
+
+  /// Run the decoder over `n_group` parallel candidate rows — the batched
+  /// (`n_group > 1`) form of [`Self::forward`] underneath best-of-N / beam
+  /// sampling (the reference's `(n_audio * n_group, T)` decode,
+  /// `decoding.py:657-667`).
+  ///
+  /// `tokens` is the `(n_group, T_new)` new-window ids in **row-major** order
+  /// (`tokens[g * T_new + t]` is row `g`'s `t`-th new token), its length an
+  /// exact multiple of `n_group`. `xa` is the encoder states broadcast to
+  /// `(n_group, n_audio_ctx, n_audio_state)`, so every candidate's
+  /// cross-attention K/V batches the same width as its self-attention K/V (the
+  /// rows decode independently — they differ once sampling diverges). Returns
+  /// `(logits, updated_cache)` with logits `(n_group, T_new, n_vocab)`.
+  ///
+  /// `n_group == 1` is exactly [`Self::forward`] — the same `run` call with the
+  /// same single `(1, T)` array — so the single-sequence path is unchanged.
+  ///
+  /// # Errors
+  /// - [`Error::OutOfRange`] if `n_group` is `0`, `tokens.len()` is not a
+  ///   multiple of `n_group`, the per-row window is empty, an id is `>=
+  ///   n_vocab`, `offset + T` exceeds the positional table, or a dimension
+  ///   overflows `i32`;
+  /// - [`Error::AllocFailure`] if the fresh per-block cache vector cannot be
+  ///   reserved;
+  /// - propagates the embedding / block / LayerNorm / logit op errors.
+  pub(crate) fn forward_batched(
+    &self,
+    tokens: &[u32],
+    n_group: usize,
+    xa: &Array,
+    kv_cache: Option<&DecoderKvCache>,
+  ) -> Result<(Array, DecoderKvCache)> {
+    let (logits, cache, _cross_qk) = self.run(tokens, n_group, xa, kv_cache, false)?;
     Ok((logits, cache))
   }
 
@@ -185,7 +220,7 @@ impl TextDecoder {
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
-    self.run(tokens, xa, kv_cache, true)
+    self.run(tokens, 1, xa, kv_cache, true)
   }
 
   /// The shared decoder forward, optionally collecting the per-layer cross-
@@ -195,28 +230,52 @@ impl TextDecoder {
   ///
   /// This is the SINGLE lowest crate-visible chokepoint every decoder gather
   /// path funnels through: it takes the new-window token ids as a host `&[u32]`
-  /// slice, value-checks every id `< n_vocab` and builds the `(1, T)` `u32`
-  /// decoder-input array internally, so the rank/batch and dtype classes are
-  /// impossible by construction and only the value-range class is a runtime
-  /// check — done once on host data before the embedding gather, so no
+  /// slice (the `(n_group, T)` rows in row-major order, `n_group == 1` for the
+  /// single-sequence path), value-checks every id `< n_vocab` and builds the
+  /// `(n_group, T)` `u32` decoder-input array internally, so the rank and dtype
+  /// classes are impossible by construction and only the value-range class is a
+  /// runtime check — done once on host data before the embedding gather, so no
   /// out-of-range id (which would index out of bounds in the `(n_vocab,
   /// n_text_state)` token-embedding row gather) can reach the gather from any
   /// caller, current or future.
   ///
   /// # Errors
-  /// See [`Self::forward`].
+  /// See [`Self::forward_batched`].
   fn run(
     &self,
     tokens: &[u32],
+    n_group: usize,
     xa: &Array,
     kv_cache: Option<&DecoderKvCache>,
     collect_cross_qk: bool,
   ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
     let offset = Self::cache_offset(kv_cache);
-    let seq_len = tokens.len();
+
+    // `n_group >= 1`: the batch dimension (1 for the single-sequence path, the
+    // candidate count for best-of-N). A zero group count has no rows to decode
+    // and would divide-by-zero below.
+    if n_group == 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: candidate group count",
+        "must be >= 1",
+        format_smolstr!("n_group={n_group}"),
+      )));
+    }
+    // `tokens` is the `(n_group, T)` new window in row-major order, so its
+    // length must split evenly into the rows. A ragged slice cannot form a
+    // rectangular `(n_group, T)` array.
+    if !tokens.len().is_multiple_of(n_group) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: token window length",
+        "must be a multiple of the candidate group count",
+        format_smolstr!("len={}, n_group={n_group}", tokens.len()),
+      )));
+    }
+    let seq_len = tokens.len() / n_group;
 
     // `T > 0`: an empty window has no tokens to forward (and would build a
-    // degenerate `(1, 0)` array). Checked on the slice before any allocation.
+    // degenerate `(n_group, 0)` array). Checked on the slice before any
+    // allocation.
     if seq_len == 0 {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
         "TextDecoder: token window length",
@@ -248,10 +307,11 @@ impl TextDecoder {
     // allocation precedes the typed error.
     self.check_context(offset, seq_len)?;
 
-    // Build the `(1, T)` `u32` decoder-input array from the validated slice —
-    // the rank/batch and dtype are fixed by construction. The `i32` `T`
-    // conversion is the dimension the embedding gather / positional slice will
-    // perform; guard it here, matching the positional-slice `i32` guards.
+    // Build the `(n_group, T)` `u32` decoder-input array from the validated
+    // slice — the rank and dtype are fixed by construction. The `i32` `T` /
+    // `n_group` conversions are the dimensions the embedding gather / positional
+    // slice will perform; guard them here, matching the positional-slice `i32`
+    // guards. `n_group == 1` recovers the single-sequence `(1, T)` array.
     let t = i32::try_from(seq_len).map_err(|_| {
       Error::OutOfRange(OutOfRangePayload::new(
         "TextDecoder: token window length",
@@ -259,7 +319,14 @@ impl TextDecoder {
         format_smolstr!("{seq_len}"),
       ))
     })?;
-    let tokens = Array::from_slice::<u32>(tokens, &[1, t])?;
+    let g = i32::try_from(n_group).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "TextDecoder: candidate group count",
+        "must fit in i32",
+        format_smolstr!("{n_group}"),
+      ))
+    })?;
+    let tokens = Array::from_slice::<u32>(tokens, &[g, t])?;
 
     // `x = token_embedding(tokens) + positional_embedding[offset:offset+T]`.
     let token_emb = self.token_embedding.forward(&tokens)?;

@@ -638,6 +638,11 @@ impl<'a> WhisperStreaming<'a> {
       task: task_to_whisper(self.options.task),
       language: self.options.language.clone(),
       temperature: self.options.temperature,
+      // Streaming decodes a single AlignAtt trajectory per chunk — no best-of /
+      // beam batching.
+      best_of: None,
+      beam_size: None,
+      length_penalty: None,
       sample_len: Some(sample_len),
       prompt: Vec::new(),
       prefix,
