@@ -410,6 +410,12 @@ impl Lfm2Vl {
   /// [`crate::vlm::models::lfm2_vl::preprocess_image`] path ignores the tiling
   /// knobs.
   ///
+  /// Also threads the checkpoint's `use_image_special_tokens` (`config.py:87`)
+  /// so [`expand_image_tokens`](super::processor::expand_image_tokens) honors it:
+  /// when `false`, no `image_start` / `image_end` brackets are emitted around the
+  /// `<image>` run (the bracket ids are still left `None` here — supplied by the
+  /// tokenizer-resolving caller — but the flag gates them either way).
+  ///
   /// # Errors
   /// Propagates [`Lfm2VlProcessorConfig::new`] / `with_tiling` validation (a
   /// non-positive dimension, an inverted tile / token band, a non-finite
@@ -419,18 +425,25 @@ impl Lfm2Vl {
     let factor = c.downsample_factor.max(1) as u32;
     let patch_size = c.vision_config.patch_size.max(1) as u32;
     let max_num_patches = c.max_num_patches.max(1) as u32;
-    Lfm2VlProcessorConfig::new(c.image_token_index, factor, patch_size, max_num_patches)?
-      .with_tiling(
-        c.do_image_splitting,
-        c.min_tiles.max(1) as u32,
-        c.max_tiles.max(1) as u32,
-        c.use_thumbnail,
-        c.min_image_tokens.max(1) as u32,
-        c.max_image_tokens.max(1) as u32,
-        c.encoder_patch_size.max(1) as u32,
-        c.tile_size.max(1) as u32,
-        c.max_pixels_tolerance,
-      )
+    Ok(
+      Lfm2VlProcessorConfig::new(c.image_token_index, factor, patch_size, max_num_patches)?
+        .with_tiling(
+          c.do_image_splitting,
+          c.min_tiles.max(1) as u32,
+          c.max_tiles.max(1) as u32,
+          c.use_thumbnail,
+          c.min_image_tokens.max(1) as u32,
+          c.max_image_tokens.max(1) as u32,
+          c.encoder_patch_size.max(1) as u32,
+          c.tile_size.max(1) as u32,
+          c.max_pixels_tolerance,
+        )?
+        // Honor the checkpoint's `use_image_special_tokens` (`config.py:87`): when
+        // `false`, `expand_image_tokens` emits no image start / end brackets, so
+        // the prompt token layout stays aligned with the reference and the
+        // image-feature / token counts do not desync.
+        .with_use_image_special_tokens(c.use_image_special_tokens),
+    )
   }
 
   /// Split ONE decoded interleaved-RGB image into its HF-tiling sub-image
@@ -446,6 +459,14 @@ impl Lfm2Vl {
   /// [`expand_image_tokens`](crate::vlm::models::lfm2_vl::expand_image_tokens)
   /// for the matching `<image>`-token run (each sub-image bracketed +
   /// concatenated).
+  ///
+  /// This is an **explicit opt-in** tiling API. The default
+  /// [`vlm_generate`](crate::vlm::generate::vlm_generate) inference path uses the
+  /// native-resolution [`Lfm2VlImageProcessor`] (NaFlex, no tiling — faithful to
+  /// mlx-vlm, which forces `do_image_splitting = False`); it does **not** call
+  /// this. Routing tiling through `vlm_generate` is a deferred follow-up that
+  /// needs the [`ImageProcessor`] trait extended to emit multiple sub-images per
+  /// image (see the [`Lfm2VlImageProcessor`] docs).
   ///
   /// `rgb` is `width * height * 3` row-major interleaved RGB bytes. The
   /// processor config is built by [`processor_config`](Self::processor_config).
@@ -619,6 +640,24 @@ impl VlmModel for Lfm2Vl {
 /// [`ProcessedImage`] carrying that tensor as `pixels`, the `spatial_shape` +
 /// `patch_mask` as the [`NativeResolution`] companions, and the per-image
 /// `ceil(H_p / f) * ceil(W_p / f)` image-token count.
+///
+/// ## Primary path is NaFlex; tiling is opt-in
+///
+/// This primary path is **always** native-resolution NaFlex and **never** tiles,
+/// faithful to mlx-vlm — whose `processing_lfm2_vl.py` defers to the slow
+/// SigLIP2 processor and FORCES `do_image_splitting = False`
+/// (`processing_lfm2_vl.py:196, 270-273`); the HF-transformers image-tiling path
+/// lives only in `Lfm2VlImageProcessorFast`. So [`new`](Self::new) pins
+/// `do_image_splitting = false` on the config here (it is not silently advertised
+/// then ignored), and `process` does not consult the splitting flag.
+///
+/// The HF tiling math is still ported and reachable as an **explicit opt-in** via
+/// [`Lfm2Vl::split_image`](Lfm2Vl::split_image) (which honors the checkpoint's
+/// `do_image_splitting`). Wiring tiling into this primary `vlm_generate` flow
+/// would require extending the [`ImageProcessor`] trait so a single `process`
+/// call can return multiple tile + thumbnail sub-images (today it returns one
+/// [`ProcessedImage`]) and threading their per-tile grids into the prompt
+/// `<image>`-run expansion — a deferred follow-up, intentionally not done here.
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
 #[derive(Debug)]
@@ -656,7 +695,15 @@ impl Lfm2VlImageProcessor {
     )
     .unwrap_or_else(|_| {
       Lfm2VlProcessorConfig::new(0, 1, 1, 1).expect("SigLIP default processor config is valid")
-    });
+    })
+    // The primary `ImageProcessor` path is native-resolution NaFlex and never
+    // tiles; pin `do_image_splitting = false` so the config does not advertise a
+    // split this path will not perform. This mirrors mlx-vlm, which FORCES
+    // `do_image_splitting = False` for its slow SigLIP2 NaFlex processor
+    // (`processing_lfm2_vl.py:196, 270-273`); the opt-in
+    // [`Lfm2Vl::split_image`](Lfm2Vl::split_image) tiling path keeps the
+    // checkpoint's flag via [`processor_config`](Lfm2Vl::processor_config).
+    .with_do_image_splitting(false);
     Self {
       cfg,
       downsample_factor: factor,

@@ -353,11 +353,48 @@ impl Lfm2VlProcessorConfig {
   /// Set the `<image_start>` / `<image_end>` bracket ids + enable bracketing
   /// (`use_image_special_tokens = true`). When either id is `None` the
   /// corresponding bracket is omitted even with bracketing enabled.
+  ///
+  /// This is the "supply the ids *and* turn bracketing on" convenience. To honor
+  /// a checkpoint's `use_image_special_tokens = false` (which suppresses the
+  /// brackets even when the ids exist), call [`with_use_image_special_tokens`]
+  /// *after* this, or set the ids with the individual setters and gate with
+  /// [`with_use_image_special_tokens`].
+  ///
+  /// [`with_use_image_special_tokens`]: Self::with_use_image_special_tokens
   #[must_use]
   pub fn with_special_tokens(mut self, start: Option<i32>, end: Option<i32>) -> Self {
     self.image_start_token = start;
     self.image_end_token = end;
     self.use_image_special_tokens = true;
+    self
+  }
+
+  /// Set whether images are bracketed by the `image_start` / `image_end` ids —
+  /// the checkpoint's `use_image_special_tokens`
+  /// (`config.py:87`, `processing_lfm2_vl.py:330-331`, default `true`). When
+  /// `false`, [`expand_image_tokens`] emits **no** start / end brackets even if
+  /// both ids are set, matching the reference's `if use_image_special_tokens:`
+  /// gate (`processing_lfm2_vl.py:388-400`); the `<image>` placeholder still
+  /// expands to its per-image token run, so the image-feature / token counts stay
+  /// consistent.
+  #[must_use]
+  pub fn with_use_image_special_tokens(mut self, enabled: bool) -> Self {
+    self.use_image_special_tokens = enabled;
+    self
+  }
+
+  /// Override only the `do_image_splitting` flag, leaving the other tiling knobs
+  /// at their current values. Used to pin the native-resolution primary path to
+  /// `false` — mlx-vlm's `processing_lfm2_vl.py` forces
+  /// `do_image_splitting = False` for the slow SigLIP2 NaFlex processor
+  /// (`processing_lfm2_vl.py:196, 270-273`), so the primary
+  /// [`Lfm2VlImageProcessor`](super::model::Lfm2VlImageProcessor) path never
+  /// advertises tiling it does not perform. The opt-in [`tile_image`] /
+  /// `split_image` path builds its config via [`with_tiling`](Self::with_tiling)
+  /// and keeps the checkpoint's flag.
+  #[must_use]
+  pub fn with_do_image_splitting(mut self, enabled: bool) -> Self {
+    self.tiling.do_image_splitting = enabled;
     self
   }
 
@@ -1097,26 +1134,51 @@ impl TilePlan {
 
 /// Round `number` to the closest integer multiple of `factor` — HF
 /// `round_by_factor` (`image_processing_lfm2_vl.py:40-42`):
-/// `round(number / factor) * factor`. `factor` must be `> 0`. Uses banker's-free
-/// round-half-away-from-zero on the ratio (Rust's `f64::round`), matching
-/// Python's `round` for the non-half case (the inputs here are integer pixel
-/// dims, so a half ratio is rare and the model is robust to a 1-patch
-/// difference either way).
+/// `round(number / factor) * factor`. `factor` must be `> 0`.
+///
+/// Python's built-in `round` is round-half-to-**even** (banker's rounding), so a
+/// quotient landing exactly on `.5` ties to the nearest even integer (e.g.
+/// `round(6.5) == 6`, `round(7.5) == 8`) — *not* round-half-away-from-zero like
+/// Rust's `f64::round`. The two diverge on exact half-ties: `208 / 32 == 6.5`
+/// rounds to `6` (HF) → `192`, but `6.5_f64.round() == 7.0` → `224`. When the
+/// rounded dims then stay within the patch budget, that one-multiple gap
+/// propagates into different tile grids / image-token counts than the reference.
+/// The inputs here are integer pixel dims, so the quotient `number / factor` is
+/// rational and the tie (`number % factor == factor / 2`, `factor` even) is
+/// resolved exactly with integer arithmetic — no float rounding involved.
 #[cfg(feature = "lfm2-vl")]
 fn round_by_factor(number: u32, factor: u32) -> Result<u32> {
   require_positive_u32("lfm2_vl tiling: round_by_factor factor", factor)?;
-  let r = (f64::from(number) / f64::from(factor)).round();
-  // `r * factor` is bounded by `number` rounded to a multiple — within u32 for
-  // the capped source dims; compute in f64 then narrow with a checked cast.
-  let scaled = r * f64::from(factor);
-  if !(0.0..=f64::from(u32::MAX)).contains(&scaled) {
-    return Err(Error::OutOfRange(OutOfRangePayload::new(
+  // Round `number / factor` to the nearest integer with ties-to-even, matching
+  // Python's `round`. `q` is the floor quotient, `r` the remainder; compare
+  // `2 * r` against `factor` to classify below / above / exactly-half. `2 * r`
+  // is `< 2 * factor <= 2 * u32::MAX`, so widen to `u64` to avoid an overflow.
+  let q = number / factor;
+  let r = number % factor;
+  let twice_r = u64::from(r) * 2;
+  let factor_w = u64::from(factor);
+  let rounded_q = if twice_r < factor_w {
+    q
+  } else if twice_r > factor_w {
+    q + 1
+  } else if q.is_multiple_of(2) {
+    // Exact half-tie: round to the even neighbour (HF / Python `round`).
+    q
+  } else {
+    q + 1
+  };
+  // `rounded_q * factor` is the closest multiple, bounded by `number` rounded up
+  // by at most `factor`; that can exceed `u32::MAX` only for a `number` already
+  // near the top of the range (the source dims are capped well below it).
+  // Compute in `u64` and narrow with a checked cast.
+  let scaled = u64::from(rounded_q) * factor_w;
+  u32::try_from(scaled).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
       "lfm2_vl tiling: round_by_factor result",
       "rounded multiple must fit in u32",
       smol_str::format_smolstr!("{scaled}"),
-    )));
-  }
-  Ok(scaled as u32)
+    ))
+  })
 }
 
 /// HF `find_closest_aspect_ratio` (`image_processing_lfm2_vl.py:45-82`): from

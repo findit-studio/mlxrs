@@ -265,6 +265,44 @@ fn expand_single_image_with_brackets() {
 }
 
 #[test]
+fn expand_honors_use_image_special_tokens_flag() {
+  // `use_image_special_tokens = false` suppresses the brackets even when both
+  // ids are present (`processing_lfm2_vl.py:388-400`'s `if use_image_special_
+  // tokens:` gate). The `<image>` run is identical to the bracketed case; only
+  // the start/end ids are dropped — so the image-feature / token count is the
+  // same 4 placeholders either way, no desync.
+  let ids = [1, 396, 2];
+  let grids = [(4, 4)];
+
+  let on = tiny_cfg(16).with_special_tokens(Some(100), Some(101));
+  assert!(on.use_image_special_tokens());
+  let out_on = expand_image_tokens(&ids, &grids, &on).unwrap();
+  assert_eq!(out_on, vec![1, 100, 396, 396, 396, 396, 101, 2]);
+
+  // Same ids, but gate the flag off AFTER supplying them.
+  let off = tiny_cfg(16)
+    .with_special_tokens(Some(100), Some(101))
+    .with_use_image_special_tokens(false);
+  assert!(!off.use_image_special_tokens());
+  let out_off = expand_image_tokens(&ids, &grids, &off).unwrap();
+  assert_eq!(
+    out_off,
+    vec![1, 396, 396, 396, 396, 2],
+    "no brackets when flag off"
+  );
+
+  // The number of `<image>` placeholder tokens is identical with the flag on or
+  // off (only the 2 bracket ids differ) — the count stays consistent.
+  let count_images = |v: &[i32]| v.iter().filter(|&&t| t == 396).count();
+  assert_eq!(count_images(&out_on), count_images(&out_off));
+  assert_eq!(
+    out_on.len(),
+    out_off.len() + 2,
+    "exactly the 2 brackets differ"
+  );
+}
+
+#[test]
 fn expand_multi_image_packs_in_order() {
   // Two images: first grid (4,4) -> 4 tokens, second grid (5,7) -> 12 tokens.
   // Placeholders at two positions; each expands to its own count, in order.
@@ -346,6 +384,65 @@ fn with_tiling_rejects_invalid_params() {
     base
       .with_tiling(true, 2, 10, false, 64, 256, 16, 0, 2.0)
       .unwrap_err(),
+    Error::OutOfRange(_)
+  ));
+}
+
+#[test]
+fn round_by_factor_ties_to_even_like_python() {
+  // HF `round_by_factor` (`image_processing_lfm2_vl.py:40-42`) is
+  // `round(number / factor) * factor`, and Python's `round` ties to EVEN. On an
+  // exact half-tie (`number % factor == factor / 2`) the quotient rounds to its
+  // nearest even neighbour — NOT away from zero. These pin the exact-tie cases
+  // that round-half-away-from-zero (Rust `f64::round`) would get wrong:
+  //   208/32 = 6.5 -> 6 (even)  -> 192   (away-from-zero would give 224)
+  //   240/32 = 7.5 -> 8 (even)  -> 256
+  //    48/32 = 1.5 -> 2 (even)  -> 64
+  //    16/32 = 0.5 -> 0 (even)  -> 0
+  assert_eq!(
+    round_by_factor(208, 32).unwrap(),
+    192,
+    "6.5 ties down to 6 (even)"
+  );
+  assert_eq!(
+    round_by_factor(240, 32).unwrap(),
+    256,
+    "7.5 ties up to 8 (even)"
+  );
+  assert_eq!(
+    round_by_factor(48, 32).unwrap(),
+    64,
+    "1.5 ties up to 2 (even)"
+  );
+  assert_eq!(
+    round_by_factor(16, 32).unwrap(),
+    0,
+    "0.5 ties down to 0 (even)"
+  );
+  // The reported divergence: 208@32 is 192, never the away-from-zero 224.
+  assert_ne!(round_by_factor(208, 32).unwrap(), 224);
+}
+
+#[test]
+fn round_by_factor_non_tie_rounds_to_nearest() {
+  // Non-half quotients round to the nearest multiple (ties-to-even is moot).
+  //   200/32 = 6.25  -> 6 -> 192
+  //   220/32 = 6.875 -> 7 -> 224
+  //   100/16 = 6.25  -> 6 -> 96
+  //   110/16 = 6.875 -> 7 -> 112
+  assert_eq!(round_by_factor(200, 32).unwrap(), 192);
+  assert_eq!(round_by_factor(220, 32).unwrap(), 224);
+  assert_eq!(round_by_factor(100, 16).unwrap(), 96);
+  assert_eq!(round_by_factor(110, 16).unwrap(), 112);
+  // An exact multiple is unchanged, and any factor of 1 is the identity.
+  assert_eq!(round_by_factor(192, 32).unwrap(), 192);
+  assert_eq!(round_by_factor(207, 1).unwrap(), 207);
+}
+
+#[test]
+fn round_by_factor_rejects_zero_factor() {
+  assert!(matches!(
+    round_by_factor(208, 0).unwrap_err(),
     Error::OutOfRange(_)
   ));
 }

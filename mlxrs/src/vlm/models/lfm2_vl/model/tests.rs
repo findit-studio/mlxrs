@@ -562,6 +562,61 @@ fn vlm_trait_image_processor_config_is_siglip() {
   assert_eq!(cfg.resample(), crate::vlm::image::ResizeFilter::Bilinear);
 }
 
+#[test]
+fn processor_config_threads_use_image_special_tokens() {
+  // The `ModelConfig::use_image_special_tokens` flag (default true) must reach
+  // the built `Lfm2VlProcessorConfig`, so a `false` checkpoint does not emit
+  // image start/end brackets (`processing_lfm2_vl.py:330-331, 388-400`).
+  let model = dense_model();
+  assert!(
+    model.config().use_image_special_tokens,
+    "tiny config defaults the flag to true (upstream parity)"
+  );
+  assert!(
+    model.processor_config().unwrap().use_image_special_tokens(),
+    "the default-true flag must thread through processor_config()"
+  );
+
+  // A checkpoint with the flag OFF must produce a processor config with
+  // bracketing disabled.
+  let mut cfg = tiny_config(false);
+  cfg.use_image_special_tokens = false;
+  let model_off = Lfm2Vl::from_weights(cfg, dense_weights(), None).unwrap();
+  assert!(
+    !model_off
+      .processor_config()
+      .unwrap()
+      .use_image_special_tokens(),
+    "use_image_special_tokens=false must thread through to suppress brackets"
+  );
+}
+
+#[test]
+fn primary_image_processor_pins_no_split() {
+  // The model config defaults `do_image_splitting = true` (HF default), but the
+  // primary native-resolution `ImageProcessor` path never tiles, so its config
+  // must pin `do_image_splitting = false` — faithful to mlx-vlm, which forces it
+  // false for the slow SigLIP2 path. This guarantees the primary path does not
+  // silently advertise a split it will not perform.
+  let model = dense_model();
+  assert!(
+    model.config().do_image_splitting,
+    "tiny config defaults do_image_splitting to true (HF parity)"
+  );
+  let proc = Lfm2VlImageProcessor::new(model.config());
+  assert!(
+    !proc.cfg.do_image_splitting(),
+    "the primary NaFlex processor must pin do_image_splitting=false"
+  );
+
+  // The opt-in tiling config (built via processor_config) STILL reflects the
+  // checkpoint's flag — only the primary processor path pins it false.
+  assert!(
+    model.processor_config().unwrap().do_image_splitting(),
+    "split_image()'s config keeps the checkpoint's do_image_splitting"
+  );
+}
+
 // ───────────────────────── native-resolution processor ─────────────────────────
 
 /// Build a deterministic `w × h` RGB PNG at `path` (a real file
