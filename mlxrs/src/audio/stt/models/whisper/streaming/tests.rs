@@ -229,6 +229,132 @@ fn alignatt_frame_attention_rejects_zero_content_frames() {
   );
 }
 
+// ─────────────────── 2b. real cached decode path (AlignAtt) ────────────────
+// The synthetic-cross-qk tests above feed a `T > 1` matrix straight into
+// `alignatt_frame_attention`; they cannot exercise the cached decode loop, where
+// every warm step's `decode_step_with_cross_qk` returns only the NEW token's
+// single (`T == 1`) cross-attention row. These tests drive the REAL
+// `decode_aligned` accumulation loop end-to-end: the per-step rows must be
+// concatenated along the token axis so the policy normalizes over the full token
+// sequence. Without that accumulation, a lone `T == 1` row normalizes to zero
+// across the token axis, the argmax collapses to frame 0, and `content_frames -
+// 0 > threshold` makes the policy commit unconditionally — exactly the bug these
+// tests fail on.
+
+/// Build a tiny biased model, its tokenizer, and a synthetic 1 s waveform for
+/// the real cached-decode tests. The model is biased to token `13` so greedy
+/// decode is deterministic and the loop runs the full `sample_len` cached steps.
+/// The samples are returned raw so each call can build a fresh wrapper + task
+/// (the borrowed-vocabulary wrapper cannot outlive a single task).
+fn cached_decode_fixture(dir_tag: &str) -> (WhisperModel, Tokenizer, Vec<f32>) {
+  let dir = fresh_dir(dir_tag);
+  let tok = write_tokenizer(dir.as_path());
+  let model = stream_model(13);
+  let samples: Vec<f32> = (0..16_000)
+    .map(|i| ((i % 50) as f32 / 50.0) - 0.5)
+    .collect();
+  (model, tok, samples)
+}
+
+/// Run one real cached `decode_aligned` over the fixture audio with the given
+/// `content_frames` / `frame_threshold`, returning the committed token count.
+/// This goes through the ACTUAL warm-cache loop (single-row cross-qk per step),
+/// so it exercises the accumulation.
+fn cached_committed(
+  model: &WhisperModel,
+  tok: &Tokenizer,
+  samples: &[f32],
+  sample_len: usize,
+  content_frames: usize,
+  frame_threshold: usize,
+) -> usize {
+  use crate::audio::stt::models::whisper::decoding::{DecodingOptions, DecodingTask, SuppressSpec};
+  let wrapper = HFTokenizerWrapper::new(tok, true, 2, Some("en"), WhisperTask::Transcribe).unwrap();
+  let audio = Array::from_slice::<f32>(samples, &[samples.len() as i32]).unwrap();
+  let mel = log_mel_spectrogram_whisper(&audio, model.dims().n_mels(), 0).unwrap();
+  let mel_window = super::super::audio::pad_or_trim(&mel, N_FRAMES, 0).unwrap();
+  let enc = model.encode(&mel_window).unwrap();
+  let decode = DecodingOptions {
+    task: super::super::tokenizer::Task::Transcribe,
+    language: Some("en".into()),
+    temperature: 0.0,
+    sample_len: Some(sample_len),
+    prompt: Vec::new(),
+    prefix: Vec::new(),
+    suppress_tokens: SuppressSpec::NonSpeech,
+    suppress_blank: true,
+    without_timestamps: true,
+    max_initial_timestamp: None,
+  };
+  let task = DecodingTask::new(model, &wrapper, decode).unwrap();
+  let aligned = task
+    .decode_aligned(&enc, content_frames, frame_threshold)
+    .unwrap();
+  // `frames` stays parallel to the committed tokens, and every committed frame is
+  // safely behind the live edge per the policy inequality.
+  assert_eq!(
+    aligned.frames.len(),
+    aligned.tokens.len(),
+    "committed frames stay parallel to committed tokens"
+  );
+  for &f in &aligned.frames {
+    assert!(
+      content_frames.saturating_sub(f) > frame_threshold,
+      "a committed token's frame {f} must be > threshold behind content_frames \
+       {content_frames}"
+    );
+  }
+  aligned.tokens.len()
+}
+
+#[test]
+fn alignatt_cached_path_waits_near_edge_commits_when_behind() {
+  // The discriminating regression for the warm-cache accumulation. With the audio
+  // edge FAR behind the model's attended frames (`content_frames` large), the
+  // policy commits the whole `sample_len`. Pulling the edge IN toward those
+  // frames makes the policy WAIT partway, committing strictly FEWER tokens.
+  //
+  // A `T == 1`-row bug (most-attended frame collapses to 0) cannot produce this
+  // gap: with most-attended ≡ 0, the commit test is `content_frames - 0 >
+  // threshold`, which is identical for both `content_frames` here (both `> 2`),
+  // so a broken decode commits the SAME (full) count in both cases. The fixed
+  // accumulation yields a real, non-zero attended frame, so the near-edge case
+  // genuinely waits.
+  let (model, tok, samples) = cached_decode_fixture("cached_wait_commit");
+  let sample_len = 6usize;
+  let threshold = 2usize;
+
+  // Edge far behind the attended frames → commit the full budget.
+  let committed_far = cached_committed(&model, &tok, &samples, sample_len, 5, threshold);
+  assert_eq!(
+    committed_far, sample_len,
+    "edge far behind the peak commits the whole sample_len"
+  );
+
+  // Edge pulled in toward the attended frames → the policy waits partway.
+  let committed_near = cached_committed(&model, &tok, &samples, sample_len, 4, threshold);
+  assert!(
+    committed_near < committed_far,
+    "edge near the peak must WAIT and commit fewer ({committed_near}) than the \
+     far case ({committed_far}); a T==1-collapse bug would commit the same count"
+  );
+}
+
+#[test]
+fn alignatt_cached_path_waits_entirely_at_the_boundary() {
+  // When the audio edge sits AT/within the threshold of every attended frame, the
+  // accumulation-normalized argmax keeps the peak inside the boundary band and
+  // the policy commits NOTHING (`current_tokens[:, :-1]; break` on the first
+  // token). This pins the WAIT branch of the real loop (not the synthetic
+  // `alignatt_frame_attention` path).
+  let (model, tok, samples) = cached_decode_fixture("cached_wait_all");
+  let committed = cached_committed(&model, &tok, &samples, 6, 1, 2);
+  assert_eq!(
+    committed, 0,
+    "edge at the boundary holds every token back (commits nothing)"
+  );
+}
+
 // ───────────────────────── 3. streaming loop ──────────────────────────────
 
 #[test]

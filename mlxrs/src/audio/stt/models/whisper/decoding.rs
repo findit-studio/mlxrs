@@ -1061,10 +1061,25 @@ impl<'a> DecodingTask<'a> {
     // continuation prefix the streaming layer set, e.g. the committed in-window
     // tokens). The no-speech probability is a property of this prefill's sot
     // position, matching `main_loop`.
-    let (logits3d, _cross_qk) = self
+    let (logits3d, prefix_cross_qk) = self
       .model
       .decode_step_with_cross_qk(&mut cache, enc, &tokens)?;
     let no_speech_prob = self.no_speech_prob(&logits3d)?;
+
+    // The running per-decoder-layer cross-attention over the FULL current token
+    // sequence, seeded from the prefix forward's rows. Each warm decode step
+    // forwards only the new token, so that step's `cross_qk` carries a single
+    // token-axis row; appending it here reconstructs the same `(heads, T,
+    // frames)` matrix the cacheless full-sequence forward would produce, because
+    // a token's cross-attention is fixed once decoded (the causal self-attention
+    // means later tokens never change an earlier token's row). `alignatt_frame_
+    // attention` std-normalizes ACROSS this token axis, so it must see every
+    // token's row, not a lone `T == 1` step (a single row normalizes to zero and
+    // collapses the argmax to frame 0). The reference accumulates its per-layer
+    // attention across the chunk's decode and normalizes over the full token
+    // sequence (`simul_whisper.py`: the `dec_attns` list is reset per chunk and
+    // each layer's rows are `torch.cat(.., dim=0)` before `std_mean(dim=-2)`).
+    let mut cross_qk_acc = prefix_cross_qk;
 
     // The committed argmax frame per sampled token (parallel to the sampled tail
     // `tokens[sample_begin..]`).
@@ -1099,10 +1114,17 @@ impl<'a> DecodingTask<'a> {
       // attention, then apply the AlignAtt policy to decide commit vs wait. The
       // `< n_ctx` loop guard keeps this pushed prefix `<= n_ctx`.
       tokens.push(next);
-      let (next_logits, cross_qk) = self
+      let (next_logits, step_cross_qk) = self
         .model
         .decode_step_with_cross_qk(&mut cache, enc, &tokens)?;
-      let frames = timing::alignatt_frame_attention(self.model, &cross_qk, content_frames)?;
+      // Append this token's single-row cross-attention to the running per-layer
+      // matrix (concatenate along the token axis, preserving the `None` layer
+      // slots) so the AlignAtt normalization sees the FULL token sequence. This
+      // is built into a NEW accumulator; the live `cross_qk_acc` is only advanced
+      // to it once the token COMMITS, so a WAIT reverts the appended row in
+      // lockstep with the reverted token simply by not advancing.
+      let next_acc = append_cross_qk_row(&cross_qk_acc, &step_cross_qk)?;
+      let frames = timing::alignatt_frame_attention(self.model, &next_acc, content_frames)?;
       // The just-sampled token is the LAST decoded position; its argmax frame is
       // the last entry of the per-token frame vector.
       let most_attended = frames.last().copied().unwrap_or(0);
@@ -1115,14 +1137,17 @@ impl<'a> DecodingTask<'a> {
       // the reference's `content_mel_len - most_attened_frame <= (4 if is_last
       // else frame_threshold)` applies the inequality on every chunk.
       if !alignatt_should_commit(content_frames, most_attended, frame_threshold) {
-        // Wait: revert the provisional token and stop committing for this chunk
+        // Wait: drop the provisional token and stop committing for this chunk
         // (the reference's `current_tokens = current_tokens[:, :-1]; break`).
+        // `cross_qk_acc` is left at its pre-step value, so the dropped token's row
+        // never enters the accumulation.
         tokens.pop();
         break;
       }
 
-      // Commit the token and its frame; continue decoding.
+      // Commit the token and its frame; advance the accumulation; continue.
       committed_frames.push(most_attended);
+      cross_qk_acc = next_acc;
       logits3d = next_logits;
       step += 1;
     }
@@ -1148,6 +1173,73 @@ impl<'a> DecodingTask<'a> {
       completed,
     })
   }
+}
+
+/// Append one warm decode step's per-layer cross-attention row to the running
+/// AlignAtt accumulation — concatenate each layer's `(1, heads, T_step, frames)`
+/// step tensor onto the accumulator's `(1, heads, T_acc, frames)` along the
+/// token axis (axis 2), preserving the `None` layer slots.
+///
+/// A warm `decode_step_with_cross_qk` forwards only the new token, so each
+/// step's `cross_qk` carries a single token row (`T_step == 1`). Concatenating
+/// the rows across the chunk's decode reconstructs the same full `(1, heads,
+/// T, frames)` matrix a cacheless full-sequence forward would produce — a
+/// token's cross-attention is fixed once decoded (causal self-attention means a
+/// later token never changes an earlier token's row). The reference accumulates
+/// the same way: it appends each layer's per-forward attention and
+/// `torch.cat(.., dim=0)`s the rows before the token-axis `std_mean`
+/// (`backspacetg/simul_whisper`, `transcriber/simul_whisper.py`).
+///
+/// `acc` and `step` must agree on layer count and (per present layer) on every
+/// non-token axis. A layer present in one but absent in the other, or a
+/// frame-width / head-count mismatch, is a contract violation between the two
+/// forwards of the same model.
+///
+/// # Errors
+/// - [`Error::OutOfRange`] if `acc` and `step` differ in layer count or a layer
+///   is `Some` in one forward and `None` in the other (the two `cross_qk` lists
+///   of the same model must agree slot for slot);
+/// - propagates the [`ops::shape::concatenate`] op error (which itself rejects a
+///   non-token axis mismatch).
+fn append_cross_qk_row(
+  acc: &[Option<Array>],
+  step: &[Option<Array>],
+) -> Result<Vec<Option<Array>>> {
+  if acc.len() != step.len() {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "Whisper AlignAtt: cross-attention accumulation layer count",
+      "the prefix and step forwards must return one cross-attention slot per \
+       decoder layer",
+      format_smolstr!("acc_layers={}, step_layers={}", acc.len(), step.len()),
+    )));
+  }
+  let mut out: Vec<Option<Array>> = Vec::new();
+  crate::model_validation::reserve_or_error(
+    &mut out,
+    "Whisper AlignAtt: cross-attention accumulation",
+    acc.len(),
+  )?;
+  for (layer, (a, s)) in acc.iter().zip(step).enumerate() {
+    let merged = match (a, s) {
+      // Concatenate the new token row onto the accumulated rows along the token
+      // axis (`(1, heads, T, frames)`, axis 2). `concatenate` returns a fresh
+      // array, so the borrowed accumulator is left intact for a possible revert.
+      (Some(a), Some(s)) => Some(ops::shape::concatenate(&[a, s], 2)?),
+      // Both forwards skip this layer's cross-attention — keep the `None` slot.
+      (None, None) => None,
+      // One forward of the same model produced this layer's cross-attention and
+      // the other did not — the two `cross_qk` lists must match slot for slot.
+      _ => {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "Whisper AlignAtt: cross-attention accumulation layer presence",
+          "a decoder layer must be present (or absent) in both forwards",
+          format_smolstr!("layer={layer} present in only one forward"),
+        )));
+      }
+    };
+    out.push(merged);
+  }
+  Ok(out)
 }
 
 /// The AlignAtt commit/wait decision for ONE just-decoded token — the policy's
