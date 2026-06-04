@@ -350,22 +350,29 @@ impl Lfm2VlProcessorConfig {
     self
   }
 
-  /// Set the `<image_start>` / `<image_end>` bracket ids + enable bracketing
-  /// (`use_image_special_tokens = true`). When either id is `None` the
-  /// corresponding bracket is omitted even with bracketing enabled.
+  /// Set the `<image_start>` / `<image_end>` bracket ids only — the identities of
+  /// the bracket tokens, not the policy that decides whether to emit them.
   ///
-  /// This is the "supply the ids *and* turn bracketing on" convenience. To honor
-  /// a checkpoint's `use_image_special_tokens = false` (which suppresses the
-  /// brackets even when the ids exist), call [`with_use_image_special_tokens`]
-  /// *after* this, or set the ids with the individual setters and gate with
-  /// [`with_use_image_special_tokens`].
+  /// Whether [`expand_image_tokens`] actually wraps each `<image>` run in these
+  /// brackets is governed *solely* by `use_image_special_tokens`
+  /// (`config.py:87`, default `true`), which the reference reads from the
+  /// checkpoint and gates emission on (`processing_lfm2_vl.py:388-400`'s `if
+  /// use_image_special_tokens:`). Supplying the ids does **not** turn bracketing
+  /// on: a checkpoint that set `use_image_special_tokens = false` keeps emitting
+  /// no brackets after this call. To enable bracketing set the flag explicitly
+  /// with [`with_use_image_special_tokens`] (or build the config via the model's
+  /// `processor_config`, which threads the checkpoint flag); a caller that wants
+  /// brackets supplies *both* the flag and the ids.
+  ///
+  /// When either id is `None` the corresponding bracket is omitted even with the
+  /// flag enabled.
   ///
   /// [`with_use_image_special_tokens`]: Self::with_use_image_special_tokens
+  /// [`expand_image_tokens`]: crate::vlm::models::lfm2_vl::expand_image_tokens
   #[must_use]
   pub fn with_special_tokens(mut self, start: Option<i32>, end: Option<i32>) -> Self {
     self.image_start_token = start;
     self.image_end_token = end;
-    self.use_image_special_tokens = true;
     self
   }
 
@@ -920,8 +927,10 @@ fn normalize_row_rgba(src: &[u8], dst: &mut [f32], scale: [f32; 3], bias: [f32; 
 /// each image the placeholder is replaced by `cfg.image_start_token?` +
 /// `num_image_tokens_from_patch_grid(rows_i, cols_i, factor)` copies of
 /// `cfg.image_token` + `cfg.image_end_token?` (the start / end brackets emitted
-/// only when [`Lfm2VlProcessorConfig::with_special_tokens`] enabled them). Any
-/// non-placeholder id passes through unchanged.
+/// only when `cfg.use_image_special_tokens` is set — `config.py:87`,
+/// [`with_use_image_special_tokens`](Lfm2VlProcessorConfig::with_use_image_special_tokens)
+/// — and the respective id is `Some`). Any non-placeholder id passes through
+/// unchanged.
 ///
 /// `grids` is the per-image native patch grid `(rows, cols)` (one entry per
 /// image, in prompt order) — typically each image's

@@ -256,12 +256,58 @@ fn expand_single_image_no_brackets() {
 
 #[test]
 fn expand_single_image_with_brackets() {
-  // Bracketed: <start> <image>*4 <end> around the run.
+  // Bracketed: <start> <image>*4 <end> around the run. The flag governs emission
+  // (`tiny_cfg` defaults it to `true`, upstream parity); `with_special_tokens`
+  // only supplies the ids the enabled gate uses.
   let cfg = tiny_cfg(16).with_special_tokens(Some(100), Some(101));
+  assert!(
+    cfg.use_image_special_tokens(),
+    "the default flag drives bracket emission; with_special_tokens only sets the ids"
+  );
   let ids = [1, 396, 2];
   let grids = [(4, 4)];
   let out = expand_image_tokens(&ids, &grids, &cfg).unwrap();
   assert_eq!(out, vec![1, 100, 396, 396, 396, 396, 101, 2]);
+}
+
+#[test]
+fn with_special_tokens_does_not_re_enable_disabled_flag() {
+  // Regression: a checkpoint that disabled image special tokens
+  // (`use_image_special_tokens = false`) must keep emitting NO brackets when the
+  // bracket ids are supplied afterwards. The natural caller order is
+  // `processor_config()?.with_special_tokens(start, end)` — `processor_config`
+  // threads the checkpoint's `false`, and supplying the ids must not flip it back
+  // on (`processing_lfm2_vl.py:388-400`: the flag, not the id presence, gates the
+  // brackets). Identity (ids) is decoupled from policy (the flag).
+  let ids = [1, 396, 2];
+  let grids = [(4, 4)];
+
+  // Flag off (as a `false` checkpoint would set via `with_use_image_special_
+  // tokens`), THEN supply the ids — the order callers reach for.
+  let off_then_ids = tiny_cfg(16)
+    .with_use_image_special_tokens(false)
+    .with_special_tokens(Some(100), Some(101));
+  assert!(
+    !off_then_ids.use_image_special_tokens(),
+    "with_special_tokens must NOT re-enable the disabled flag"
+  );
+  let out = expand_image_tokens(&ids, &grids, &off_then_ids).unwrap();
+  assert_eq!(
+    out,
+    vec![1, 396, 396, 396, 396, 2],
+    "no brackets emitted when the flag is off, even with both bracket ids set"
+  );
+
+  // The `<image>` placeholder count matches the no-special-tokens baseline
+  // (`expand_single_image_no_brackets`): only the would-be brackets differ, so
+  // the image-feature / token counts stay aligned with the reference.
+  let baseline = expand_image_tokens(&ids, &grids, &tiny_cfg(16)).unwrap();
+  let count_images = |v: &[i32]| v.iter().filter(|&&t| t == 396).count();
+  assert_eq!(count_images(&out), count_images(&baseline));
+  assert_eq!(
+    out, baseline,
+    "flag-off output equals the no-bracket-ids baseline"
+  );
 }
 
 #[test]
@@ -270,16 +316,21 @@ fn expand_honors_use_image_special_tokens_flag() {
   // ids are present (`processing_lfm2_vl.py:388-400`'s `if use_image_special_
   // tokens:` gate). The `<image>` run is identical to the bracketed case; only
   // the start/end ids are dropped — so the image-feature / token count is the
-  // same 4 placeholders either way, no desync.
+  // same 4 placeholders either way, no desync. The flag and the ids are
+  // independent: emission tracks the flag regardless of when the ids were set.
   let ids = [1, 396, 2];
   let grids = [(4, 4)];
 
+  // Flag on (the `tiny_cfg` default) with both ids supplied -> brackets emitted.
   let on = tiny_cfg(16).with_special_tokens(Some(100), Some(101));
   assert!(on.use_image_special_tokens());
   let out_on = expand_image_tokens(&ids, &grids, &on).unwrap();
   assert_eq!(out_on, vec![1, 100, 396, 396, 396, 396, 101, 2]);
 
-  // Same ids, but gate the flag off AFTER supplying them.
+  // Same ids, flag explicitly off -> no brackets. Setting the flag off does not
+  // depend on ordering relative to `with_special_tokens` (see
+  // `with_special_tokens_does_not_re_enable_disabled_flag` for the reverse
+  // order); the flag alone governs the gate.
   let off = tiny_cfg(16)
     .with_special_tokens(Some(100), Some(101))
     .with_use_image_special_tokens(false);

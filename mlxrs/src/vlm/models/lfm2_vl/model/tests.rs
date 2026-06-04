@@ -582,12 +582,29 @@ fn processor_config_threads_use_image_special_tokens() {
   let mut cfg = tiny_config(false);
   cfg.use_image_special_tokens = false;
   let model_off = Lfm2Vl::from_weights(cfg, dense_weights(), None).unwrap();
+  let cfg_off = model_off.processor_config().unwrap();
   assert!(
-    !model_off
-      .processor_config()
-      .unwrap()
-      .use_image_special_tokens(),
+    !cfg_off.use_image_special_tokens(),
     "use_image_special_tokens=false must thread through to suppress brackets"
+  );
+
+  // Regression for the natural caller order `processor_config()?.
+  // with_special_tokens(start, end)`: supplying the bracket ids after the `false`
+  // checkpoint threaded its flag must NOT re-enable bracketing — the flag, not
+  // the id presence, governs emission (`processing_lfm2_vl.py:388-400`).
+  let cfg_off_with_ids = cfg_off.with_special_tokens(Some(100), Some(101));
+  assert!(
+    !cfg_off_with_ids.use_image_special_tokens(),
+    "with_special_tokens must not flip a `false` checkpoint's flag back on"
+  );
+  let image_id = cfg_off_with_ids.image_token();
+  let ids = [1, image_id, 2];
+  let grids = [(4, 4)];
+  let out =
+    crate::vlm::models::lfm2_vl::expand_image_tokens(&ids, &grids, &cfg_off_with_ids).unwrap();
+  assert!(
+    !out.contains(&100) && !out.contains(&101),
+    "no image start/end brackets emitted for a `false` checkpoint, even with the ids supplied"
   );
 }
 
