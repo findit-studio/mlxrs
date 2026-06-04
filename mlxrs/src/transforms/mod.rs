@@ -27,6 +27,16 @@
 //! - [`crate::transforms::checkpoint::checkpoint`] — wrap a function so its
 //!   activations are recomputed (rather than stored) during the backward
 //!   pass, trading compute for memory.
+//! - [`crate::transforms::compile::compile`] — compile a function over arrays
+//!   into a cached graph (with mode-dependent fusion) that is reused (rather than re-traced) on later
+//!   calls with matching shapes/dtypes *when built while compilation is enabled*
+//!   (the default); a [`crate::transforms::compile::Compiled`] built while
+//!   compilation is disabled is instead a direct passthrough to the function.
+//!   The [`crate::transforms::compile::CompileMode`] /
+//!   [`crate::transforms::compile::enable_compile`] /
+//!   [`crate::transforms::compile::disable_compile`] controls toggle the
+//!   process-global backend behavior (see `compile` for the construction-time
+//!   semantics).
 //! - [`crate::transforms::eval::eval`] / [`crate::transforms::eval::async_eval`]
 //!   — synchronously / asynchronously materialize the lazy graph rooted at a
 //!   batch of arrays.
@@ -43,11 +53,15 @@
 pub mod autograd;
 pub mod checkpoint;
 pub mod closure;
+pub mod compile;
 pub mod custom;
 pub mod eval;
 
 pub use autograd::{grad, jvp, value_and_grad, vjp};
 pub use checkpoint::checkpoint;
 pub use closure::Closure;
+pub use compile::{
+  CompileMode, Compiled, compile, compile_fn, disable_compile, enable_compile, set_compile_mode,
+};
 pub use custom::{custom_function, custom_vjp};
 pub use eval::{async_eval, eval};
