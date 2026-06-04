@@ -771,6 +771,60 @@ impl MaybeQuantizedLinear {
       Ok(MaybeQuantizedLinear::Dense(Linear::new(weight, bias)))
     }
   }
+
+  /// Build a quantize-aware linear with an **explicitly-supplied** dense output
+  /// `bias`, rather than auto-consuming `<prefix>.bias` from the map.
+  ///
+  /// Identical to [`from_weights`](Self::from_weights) except for the dense
+  /// output bias: where `from_weights` opportunistically pops any `<prefix>.bias`
+  /// it finds, this takes the bias as an argument and applies it on BOTH the
+  /// dense and the quantized path (`mlx`'s `QuantizedLinear.from_linear`
+  /// preserves the source `Linear.bias`, so the dense-bias arity is identical
+  /// whether the projection is dense or quantized). The packed `<prefix>.weight`
+  /// (and, on the quantized path, `<prefix>.scales` / `<prefix>.biases`) are
+  /// still consumed from `weights` by key; `<prefix>.bias` is **not** touched.
+  ///
+  /// This is the seam a caller uses to enforce a config-flag-gated bias contract
+  /// (e.g. LFM2.5-VL's `projector_bias` / the LFM2 LM's `conv_bias`): the caller
+  /// drains `<prefix>.bias` through the [`take_if`](crate::model_validation::take_if)
+  /// gate (required-when-`true`, forbidden-when-`false`) and passes the result
+  /// here, so a missing-required or stray-forbidden bias is a typed error rather
+  /// than the silent auto-consume `from_weights` would do. Mirrors the LFM2 LM's
+  /// `Linear::from_weights_with_bias`.
+  ///
+  /// # Errors
+  /// - [`Error::MissingKey`] if `<prefix>.weight` (or, on the quantized path,
+  ///   `<prefix>.scales`) is absent;
+  /// - [`Error::InvariantViolation`] if `<prefix>.scales` is present but `quant`
+  ///   is `None`;
+  /// - propagates [`QuantizedLinear::from_parts`]'s structural validation
+  ///   (including the dense-bias arity check — the bias, if `Some`, must be
+  ///   `(out_features,)`).
+  pub fn from_weights_with_bias(
+    weights: &mut HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<(i32, i32, &str)>,
+    bias: Option<Array>,
+  ) -> Result<Self> {
+    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
+    if weights.contains_key(&scales_key) {
+      let Some((group_size, bits, mode)) = quant else {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "MaybeQuantizedLinear::from_weights_with_bias: checkpoint carries a `.scales` sibling for this layer but no quantization config resolved scheme parameters",
+          "a quantized layer requires (group_size, bits, mode) from the config `quantization` block",
+        )));
+      };
+      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
+      let scales = take_required(weights, prefix, SCALES_SUFFIX)?;
+      let quant_biases = weights.remove(&format!("{prefix}{BIASES_SUFFIX}"));
+      let q =
+        QuantizedLinear::from_parts(weight, scales, quant_biases, bias, group_size, bits, mode)?;
+      Ok(MaybeQuantizedLinear::Quantized(q))
+    } else {
+      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
+      Ok(MaybeQuantizedLinear::Dense(Linear::new(weight, bias)))
+    }
+  }
 }
 
 /// Pop a required `<prefix><suffix>` tensor from `weights`, or return a typed

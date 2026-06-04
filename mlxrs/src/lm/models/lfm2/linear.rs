@@ -111,33 +111,8 @@ impl Linear {
     quant: Option<(i32, i32, &str)>,
     bias: Option<Array>,
   ) -> Result<Self> {
-    let scales_key = format!("{prefix}{SCALES_SUFFIX}");
-    if weights.contains_key(&scales_key) {
-      let Some((group_size, bits, mode)) = quant else {
-        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
-          "lfm2::Linear::from_weights_with_bias: checkpoint carries a `.scales` sibling for this projection but no quantization config resolved scheme parameters",
-          "a quantized Linear requires (group_size, bits, mode) from the config `quantization` block",
-        )));
-      };
-      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
-      let scales = take_required(weights, prefix, SCALES_SUFFIX)?;
-      let quant_biases = weights.remove(&format!("{prefix}{BIASES_SUFFIX}"));
-      let q = crate::nn::QuantizedLinear::from_parts(
-        weight,
-        scales,
-        quant_biases,
-        bias,
-        group_size,
-        bits,
-        mode,
-      )?;
-      Ok(Self {
-        inner: MaybeQuantizedLinear::Quantized(q),
-      })
-    } else {
-      let weight = take_required(weights, prefix, WEIGHT_SUFFIX)?;
-      Ok(Self::new(weight, bias))
-    }
+    let inner = MaybeQuantizedLinear::from_weights_with_bias(weights, prefix, quant, bias)?;
+    Ok(Self { inner })
   }
 
   /// `y = x @ weight.T (+ bias)` (dense) or `quantized_matmul(...) (+ bias)`

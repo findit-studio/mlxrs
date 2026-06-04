@@ -100,6 +100,19 @@ pub struct VisionConfig {
   /// `eps` shared by every `LayerNorm` (`1e-6`).
   #[serde(default = "default_vision_layer_norm_eps")]
   pub layer_norm_eps: f64,
+  /// The encoder-MLP activation (`config.py:65`, default `"gelu_pytorch_tanh"`).
+  /// `vision.py:67` builds the MLP as `nn.GELU(approx="precise")`, whose
+  /// `__call__` dispatches `precise` (and its PyTorch alias `tanh`) to
+  /// `mlx.nn.gelu_approx` — the **tanh** approximation
+  /// (`mlx/python/mlx/nn/layers/activations.py:584-585`, `gelu_approx` at `:182`).
+  /// The HuggingFace activation id for that tanh GELU is `gelu_pytorch_tanh`, so
+  /// the config value and the impl agree. The MLP forward
+  /// ([`crate::vlm::models::lfm2_vl::vision`]) hard-codes that tanh GELU, so
+  /// [`validate`](Self::validate) pins this field to `"gelu_pytorch_tanh"` — a
+  /// checkpoint declaring any other activation fails loudly rather than silently
+  /// running the tanh GELU under a mismatched declared activation.
+  #[serde(default = "default_vision_hidden_act")]
+  pub hidden_act: String,
 }
 
 #[cfg(feature = "lfm2-vl")]
@@ -142,11 +155,22 @@ fn default_vision_num_patches() -> i32 {
 fn default_vision_layer_norm_eps() -> f64 {
   1e-6
 }
+#[cfg(feature = "lfm2-vl")]
+fn default_vision_hidden_act() -> String {
+  "gelu_pytorch_tanh".to_string()
+}
 
 /// The two architecture ids `vision.py`'s `VisionModel` accepts
 /// (`["lfm2_vl", "siglip2_vision_model"]`).
 #[cfg(feature = "lfm2-vl")]
 const VISION_MODEL_TYPES: &[&str] = &["lfm2_vl", "siglip2_vision_model"];
+
+/// The sole vision-MLP activation the tower implements: the tanh GELU
+/// (`mlx.nn.GELU(approx="precise")` → `gelu_approx`, `vision.py:67`), whose
+/// HuggingFace id is `gelu_pytorch_tanh` (`config.py:65`). The MLP forward
+/// hard-codes this activation, so `validate` pins `hidden_act` to it.
+#[cfg(feature = "lfm2-vl")]
+const VISION_HIDDEN_ACTS: &[&str] = &["gelu_pytorch_tanh"];
 
 /// The top-level architecture ids the LFM2.5-VL [`ModelConfig`] accepts.
 /// `config.py`'s default is `"lfm2-vl"` (hyphen, `config.py:75`), but the
@@ -207,19 +231,30 @@ impl VisionConfig {
   /// tensor is built.
   ///
   /// Pins `model_type` to one of `vision.py`'s accepted ids
-  /// (`"lfm2_vl"` / `"siglip2_vision_model"`); requires every dimension / count
-  /// (`hidden_size`, `intermediate_size`, the layer + head counts,
-  /// `num_channels`, `image_size`, `patch_size`, `num_patches`) strictly
-  /// positive; requires `hidden_size` divisible by `num_attention_heads` (the
-  /// per-head split); requires `num_patches` a perfect square (the trained
-  /// position grid is `sqrt(num_patches) x sqrt(num_patches)`); and validates
-  /// that the derived `patch_feature_dim` (`num_channels * patch_size^2`)
-  /// arithmetic does not overflow (a wrapped width would be UB downstream).
+  /// (`"lfm2_vl"` / `"siglip2_vision_model"`); pins `hidden_act` to the tanh
+  /// GELU the MLP implements (`"gelu_pytorch_tanh"`, `vision.py:67` /
+  /// `config.py:65`); requires every dimension / count (`hidden_size`,
+  /// `intermediate_size`, the layer + head counts, `num_channels`, `image_size`,
+  /// `patch_size`, `num_patches`) strictly positive; requires `hidden_size`
+  /// divisible by `num_attention_heads` (the per-head split); requires
+  /// `num_patches` a perfect square (the trained position grid is
+  /// `sqrt(num_patches) x sqrt(num_patches)`); and validates that the derived
+  /// `patch_feature_dim` (`num_channels * patch_size^2`) arithmetic does not
+  /// overflow (a wrapped width would be UB downstream).
   pub fn validate(&self) -> Result<()> {
     crate::model_validation::pin_str(
       "lfm2_vl::VisionConfig: model_type",
       self.model_type.as_str(),
       VISION_MODEL_TYPES,
+    )?;
+    // The vision MLP forward (`vision.rs`) hard-codes the tanh GELU
+    // (`nn.GELU(approx="precise")` → `gelu_approx`); pin the architecture-defining
+    // activation so a checkpoint declaring a different `hidden_act` fails loudly
+    // rather than silently running the tanh GELU under a mismatched declaration.
+    crate::model_validation::pin_str(
+      "lfm2_vl::VisionConfig: hidden_act",
+      self.hidden_act.as_str(),
+      VISION_HIDDEN_ACTS,
     )?;
     for (name, value) in [
       ("lfm2_vl::VisionConfig: hidden_size", self.hidden_size),

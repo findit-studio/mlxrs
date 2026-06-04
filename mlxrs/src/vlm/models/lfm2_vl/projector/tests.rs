@@ -252,6 +252,91 @@ fn projector_missing_layernorm_weight_is_typed_error() {
   assert!(matches!(err, Error::MissingKey(_)), "got {err}");
 }
 
+/// A tiny config with an explicit `projector_bias` flag (otherwise identical to
+/// [`tiny_model_config`], layernorm on).
+fn tiny_model_config_bias(projector_bias: bool) -> ModelConfig {
+  let json = format!(
+    r#"{{
+      "model_type": "lfm2-vl",
+      "downsample_factor": 2,
+      "projector_hidden_size": {PROJ_HIDDEN},
+      "projector_use_layernorm": true,
+      "projector_bias": {projector_bias},
+      "text_config": {{
+        "model_type": "lfm2", "hidden_size": {TEXT_HIDDEN},
+        "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "vocab_size": 32, "block_dim": {TEXT_HIDDEN}, "block_ff_dim": 8,
+        "block_auto_adjust_ff_dim": false, "block_multiple_of": 1, "conv_L_cache": 3
+      }},
+      "vision_config": {{
+        "model_type": "lfm2_vl", "hidden_size": 8, "intermediate_size": 16,
+        "num_hidden_layers": 2, "num_attention_heads": 2, "num_channels": 3,
+        "image_size": 4, "patch_size": 2, "num_patches": 4, "layer_norm_eps": 1e-6
+      }}
+    }}"#
+  );
+  let cfg = ModelConfig::from_json(&json).unwrap();
+  cfg.validate().unwrap();
+  cfg
+}
+
+/// The projector weight map WITHOUT the two `linear_*.bias` tensors (the
+/// `projector_bias = false` checkpoint shape): layer_norm + the two weights.
+fn projector_weights_no_bias() -> HashMap<String, Array> {
+  let mut w = HashMap::new();
+  w.insert("layer_norm.weight".to_string(), vec_n(PROJ_IN));
+  w.insert("layer_norm.bias".to_string(), vec_n(PROJ_IN));
+  w.insert("linear_1.weight".to_string(), mat(PROJ_HIDDEN, PROJ_IN));
+  w.insert("linear_2.weight".to_string(), mat(TEXT_HIDDEN, PROJ_HIDDEN));
+  w
+}
+
+#[test]
+fn projector_bias_true_requires_bias_tensors() {
+  // projector_bias=true + both linear biases present: loads and forwards (the
+  // matched-true case).
+  let cfg = tiny_model_config_bias(true);
+  let mut w = projector_dense_weights(true);
+  let proj = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap();
+  let out = proj.forward(&mat(2, PROJ_IN)).unwrap();
+  assert_eq!(out.shape(), vec![2, TEXT_HIDDEN as usize]);
+}
+
+#[test]
+fn projector_bias_true_missing_bias_is_missing_key() {
+  // projector_bias=true but a required `linear_*.bias` is absent: a typed
+  // MissingKey (the `take_if` required-when-true gate), NOT a silent omission.
+  let cfg = tiny_model_config_bias(true);
+  let mut w = projector_dense_weights(true);
+  w.remove("linear_2.bias");
+  let err = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap_err();
+  assert!(matches!(err, Error::MissingKey(_)), "got {err}");
+}
+
+#[test]
+fn projector_bias_false_loads_without_biases() {
+  // projector_bias=false + no linear biases present: loads and forwards (the
+  // matched-false case — the bias-free projector).
+  let cfg = tiny_model_config_bias(false);
+  let mut w = projector_weights_no_bias();
+  let proj = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap();
+  let out = proj.forward(&mat(2, PROJ_IN)).unwrap();
+  assert_eq!(out.shape(), vec![2, TEXT_HIDDEN as usize]);
+  // The map is fully drained (no stray `.bias` left behind, none consumed).
+  assert!(w.is_empty(), "no leftover weights, got {w:?}");
+}
+
+#[test]
+fn projector_bias_false_stray_bias_is_key_collision() {
+  // projector_bias=false but a `linear_*.bias` is present: a typed KeyCollision
+  // (the `take_if` forbidden-when-false gate), NOT a silent auto-apply.
+  let cfg = tiny_model_config_bias(false);
+  let mut w = projector_weights_no_bias();
+  w.insert("linear_1.bias".to_string(), vec_n(PROJ_HIDDEN));
+  let err = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap_err();
+  assert!(matches!(err, Error::KeyCollision(_)), "got {err}");
+}
+
 #[test]
 fn projector_3d_input_preserves_leading_dims() {
   // The projector is applied to the pixel-unshuffled (1, H/f, W/f, in) grid in

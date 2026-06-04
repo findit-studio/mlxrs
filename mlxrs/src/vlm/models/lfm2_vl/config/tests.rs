@@ -61,9 +61,42 @@ fn vision_config_defaults_match_reference() {
   assert_eq!(cfg.patch_size, 16);
   assert_eq!(cfg.num_patches, 256);
   assert!((cfg.layer_norm_eps - 1e-6).abs() < 1e-12);
+  // The default vision activation (`config.py:65`) is the tanh GELU the MLP runs.
+  assert_eq!(cfg.hidden_act, "gelu_pytorch_tanh");
   // `3 * 16^2 = 768` flattened-patch width.
   assert_eq!(cfg.patch_feature_dim().unwrap(), 768);
   cfg.validate().unwrap();
+}
+
+#[test]
+fn vision_config_default_hidden_act_validates() {
+  // The default `hidden_act` (`gelu_pytorch_tanh`, the tanh GELU the MLP
+  // implements) clears `validate`.
+  let cfg = VisionConfig::from_json(r#"{"hidden_act": "gelu_pytorch_tanh"}"#).unwrap();
+  cfg.validate().unwrap();
+  assert_eq!(cfg.hidden_act, "gelu_pytorch_tanh");
+}
+
+#[test]
+fn vision_config_rejects_non_tanh_hidden_act() {
+  // The vision MLP forward (`vision.rs`) hard-codes the tanh GELU
+  // (`nn.GELU(approx="precise")` → `gelu_approx`, `vision.py:67`); a checkpoint
+  // declaring any other `hidden_act` must fail loudly rather than silently
+  // running the tanh GELU under a mismatched declared activation. `gelu`
+  // (the erf GELU) is the most adversarial near-miss — it must still be rejected.
+  for bad in [
+    r#"{"hidden_act": "gelu"}"#,
+    r#"{"hidden_act": "gelu_new"}"#,
+    r#"{"hidden_act": "relu"}"#,
+    r#"{"hidden_act": "silu"}"#,
+  ] {
+    let cfg = VisionConfig::from_json(bad).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+      matches!(err, Error::UnknownEnumValue(_)),
+      "expected UnknownEnumValue for {bad}, got {err}"
+    );
+  }
 }
 
 #[test]
@@ -151,6 +184,8 @@ fn model_config_defaults_fill_top_level_fields() {
   assert!(!cfg.use_thumbnail);
   assert!(cfg.use_image_special_tokens);
   assert_eq!(cfg.projector_hidden_act, "gelu");
+  // The nested vision activation default (`config.py:65`).
+  assert_eq!(cfg.vision_config.hidden_act, "gelu_pytorch_tanh");
   assert!(cfg.quantization().is_none(), "dense by default");
   cfg.validate().unwrap();
 }
