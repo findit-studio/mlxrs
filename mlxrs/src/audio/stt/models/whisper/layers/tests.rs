@@ -476,6 +476,116 @@ fn mha_matches_reference_qkv_equation() {
   }
 }
 
+/// The encoder fused-SDPA route ([`MultiHeadAttention::sdpa_attention`]) must
+/// stay numerically equivalent to the hand-rolled `qkv_attention_no_qk(mask =
+/// None)` it replaces — NOT just in f32 (covered by
+/// [`mha_matches_reference_qkv_equation`]) but in the low precisions a real
+/// checkpoint runs (f16/bf16). The fused kernel accumulates the scores in f32
+/// while the manual path runs the score matmul in the activation dtype, so the
+/// two are equal over reals but not bit-identical in f16/bf16; this pins the
+/// finite-precision drift to a small relative bound so an encoder-output (hence
+/// transcript) regression cannot ship silently. The two cores are driven from
+/// DISTINCT deterministic q, k, v (not q = k = v), so an operand mis-wiring in
+/// the fused path — a q/k swap, feeding k as the values, a wrong transpose —
+/// would diverge from the reference (which identity projections cannot catch),
+/// at the real encoder head width (`head_dim = 64`).
+#[test]
+fn sdpa_matches_qkv_attention_across_precisions() {
+  let n_head = 4usize;
+  let head_dim = 64usize; // the whisper encoder head_dim (n_state / n_head)
+  let n_state = n_head * head_dim;
+  // The real encoder sequence length (n_audio_ctx), so the fused full-attention
+  // kernel — not a small-sequence fallback — is exercised.
+  let t = 1500i32;
+  // Distinct deterministic q, k, v (the already-projected attention inputs):
+  // different frequencies, phases, and magnitudes so no two operands coincide.
+  // Build a sharply PEAKED, order-SENSITIVE attention: q[i] = pattern[i] and
+  // k[i] = pattern[(i-1) mod T], so the score q[i]·k[j] peaks hard at
+  // j = (i+1) mod T — query i selects value row i+1. The output is therefore
+  // O(v) (not a near-zero average), and a q/k swap (which would make query i
+  // select i-1) changes it by O(1), so an operand mis-wiring cannot pass.
+  let n = t as usize * n_state;
+  let tt = t as usize;
+  // Decorrelated per-position pattern (a deterministic hash, NOT a smooth
+  // sinusoid) so distinct positions are near-orthogonal: q[i]·k[j] is then a
+  // single sharp peak at j = (i+1) mod T with negligible off-diagonal, and no
+  // periodic secondary peaks.
+  let pat = |p: usize, c: usize| -> f32 {
+    // murmur3-style finalizer: avalanches all bits so distinct positions are
+    // near-orthogonal (a plain XOR hash left low-bit correlations that spread
+    // the softmax).
+    let mut h = (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+      ^ (c as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    ((h >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 4.0
+  };
+  let mut qb = vec![0.0_f32; n];
+  let mut kb = vec![0.0_f32; n];
+  let mut vb = vec![0.0_f32; n];
+  for i in 0..tt {
+    for c in 0..n_state {
+      qb[i * n_state + c] = pat(i, c);
+      kb[i * n_state + c] = pat((i + tt - 1) % tt, c);
+      vb[i * n_state + c] = (((i as f32) * 0.045 + (c as f32) * 0.11).cos()) * 0.9;
+    }
+  }
+  let q32 = arr(&qb, &[1, t, n_state as i32]);
+  let k32 = arr(&kb, &[1, t, n_state as i32]);
+  let v32 = arr(&vb, &[1, t, n_state as i32]);
+  // `n_head` is the only field the attention cores read; the projections are
+  // unused because q, k, v are supplied directly.
+  let mha = MultiHeadAttention::new(
+    n_head,
+    identity_linear(n_state),
+    identity_linear(n_state),
+    identity_linear(n_state),
+    identity_linear(n_state),
+  );
+  // The cores agree to a small ABSOLUTE bound (the natural metric for the
+  // bounded attention output): the score matmul accumulates in f32 in both
+  // paths, so the only divergence is a few ulps of the activation dtype. Each
+  // iteration ALSO checks that the q/k-swapped manual reference moves the output
+  // far more than that drift — proving the operands are genuinely order-
+  // sensitive, so a real operand mis-wiring in `sdpa_attention` (a q/k swap, or
+  // k fed as the values) could not hide under `atol`.
+  let f32v = |a: Array| to_vec(&a.astype(Dtype::F32).unwrap());
+  let max_inf = |a: &[f32], b: &[f32]| {
+    a.iter()
+      .zip(b)
+      .fold(0.0_f32, |m, (&x, &y)| m.max((x - y).abs()))
+  };
+  for (dtype, atol) in [
+    (Dtype::F32, 1e-4_f32),
+    (Dtype::F16, 1e-3_f32),
+    (Dtype::BF16, 2e-3_f32),
+  ] {
+    let q = q32.astype(dtype).unwrap();
+    let k = k32.astype(dtype).unwrap();
+    let v = v32.astype(dtype).unwrap();
+    // Widen the (possibly f16/bf16) outputs to f32 before reading (`to_vec`
+    // reads f32) so the compared difference is exactly the cores' output drift.
+    let sdpa = f32v(mha.sdpa_attention(&q, &k, &v).unwrap());
+    let naive = f32v(mha.qkv_attention_no_qk(&q, &k, &v, None).unwrap());
+    // q/k SWAPPED through the trusted manual core — what a swap mis-wiring gives.
+    let swapped = f32v(mha.qkv_attention_no_qk(&k, &q, &v, None).unwrap());
+    assert_eq!(sdpa.len(), naive.len());
+    let drift = max_inf(&sdpa, &naive);
+    let swap_diff = max_inf(&swapped, &naive);
+    assert!(
+      drift <= atol,
+      "{dtype:?}: SDPA vs naive abs diff {drift:.5} exceeds {atol}"
+    );
+    // The peaked attention makes a q/k swap move the output by ~1.35; require a
+    // large gap so the equivalence above is a genuine, operand-sensitive match.
+    assert!(
+      swap_diff > 0.5,
+      "{dtype:?}: not operand-sensitive — q/k swap moved the output only {swap_diff:.5}"
+    );
+  }
+}
+
 /// Self-attention KV cache: passing an incoming `(k, v)` concatenates it with
 /// the freshly-projected k/v along the time axis (axis 1), so the returned
 /// kv time dimension grows by the cached length. With identity projections,

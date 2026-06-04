@@ -585,3 +585,72 @@ fn encoder_forward_preserves_dtype(dtype: Dtype) {
     "encoder output must stay in the activation dtype (no promotion to f32)"
   );
 }
+
+/// Regression bench for the encoder self-attention fused-SDPA routing — the
+/// per-block operation that change optimizes. Times
+/// [`MultiHeadAttention::forward`] on the turbo encoder's real shape
+/// (`(1, n_audio_ctx = 1500, n_state = 1280)`, `n_head = 20`) with no mask, no
+/// cache, and no cross source — exactly the mask-free self-attention each of the
+/// 32 encoder blocks runs. On `main` this dispatches to the hand-rolled
+/// `qkv_attention` (which materializes the `(1, 20, 1500, 1500)` score matrix);
+/// with the SDPA routing it dispatches to the fused kernel. Run the SAME bench
+/// on both branches for the A/B (measured on an M-series GPU, f16: the SDPA
+/// routing cut the full per-window encoder from ~493 ms to ~355 ms, ~28%).
+///
+/// `#[ignore]`d: timing is machine- and thermal-dependent and must not gate CI;
+/// run explicitly with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing micro-bench — run with --ignored --nocapture"]
+fn bench_encoder_self_attention_sdpa() {
+  use std::time::Instant;
+  let n_state = 1280usize;
+  let n_head = 20usize;
+  let t = 1500i32;
+  // Random f16 projections at the real encoder width (values are irrelevant to
+  // timing; a small weight scale keeps the f16 score path finite).
+  let rand_linear = |seed: u64| {
+    let w = crate::ops::random::normal(
+      &[n_state as i32, n_state as i32],
+      Dtype::F16,
+      0.0,
+      0.02,
+      &crate::ops::random::key(seed).unwrap(),
+    )
+    .unwrap();
+    Linear::new(w, None)
+  };
+  let mha = MultiHeadAttention::new(
+    n_head,
+    rand_linear(1),
+    rand_linear(2),
+    rand_linear(3),
+    rand_linear(4),
+  );
+  let x = crate::ops::random::normal(
+    &[1, t, n_state as i32],
+    Dtype::F16,
+    0.0,
+    1.0,
+    &crate::ops::random::key(0).unwrap(),
+  )
+  .unwrap();
+  crate::transforms::eval(&[&x]).unwrap();
+
+  for _ in 0..5 {
+    let (out, _) = mha.forward(&x, None, None, None).unwrap();
+    crate::transforms::eval(&[&out]).unwrap();
+  }
+  let mut times = Vec::with_capacity(30);
+  for _ in 0..30 {
+    let t0 = Instant::now();
+    let (out, _) = mha.forward(&x, None, None, None).unwrap();
+    crate::transforms::eval(&[&out]).unwrap();
+    times.push(t0.elapsed().as_secs_f64() * 1e3);
+  }
+  times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+  println!(
+    "\nencoder self-attn forward (1x{t}x{n_state}, {n_head} heads): min={:.3}ms median={:.3}ms  (x32 blocks ~= one encoder window)",
+    times[0],
+    times[times.len() / 2]
+  );
+}
