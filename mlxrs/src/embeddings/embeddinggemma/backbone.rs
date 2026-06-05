@@ -291,7 +291,65 @@ fn clip_residual(x: &Array, y: &Array) -> Result<Array> {
   if x.dtype()? != crate::dtype::Dtype::F16 {
     return x.add(y);
   }
-  // f16 finite range. `half::f16::MAX` is mlx's `finfo(float16).max` (`65504`).
+  // The f16 saturating add below is `gemma3_text.py`'s
+  // `@partial(mx.compile, shapeless=True) def clip_residual` — five ops
+  // (astype, astype, add, clip, astype) the reference fuses into ONE kernel.
+  // Route it through a process-lifetime compiled graph (traced once on first
+  // use, reused for every later call) so this block dispatches one fused kernel
+  // instead of five; it is applied twice per layer across every block, so the
+  // un-fused form is a measurable share of a short f16 forward.
+  // Fall back to the uncompiled body if the graph cannot be built or a call
+  // fails — the math is identical, only un-fused.
+  //
+  // The `Compiled` is **leaked** to `'static` rather than stored by value in the
+  // `thread_local`. That is deliberate: a `thread_local` `Compiled` would be
+  // dropped at *thread teardown*, running `mlx_closure_free` after mlx's own
+  // static state may already be gone — a use-after-free observed as a SIGSEGV at
+  // process exit. Leaking mirrors the reference's module-level `@mx.compile`
+  // (likewise never freed) and mlx's process-global compile cache: one tiny
+  // handle per thread, alive for the process.
+  thread_local! {
+    static CLIP_F16: std::cell::OnceCell<Option<&'static crate::transforms::compile::Compiled>> =
+      const { std::cell::OnceCell::new() };
+  }
+  let compiled: Option<&'static crate::transforms::compile::Compiled> = CLIP_F16.with(|cell| {
+    *cell.get_or_init(|| {
+      crate::transforms::compile::compile(
+        |ins: &[Array]| clip_residual_f16(&ins[0], &ins[1]).map(|out| vec![out]),
+        true,
+      )
+      .ok()
+      .map(|c| &*Box::leak(Box::new(c)))
+    })
+  });
+  match compiled {
+    Some(c) => {
+      // Marshal the two inputs for the compiled call. `try_clone` is a fallible
+      // FFI handle-retain; a clone failure falls back to the uncompiled body
+      // rather than propagating — the contract is that ANY compiled-path failure
+      // degrades to the identical uncompiled math, so a recoverable alloc/FFI
+      // error never surfaces as an error out of a saturating residual add.
+      let inputs = match (x.try_clone(), y.try_clone()) {
+        (Ok(a), Ok(b)) => [a, b],
+        _ => return clip_residual_f16(x, y),
+      };
+      c.call(&inputs)
+        .ok()
+        .and_then(|mut out| out.pop())
+        .map_or_else(|| clip_residual_f16(x, y), Ok)
+    }
+    None => clip_residual_f16(x, y),
+  }
+}
+
+/// The f16 saturating residual add (`gemma3_text.py`'s `clip_residual` body):
+/// add in f32, clamp to the finite f16 range `[-f16::MAX, f16::MAX]`, and cast
+/// back to f16 — so an f16 backbone saturates rather than overflowing to
+/// `inf`/`NaN`. Extracted so [`clip_residual`] can hand it to `mx.compile` and
+/// reuse it verbatim as the uncompiled fallback.
+#[cfg(feature = "embeddinggemma")]
+fn clip_residual_f16(x: &Array, y: &Array) -> Result<Array> {
+  // `half::f16::MAX` is mlx's `finfo(float16).max` (`65504`).
   let bound = f32::from(half::f16::MAX);
   let xf = ops::misc::astype(x, crate::dtype::Dtype::F32)?;
   let yf = ops::misc::astype(y, crate::dtype::Dtype::F32)?;

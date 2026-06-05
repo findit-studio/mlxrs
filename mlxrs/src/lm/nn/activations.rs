@@ -23,8 +23,11 @@
 //! [`swiglu`] takes two operands): it builds a new lazy [`Array`] and never
 //! evaluates — eval stays an explicit `&mut` step on the result, exactly like
 //! every other `mlxrs` op. The reference (`python/mlx/nn/layers/activations.py`)
-//! decorates the closed-form variants with `@mx.compile`; that is a graph-fusion
-//! hint with no effect on the math, so it has no analogue here.
+//! decorates the closed-form variants with `@partial(mx.compile, shapeless=True)`
+//! to fuse each closed form into a single kernel; the variants here mirror that
+//! by routing through a process-lifetime compiled graph (the private
+//! `run_compiled_unary` helper) — identical math, fused dispatch instead of one
+//! element-wise op per term.
 //!
 //! Mirroring the references' forward expressions verbatim, the scalar
 //! literals (`0.5`, `1 / √2`, `√(2/π)`, `0.044715`, `1.702`) are folded into
@@ -40,7 +43,15 @@
 //! genuinely **rank-0** (not shape-`[1]`), so it NumPy-broadcasts against `x`
 //! without ever lifting a rank-0 scalar input to rank 1.
 
-use crate::{array::Array, dtype::Dtype, error::Result, ops};
+use std::cell::OnceCell;
+
+use crate::{
+  array::Array,
+  dtype::Dtype,
+  error::Result,
+  ops,
+  transforms::compile::{Compiled, compile},
+};
 
 /// Build a rank-0 `f32` constant of `value`, cast to `like`'s dtype.
 ///
@@ -73,6 +84,56 @@ fn scalar_like(value: f32, like: &Array) -> Result<Array> {
   ops::misc::astype(&Array::full::<f32>(&[0i32; 0], value)?, dtype)
 }
 
+/// Route a unary activation through a process-lifetime compiled graph, mirroring
+/// mlx core's `@partial(mx.compile, shapeless=True)` on every `nn` activation
+/// (`python/mlx/nn/layers/activations.py`): the closed-form expression is fused
+/// into a single kernel rather than dispatching each element-wise op separately.
+/// On op-heavy short forwards this fusion is the dominant factor in matching the
+/// reference's throughput — the reference fuses these helpers and the port did
+/// not before.
+///
+/// The graph is traced once per thread on first use and reused. It is **leaked**
+/// to `'static` rather than stored by value in the `thread_local`: a
+/// `thread_local` `Compiled` would be dropped at *thread teardown*, running
+/// `mlx_closure_free` after mlx's static state may already be gone — a
+/// use-after-free observed as a SIGSEGV at process exit. Leaking matches the
+/// reference's module-level decoration (never freed) and mlx's own
+/// process-global compile cache: one tiny handle per activation per thread, for
+/// the process lifetime. If the graph cannot be built or a call fails, the
+/// uncompiled `f` runs — identical math, only un-fused.
+///
+/// **Threading.** The first call on a thread *traces* the graph, which touches
+/// mlx's process-global tracing stack — the same stack ordinary mlx ops read.
+/// This 1:1 mirrors mlx-swift's `MLXNN` activations (also mlx-c-based, not
+/// nanobind): lazy compiled globals whose `CompiledFunction` is marked
+/// `@unchecked Sendable` — the canonical binding accepts the first-call trace
+/// and does not serialize it against ordinary ops. mlxrs inference is
+/// single-threaded per the [`Array`] `!Send` + `!Sync` contract, so the trace
+/// is off-contract for concurrent ops; the underlying process-global tracing
+/// stack is an upstream mlx property, to be addressed there rather than by
+/// diverging from the reference design (e.g. mandatory warmup) here.
+fn run_compiled_unary(
+  cache: &'static std::thread::LocalKey<OnceCell<Option<&'static Compiled>>>,
+  f: fn(&Array) -> Result<Array>,
+  x: &Array,
+) -> Result<Array> {
+  let compiled = cache.with(|cell| {
+    *cell.get_or_init(|| {
+      compile(move |ins: &[Array]| f(&ins[0]).map(|out| vec![out]), true)
+        .ok()
+        .map(|c| &*Box::leak(Box::new(c)))
+    })
+  });
+  match compiled {
+    Some(c) => c
+      .call(std::slice::from_ref(x))
+      .ok()
+      .and_then(|mut out| out.pop())
+      .map_or_else(|| f(x), Ok),
+    None => f(x),
+  }
+}
+
 /// Sigmoid Linear Unit, a.k.a. Swish: `silu(x) = x · σ(x)`.
 ///
 /// 1:1 port of `mlx.nn.silu` (`python/mlx/nn/layers/activations.py`):
@@ -83,6 +144,15 @@ fn scalar_like(value: f32, like: &Array) -> Result<Array> {
 /// Returns a new lazy [`Array`] the same shape/dtype as `x` (no implicit
 /// eval).
 pub fn silu(x: &Array) -> Result<Array> {
+  thread_local! {
+    static CACHE: OnceCell<Option<&'static Compiled>> = const { OnceCell::new() };
+  }
+  run_compiled_unary(&CACHE, silu_uncompiled, x)
+}
+
+/// The uncompiled [`silu`] body, extracted so [`silu`] can hand it to
+/// `mx.compile` and reuse it as the uncompiled fallback.
+fn silu_uncompiled(x: &Array) -> Result<Array> {
   // `x * mx.sigmoid(x)` — verbatim from the reference.
   x.multiply(&x.sigmoid()?)
 }
@@ -114,6 +184,15 @@ pub fn swiglu(gate: &Array, x: &Array) -> Result<Array> {
 /// Returns a new lazy [`Array`] the same shape/dtype as `x` (no implicit
 /// eval).
 pub fn gelu(x: &Array) -> Result<Array> {
+  thread_local! {
+    static CACHE: OnceCell<Option<&'static Compiled>> = const { OnceCell::new() };
+  }
+  run_compiled_unary(&CACHE, gelu_uncompiled, x)
+}
+
+/// The uncompiled [`gelu`] body, extracted so [`gelu`] can hand it to
+/// `mx.compile` and reuse it as the uncompiled fallback.
+fn gelu_uncompiled(x: &Array) -> Result<Array> {
   // `x * (1 + mx.erf(x / math.sqrt(2))) / 2` — verbatim from the reference,
   // with the scalar literals (`√2`, `1`, `2`) lifted to dtype-matched
   // rank-0 broadcast arrays (see the `scalar_like` helper).
@@ -138,6 +217,15 @@ pub fn gelu(x: &Array) -> Result<Array> {
 /// Returns a new lazy [`Array`] the same shape/dtype as `x` (no implicit
 /// eval).
 pub fn gelu_approx(x: &Array) -> Result<Array> {
+  thread_local! {
+    static CACHE: OnceCell<Option<&'static Compiled>> = const { OnceCell::new() };
+  }
+  run_compiled_unary(&CACHE, gelu_approx_uncompiled, x)
+}
+
+/// The uncompiled [`gelu_approx`] body, extracted so [`gelu_approx`] can hand it
+/// to `mx.compile` and reuse it as the uncompiled fallback.
+fn gelu_approx_uncompiled(x: &Array) -> Result<Array> {
   // `0.5 * x * (1 + mx.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))`
   // — verbatim from the reference, scalar literals lifted to dtype-matched
   // rank-0 broadcast arrays (see the `scalar_like` helper).
@@ -164,6 +252,15 @@ pub fn gelu_approx(x: &Array) -> Result<Array> {
 /// Returns a new lazy [`Array`] the same shape/dtype as `x` (no implicit
 /// eval).
 pub fn gelu_fast_approx(x: &Array) -> Result<Array> {
+  thread_local! {
+    static CACHE: OnceCell<Option<&'static Compiled>> = const { OnceCell::new() };
+  }
+  run_compiled_unary(&CACHE, gelu_fast_approx_uncompiled, x)
+}
+
+/// The uncompiled [`gelu_fast_approx`] body, extracted so [`gelu_fast_approx`]
+/// can hand it to `mx.compile` and reuse it as the uncompiled fallback.
+fn gelu_fast_approx_uncompiled(x: &Array) -> Result<Array> {
   // `x * mx.sigmoid(1.702 * x)` — verbatim from the reference, the `1.702`
   // literal lifted to a dtype-matched rank-0 array (see `scalar_like`).
   let c = scalar_like(1.702, x)?;
