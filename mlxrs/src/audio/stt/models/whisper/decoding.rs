@@ -44,6 +44,29 @@ use super::{
   tokenizer::HFTokenizerWrapper,
 };
 
+// Diagnostic split timers (encoder vs decode wall-time + decode step count),
+// accumulated across every `run()` call when `MLXRS_TIMING2` is set. Read and
+// reset by the perf-bench harness to attribute the real transcribe cost.
+pub(crate) static TIMING2_ENC_NS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TIMING2_DEC_NS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TIMING2_STEPS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TIMING2_CALLS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+// Warm-loop only (excludes the batched condition-prefill), to recover the true
+// per-warm-step in-situ cost separate from the prefill-inflated token count.
+pub(crate) static TIMING2_WARM_NS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TIMING2_WARM_STEPS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+fn timing2_on() -> bool {
+  use std::sync::OnceLock;
+  static ON: OnceLock<bool> = OnceLock::new();
+  *ON.get_or_init(|| std::env::var("MLXRS_TIMING2").is_ok())
+}
+
 /// The gzip/zlib compression ratio of `text` — `compression_ratio`
 /// (`decoding.py:15-17`): `len(utf8) / len(zlib.compress(utf8))`.
 ///
@@ -293,12 +316,32 @@ const NEG_ONE_U32: u32 = u32::MAX;
 /// its constant mask(s) once at construction and adds them on device, so the
 /// per-step cost is an `add` (and, for the timestamp rules, the on-device
 /// probability-mass comparison) — no host round-trip of the `n_vocab` row.
+/// The on-device per-step context for [`LogitFilter::apply_lazy`] — the lazy
+/// analogue of the host `&[u32]` token slice (#369). It carries only the scalars
+/// the filters need, so the token history never has to be materialized on the
+/// host: `last_tok` / `penult_tok` are the last two sampled tokens and `last_ts`
+/// the running max timestamp value (a `0` sentinel below `timestamp_begin` when
+/// none has been sampled), each a `(1,)` integer array; `step` is the host count
+/// of sampled tokens so far (`seq.len()`).
+struct LazyFilterCtx<'a> {
+  last_tok: &'a Array,
+  penult_tok: &'a Array,
+  last_ts: &'a Array,
+  step: usize,
+}
+
 trait LogitFilter {
   /// Apply the filter to the `(n_vocab,)` logits row, returning the masked row.
   ///
   /// # Errors
   /// Propagates the device add / mask-construction / reduction op errors.
   fn apply(&self, logits: &Array, tokens: &[u32]) -> Result<Array>;
+
+  /// The lazy, on-device analogue of [`Self::apply`] for the pipelined decode
+  /// loop (#369): identical masking, but fed by a [`LazyFilterCtx`] of device
+  /// scalars instead of a host `&[u32]`, so applying the filters forces no
+  /// per-token GPU->host readback.
+  fn apply_lazy(&self, logits: &Array, ctx: &LazyFilterCtx<'_>) -> Result<Array>;
 }
 
 /// Build a `(n_vocab,)` additive mask Array — `0.0` everywhere except `-inf`
@@ -384,6 +427,15 @@ impl LogitFilter for SuppressBlank {
       logits.try_clone()
     }
   }
+
+  fn apply_lazy(&self, logits: &Array, ctx: &LazyFilterCtx<'_>) -> Result<Array> {
+    // `tokens.len() == sample_begin` ⟺ no sampled tokens yet ⟺ `step == 0`.
+    if ctx.step == 0 {
+      overwrite_masked(logits, &self.mask)
+    } else {
+      logits.try_clone()
+    }
+  }
 }
 
 /// Suppress a fixed id set at every step — `SuppressTokens`
@@ -407,6 +459,10 @@ impl SuppressTokens {
 
 impl LogitFilter for SuppressTokens {
   fn apply(&self, logits: &Array, _tokens: &[u32]) -> Result<Array> {
+    overwrite_masked(logits, &self.mask)
+  }
+
+  fn apply_lazy(&self, logits: &Array, _ctx: &LazyFilterCtx<'_>) -> Result<Array> {
     overwrite_masked(logits, &self.mask)
   }
 }
@@ -531,6 +587,95 @@ impl ApplyTimestampRules {
 
     mask
   }
+
+  /// The device-op analogue of [`Self::deterministic_mask`] for the pipelined
+  /// decode loop (#369): builds the SAME `(n_vocab,)` `0.0` / `-inf` mask, but
+  /// from on-device scalars instead of a host `&[u32]`, so applying the timestamp
+  /// rules never forces a per-token host readback. The mask depends only on the
+  /// last sampled token, the penultimate one, the running max timestamp value,
+  /// and the step index: `last_tok` / `penult_tok` / `last_ts` are `(1,)` integer
+  /// scalars carried across steps (`last_ts` is `0` when no timestamp has been
+  /// sampled yet — a sentinel below `timestamp_begin`, so the monotonicity rule
+  /// is inert); `step` is the host count of sampled tokens so far (`seq.len()`).
+  /// At `step == 0` the sampled sequence is empty, so only the first-position
+  /// rules apply (and the scalars are unread); at `step >= 1` the pair +
+  /// monotonicity rules apply.
+  fn deterministic_mask_device(
+    &self,
+    last_tok: &Array,
+    penult_tok: &Array,
+    last_ts: &Array,
+    step: usize,
+  ) -> Result<Array> {
+    let n_vocab = self.n_vocab;
+    let n = i32::try_from(n_vocab).map_err(|_| dim_overflow("n_vocab"))?;
+    let scalar = |v: u32| -> Result<Array> { Array::full::<i32>(&[1], v as i32) };
+    let neg_inf = Array::full::<f32>(&[0i32; 0], f32::NEG_INFINITY)?;
+    let arange = Array::arange::<i32>(0.0, n_vocab as f64, 1.0)?; // (n,) i32
+    let ts_begin = scalar(self.timestamp_begin)?;
+    let eot = scalar(self.eot)?;
+    let arange_ge_ts = ops::comparison::greater_equal(&arange, &ts_begin)?;
+    let arange_lt_eot = ops::comparison::less(&arange, &eot)?;
+
+    // base: `0` everywhere, `-inf` at `no_timestamps` (suppressed unconditionally).
+    let mut mask = Array::full::<f32>(&[n], 0.0)?;
+    let is_nt = ops::comparison::equal(&arange, &scalar(self.no_timestamps)?)?;
+    mask = ops::logical::select(&is_nt, &neg_inf, &mask)?;
+
+    if step == 0 {
+      // First sampled position: force a timestamp (mask `[0, ts_begin)`), then
+      // the `max_initial_timestamp` cap (mask `(last_allowed, n_vocab)`).
+      let pre_ts = ops::comparison::less(&arange, &ts_begin)?;
+      mask = ops::logical::select(&pre_ts, &neg_inf, &mask)?;
+      if let Some(idx) = self.max_initial_timestamp_index {
+        let last_allowed = (self.timestamp_begin as usize)
+          .checked_add(idx)
+          .ok_or_else(|| dim_overflow("max_initial_timestamp"))?;
+        let la = i32::try_from(last_allowed).map_err(|_| dim_overflow("max_initial_timestamp"))?;
+        let above = ops::comparison::greater(&arange, &Array::full::<i32>(&[1], la)?)?;
+        mask = ops::logical::select(&above, &neg_inf, &mask)?;
+      }
+      return Ok(mask);
+    }
+
+    // step >= 1: the pair + monotonicity rules, from the carried scalars.
+    let last = ops::misc::astype(last_tok, Dtype::I32)?;
+    let last_was_ts = ops::comparison::greater_equal(&last, &ts_begin)?;
+    // `penultimate_was_timestamp` is True when there are fewer than 2 sampled
+    // tokens (`decoding.py:396-398`).
+    let penult_was_ts = if step < 2 {
+      Array::full::<bool>(&[1], true)?
+    } else {
+      let penult = ops::misc::astype(penult_tok, Dtype::I32)?;
+      ops::comparison::greater_equal(&penult, &ts_begin)?
+    };
+
+    // last_was_ts && penult_was_ts ⇒ force non-timestamp (mask `[ts_begin, n)`).
+    let cond_a = ops::logical::logical_and(&last_was_ts, &penult_was_ts)?;
+    let m_a = ops::logical::logical_and(&cond_a, &arange_ge_ts)?;
+    mask = ops::logical::select(&m_a, &neg_inf, &mask)?;
+
+    // last_was_ts && !penult_was_ts ⇒ cannot be normal text (mask `[0, eot)`).
+    let not_penult = ops::logical::logical_not(&penult_was_ts)?;
+    let cond_b = ops::logical::logical_and(&last_was_ts, &not_penult)?;
+    let m_b = ops::logical::logical_and(&cond_b, &arange_lt_eot)?;
+    mask = ops::logical::select(&m_b, &neg_inf, &mask)?;
+
+    // Monotonicity: timestamps must be non-decreasing. `last_ts < ts_begin` (the
+    // `0` sentinel) ⇒ no timestamp yet ⇒ inert. `timestamp_last = last_ts` when
+    // the last token opens a fresh pair (cond_b), else `last_ts + 1` — masking
+    // `[ts_begin, timestamp_last)`.
+    let lts = ops::misc::astype(last_ts, Dtype::I32)?;
+    let has_ts = ops::comparison::greater_equal(&lts, &ts_begin)?;
+    let lts_p1 = ops::arithmetic::add(&lts, &Array::full::<i32>(&[1], 1)?)?;
+    let timestamp_last = ops::logical::select(&cond_b, &lts, &lts_p1)?;
+    let arange_lt_tslast = ops::comparison::less(&arange, &timestamp_last)?;
+    let mono = ops::logical::logical_and(&arange_ge_ts, &arange_lt_tslast)?;
+    let m_mono = ops::logical::logical_and(&has_ts, &mono)?;
+    mask = ops::logical::select(&m_mono, &neg_inf, &mask)?;
+
+    Ok(mask)
+  }
 }
 
 impl LogitFilter for ApplyTimestampRules {
@@ -603,6 +748,39 @@ impl LogitFilter for ApplyTimestampRules {
     let force = ops::comparison::greater(&ts_lse, &text_max)?; // rank-0 bool
 
     // masked[:ts_begin] = where(force, -inf, masked[:ts_begin]).
+    let head = ops::indexing::slice(&masked, &[0], &[ts_b_i], &[1])?;
+    let neg_inf = Array::full::<f32>(&[ts_b_i], f32::NEG_INFINITY)?;
+    let new_head = ops::logical::select(&force, &neg_inf, &head)?;
+    ops::indexing::slice_update(&masked, &new_head, &[0], &[ts_b_i], &[1])
+  }
+
+  fn apply_lazy(&self, logits: &Array, ctx: &LazyFilterCtx<'_>) -> Result<Array> {
+    // Device analogue of `apply`: the deterministic (token-history) mask is built
+    // from the carried scalars by `deterministic_mask_device` (parity-tested
+    // against `deterministic_mask`) rather than a host `&[u32]`. The
+    // probability-mass rule below is the SAME on-device computation as `apply`'s
+    // — it reads only the already-masked `(n_vocab,)` row, so the two are kept
+    // bit-identical (see `apply` for the full derivation of the literal-`logprobs`
+    // form that stays correct for non-finite rows).
+    let det_mask =
+      self.deterministic_mask_device(ctx.last_tok, ctx.penult_tok, ctx.last_ts, ctx.step)?;
+    let masked = overwrite_masked(logits, &det_mask)?;
+
+    let n_vocab = self.n_vocab;
+    let ts_begin = self.timestamp_begin as usize;
+    let n = i32::try_from(n_vocab).map_err(|_| dim_overflow("n_vocab"))?;
+    let ts_b = ts_begin.min(n_vocab);
+    let ts_b_i = i32::try_from(ts_b).map_err(|_| dim_overflow("timestamp_begin"))?;
+    if ts_b == 0 || ts_b >= n_vocab {
+      return Ok(masked);
+    }
+    let row_lse = ops::reduction::logsumexp(&masked, false)?;
+    let logprobs = ops::arithmetic::subtract(&masked, &row_lse)?;
+    let ts_slice = ops::indexing::slice(&logprobs, &[ts_b_i], &[n], &[1])?;
+    let text_slice = ops::indexing::slice(&logprobs, &[0], &[ts_b_i], &[1])?;
+    let ts_lse = ops::reduction::logsumexp(&ts_slice, false)?;
+    let text_max = ops::reduction::max(&text_slice, false)?;
+    let force = ops::comparison::greater(&ts_lse, &text_max)?;
     let head = ops::indexing::slice(&masked, &[0], &[ts_b_i], &[1])?;
     let neg_inf = Array::full::<f32>(&[ts_b_i], f32::NEG_INFINITY)?;
     let new_head = ops::logical::select(&force, &neg_inf, &head)?;
@@ -725,6 +903,48 @@ impl GreedyDecoder {
 
     let completed = next == self.eot;
     Ok((next, completed))
+  }
+
+  /// Lazy analogue of [`Self::update`] for the pipelined decode loop (#369):
+  /// returns the next token, the completion flag, AND the (eot-gated)
+  /// log-probability contribution as LAZY device arrays — no `.item()` readback,
+  /// so the loop can `async_eval` the step and defer every host read to a single
+  /// post-loop materialization. `last_tok` is the previous token as a `(1,)`
+  /// `u32` array (the reference's `tokens[:, -1]`); the eot-stick and the
+  /// logprob-accumulation gate are applied on device via `select`, so the
+  /// per-token result never leaves the GPU.
+  ///
+  /// Returns `(next_tok, completed, logprob_contrib)`, each `(1,)`: `next_tok`
+  /// `u32`, `completed` `bool`, `logprob_contrib` `f32` (the chosen log-prob, or
+  /// `0` when the previous token was eot so the running `sum_logprob` is left
+  /// unchanged past completion — the lazy form of `update`'s `last_token !=
+  /// self.eot` gate).
+  fn update_lazy(&mut self, logits: &Array, last_tok: &Array) -> Result<(Array, Array, Array)> {
+    let eot = Array::full::<u32>(&[1], self.eot)?;
+    let last_is_eot = ops::comparison::equal(last_tok, &eot)?; // (1,) bool
+
+    // The sampled index (argmax for temperature 0, else a categorical draw),
+    // kept LAZY and keepdim `(1,)` for the gather.
+    let idx = if self.temperature == 0.0 {
+      ops::misc::argmax(logits, Some(-1), true)? // (1,) u32
+    } else {
+      let (next_key, sub) = ops::random::split(&self.key)?;
+      self.key = next_key;
+      let sampled = crate::lm::sample::categorical_sampling(logits, self.temperature, &sub)?;
+      ops::shape::reshape(&sampled, &[1i32])? // ensure (1,) for take_along_axis
+    };
+
+    // logprob[idx] = logits[idx] - logsumexp(logits), on device.
+    let lse = ops::reduction::logsumexp(logits, true)?; // (1,)
+    let chosen = ops::indexing::take_along_axis(logits, &idx, -1)?; // (1,)
+    let logprob = ops::arithmetic::subtract(&chosen, &lse)?; // (1,) f32
+
+    // eot sticks: once emitted, re-emit eot and stop accumulating logprob.
+    let next = ops::logical::select(&last_is_eot, &eot, &idx)?; // (1,) u32
+    let zero = Array::full::<f32>(&[1], 0.0)?;
+    let logprob_contrib = ops::logical::select(&last_is_eot, &zero, &logprob)?; // (1,) f32
+    let completed = ops::comparison::equal(&next, &eot)?; // (1,) bool
+    Ok((next, completed, logprob_contrib))
   }
 
   /// `logprobs[next] = logits[next] - logsumexp(logits)` — the chosen token's
@@ -1353,14 +1573,28 @@ impl<'a> DecodingTask<'a> {
   /// # Errors
   /// Propagates the encoder / decoder / sampling op errors.
   pub fn run(&self, mel: &Array, language: &str) -> Result<DecodingResult> {
+    use std::sync::atomic::Ordering::Relaxed;
     // Encoder forward (or pass-through if already-encoded features).
     let audio_features = self.audio_features(mel)?;
+    if timing2_on() {
+      // Force the (otherwise lazy) encoder graph so its cost is timed here and
+      // not folded into the first decode step.
+      let t = std::time::Instant::now();
+      crate::transforms::eval(&[&audio_features])?;
+      TIMING2_ENC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+      TIMING2_CALLS.fetch_add(1, Relaxed);
+    }
 
     if self.n_group == 1 {
       // Single-sequence path — unchanged (the batching introduces no regression
       // here; the `n_group == 1` batched path is proven bit-identical to it by
       // the parity-gate test).
-      let (tokens, sum_logprob, no_speech_prob) = self.main_loop(&audio_features)?;
+      let td = std::time::Instant::now();
+      let (tokens, sum_logprob, no_speech_prob) = self.main_loop_pipelined(&audio_features)?;
+      if timing2_on() {
+        TIMING2_DEC_NS.fetch_add(td.elapsed().as_nanos() as u64, Relaxed);
+        TIMING2_STEPS.fetch_add(tokens.len() as u64, Relaxed);
+      }
       let sampled = self.truncate_sampled(&tokens)?;
       self.assemble_result(sampled, sum_logprob, no_speech_prob, language)
     } else {
@@ -1441,6 +1675,10 @@ impl<'a> DecodingTask<'a> {
 
   /// The autoregressive greedy loop — `_main_loop` (`decoding.py:588-632`),
   /// single-sequence. Returns `(all_tokens, sum_logprob, no_speech_prob)`.
+  ///
+  /// Serial reference retained for the parity gate + the A/B bench; production
+  /// uses [`Self::main_loop_pipelined`].
+  #[allow(dead_code)]
   fn main_loop(&self, audio_features: &Array) -> Result<(Vec<u32>, f64, f64)> {
     let mut decoder = GreedyDecoder::new(
       self.options.temperature,
@@ -1483,6 +1721,14 @@ impl<'a> DecodingTask<'a> {
     tokens.push(next);
 
     // Subsequent single-token steps (`decoding.py:618-631`).
+    let warm_t = if timing2_on() {
+      Some(std::time::Instant::now())
+    } else {
+      None
+    };
+    let skip_filters = std::env::var("MLXRS_SKIP_FILTERS").is_ok();
+    let bench_decode = std::env::var("MLXRS_BENCH_DECODE").is_ok();
+    let mut warm_n = 0u64;
     for _ in 1..self.sample_len {
       if completed || tokens.len() > self.n_ctx {
         break;
@@ -1494,15 +1740,166 @@ impl<'a> DecodingTask<'a> {
       cache = Some(new_cache);
 
       let row = last_position_row(&logits3d)?;
-      let row = self.apply_filters(&row, &tokens)?;
-      let last_token = *tokens.last().unwrap_or(&self.tokenizer.eot());
-      let (n, c) = decoder.update(&row, last_token)?;
-      next = n;
-      completed = c;
+      if bench_decode {
+        // Timing-only: replicate the pure interleave-bench step exactly (argmax +
+        // one sync, NO filters, NO logprob/update) to isolate the forward cost
+        // from the filter/update cost. Produces wrong output.
+        let mut idx = ops::misc::argmax(&row, Some(-1), false)?;
+        crate::transforms::eval(&[&idx])?;
+        next = idx.item::<u32>()?;
+        completed = next == self.tokenizer.eot();
+      } else {
+        // MLXRS_SKIP_FILTERS: timing-only A/B — skip the per-token logit filters
+        // to measure their share of the warm-step cost (produces wrong output).
+        let row = if skip_filters {
+          row
+        } else {
+          self.apply_filters(&row, &tokens)?
+        };
+        let last_token = *tokens.last().unwrap_or(&self.tokenizer.eot());
+        let (n, c) = decoder.update(&row, last_token)?;
+        next = n;
+        completed = c;
+      }
       tokens.push(next);
+      warm_n += 1;
+    }
+    if let Some(t) = warm_t {
+      use std::sync::atomic::Ordering::Relaxed;
+      TIMING2_WARM_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+      TIMING2_WARM_STEPS.fetch_add(warm_n, Relaxed);
     }
 
     // `cache` is dropped here — the decode trajectory is finished.
+    drop(cache);
+    Ok((tokens, decoder.sum_logprob, no_speech_prob))
+  }
+
+  /// The pipelined warm-step decode loop (#369) — the structural fix that keeps
+  /// the per-token GPU<->host round-trip out of the loop. Prefill + the first
+  /// sampled token are host (one-time); every subsequent step keeps its token,
+  /// completion flag, and log-prob ON DEVICE, dispatches the step non-blocking
+  /// via `async_eval`, checks the PREVIOUS step's completion (materialized a full
+  /// iteration behind, so the GPU never idles on a host readback), and defers all
+  /// host materialization to a single `eval` after the loop — mirroring
+  /// `decoding.py:618-630`. Produces the same tokens + `sum_logprob` as
+  /// [`Self::main_loop`] (token-sequence parity tested).
+  fn main_loop_pipelined(&self, audio_features: &Array) -> Result<(Vec<u32>, f64, f64)> {
+    let mut decoder = GreedyDecoder::new(self.options.temperature, self.tokenizer.eot(), 0)?;
+    let mut tokens: Vec<u32> = self.initial_tokens.clone();
+
+    let (logits3d, new_cache) = self.model.decode_tokens(&tokens, audio_features, None)?;
+    let mut cache = Some(new_cache);
+    let no_speech_prob = self.no_speech_prob(&logits3d)?;
+
+    if self.sample_len == 0 {
+      drop(cache);
+      return Ok((tokens, decoder.sum_logprob, no_speech_prob));
+    }
+
+    // First sampled token (host — the filters see only the prefix ⇒ is_first;
+    // one host step, not the per-token hot path).
+    let last_row = last_position_row(&logits3d)?;
+    let last_row = self.apply_filters(&last_row, &tokens)?;
+    let first_last = *tokens.last().unwrap_or(&self.tokenizer.sot());
+    let (first, first_completed) = decoder.update(&last_row, first_last)?;
+    tokens.push(first);
+    if first_completed {
+      drop(cache);
+      return Ok((tokens, decoder.sum_logprob, no_speech_prob));
+    }
+
+    // ─── pipelined warm-step loop ───
+    let ts_begin = self.tokenizer.timestamp_begin();
+    let ts_begin_arr = Array::from_slice::<u32>(&[ts_begin], &[1])?;
+    // Carried `(1,)` `u32` scalars: the last two sampled tokens + the running
+    // MOST-RECENT timestamp value (host `deterministic_mask` overwrites with the
+    // latest timestamp, not the max; `0` sentinel ⇒ none yet).
+    let mut last_tok = Array::from_slice::<u32>(&[first], &[1])?;
+    let mut penult_tok = Array::from_slice::<u32>(&[0], &[1])?;
+    let mut last_ts = Array::from_slice::<u32>(&[if first >= ts_begin { first } else { 0 }], &[1])?;
+    // token_0 is not eot (we returned above otherwise) ⇒ the one-behind
+    // completion flag starts false.
+    let mut completed = Array::from_slice::<bool>(&[false], &[1])?;
+    let mut sampled: Vec<Array> = Vec::new();
+    // Per-step log-prob CONTRIBUTIONS, kept as individual `(1,)` f32 device
+    // arrays (NOT summed on device): the serial loop folds each token's f32
+    // logprob into a HOST f64 accumulator one-at-a-time, so a device f32 sum is
+    // not bit-equivalent past the first warm token. We defer every host read to
+    // a single post-loop `eval` (the pipeline's whole point — no per-token
+    // GPU→host sync), then fold the contributions into `decoder.sum_logprob` in
+    // SERIAL ORDER via `item::<f32>() as f64`, exactly matching `main_loop`.
+    // Parallel to `sampled`: a contribution is recorded iff its token is kept,
+    // so the fold visits exactly the serial loop's accumulated tokens, in order.
+    let mut logprob_contribs: Vec<Array> = Vec::new();
+    let mut step = 1usize;
+
+    // `step` is carried decode state (the timestamp-rule step index fed into
+    // `LazyFilterCtx`), not a plain loop counter: it advances only at the loop
+    // tail, so the one-behind-completion `break` leaves it un-incremented. An
+    // `.enumerate()` counter would advance on that breaking iteration and feed
+    // the filters a wrong step, so the manual increment is deliberate.
+    #[allow(clippy::explicit_counter_loop)]
+    for _ in 1..self.sample_len {
+      if self.initial_tokens.len() + 1 + sampled.len() > self.n_ctx {
+        break;
+      }
+      let tok_1x1 = ops::shape::reshape(&last_tok, &[1i32, 1])?;
+      let (logits3d, new_cache) =
+        self
+          .model
+          .decode_token_lazy(&tok_1x1, audio_features, cache.as_ref())?;
+      cache = Some(new_cache);
+      let row = last_position_row(&logits3d)?;
+      let ctx = LazyFilterCtx {
+        last_tok: &last_tok,
+        penult_tok: &penult_tok,
+        last_ts: &last_ts,
+        step,
+      };
+      let row = self.apply_filters_lazy(&row, &ctx)?;
+      let (next, next_completed, logprob_contrib) = decoder.update_lazy(&row, &last_tok)?;
+
+      // Non-blocking dispatch of this step (mlx `async_eval`). The contribution
+      // rides along so it is materialized lazily WITH the step (not summed on
+      // device), keeping the per-token GPU→host sync out of the loop.
+      crate::transforms::async_eval(&[&next, &next_completed, &logprob_contrib])?;
+
+      // Read the PREVIOUS step's completion — dispatched a full iteration ago, so
+      // the GPU has computed it by now and this does not stall (the pipelining).
+      if completed.item::<bool>()? {
+        break;
+      }
+
+      sampled.push(next.try_clone()?);
+      // Record this kept token's contribution in lockstep with `sampled`.
+      logprob_contribs.push(logprob_contrib);
+      let next_is_ts = ops::comparison::greater_equal(&next, &ts_begin_arr)?;
+      last_ts = ops::logical::select(&next_is_ts, &next, &last_ts)?;
+      penult_tok = last_tok;
+      last_tok = next;
+      completed = next_completed;
+      step += 1;
+    }
+
+    // Single deferred materialization: read the loop's tokens + per-token
+    // log-prob contributions to the host in ONE `eval` (the only sync the warm
+    // loop incurs).
+    {
+      let mut refs: Vec<&Array> = sampled.iter().collect();
+      refs.extend(logprob_contribs.iter());
+      crate::transforms::eval(&refs)?;
+    }
+    for t in &mut sampled {
+      tokens.push(t.item::<u32>()?);
+    }
+    // Fold the contributions into the f64 accumulator ONE-AT-A-TIME in serial
+    // order — bit-identical to `main_loop`'s host f64 accumulation (no device
+    // f32 partial sum to lose precision against).
+    for c in &mut logprob_contribs {
+      decoder.sum_logprob += c.item::<f32>()? as f64;
+    }
+
     drop(cache);
     Ok((tokens, decoder.sum_logprob, no_speech_prob))
   }
@@ -1694,6 +2091,18 @@ impl<'a> DecodingTask<'a> {
     let mut row = row.try_clone()?;
     for filter in &self.logit_filters {
       row = filter.apply(&row, tokens)?;
+    }
+    Ok(row)
+  }
+
+  /// The lazy, on-device analogue of [`Self::apply_filters`] for the pipelined
+  /// decode loop (#369): runs the same filter chain, but each filter is fed the
+  /// [`LazyFilterCtx`] device scalars rather than a host `&[u32]`, so the chain
+  /// forces no per-token GPU->host readback.
+  fn apply_filters_lazy(&self, row: &Array, ctx: &LazyFilterCtx<'_>) -> Result<Array> {
+    let mut row = row.try_clone()?;
+    for filter in &self.logit_filters {
+      row = filter.apply_lazy(&row, ctx)?;
     }
     Ok(row)
   }
@@ -3672,3 +4081,6 @@ fn push_segment(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod perf_bench;

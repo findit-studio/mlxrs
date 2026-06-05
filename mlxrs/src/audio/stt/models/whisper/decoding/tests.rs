@@ -1167,6 +1167,95 @@ fn greedy_decode_runs_and_emits_target_then_eot() {
   assert!(result.avg_logprob <= 0.0);
 }
 
+/// Phase-3 gate (#369): the pipelined decode loop (`main_loop_pipelined`) must
+/// produce the EXACT same token sequence + `sum_logprob` + `no_speech_prob` as
+/// the serialized loop (`main_loop`), across the no-eot run, an eot-mid-sequence
+/// run (eot masked at step 0 by the timestamp rules, then emitted at step 1, so
+/// the completed-one-behind break is exercised), and the no-timestamp path.
+#[test]
+fn pipelined_loop_matches_serial() {
+  let dir = fresh_dir("pipeline_parity");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
+  let mel = tiny_mel();
+
+  // (target bias, without_timestamps): no-eot text run, eot-mid with timestamps,
+  // no-timestamp text run.
+  for (target, without_timestamps) in [(13u32, false), (2u32, false), (13u32, true)] {
+    let model = tiny_model(target);
+    let enc = model.encode(&mel).unwrap();
+    let mut options = DecodingOptions {
+      without_timestamps,
+      suppress_blank: true,
+      sample_len: Some(8),
+      ..Default::default()
+    };
+    options.language = Some("en".into());
+    let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+
+    let (s_tokens, s_sum, s_ns) = task.main_loop(&enc).unwrap();
+    let (p_tokens, p_sum, p_ns) = task.main_loop_pipelined(&enc).unwrap();
+
+    assert_eq!(
+      s_tokens, p_tokens,
+      "pipelined tokens must match serial (target={target}, without_ts={without_timestamps})"
+    );
+    // BIT-EXACT `sum_logprob`: the pipelined loop folds each token's f32 logprob
+    // contribution into the host f64 accumulator one-at-a-time in serial order
+    // (it does NOT sum on device), so it must reproduce `main_loop`'s f64
+    // accumulation to the last bit — not merely within a tolerance that could
+    // hide an `avg_logprob` drift across the temperature-fallback / no-speech
+    // thresholds. Compare the raw bit patterns.
+    assert_eq!(
+      s_sum.to_bits(),
+      p_sum.to_bits(),
+      "sum_logprob must be BIT-EXACT (target={target}): serial={s_sum} ({:#018x}) pipelined={p_sum} ({:#018x})",
+      s_sum.to_bits(),
+      p_sum.to_bits()
+    );
+    assert!(
+      (s_ns - p_ns).abs() < 1e-9,
+      "no_speech_prob mismatch (target={target}): serial={s_ns} pipelined={p_ns}"
+    );
+  }
+}
+
+/// #369 investigation: per-step decode cost on a TINY model (negligible layer
+/// compute) isolates any FIXED model-independent per-step overhead from real
+/// compute. If this is ~ms (≈ the ~0.8ms command-buffer latency) then large-v3's
+/// ~13ms is genuine compute; if it is also ~13ms there is a fixed overhead bug
+/// (the real cause of mlxrs being ~3x slower than Python on the same model).
+#[test]
+#[ignore = "timing microbenchmark — run with --ignored --nocapture"]
+fn tiny_decode_per_step_timing() {
+  use std::time::Instant;
+  let model = tiny_model(13);
+  let enc = model.encode(&tiny_mel()).unwrap();
+  let tok = crate::Array::from_slice::<u32>(&[13u32], &[1, 1]).unwrap();
+
+  // warmup
+  for _ in 0..10 {
+    let (l, _c) = model.decode_token_lazy(&tok, &enc, None).unwrap();
+    let row = last_position_row(&l).unwrap();
+    let mut idx = crate::ops::misc::argmax(&row, Some(-1), false).unwrap();
+    crate::transforms::eval(&[&idx]).unwrap();
+    let _ = idx.item::<u32>().unwrap();
+  }
+  const N: usize = 100;
+  let t = Instant::now();
+  for _ in 0..N {
+    let (l, _c) = model.decode_token_lazy(&tok, &enc, None).unwrap();
+    let row = last_position_row(&l).unwrap();
+    let mut idx = crate::ops::misc::argmax(&row, Some(-1), false).unwrap();
+    crate::transforms::eval(&[&idx]).unwrap();
+    let _ = idx.item::<u32>().unwrap();
+  }
+  println!(
+    "\nTINY decode per-step (1-layer/4-dim model, fresh cache): {:.1} us/step",
+    t.elapsed().as_secs_f64() * 1e6 / N as f64
+  );
+}
+
 #[test]
 fn greedy_decode_stops_at_eot() {
   // Bias the head to eot → the first sampled token is eot, the loop completes

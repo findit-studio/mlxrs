@@ -369,6 +369,69 @@ fn decoder_context_checked_before_embedding_at_offset() {
   assert!(dec.forward(&one, &xa, Some(&cache)).is_ok());
 }
 
+/// The lazy warm-step entry (`forward_array`) accepts a well-formed `(1, 1)`
+/// `u32` token and produces the SAME logits as the host `forward` on the same
+/// single token (the only difference is how the token array is built) — the
+/// metadata guard does not perturb the happy path.
+#[test]
+fn forward_array_accepts_valid_token_and_matches_forward() {
+  let n_vocab = 5usize;
+  let n_state = 4usize;
+  let n_ctx = 8usize;
+  let blocks = vec![identity_decoder_block(n_state, 2)];
+  let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
+  let xa = arr(&[0.1, 0.2, 0.3, 0.4], &[1, 1, n_state as i32]);
+
+  let id = 3u32;
+  let (host_logits, _) = dec.forward(&[id], &xa, None).unwrap();
+  let token = Array::from_slice::<u32>(&[id], &[1, 1]).unwrap();
+  let (lazy_logits, _) = dec.forward_array(&token, &xa, None).unwrap();
+  assert_eq!(host_logits.shape(), lazy_logits.shape());
+  assert_eq!(to_vec(&host_logits), to_vec(&lazy_logits));
+}
+
+/// Trust-boundary guard (`forward_array`): a malformed lazy token is rejected on
+/// METADATA before the token-embedding gather — a wrong shape yields a typed
+/// `ShapePairMismatch`, a non-`u32` dtype a typed `DtypeMismatch`. The guard
+/// never reads the token's value (that would reintroduce the per-token sync the
+/// lazy path removes), so an out-of-vocab id is NOT rejected here — that is a
+/// documented caller guarantee, satisfied by the in-vocab argmax/sampler.
+#[test]
+fn forward_array_rejects_malformed_token_on_metadata() {
+  let n_vocab = 5usize;
+  let n_state = 4usize;
+  let n_ctx = 8usize;
+  let blocks = vec![transparent_decoder_block(n_state, 2)];
+  let (dec, _, _) = build_decoder(n_vocab, n_state, n_ctx, blocks);
+  let xa = arr(&[0.1, 0.2, 0.3, 0.4], &[1, 1, n_state as i32]);
+
+  // Wrong rank: a `(1,)` token (not `(1, 1)`) is rejected.
+  let rank1 = Array::from_slice::<u32>(&[1u32], &[1]).unwrap();
+  let err = dec
+    .forward_array(&rank1, &xa, None)
+    .expect_err("a (1,) token must be rejected — wrong rank");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+
+  // Wrong shape with the right rank: `(1, 2)` carries two tokens, not one.
+  let wide = Array::from_slice::<u32>(&[1u32, 2], &[1, 2]).unwrap();
+  let err = dec
+    .forward_array(&wide, &xa, None)
+    .expect_err("a (1, 2) token must be rejected — wrong shape");
+  assert!(matches!(err, Error::ShapePairMismatch(_)), "got {err:?}");
+
+  // Wrong dtype: a `(1, 1)` `i32` token is rejected (the gather indexes with
+  // `u32`). The value `2` is in vocab, so only the dtype class fires.
+  let signed = Array::from_slice::<i32>(&[2i32], &[1, 1]).unwrap();
+  let err = dec
+    .forward_array(&signed, &xa, None)
+    .expect_err("a non-u32 token must be rejected — wrong dtype");
+  assert!(matches!(err, Error::DtypeMismatch(_)), "got {err:?}");
+
+  // A well-formed `(1, 1)` `u32` token in vocab is accepted (control).
+  let ok = Array::from_slice::<u32>(&[2u32], &[1, 1]).unwrap();
+  assert!(dec.forward_array(&ok, &xa, None).is_ok());
+}
+
 /// Cross-attention weight extraction (`forward_with_cross_qk`): a multi-block
 /// decoder returns one cross-attention `qk` per block, each shaped
 /// `(B, n_head, T, T_kv)` (the per-head attention scores over the encoder
