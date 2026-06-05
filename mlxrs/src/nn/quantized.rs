@@ -345,14 +345,20 @@ impl Linear {
   /// `y = x @ weightᵀ (+ bias)`. `x` is `(..., in_features)`; the result is
   /// `(..., out_features)`.
   ///
+  /// The biased path uses the fused `addmm` (`alpha * (x @ wᵀ) + beta * bias`,
+  /// both coefficients `1`) — the single kernel mlx's `nn.Linear.__call__`
+  /// emits (`mx.addmm(self["bias"], x, self["weight"].T)`,
+  /// `mlx/nn/layers/linear.py`) — rather than a `matmul` followed by a
+  /// separate bias-add, which would re-read the whole output from memory. The
+  /// unbiased path is the plain `matmul`.
+  ///
   /// # Errors
-  /// Propagates the transpose / matmul / add op errors.
+  /// Propagates the transpose / matmul / addmm op errors.
   pub fn forward(&self, x: &Array) -> Result<Array> {
     let wt = self.weight.transpose()?;
-    let y = x.matmul(&wt)?;
     match &self.bias {
-      Some(b) => y.add(b),
-      None => Ok(y),
+      Some(b) => x.addmm(b, &wt, 1.0, 1.0),
+      None => x.matmul(&wt),
     }
   }
 
