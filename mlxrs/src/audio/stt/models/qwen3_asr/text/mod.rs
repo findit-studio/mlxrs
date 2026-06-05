@@ -38,8 +38,8 @@ use crate::{
   Dtype,
   array::Array,
   error::{
-    Error, LayerKeyedPayload, LengthMismatchPayload, MissingKeyPayload, RankMismatchPayload,
-    Result, ShapePairMismatchPayload,
+    Error, InvariantViolationPayload, LayerKeyedPayload, LengthMismatchPayload, MissingKeyPayload,
+    RankMismatchPayload, Result, ShapePairMismatchPayload,
   },
   lm::{
     cache::{KvCache, MaskMode, StandardKvCache},
@@ -48,22 +48,115 @@ use crate::{
       attention::{Mask, scaled_dot_product_attention},
       norm::RMSNorm,
     },
+    quant::PerLayerQuantization,
   },
   model_validation::reserve_or_error,
+  nn::{MaybeQuantizedEmbedding, MaybeQuantizedLinear},
   ops::{
     indexing::{slice, take_axis},
-    linalg_basic::matmul,
-    shape::{broadcast_to, concatenate, expand_dims_axes, reshape, swapaxes, transpose_axes},
+    shape::{broadcast_to, concatenate, expand_dims_axes, reshape, transpose_axes},
   },
 };
 
-// ───────────────────────────── linear helper ─────────────────────────────
+// ───────────────────────────── quantization ─────────────────────────────
 
-/// `y = x @ weightᵀ` — a bias-free `nn.Linear` forward (every Qwen3 text
-/// projection is bias-free). `weight` is the `(out, in)` `nn.Linear` layout.
-fn linear(x: &Array, weight: &Array) -> Result<Array> {
-  let wt = swapaxes(weight, -1, -2)?;
-  matmul(x, &wt)
+/// Resolve the `(group_size, bits, mode)` tuple the shared quantize-aware
+/// builders ([`MaybeQuantizedLinear::from_weights`] /
+/// [`MaybeQuantizedEmbedding::from_weights`]) take for one consumed `prefix`,
+/// from the parsed [`PerLayerQuantization`] — the qwen3 per-prefix resolution
+/// ([`PerLayerQuantization::quantization_for`]).
+///
+/// Returns `None` for a dense load (`quant == None`), a per-layer
+/// [`Skip`](crate::lm::quant::QuantizationOption::Skip) override, OR no global
+/// default with no override for this layer — exactly the cases the per-layer
+/// builder treats as "build the dense arm". When a `<prefix>.scales` is
+/// nevertheless present, the shared builder rejects the mismatch with a typed
+/// [`Error::InvariantViolation`]. The resolved tuple is per-prefix, so a
+/// per-layer parameter override builds that layer with its own
+/// `(group_size, bits, mode)` rather than a single collapsed global tuple.
+fn resolve_layer_quant(
+  quant: Option<&PerLayerQuantization>,
+  prefix: &str,
+) -> Option<(i32, i32, &'static str)> {
+  quant
+    .and_then(|q| q.quantization_for(prefix))
+    .map(|q| (q.group_size, q.bits, q.mode.as_str()))
+}
+
+/// Build a quantize-aware projection from `<prefix>.weight` (and, on a quantized
+/// checkpoint, `<prefix>.scales` / `<prefix>.biases`), pinning its logical
+/// `(out, in)` to the config-derived extents at load.
+///
+/// Every Qwen3-ASR text projection is bias-free (Qwen3 is `bias=False`), so no
+/// dense output bias is consumed. The dense path is byte-for-byte the prior
+/// `(out, in)`-shape-pinned `matmul(x, weightᵀ)`; the quantized arm is pinned
+/// identically through its dequantized logical shape (no materialization).
+///
+/// # Errors
+/// - [`Error::MissingKey`] for an absent `<prefix>.weight` / `<prefix>.scales`;
+/// - [`Error::LayerKeyed`] wrapping a [`Error::ShapePairMismatch`] if the
+///   logical shape disagrees with `(out, in)`;
+/// - [`Error::InvariantViolation`] if `<prefix>.scales` is present but the
+///   config resolved no scheme for that layer;
+/// - propagates the [`MaybeQuantizedLinear::from_weights`] errors.
+///
+/// `pub(super)` so the aligner reuses it for the `lm_head` timestamp head (the
+/// same quantize-aware, shape-pinned bias-free projection).
+pub(super) fn build_linear(
+  weights: &mut HashMap<String, Array>,
+  prefix: &str,
+  out: i32,
+  in_features: i32,
+  descriptor: &'static str,
+  quant: Option<&PerLayerQuantization>,
+) -> Result<MaybeQuantizedLinear> {
+  // Every Qwen3-ASR decoder projection and the `lm_head` is bias-free
+  // (`x @ Wᵀ`, `nn.Linear(bias=False)`). The shared
+  // [`MaybeQuantizedLinear::from_weights`] would otherwise consume and APPLY an
+  // optional dense `<prefix>.bias`, so a stray bias in a malformed checkpoint
+  // would silently change the logits (and the dense path would no longer be
+  // byte-identical to the prior raw-weight load, which never read `.bias`).
+  // Reject it explicitly. The per-group quantized `<prefix>.biases` (affine, an
+  // entirely separate key) is untouched by this check and remains legitimate.
+  if weights.contains_key(&format!("{prefix}.bias")) {
+    return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+      "Qwen3-ASR projection is bias-free (x @ weightᵀ) but the checkpoint carries a dense `.bias`",
+      "remove the stray `<prefix>.bias`; the per-group quantized `<prefix>.biases` is a separate key",
+    )));
+  }
+  let linear =
+    MaybeQuantizedLinear::from_weights(weights, prefix, resolve_layer_quant(quant, prefix))?;
+  pin_linear_shape(&linear, prefix, out, in_features, descriptor)?;
+  Ok(linear)
+}
+
+/// Pin a [`MaybeQuantizedLinear`]'s logical `(out, in)` to the config-derived
+/// extents at load — the quantize-aware analogue of the dense [`take_shaped`]
+/// gate (the packed `uint32` weight's shape differs from the dense `(out, in)`
+/// and cannot reach [`expect_shape`]).
+///
+/// Reads only `shape()` metadata (no materialization / eval). On mismatch
+/// returns a typed [`Error::ShapePairMismatch`] wrapped in [`Error::LayerKeyed`]
+/// naming the offending `<prefix>.weight`, mirroring the dense [`expect_shape`].
+fn pin_linear_shape(
+  linear: &MaybeQuantizedLinear,
+  prefix: &str,
+  out: i32,
+  in_features: i32,
+  descriptor: &'static str,
+) -> Result<()> {
+  let shape = linear.logical_shape()?;
+  if shape != (out, in_features) {
+    return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+      format_smolstr!("{prefix}.weight"),
+      Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        descriptor,
+        vec![out.max(0) as usize, in_features.max(0) as usize],
+        vec![shape.0.max(0) as usize, shape.1.max(0) as usize],
+      )),
+    )));
+  }
+  Ok(())
 }
 
 // ───────────────────────────── multimodal RoPE ─────────────────────────────
@@ -235,10 +328,10 @@ struct Attention {
   n_kv_heads: i32,
   head_dim: i32,
   scale: f32,
-  q_proj: Array,
-  k_proj: Array,
-  v_proj: Array,
-  o_proj: Array,
+  q_proj: MaybeQuantizedLinear,
+  k_proj: MaybeQuantizedLinear,
+  v_proj: MaybeQuantizedLinear,
+  o_proj: MaybeQuantizedLinear,
   q_norm: RMSNorm,
   k_norm: RMSNorm,
 }
@@ -260,9 +353,9 @@ impl Attention {
     let (b, l) = (shape[0] as i32, shape[1] as i32);
     let hd = self.head_dim;
 
-    let queries = linear(x, &self.q_proj)?;
-    let keys = linear(x, &self.k_proj)?;
-    let values = linear(x, &self.v_proj)?;
+    let queries = self.q_proj.forward(x)?;
+    let keys = self.k_proj.forward(x)?;
+    let values = self.v_proj.forward(x)?;
 
     // Per-head reshape (B, L, n, head_dim), q/k RMSNorm over head_dim, transpose
     // to (B, n, L, head_dim).
@@ -286,7 +379,7 @@ impl Attention {
     let output = scaled_dot_product_attention(&queries, &keys, &values, self.scale, attn_mask)?;
     let output = transpose_axes(&output, &[0, 2, 1, 3])?;
     let output = reshape(&output, &[b, l, self.n_heads * hd])?;
-    linear(&output, &self.o_proj)
+    self.o_proj.forward(&output)
   }
 }
 
@@ -306,17 +399,17 @@ fn mask_mode_to_mask(mode: &MaskMode) -> Mask<'_> {
 /// dense Qwen3 MLP.
 #[derive(Debug)]
 struct Mlp {
-  gate_proj: Array,
-  up_proj: Array,
-  down_proj: Array,
+  gate_proj: MaybeQuantizedLinear,
+  up_proj: MaybeQuantizedLinear,
+  down_proj: MaybeQuantizedLinear,
 }
 
 impl Mlp {
   fn forward(&self, x: &Array) -> Result<Array> {
-    let gate = linear(x, &self.gate_proj)?;
-    let up = linear(x, &self.up_proj)?;
+    let gate = self.gate_proj.forward(x)?;
+    let up = self.up_proj.forward(x)?;
     let act = swiglu(&gate, &up)?;
-    linear(&act, &self.down_proj)
+    self.down_proj.forward(&act)
   }
 }
 
@@ -373,8 +466,11 @@ impl TransformerBlock {
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr-aligner")))]
 #[derive(Debug)]
 pub struct Qwen3AsrTextModel {
-  /// `(vocab, hidden)` token-embedding table.
-  embed_tokens: Array,
+  /// `(vocab, hidden)` token-embedding table — quantize-aware (a dense table or
+  /// a packed `mlx.nn.QuantizedEmbedding`, auto-detected by the
+  /// `model.embed_tokens.scales` sibling; mlx-lm's `class_predicate` quantizes
+  /// `nn.Embedding` alongside `nn.Linear`).
+  embed_tokens: MaybeQuantizedEmbedding,
   layers: Vec<TransformerBlock>,
   norm: RMSNorm,
   rope: MRope,
@@ -392,8 +488,12 @@ impl Qwen3AsrTextModel {
   /// `input_ids` against `vocab_size` before calling this, so its callers never
   /// reach the gather with an out-of-range id; a caller invoking this primitive
   /// directly owns that same `[0, vocab_size)` contract.
+  ///
+  /// On a quantized checkpoint the gathered packed rows / scales / biases are
+  /// dequantized (`mlx.nn.QuantizedEmbedding.__call__`), so the returned
+  /// `(B, L, hidden)` is the dequantized embedding at the table's dtype.
   pub fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
-    take_axis(&self.embed_tokens, tokens, 0)
+    self.embed_tokens.gather(tokens)
   }
 
   /// The number of decoder layers — also the per-layer cache cardinality
@@ -449,16 +549,17 @@ impl Qwen3AsrTextModel {
         shape,
       )));
     }
-    // The token-embedding table is `(vocab, hidden)`, so its axis-1 is the width
-    // every attention/MLP projection expects; reject a mismatched hidden axis
-    // before the layers index it.
-    let expected_hidden = self.embed_tokens.shape().get(1).copied();
-    if let Some(hidden) = expected_hidden
-      && shape[2] != hidden
-    {
+    // The token-embedding table's logical shape is `(vocab, hidden)`, so its
+    // hidden (axis-1) width is what every attention/MLP projection expects;
+    // reject a mismatched hidden axis before the layers index it. `logical_shape`
+    // recovers `hidden` identically for the dense table and the packed quantized
+    // table (whose raw axis-1 is the `hidden * bits / 32` packed width, not the
+    // logical hidden), so the gate is correct on a quantized checkpoint too.
+    let expected_hidden = self.embed_tokens.logical_shape()?.1;
+    if shape[2] != expected_hidden as usize {
       return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
         "Qwen3AsrTextModel::forward: hidden-states width vs token-embedding width",
-        vec![hidden],
+        vec![expected_hidden.max(0) as usize],
         vec![shape[2]],
       )));
     }
@@ -543,9 +644,47 @@ impl Qwen3AsrTextModel {
   /// (`model.embed_tokens.weight`, `model.norm.weight`, and per-layer
   /// `model.layers.{i}.…` projections / norms). A missing required weight is an
   /// [`Error::MissingKey`].
+  ///
+  /// This is the **dense** entry point (the prior behavior). A quantized
+  /// checkpoint — whose `model.embed_tokens` / per-layer projections carry the
+  /// `<prefix>.scales` sibling — must load through
+  /// [`from_weights_quantized`](Self::from_weights_quantized), which threads the
+  /// parsed [`PerLayerQuantization`] so each quantize-aware layer can resolve its
+  /// `(group_size, bits, mode)`.
   pub fn from_weights(
     config: &Qwen3AsrTextConfig,
     weights: &mut HashMap<String, Array>,
+  ) -> Result<Qwen3AsrTextModel> {
+    Self::from_weights_quantized(config, weights, None)
+  }
+
+  /// Build the head-less decoder, threading the parsed [`PerLayerQuantization`]
+  /// so a quantized checkpoint loads through the shared quantize-aware layers.
+  ///
+  /// Each token-embedding / projection is built via the shared
+  /// [`MaybeQuantizedEmbedding`] / [`MaybeQuantizedLinear`], which auto-detect a
+  /// quantized layer from its `<prefix>.scales` sibling ALONE (mlx-lm's
+  /// `class_predicate`, which quantizes every `nn.Linear` / `nn.Embedding`) and
+  /// resolve their `(group_size, bits, mode)` PER PREFIX from `quant`
+  /// ([`PerLayerQuantization::quantization_for`], via the per-prefix
+  /// `resolve_layer_quant` helper). A
+  /// `<prefix>.scales` present but no resolvable scheme is a typed
+  /// [`Error::InvariantViolation`], never a silent dense reinterpret. The decoder
+  /// RMSNorms (`q/k_norm`, `input/post_attention_layernorm`, `model.norm`) are
+  /// not `nn.Linear` / `nn.Embedding`, so they stay dense (the reference
+  /// `model_quant_predicate` only reaches `to_quantized` modules); a dense
+  /// checkpoint (`quant == None`, no `.scales`) loads byte-for-byte the prior
+  /// path.
+  ///
+  /// The reference's `model_quant_predicate` quantizes every prefix NOT under
+  /// `audio_tower`, so the released 8-bit checkpoint
+  /// (`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`) carries `.scales` for the
+  /// whole decoder including `model.embed_tokens`; the audio tower stays dense
+  /// (handled in [`super::AudioEncoder`], unchanged).
+  pub fn from_weights_quantized(
+    config: &Qwen3AsrTextConfig,
+    weights: &mut HashMap<String, Array>,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Qwen3AsrTextModel> {
     // Validate the (public-field) config BEFORE deriving any head count or
     // projection width from it. The fields are public, so a caller can hand in a
@@ -564,7 +703,7 @@ impl Qwen3AsrTextModel {
     // realizes). Each loaded tensor is shape-checked against these so a malformed
     // decoder checkpoint is rejected here, not as an opaque MLX error later — and
     // the accepted hidden width cannot be silently changed via the embedding
-    // table's axis-1.
+    // table's logical axis-1.
     let hidden = config.hidden_size;
     let vocab = config.vocab_size;
     let inter = config.intermediate_size;
@@ -574,12 +713,28 @@ impl Qwen3AsrTextModel {
     let q_out = config.num_attention_heads.saturating_mul(head_dim);
     let kv_out = config.num_key_value_heads.saturating_mul(head_dim);
 
-    let embed_tokens = take_shaped(
+    // The token embedding quantizes alongside the projections (mlx-lm's
+    // `class_predicate` quantizes `nn.Embedding`); the released 8-bit checkpoint
+    // carries `model.embed_tokens.scales`. Build it quantize-aware and pin its
+    // logical `(vocab, hidden)` against the config (the quantized arm through its
+    // dequantized logical shape, no materialization).
+    let embed_prefix = "model.embed_tokens";
+    let embed_tokens = MaybeQuantizedEmbedding::from_weights(
       weights,
-      "model.embed_tokens.weight",
-      "embed_tokens weight (vocab, hidden)",
-      &[vocab, hidden],
+      embed_prefix,
+      resolve_layer_quant(quant, embed_prefix),
     )?;
+    let embed_shape = embed_tokens.logical_shape()?;
+    if embed_shape != (vocab, hidden) {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format_smolstr!("{embed_prefix}.weight"),
+        Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+          "embed_tokens weight (vocab, hidden)",
+          vec![vocab.max(0) as usize, hidden.max(0) as usize],
+          vec![embed_shape.0.max(0) as usize, embed_shape.1.max(0) as usize],
+        )),
+      )));
+    }
     let norm = RMSNorm::new(
       take_shaped(
         weights,
@@ -605,29 +760,37 @@ impl Qwen3AsrTextModel {
         n_kv_heads: config.num_key_value_heads,
         head_dim,
         scale: (head_dim as f32).powf(-0.5),
-        q_proj: take_shaped(
+        q_proj: build_linear(
           weights,
-          &format!("{q}.q_proj.weight"),
+          &format!("{q}.q_proj"),
+          q_out,
+          hidden,
           "q_proj weight (n_heads * head_dim, hidden)",
-          &[q_out, hidden],
+          quant,
         )?,
-        k_proj: take_shaped(
+        k_proj: build_linear(
           weights,
-          &format!("{q}.k_proj.weight"),
+          &format!("{q}.k_proj"),
+          kv_out,
+          hidden,
           "k_proj weight (n_kv_heads * head_dim, hidden)",
-          &[kv_out, hidden],
+          quant,
         )?,
-        v_proj: take_shaped(
+        v_proj: build_linear(
           weights,
-          &format!("{q}.v_proj.weight"),
+          &format!("{q}.v_proj"),
+          kv_out,
+          hidden,
           "v_proj weight (n_kv_heads * head_dim, hidden)",
-          &[kv_out, hidden],
+          quant,
         )?,
-        o_proj: take_shaped(
+        o_proj: build_linear(
           weights,
-          &format!("{q}.o_proj.weight"),
+          &format!("{q}.o_proj"),
+          hidden,
+          q_out,
           "o_proj weight (hidden, n_heads * head_dim)",
-          &[hidden, q_out],
+          quant,
         )?,
         q_norm: RMSNorm::new(
           take_shaped(
@@ -650,23 +813,29 @@ impl Qwen3AsrTextModel {
       };
 
       let mlp = Mlp {
-        gate_proj: take_shaped(
+        gate_proj: build_linear(
           weights,
-          &format!("{p}.mlp.gate_proj.weight"),
+          &format!("{p}.mlp.gate_proj"),
+          inter,
+          hidden,
           "mlp gate_proj weight (intermediate, hidden)",
-          &[inter, hidden],
+          quant,
         )?,
-        up_proj: take_shaped(
+        up_proj: build_linear(
           weights,
-          &format!("{p}.mlp.up_proj.weight"),
+          &format!("{p}.mlp.up_proj"),
+          inter,
+          hidden,
           "mlp up_proj weight (intermediate, hidden)",
-          &[inter, hidden],
+          quant,
         )?,
-        down_proj: take_shaped(
+        down_proj: build_linear(
           weights,
-          &format!("{p}.mlp.down_proj.weight"),
+          &format!("{p}.mlp.down_proj"),
+          hidden,
+          inter,
           "mlp down_proj weight (hidden, intermediate)",
-          &[hidden, inter],
+          quant,
         )?,
       };
 

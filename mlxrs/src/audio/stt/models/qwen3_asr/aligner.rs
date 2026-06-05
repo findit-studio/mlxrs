@@ -35,21 +35,25 @@ use crate::{
     AlignOptions, AlignedSpan, ForcedAligner as ForcedAlignerTrait, ForcedAlignment,
   },
   error::{
-    AllocFailurePayload, Error, LengthMismatchPayload, MissingKeyPayload, OutOfRangePayload,
-    RankMismatchPayload, Result, ShapePairMismatchPayload,
+    AllocFailurePayload, Error, LengthMismatchPayload, OutOfRangePayload, RankMismatchPayload,
+    Result, ShapePairMismatchPayload,
   },
-  lm::cache::KvCache,
+  lm::{cache::KvCache, quant::PerLayerQuantization},
   model_validation::{alloc_filled, reserve_or_error},
+  nn::MaybeQuantizedLinear,
   ops::{
     indexing::take_axis,
-    linalg_basic::matmul,
     misc::argmax,
-    shape::{concatenate, reshape, swapaxes},
+    shape::{concatenate, reshape},
   },
   tokenizer::Tokenizer,
 };
 
-use super::{aligner_config::ForcedAlignerConfig, audio::AudioEncoder, text::Qwen3AsrTextModel};
+use super::{
+  aligner_config::ForcedAlignerConfig,
+  audio::AudioEncoder,
+  text::{Qwen3AsrTextModel, build_linear},
+};
 
 /// The `<|audio_start|>` marker string the aligner prepends to the assembled
 /// transcript before tokenization (the reference's literal in
@@ -353,9 +357,14 @@ pub struct ForcedAligner {
   config: ForcedAlignerConfig,
   audio_tower: AudioEncoder,
   model: Qwen3AsrTextModel,
-  /// Bias-free timestamp head weight `(classify_num, hidden)`. Applied as
-  /// `hidden @ weightᵀ` (an `nn.Linear(hidden -> classify_num)` forward).
-  timestamp_head_weight: Array,
+  /// Bias-free timestamp head `Linear(hidden -> classify_num)` — quantize-aware
+  /// (a dense `(classify_num, hidden)` weight or a packed
+  /// `mlx.nn.QuantizedLinear`, auto-detected by the `lm_head.scales` sibling).
+  /// Applied as `hidden @ weightᵀ` (`mlx.nn.Linear` / `QuantizedLinear`
+  /// `__call__`). The reference's `model_quant_predicate` quantizes `lm_head`
+  /// (it is not under `audio_tower`), so the released 8-bit checkpoint carries
+  /// `lm_head.scales`.
+  timestamp_head: MaybeQuantizedLinear,
   /// The model's own tokenizer, used by the [`RawTranscript`] align path to
   /// encode the assembled `<|audio_start|>…<timestamp><timestamp>` marker
   /// string (the reference's `self._tokenizer.encode(..,
@@ -373,7 +382,7 @@ impl std::fmt::Debug for ForcedAligner {
       .field("config", &self.config)
       .field("audio_tower", &self.audio_tower)
       .field("model", &self.model)
-      .field("timestamp_head_weight", &self.timestamp_head_weight)
+      .field("timestamp_head", &self.timestamp_head)
       .field("tokenizer", &self.tokenizer.is_some())
       .finish()
   }
@@ -414,41 +423,74 @@ impl ForcedAligner {
   /// stripped); `decoder_weights` carries the decoder `model.*` keys plus
   /// `lm_head.weight`. They are kept separate because the audio sanitize drops
   /// every non-audio key, so a single combined map cannot feed both builders.
+  ///
+  /// This is the **dense** entry point (the prior behavior). A quantized
+  /// checkpoint — whose decoder projections / `model.embed_tokens` / `lm_head`
+  /// carry the `<prefix>.scales` sibling — must load through
+  /// [`from_weights_quantized`](Self::from_weights_quantized), which threads the
+  /// parsed [`PerLayerQuantization`] (the `config.json` `quantization` block,
+  /// parsed by [`crate::audio::load::apply_quantization`]).
   pub fn from_weights(
     config: ForcedAlignerConfig,
     audio_weights: HashMap<String, Array>,
+    decoder_weights: HashMap<String, Array>,
+  ) -> Result<Self> {
+    Self::from_weights_quantized(config, audio_weights, decoder_weights, None)
+  }
+
+  /// Build a [`ForcedAligner`], threading the parsed [`PerLayerQuantization`] so
+  /// a quantized checkpoint loads through the shared quantize-aware layers.
+  ///
+  /// The decoder ([`Qwen3AsrTextModel`]) and the `lm_head` timestamp head are
+  /// built quantize-aware: each projection / the token embedding / the head
+  /// auto-detects a quantized layer from its `<prefix>.scales` sibling ALONE
+  /// (mlx-lm's `class_predicate`) and resolves its `(group_size, bits, mode)`
+  /// PER PREFIX from `quant`. The **audio tower stays dense** — the reference's
+  /// `model_quant_predicate` returns `not p.startswith("audio_tower")`, so the
+  /// whole audio encoder (conv stem + its q/k/v/out + fc1/fc2 + proj1/proj2) is
+  /// never quantized; [`AudioEncoder::from_weights`] is unchanged and consumes
+  /// the dense audio map verbatim. A `<prefix>.scales` present but no resolvable
+  /// scheme is a typed [`Error::InvariantViolation`]; a dense checkpoint
+  /// (`quant == None`, no `.scales`) loads byte-for-byte the prior path.
+  ///
+  /// `quant` is typically the global `{ group_size, bits, mode }` block the
+  /// released 8-bit checkpoint (`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`)
+  /// carries at the `config.json` root (group_size 64, bits 8, affine).
+  pub fn from_weights_quantized(
+    config: ForcedAlignerConfig,
+    audio_weights: HashMap<String, Array>,
     mut decoder_weights: HashMap<String, Array>,
+    quant: Option<&PerLayerQuantization>,
   ) -> Result<Self> {
     config.validate()?;
 
+    // The audio tower is NEVER quantized (the reference predicate excludes the
+    // `audio_tower` prefix), so it loads through the unchanged dense builder.
     let audio_tower = AudioEncoder::from_weights(config.audio_config.clone(), audio_weights)?;
-    let model = Qwen3AsrTextModel::from_weights(&config.text_config, &mut decoder_weights)?;
+    let model =
+      Qwen3AsrTextModel::from_weights_quantized(&config.text_config, &mut decoder_weights, quant)?;
 
-    // The timestamp head is `Linear(hidden -> classify_num, bias=False)`, so
-    // the weight is `(classify_num, hidden)`.
+    // The timestamp head is `Linear(hidden -> classify_num, bias=False)`, so the
+    // logical weight is `(classify_num, hidden)`. Build it quantize-aware (the
+    // released checkpoint carries `lm_head.scales`) with its logical shape pinned
+    // against the config — the quantized arm through its dequantized logical
+    // shape (no materialization), matching the decoder projections.
     let hidden = config.text_config.hidden_size;
     let classify_num = config.classify_num;
-    let timestamp_head_weight = decoder_weights.remove("lm_head.weight").ok_or_else(|| {
-      Error::MissingKey(MissingKeyPayload::new(
-        "ForcedAligner weight map",
-        smol_str::format_smolstr!("lm_head.weight"),
-      ))
-    })?;
-    let want = vec![classify_num.max(0) as usize, hidden.max(0) as usize];
-    let got = timestamp_head_weight.shape();
-    if got != want {
-      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
-        "ForcedAligner: lm_head.weight (classify_num, hidden)",
-        want,
-        got,
-      )));
-    }
+    let timestamp_head = build_linear(
+      &mut decoder_weights,
+      "lm_head",
+      classify_num,
+      hidden,
+      "lm_head.weight (classify_num, hidden)",
+      quant,
+    )?;
 
     Ok(Self {
       config,
       audio_tower,
       model,
-      timestamp_head_weight,
+      timestamp_head,
       tokenizer: None,
     })
   }
@@ -486,11 +528,11 @@ impl ForcedAligner {
     self.tokenizer.as_ref()
   }
 
-  /// Apply the bias-free timestamp head: `(B, L, hidden) @ weightᵀ` →
-  /// `(B, L, classify_num)`.
+  /// Apply the bias-free timestamp head: `(B, L, hidden)` → `(B, L,
+  /// classify_num)` (`mlx.nn.Linear` / `QuantizedLinear` `__call__`). The
+  /// quantized arm's `quantized_matmul` follows `hidden`'s dtype (no promotion).
   fn timestamp_head(&self, hidden: &Array) -> Result<Array> {
-    let wt = swapaxes(&self.timestamp_head_weight, -1, -2)?;
-    matmul(hidden, &wt)
+    self.timestamp_head.forward(hidden)
   }
 
   /// Forward pass: token ids + audio mel features → timestamp logits
