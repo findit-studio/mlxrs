@@ -7,13 +7,19 @@
 //!
 //! These are kept **private to the Whisper model**: the Whisper attention is
 //! non-standard (the `head_dim ** -0.25` scale on BOTH q and k, manual
-//! `qkv_attention`, cross-attention K/V caching) and cannot reuse the generic
-//! [`crate::lm::nn::attention`] fast-SDPA path, so it ports `qkv_attention`
-//! by hand for exact parity.
+//! `qkv_attention`, cross-attention K/V caching). The decoder paths port
+//! `qkv_attention` by hand for exact parity and `qk` extraction; the encoder's
+//! mask-free, cache-free self-attention (which needs no `qk`) routes to the
+//! fused [`crate::lm::nn::attention`] SDPA kernel, mathematically equivalent but
+//! without materializing the `(B, H, 1500, 1500)` score matrix.
 
 use crate::{
   Array, Result,
-  lm::nn::{activations::gelu, norm::LayerNorm},
+  lm::nn::{
+    activations::gelu,
+    attention::{Mask, scaled_dot_product_attention},
+    norm::LayerNorm,
+  },
   nn::MaybeQuantizedLinear,
   ops::{self, shape::concatenate},
 };
@@ -382,9 +388,58 @@ impl MultiHeadAttention {
   ) -> Result<(Array, KvPair)> {
     let q = self.query.forward(x)?;
     let (k, v) = self.project_kv(x, xa, kv_cache)?;
-    let wv = self.qkv_attention_no_qk(&q, &k, &v, mask)?;
+    // Encoder self-attention is the only call with no cross source, no mask, and
+    // no cache — a full bidirectional attention over the audio frames with no
+    // qk-weight requirement. Route it to the fused MLX SDPA kernel, which avoids
+    // materializing the `(B, H, T, T)` score matrix (T = n_audio_ctx = 1500) and
+    // fuses the softmax. It is mathematically the hand-rolled `qkv_attention`
+    // (the `head_dim ** -0.25` scale on both q and k equals SDPA's single
+    // `head_dim ** -0.5`), differing only by the fused/online softmax. Every
+    // decoder path (xa, mask, or cache present) keeps the hand-rolled path for
+    // exact parity and `qk` extraction.
+    let wv = if xa.is_none() && mask.is_none() && kv_cache.is_none() {
+      self.sdpa_attention(&q, &k, &v)?
+    } else {
+      self.qkv_attention_no_qk(&q, &k, &v, mask)?
+    };
     let out = self.out.forward(&wv)?;
     Ok((out, (k, v)))
+  }
+
+  /// Fused scaled-dot-product attention for the encoder's mask-free, cache-free
+  /// self-attention. Head-splits q/k/v to `(B, H, T, D)`, runs the fused MLX
+  /// SDPA kernel (`scale = head_dim ** -0.5`, no mask), and recombines the heads
+  /// to `(B, T, n_state)` — equivalent to [`Self::qkv_attention_no_qk`] with
+  /// `mask = None`, but without materializing the `(B, H, T, T)` score tensor.
+  ///
+  /// # Errors
+  /// Propagates the reshape / transpose / SDPA op errors.
+  fn sdpa_attention(&self, q: &Array, k: &Array, v: &Array) -> Result<Array> {
+    let q_shape = q.shape();
+    let n_batch = q_shape[0] as i32;
+    let n_ctx = q_shape[1] as i32;
+    let n_state = q_shape[2];
+    let n_head = self.n_head as i32;
+    let head_dim = (n_state / self.n_head) as i32;
+    let k_ctx = k.shape()[1] as i32;
+    // (B, T, n_state) -> (B, H, T, D) for q, k, and v.
+    let q = q
+      .reshape(&[n_batch, n_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 1, 3])?;
+    let k = k
+      .reshape(&[n_batch, k_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 1, 3])?;
+    let v = v
+      .reshape(&[n_batch, k_ctx, n_head, head_dim])?
+      .transpose_axes(&[0, 2, 1, 3])?;
+    // The hand-rolled path applies `head_dim ** -0.25` to BOTH q and k (an
+    // effective `head_dim ** -0.5`); SDPA takes that combined scale directly.
+    let scale = (n_state as f64 / self.n_head as f64).powf(-0.5) as f32;
+    let out = scaled_dot_product_attention(&q, &k, &v, scale, Mask::None)?;
+    // (B, H, T, D) -> (B, T, n_state).
+    out
+      .transpose_axes(&[0, 2, 1, 3])?
+      .reshape(&[n_batch, n_ctx, n_state as i32])
   }
 
   /// Run attention and also surface the pre-`v` attention weights `qk` — the
