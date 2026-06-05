@@ -360,7 +360,17 @@ impl AudioStage {
       };
       let prefix = format!("layers.{stage}.blocks.{i}");
       blocks.push(SwinBlock::from_weights(
-        weights, &prefix, dim, num_heads, window, shift, hidden, eps, quant,
+        weights,
+        &prefix,
+        dim,
+        num_heads,
+        window,
+        shift,
+        input_height,
+        input_width,
+        hidden,
+        eps,
+        quant,
       )?);
     }
 

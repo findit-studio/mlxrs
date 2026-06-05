@@ -396,6 +396,8 @@ fn build_swin_block(
   heads: i32,
   window: i32,
   shift: i32,
+  height: i32,
+  width: i32,
   cast: Option<Dtype>,
 ) -> SwinBlock {
   let hidden = 4 * dim; // mlp_ratio = 4
@@ -424,6 +426,8 @@ fn build_swin_block(
     heads,
     window,
     shift,
+    height,
+    width,
     hidden,
     1e-5,
     None,
@@ -440,8 +444,8 @@ fn swin_block_even_and_odd_run_and_shift_changes_output() {
   let (h, w) = (8, 8);
   let x = ops::shape::reshape(&mat(h * w, dim), &[1, h * w, dim]).unwrap();
 
-  let even = build_swin_block(dim, heads, window, 0, None);
-  let odd = build_swin_block(dim, heads, window, window / 2, None);
+  let even = build_swin_block(dim, heads, window, 0, h, w, None);
+  let odd = build_swin_block(dim, heads, window, window / 2, h, w, None);
 
   let out_even = even.forward(&x, h, w).unwrap();
   let out_odd = odd.forward(&x, h, w).unwrap();
@@ -469,7 +473,7 @@ fn swin_block_even_and_odd_run_and_shift_changes_output() {
 fn swin_block_preserves_f16_dtype() {
   let (dim, heads, window) = (4, 2, 4);
   let (h, w) = (8, 8);
-  let block = build_swin_block(dim, heads, window, window / 2, Some(Dtype::F16));
+  let block = build_swin_block(dim, heads, window, window / 2, h, w, Some(Dtype::F16));
   let x = ops::shape::reshape(&mat(h * w, dim), &[1, h * w, dim]).unwrap();
   let x = ops::misc::astype(&x, Dtype::F16).unwrap();
   let out = block.forward(&x, h, w).unwrap();
@@ -504,6 +508,8 @@ fn swin_block_rejects_out_of_range_shift() {
       heads,
       window,
       window,
+      8,
+      8,
       hidden,
       1e-5,
       None
@@ -762,6 +768,8 @@ fn swin_block_quantized_path_builds_quantized_and_runs() {
     heads,
     window,
     window / 2,
+    8,
+    8,
     hidden,
     1e-5,
     Some(&quant),
