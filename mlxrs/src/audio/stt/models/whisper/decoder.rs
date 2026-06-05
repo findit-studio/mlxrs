@@ -19,8 +19,8 @@
 //! absolute position.
 
 use crate::{
-  Array, Result,
-  error::{Error, OutOfRangePayload},
+  Array, Dtype, Result,
+  error::{DtypeMismatchPayload, Error, OutOfRangePayload, ShapePairMismatchPayload},
   lm::nn::norm::LayerNorm,
   ops::{self, indexing::slice},
 };
@@ -160,6 +160,84 @@ impl TextDecoder {
   ) -> Result<(Array, DecoderKvCache)> {
     let (logits, cache, _cross_qk) = self.run(tokens, 1, xa, kv_cache, false)?;
     Ok((logits, cache))
+  }
+
+  /// Warm-step decode from a token already on-device — the lazy-input analogue
+  /// of [`Self::forward`] that keeps the decode loop off the host (#369). `token`
+  /// is a `(1, 1)` `u32` array (the model's own previous argmax). Skips the
+  /// `&[u32]` -> `Array` build + host value-range scan so no per-token GPU->host
+  /// round-trip is forced.
+  ///
+  /// # Token invariants
+  /// The single `pub(crate)` chokepoint [`Self::run`] value-checks every id
+  /// `< n_vocab` on the host slice it owns; this lazy path takes the token as a
+  /// device [`Array`] and must NOT read its value (a per-token `.item()` would
+  /// reintroduce exactly the GPU->host sync #369 removed). So the rank and dtype
+  /// classes are enforced here on METADATA only ([`Self::validate_lazy_token`]:
+  /// `(1, 1)` shape, `u32` dtype — no value read), and the **value-range**
+  /// invariant (`0 <= id < n_vocab`) is a CALLER GUARANTEE:
+  ///
+  /// - the sole production caller, [`main_loop_pipelined`], feeds the model's own
+  ///   greedy/categorical sample (`argmax`/`categorical` over the `n_vocab`
+  ///   logits row), which is in `[0, n_vocab)` by construction;
+  /// - the eot-stick (`select(last_is_eot, eot, idx)`) only ever re-emits `eot`,
+  ///   itself a valid vocab id.
+  ///
+  /// An out-of-range id would index out of bounds in the `(n_vocab,
+  /// n_text_state)` token-embedding row gather (documented UB hazard), so the
+  /// surface is kept `pub(crate)` and this guarantee must hold at every call
+  /// site. ([`main_loop_pipelined`]: see
+  /// `whisper::decoding::DecodingTask::main_loop_pipelined`.)
+  ///
+  /// # Errors
+  /// - [`Error::ShapePairMismatch`] if `token` is not `(1, 1)`;
+  /// - [`Error::DtypeMismatch`] if `token` is not `u32`;
+  /// - [`Error::OutOfRange`] if `offset + 1` exceeds the positional table;
+  /// - propagates the embedding / block / LayerNorm / logit op errors.
+  pub(crate) fn forward_array(
+    &self,
+    token: &Array,
+    xa: &Array,
+    kv_cache: Option<&DecoderKvCache>,
+  ) -> Result<(Array, DecoderKvCache)> {
+    // Rank + dtype guard on metadata only — closes the two token classes a host
+    // `&[u32]` would make true by construction, WITHOUT a host value read.
+    Self::validate_lazy_token(token)?;
+    let offset = Self::cache_offset(kv_cache);
+    // Bound the decode context BEFORE the embedding gather (mirrors `run`'s
+    // pre-gather check; the loop also caps total length).
+    self.check_context(offset, 1)?;
+    let (logits, cache, _cross_qk) = self.run_from_array(token, 1, offset, xa, kv_cache, false)?;
+    Ok((logits, cache))
+  }
+
+  /// Validate a lazy warm-step token's rank and dtype on METADATA ONLY — the
+  /// trust-boundary guard for [`Self::forward_array`]. A warm-step token is a
+  /// `(1, 1)` `u32` array; this rejects a wrong shape ([`Error::ShapePairMismatch`])
+  /// or a non-`u32` dtype ([`Error::DtypeMismatch`]) BEFORE the token reaches the
+  /// token-embedding gather, using only [`Array::shape`] / [`Array::dtype`]
+  /// (both pure metadata queries — no graph evaluation, no GPU->host sync). The
+  /// remaining token class, the value range `id < n_vocab`, cannot be checked
+  /// without reading the value off-device (which would reintroduce the per-token
+  /// sync #369 removed); it is a caller guarantee documented on
+  /// [`Self::forward_array`].
+  fn validate_lazy_token(token: &Array) -> Result<()> {
+    let shape = token.shape();
+    if shape.as_slice() != [1usize, 1] {
+      return Err(Error::ShapePairMismatch(ShapePairMismatchPayload::new(
+        "TextDecoder: lazy warm-step token",
+        [1usize, 1],
+        shape,
+      )));
+    }
+    let dtype = token.dtype()?;
+    if dtype != Dtype::U32 {
+      return Err(Error::DtypeMismatch(DtypeMismatchPayload::new(
+        Dtype::U32,
+        dtype,
+      )));
+    }
+    Ok(())
   }
 
   /// Run the decoder over `n_group` parallel candidate rows — the batched
@@ -327,9 +405,29 @@ impl TextDecoder {
       ))
     })?;
     let tokens = Array::from_slice::<u32>(tokens, &[g, t])?;
+    self.run_from_array(&tokens, seq_len, offset, xa, kv_cache, collect_cross_qk)
+  }
 
+  /// The device-side decoder core, from the `(n_group, T)` token array onward:
+  /// token-embedding gather + positional add + cross-attention blocks + final
+  /// LayerNorm + weight-tied logits. Factored out of [`Self::run`] so the
+  /// warm-step path ([`Self::forward_array`]) can feed a token array produced
+  /// LAZILY by the model's own argmax (#369), keeping it on-device instead of
+  /// round-tripping through a host `&[u32]` every token. `seq_len` / `offset` are
+  /// the host-known positional dimensions; the token array's value range and rank
+  /// are guaranteed by the caller (a validated host slice on the prefill path, an
+  /// in-vocab argmax on the warm-step path).
+  fn run_from_array(
+    &self,
+    tokens: &Array,
+    seq_len: usize,
+    offset: usize,
+    xa: &Array,
+    kv_cache: Option<&DecoderKvCache>,
+    collect_cross_qk: bool,
+  ) -> Result<(Array, DecoderKvCache, DecoderCrossQk)> {
     // `x = token_embedding(tokens) + positional_embedding[offset:offset+T]`.
-    let token_emb = self.token_embedding.forward(&tokens)?;
+    let token_emb = self.token_embedding.forward(tokens)?;
     let pe_slice = self.positional_slice(offset, seq_len)?;
     let mut x = token_emb.add(&pe_slice)?;
 

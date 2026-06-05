@@ -752,6 +752,22 @@ impl WhisperModel {
     Ok((logits, new_cache))
   }
 
+  /// Warm-step decode from a token already on-device — the lazy-input analogue
+  /// of [`Self::decode_tokens`] (#369). `token` is a `(1, 1)` `u32` array (the
+  /// previous step's argmax, kept lazy), so the decode loop never round-trips the
+  /// token through a host `&[u32]`.
+  pub(crate) fn decode_token_lazy(
+    &self,
+    token: &Array,
+    encoder_states: &Array,
+    cache: Option<&DecoderKvCache>,
+  ) -> Result<(Array, DecoderKvCache)> {
+    self.validate_encoder_states(encoder_states, 1)?;
+    let (logits, new_cache) = self.decoder.forward_array(token, encoder_states, cache)?;
+    let logits = logits.astype(Dtype::F32)?;
+    Ok((logits, new_cache))
+  }
+
   /// Run the decoder over `n_group` parallel candidate rows — the batched
   /// (`n_group > 1`) analogue of [`Self::decode_tokens`] underneath best-of-N
   /// sampling (the reference's `(n_audio * n_group, T)` decode,
