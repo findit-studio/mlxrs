@@ -501,10 +501,26 @@ impl VisionModel {
     // `NativeResolution` seam) therefore cannot drop real keys, re-admit padded
     // keys, or all-mask a row. Held in an `Option<Array>` so the `Mask` borrow
     // below outlives every layer's use.
+    //
+    // Skip the mask entirely when NO image is padded (every grid fills the
+    // patch budget): the derived mask would be all-`0.0`, numerically identical
+    // to no mask, but building it costs a per-call host buffer + device copy and
+    // routes SDPA onto the masked-kernel path every forward. `vision.py` always
+    // passes `mask=None`; match that for the unpadded case and only pay for the
+    // mask when padding actually requires excluding keys.
     let attn_mask = match pixel_attention_mask {
       Some(m) => {
         validate_mask_shape(m, n, num_patches)?;
-        Some(build_attention_mask(&shapes, n, num_patches)?)
+        // `validate_active_grid` above proved every `H_p * W_p <= num_patches`,
+        // so the product cannot overflow; `saturating_mul` is belt-and-braces.
+        let has_padding = shapes
+          .iter()
+          .any(|&(h_p, w_p)| h_p.saturating_mul(w_p) < num_patches);
+        if has_padding {
+          Some(build_attention_mask(&shapes, n, num_patches)?)
+        } else {
+          None
+        }
       }
       None => None,
     };

@@ -770,6 +770,17 @@ fn bicubic_resample(
     ));
   }
 
+  // Fast path: identical shape ⇒ the cubic taps land on integer offsets (scale
+  // 1, no antialias) so each row is one-hot — skip the gather + weighted sum +
+  // the f32 round-trip entirely; a no-op resize is exactly the input.
+  // `try_clone` preserves the lazy graph reference. Placed after the dim / cap /
+  // dtype validation (mirroring the bilinear path), so an identity resize of a
+  // non-float or degenerate grid is still rejected. The SigLIP2 position-embed
+  // grid is square, so a full-budget image hits this every forward.
+  if in_h == out_h && in_w == out_w {
+    return x.try_clone();
+  }
+
   // ── height resample: gather TAPS rows along axis 2, contract over taps ──
   let (pix_y, wy) = build_axis(in_h, out_h);
   // `x[:, :, pix_y.reshape(-1), :]` → (B, C, out_h * TAPS, W_in).
