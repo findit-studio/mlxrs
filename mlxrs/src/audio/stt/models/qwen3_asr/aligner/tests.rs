@@ -472,15 +472,52 @@ fn from_weights_wrong_head_shape_is_typed_error() {
   let cfg = tiny_aligner_config();
   let audio = tiny_audio_weights(&cfg.audio_config);
   let mut dec = tiny_decoder_weights(&cfg.text_config);
-  // A head of the wrong width (classify_num + 1) must be rejected.
+  // A head of the wrong width (classify_num + 1) must be rejected. The
+  // quantize-aware head builder pins the logical `(classify_num, hidden)` shape
+  // and reports a `LayerKeyed(ShapePairMismatch)` naming the offending
+  // `lm_head.weight` key — the same shape-pin discipline the decoder projections
+  // use.
   dec.insert(
     "lm_head.weight".into(),
     filled(&[CLASSIFY_NUM + 1, HIDDEN], 0.1),
   );
-  assert!(matches!(
-    ForcedAligner::from_weights(cfg, audio, dec),
-    Err(Error::ShapePairMismatch(_))
-  ));
+  match ForcedAligner::from_weights(cfg, audio, dec) {
+    Err(Error::LayerKeyed(p)) => {
+      assert_eq!(
+        p.layer(),
+        "lm_head.weight",
+        "the error must name the head key"
+      );
+      assert!(
+        matches!(p.inner(), Error::ShapePairMismatch(_)),
+        "inner must be a ShapePairMismatch, got {:?}",
+        p.inner()
+      );
+    }
+    other => panic!("expected LayerKeyed(ShapePairMismatch) for the head, got {other:?}"),
+  }
+}
+
+#[test]
+fn from_weights_rejects_bias_on_bias_free_projection() {
+  // Every Qwen3-ASR decoder projection AND the `lm_head` timestamp head is
+  // bias-free (`x @ Wᵀ`). The shared `MaybeQuantizedLinear::from_weights` would
+  // otherwise consume + apply an optional dense `<prefix>.bias`, so a stray bias
+  // in a malformed checkpoint must be rejected (not silently applied, which
+  // would change the logits). Inject a `lm_head.bias` — built through the same
+  // bias-rejecting `build_linear` as the decoder projections — and assert the
+  // typed `InvariantViolation`.
+  let cfg = tiny_aligner_config();
+  let audio = tiny_audio_weights(&cfg.audio_config);
+  let mut dec = tiny_decoder_weights(&cfg.text_config);
+  dec.insert("lm_head.bias".into(), filled(&[CLASSIFY_NUM], 0.1));
+  assert!(
+    matches!(
+      ForcedAligner::from_weights(cfg, audio, dec),
+      Err(Error::InvariantViolation(_))
+    ),
+    "a `.bias` on the bias-free lm_head must be a typed InvariantViolation"
+  );
 }
 
 // ════════════════════════════ build_input_ids ════════════════════════════
@@ -1785,4 +1822,234 @@ fn config_rejects_malformed_mrope_section() {
     ForcedAlignerConfig::from_json(&json),
     Err(Error::OutOfRange(_))
   ));
+}
+
+// ════════════════════════════ quantized (8-bit) load + forward ════════════════════════════
+//
+// A synthetic affine-quantized checkpoint (`mlx-community/Qwen3-ForcedAligner-
+// 0.6B-8bit` carries group_size 64 / bits 8 / affine) exercises the
+// quantize-aware load path: the decoder projections, the token embedding, and
+// the `lm_head` timestamp head are each quantized (their `<prefix>.scales`
+// sibling makes the shared `MaybeQuantized*` builders pick the quantized arm),
+// while the audio tower stays DENSE (the reference `model_quant_predicate`
+// excludes the `audio_tower` prefix). The triples are produced by the real
+// `crate::ops::quantized::quantize`, so the loaded quantized layout is
+// structurally valid and the forward runs to finite logits.
+
+/// The affine quantization scheme the synthetic 8-bit fixture uses. `group_size
+/// = 32` is the smallest mlx affine group (`mlx/ops.cpp:4740` requires
+/// `{32, 64, 128}`); `bits = 8` matches the released checkpoint.
+const QUANT_GROUP: i32 = 32;
+const QUANT_BITS: i32 = 8;
+
+// Dims chosen so every quantized projection's `in_features` is a multiple of
+// `QUANT_GROUP` (>= 32): hidden / intermediate / vocab / classify == 32, and the
+// q-projection fan-in `n_heads * head_dim == 64`.
+const Q_HIDDEN: i32 = 32;
+const Q_HEAD_DIM: i32 = 32;
+const Q_N_HEADS: i32 = 2;
+const Q_N_KV: i32 = 1;
+const Q_INTER: i32 = 32;
+const Q_VOCAB: i32 = 64;
+const Q_CLASSIFY: i32 = 32;
+
+/// The global affine [`PerLayerQuantization`] the released 8-bit checkpoint
+/// carries (a single `{ group_size, bits, mode }` block, no per-layer override).
+fn quant_global() -> crate::lm::quant::PerLayerQuantization {
+  crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(
+    QUANT_GROUP,
+    QUANT_BITS,
+  ))
+}
+
+/// The aligner config for the quantized fixture: a tiny dense audio tower whose
+/// `output_dim == Q_HIDDEN` (so the audio splice replaces a hidden-width row)
+/// wired to a 32-wide text decoder.
+fn quant_aligner_config() -> ForcedAlignerConfig {
+  let json = format!(
+    r#"{{
+      "model_type": "qwen3_asr",
+      "thinker_config": {{
+        "model_type": "qwen3_forced_aligner",
+        "audio_config": {{
+          "num_mel_bins": 8,
+          "encoder_layers": 1,
+          "encoder_attention_heads": 2,
+          "encoder_ffn_dim": 8,
+          "d_model": 4,
+          "output_dim": {Q_HIDDEN},
+          "max_source_positions": 8,
+          "n_window": 4,
+          "n_window_infer": 8,
+          "downsample_hidden_size": 2
+        }},
+        "text_config": {{
+          "hidden_size": {Q_HIDDEN}, "head_dim": {Q_HEAD_DIM}, "num_attention_heads": {Q_N_HEADS},
+          "num_key_value_heads": {Q_N_KV}, "num_hidden_layers": 1, "intermediate_size": {Q_INTER},
+          "vocab_size": {Q_VOCAB}, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+          "tie_word_embeddings": true
+        }},
+        "classify_num": {Q_CLASSIFY},
+        "audio_token_id": 30,
+        "audio_start_token_id": 31,
+        "audio_end_token_id": 32,
+        "timestamp_token_id": 33,
+        "timestamp_segment_time": 80.0
+      }}
+    }}"#
+  );
+  ForcedAlignerConfig::from_json(&json).expect("quant aligner config must validate")
+}
+
+/// Affine-quantize the dense `(out, in)` `weight` and insert the
+/// `(<prefix>.weight, <prefix>.scales, <prefix>.biases)` triple — the layout
+/// mlx's `quantize` produces and the shared `MaybeQuantized*` builders detect.
+/// `in_features` must be a multiple of [`QUANT_GROUP`].
+fn insert_quantized(w: &mut HashMap<String, Array>, prefix: &str, out: i32, in_features: i32) {
+  // A small, deterministic non-constant dense weight (a tiny ramp keeps the
+  // quantized values well-defined yet the forward numerically stable).
+  let n = (out * in_features) as usize;
+  let dense_vals: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.01 - 0.05).collect();
+  let dense = Array::from_slice::<f32>(&dense_vals, &[out, in_features]).unwrap();
+  let (packed, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QUANT_GROUP, QUANT_BITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), packed);
+  w.insert(format!("{prefix}.scales"), scales);
+  // Affine mode always yields per-group biases.
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine quantize yields per-group biases"),
+  );
+}
+
+/// The decoder (`model.*`) + `lm_head` weight map with every quantizable layer
+/// affine-quantized: the q/k/v/o + gate/up/down projections, the token
+/// embedding, and the `lm_head` timestamp head carry `(weight, scales, biases)`
+/// triples; the RMSNorms stay dense (they are not `nn.Linear` / `nn.Embedding`).
+fn quant_decoder_weights(cfg: &Qwen3AsrTextConfig) -> HashMap<String, Array> {
+  let hidden = cfg.hidden_size;
+  let head_dim = cfg.head_dim;
+  let n_heads = cfg.num_attention_heads;
+  let n_kv = cfg.num_key_value_heads;
+  let inter = cfg.intermediate_size;
+  let vocab = cfg.vocab_size;
+  let mut m: HashMap<String, Array> = HashMap::new();
+
+  // Quantized token embedding `(vocab, hidden)` (mlx-lm quantizes nn.Embedding).
+  insert_quantized(&mut m, "model.embed_tokens", vocab, hidden);
+  // Dense final norm (not a quantizable module).
+  m.insert("model.norm.weight".into(), filled(&[hidden], 1.0));
+
+  let p = "model.layers.0";
+  // Quantized attention projections.
+  insert_quantized(
+    &mut m,
+    &format!("{p}.self_attn.q_proj"),
+    n_heads * head_dim,
+    hidden,
+  );
+  insert_quantized(
+    &mut m,
+    &format!("{p}.self_attn.k_proj"),
+    n_kv * head_dim,
+    hidden,
+  );
+  insert_quantized(
+    &mut m,
+    &format!("{p}.self_attn.v_proj"),
+    n_kv * head_dim,
+    hidden,
+  );
+  insert_quantized(
+    &mut m,
+    &format!("{p}.self_attn.o_proj"),
+    hidden,
+    n_heads * head_dim,
+  );
+  // Dense q/k norms (RMSNorm, not quantized).
+  m.insert(
+    format!("{p}.self_attn.q_norm.weight"),
+    filled(&[head_dim], 1.0),
+  );
+  m.insert(
+    format!("{p}.self_attn.k_norm.weight"),
+    filled(&[head_dim], 1.0),
+  );
+  // Quantized MLP projections.
+  insert_quantized(&mut m, &format!("{p}.mlp.gate_proj"), inter, hidden);
+  insert_quantized(&mut m, &format!("{p}.mlp.up_proj"), inter, hidden);
+  insert_quantized(&mut m, &format!("{p}.mlp.down_proj"), hidden, inter);
+  // Dense decoder-block norms.
+  m.insert(
+    format!("{p}.input_layernorm.weight"),
+    filled(&[hidden], 1.0),
+  );
+  m.insert(
+    format!("{p}.post_attention_layernorm.weight"),
+    filled(&[hidden], 1.0),
+  );
+  // Quantized timestamp head `Linear(hidden -> classify_num)`.
+  insert_quantized(&mut m, "lm_head", Q_CLASSIFY, hidden);
+  m
+}
+
+fn quant_aligner() -> ForcedAligner {
+  let cfg = quant_aligner_config();
+  let audio = tiny_audio_weights(&cfg.audio_config);
+  let dec = quant_decoder_weights(&cfg.text_config);
+  ForcedAligner::from_weights_quantized(cfg, audio, dec, Some(&quant_global()))
+    .expect("quantized aligner must build")
+}
+
+#[test]
+fn from_weights_quantized_loads_and_forwards_to_finite_logits() {
+  // The whole quantize-aware load path: the decoder projections + token
+  // embedding + lm_head are built quantized (their `.scales` siblings), the
+  // audio tower stays dense, and a forward produces finite `(B, L, classify_num)`
+  // logits — proving the 8-bit checkpoint loads and runs end to end.
+  let a = quant_aligner();
+  assert_eq!(a.config().classify_num, Q_CLASSIFY);
+  assert_eq!(a.decoder().num_layers(), 1);
+
+  let feats = filled(&[1, 8, 8], 0.1);
+  let n_audio = a.num_audio_tokens_for_test(&feats);
+  let transcript = [AlignWord::new("x", vec![10]), AlignWord::new("y", vec![11])];
+  let ids = a.build_input_ids(&transcript, n_audio).unwrap();
+  let l = ids.shape()[1];
+
+  let mut logits = a.forward(&ids, &feats).unwrap();
+  assert_eq!(logits.shape(), vec![1, l, Q_CLASSIFY as usize]);
+  let vals = logits.to_vec::<f32>().unwrap();
+  assert!(
+    vals.iter().all(|v| v.is_finite()),
+    "quantized forward produced non-finite logits: {vals:?}"
+  );
+}
+
+#[test]
+fn from_weights_quantized_scales_without_scheme_is_typed_error() {
+  // A quantized checkpoint loaded with `quant = None` (the config resolved no
+  // scheme) must be a typed InvariantViolation when a `.scales` sibling is
+  // present — never a silent dense reinterpret of the packed `uint32` weight.
+  let cfg = quant_aligner_config();
+  let audio = tiny_audio_weights(&cfg.audio_config);
+  let dec = quant_decoder_weights(&cfg.text_config);
+  assert!(matches!(
+    ForcedAligner::from_weights_quantized(cfg, audio, dec, None),
+    Err(Error::InvariantViolation(_))
+  ));
+}
+
+#[test]
+fn dense_from_weights_still_builds_and_forwards() {
+  // The dense path is unchanged: the existing dense fixture loads through the
+  // public `from_weights` and forwards to the documented logits shape.
+  let a = tiny_aligner();
+  let feats = filled(&[1, 8, 8], 0.1);
+  let n_audio = a.num_audio_tokens_for_test(&feats);
+  let transcript = [AlignWord::new("x", vec![10])];
+  let ids = a.build_input_ids(&transcript, n_audio).unwrap();
+  let l = ids.shape()[1];
+  let logits = a.forward(&ids, &feats).unwrap();
+  assert_eq!(logits.shape(), vec![1, l, CLASSIFY_NUM as usize]);
 }
