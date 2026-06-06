@@ -1,0 +1,39 @@
+# Standalone feasibility-spike crate (NOT a member of the mlxrs workspace).
+#
+# It carries its own empty `[workspace]` table so Cargo treats this directory
+# as an independent workspace root. That guarantees the spike's CoreML / objc2
+# dependency graph is fully isolated from `mlxrs` — building or testing mlxrs
+# never sees objc2-core-ml, and `cargo build` at the mlxrs workspace root is
+# provably unaffected by this crate.
+#
+# Purpose: de-risk driving Apple CoreML (and thus the ANE) from Rust as the
+# foundation for a future CoreML/ANE Whisper backend in mlxrs.
+[workspace]
+
+[package]
+name = "coreml-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "coreml_spike"
+path = "src/main.rs"
+
+# CoreML is macOS/iOS-only. Gate the objc2-core-ml dependency to Apple targets
+# so the crate is at least *parseable* elsewhere (it does nothing useful off
+# Apple, but the dep won't even be resolved on Linux/Windows).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# objc2 0.3.x framework crates over objc2 0.6.x core. All required CoreML
+# classes (MLModel, MLMultiArray, MLModelConfiguration, MLState, …) live behind
+# per-class cargo features that are ON by default (79 of 80 features default).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+  "NSArray",
+  "NSDictionary",
+  "NSString",
+  "NSValue",     # NSNumber
+  "NSError",
+  "NSURL",
+] }
+objc2-core-ml = "0.3"
