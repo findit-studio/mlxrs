@@ -13,32 +13,44 @@ rust-version.workspace = true
 
 [features]
 default = []
+# `serde_json` is an explicit feature (not a bare `dep:serde_json`) so a
+# `#[cfg(feature = "serde_json")]` gate is accurate wherever the dep is
+# pulled — used by the always-compiled `io::load_weights_from_dir` to gate
+# its `model.safetensors.index.json` (JSON) discovery tier without forcing
+# JSON onto the `serde_json`-free `embeddings` feature. Every feature that
+# needs JSON parsing depends on `"serde_json"` (the feature), which enables
+# `dep:serde_json` **and** `dep:serde`: `load_via_index` deserializes the
+# index `weight_map` through a typed `serde::Deserialize` visitor (so it can
+# reject a duplicate tensor→shard binding, which `serde_json::Value` would
+# silently collapse), and that visitor needs the `serde` derive/trait crate
+# present wherever the `serde_json` index tier compiles.
+serde_json           = ["dep:serde_json", "dep:serde"]
 tokenizer            = ["dep:tokenizers"]                                          # HfTokenizer load + encode/decode + special tokens from tokenizer.json. NO serde_json/minijinja.
-tokenizer-config     = ["tokenizer", "dep:serde_json"]                             # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
-tokenizer-stream     = ["tokenizer"]                                               # StreamingDetokenizer trait + NaiveStreamingDetokenizer (no serde_json)
+tokenizer-config     = ["tokenizer", "serde_json"]                                 # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
+tokenizer-stream     = ["tokenizer"]                                              # StreamingDetokenizer trait + NaiveStreamingDetokenizer (no serde_json)
 tokenizer-gpt2       = []                                                          # GPT-2 bytes↔unicode table (committed cargo-xtask-codegen artifact)
-tokenizer-bpe        = ["tokenizer-stream", "tokenizer-gpt2", "dep:serde_json"]    # GPT-2 byte-level streaming detok + decoder-class inference
-tokenizer-spm        = ["tokenizer-stream", "dep:serde_json"]                      # SentencePiece (+no-space) streaming detok + decoder-class inference
+tokenizer-bpe        = ["tokenizer-stream", "tokenizer-gpt2", "serde_json"]        # GPT-2 byte-level streaming detok + decoder-class inference
+tokenizer-spm        = ["tokenizer-stream", "serde_json"]                          # SentencePiece (+no-space) streaming detok + decoder-class inference
 tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-contrib", "dep:serde", "dep:jiff"]   # jinja apply_chat_template (jiff: strftime_now)
 tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
-tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
+tokenizer-tools      = ["tokenizer-config", "serde_json"]                          # tool-call parsers + infer_tool_parser
 
 embeddings           = ["tokenizer", "dep:memspan", "dep:glob"]
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
-llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "dep:serde_json"]
+llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "serde_json"]
 vlm                  = ["lm", "dep:image"]
 lfm2-vl              = ["vlm"]                                                     # LFM2 hybrid conv+attention LM + (later) the LFM2.5-VL vision-language wrapper
-qwen3                = ["lm", "dep:serde", "dep:serde_json"]                       # Qwen3 dense text transformer (GQA + per-head Q/K-norm + SwiGLU): config + forward + tied head
+qwen3                = ["lm", "dep:serde", "serde_json"]                           # Qwen3 dense text transformer (GQA + per-head Q/K-norm + SwiGLU): config + forward + tied head
 audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
-wav2vec2             = ["audio", "dep:serde", "dep:serde_json"]                    # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
-siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "dep:serde_json"]        # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
+wav2vec2             = ["audio", "dep:serde", "serde_json"]                        # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
+siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "serde_json"]            # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
 whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
-qwen3-asr            = ["qwen3", "audio", "dep:serde", "dep:serde_json"]           # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
+qwen3-asr            = ["qwen3", "audio", "dep:serde", "serde_json"]               # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
 qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
-sensevoice           = ["audio", "tokenizer-spm", "dep:serde", "dep:serde_json"]  # SenseVoice-Small CTC STT (mlx-community/SenseVoiceSmall): Kaldi-fbank+LFR+CMVN front-end, SANM/FSMN encoder, CTC head + rich-info (language/emotion/event); SentencePiece via tokenizer-spm
-vad                  = ["audio", "dep:serde", "dep:serde_json"]                    # Silero VAD (snakers4/silero-vad): per-rate STFT-conv + 4 conv blocks + LSTM + sigmoid speech-prob head, fixed 512/256-sample chunking at 16k/8k, streaming context, speech-segment post-processing (threshold + min-speech/min-silence + speech-pad)
-embeddinggemma       = ["embeddings", "lm", "dep:serde", "dep:serde_json"]         # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
-clap                 = ["embeddings", "audio", "npz", "dep:serde", "dep:serde_json"]  # CLAP-HTSAT-unfused dual-tower audio+text embeddings (laion/clap-htsat-unfused): config + Slaney mel front-end (reuses audio::dsp), HTSAT Swin + RoBERTa towers; npz for the .npy oracle fixtures
+sensevoice           = ["audio", "tokenizer-spm", "dep:serde", "serde_json"]       # SenseVoice-Small CTC STT (mlx-community/SenseVoiceSmall): Kaldi-fbank+LFR+CMVN front-end, SANM/FSMN encoder, CTC head + rich-info (language/emotion/event); SentencePiece via tokenizer-spm
+vad                  = ["audio", "dep:serde", "serde_json"]                        # Silero VAD (snakers4/silero-vad): per-rate STFT-conv + 4 conv blocks + LSTM + sigmoid speech-prob head, fixed 512/256-sample chunking at 16k/8k, streaming context, speech-segment post-processing (threshold + min-speech/min-silence + speech-pad)
+embeddinggemma       = ["embeddings", "lm", "dep:serde", "serde_json"]             # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
+clap                 = ["embeddings", "audio", "npz", "dep:serde", "serde_json"]   # CLAP-HTSAT-unfused dual-tower audio+text embeddings (laion/clap-htsat-unfused): config + Slaney mel front-end (reuses audio::dsp), HTSAT Swin + RoBERTa towers; npz for the .npy oracle fixtures
 unstable-ops-overload = []
 gguf                 = []
 npz                  = ["dep:zip", "dep:memmapix"]                                # NumPy .npy (single array) + .npz (ZIP of <name>.npy members); mirrors mx.save/savez/savez_compressed (stored + deflate). memmapix memory-maps the file on load (peak ~3x→~1x)
