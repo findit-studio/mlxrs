@@ -193,6 +193,21 @@ fn read_f16_checked_f32(
   Ok(out)
 }
 
+/// A zero-filled `f32` buffer of `rows * cols`, allocated FALLIBLY: the product
+/// is checked (no overflow → no later out-of-bounds write), then reserved via
+/// `reserve_or_error` (no infallible `vec![0.0; n]` / panic-OOM on a model-sized
+/// extent) and resized into the pre-sized capacity (no realloc). The shared
+/// allocation primitive for the channel-major transpose buffers.
+fn try_zeroed_f32(context: &'static str, rows: usize, cols: usize) -> Result<Vec<f32>> {
+  let n = rows
+    .checked_mul(cols)
+    .ok_or_else(|| dim_overflow(context))?;
+  let mut v = Vec::new();
+  crate::model_validation::reserve_or_error(&mut v, context, n)?;
+  v.resize(n, 0.0f32);
+  Ok(v)
+}
+
 /// Number of scalar elements in an [`MLMultiArray`] (clamped to `>= 0`).
 fn ml_count(a: &MLMultiArray) -> usize {
   // SAFETY: `count` is a plain readonly property.
@@ -751,7 +766,7 @@ impl CoreMlWhisper {
       &out,
       state * ctx,
     )?;
-    let mut hwc = vec![0.0f32; ctx * state];
+    let mut hwc = try_zeroed_f32("CoreMlWhisper::encode: encoder host transpose", ctx, state)?;
     for s in 0..state {
       for t in 0..ctx {
         hwc[t * state + s] = chw[s * ctx + t];
@@ -795,7 +810,11 @@ impl super::inference::WhisperInference for CoreMlWhisper {
     }
     let mut mel32 = mel.try_clone()?;
     let host = mel32.to_vec::<f32>()?; // row-major over (N_AUDIO_FRAMES, mels)
-    let mut chw = vec![0.0f32; n_mels * N_AUDIO_FRAMES];
+    let mut chw = try_zeroed_f32(
+      "CoreMlWhisper::encode: mel host transpose",
+      n_mels,
+      N_AUDIO_FRAMES,
+    )?;
     for t in 0..N_AUDIO_FRAMES {
       for m in 0..n_mels {
         // dst[m, t] (channel-major, padded width 3000) ← src[t, m].
@@ -993,7 +1012,11 @@ impl CoreMlWhisper {
     // so the channel-major transpose below can assume it.
     let mut e = encoder_states.try_clone()?;
     let host = e.to_vec::<f32>()?; // row-major over (1, ctx, state)
-    let mut chw = vec![0.0f32; state * ctx];
+    let mut chw = try_zeroed_f32(
+      "CoreMlWhisper::encode: encoder states transpose",
+      state,
+      ctx,
+    )?;
     for t in 0..ctx {
       for s in 0..state {
         chw[s * ctx + t] = host[t * state + s];
