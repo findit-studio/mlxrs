@@ -184,7 +184,13 @@ fn read_f16_checked_f32(
   expected_count: usize,
 ) -> Result<Vec<f32>> {
   let bits = read_f16_checked(context, a, expected_count)?;
-  Ok(bits.iter().map(|&b| f16::from_bits(b).to_f32()).collect())
+  // Allocate the f32 output FALLIBLY: a `collect` would infallibly
+  // `with_capacity` on the (model-output-sized) count and panic on OOM; reserving
+  // first and `extend`ing into the pre-sized buffer never reallocates.
+  let mut out = Vec::new();
+  crate::model_validation::reserve_or_error(&mut out, context, bits.len())?;
+  out.extend(bits.iter().map(|&b| f16::from_bits(b).to_f32()));
+  Ok(out)
 }
 
 /// Number of scalar elements in an [`MLMultiArray`] (clamped to `>= 0`).
@@ -895,6 +901,18 @@ impl super::inference::WhisperInference for CoreMlWhisper {
       .iter()
       .copied()
       .fold(1usize, usize::saturating_mul);
+    // The lazy entry advances EXACTLY one token (the next-token tensor); reject a
+    // multi-element token tensor rather than silently decoding it as a multi-token
+    // prefix through `decode_tokens`.
+    if n_tokens != 1 {
+      return Err(Error::ShapePairMismatch(
+        crate::error::ShapePairMismatchPayload::new(
+          "CoreMlWhisper::decode_token_lazy: expected a single next-token tensor (1 element)",
+          vec![1usize],
+          token.shape().to_vec(),
+        ),
+      ));
+    }
     self.precheck_decode(cache, n_tokens, encoder_states)?;
     let mut t = token.try_clone()?;
     let ids = t.to_vec::<u32>()?;
@@ -1329,27 +1347,27 @@ mod tests {
     );
   }
 
-  /// The lazy single-token decode entry point also guards UP FRONT: an over-cap
-  /// token tensor is rejected by `precheck_decode` before the host `to_vec`
-  /// materialization (the element count is read from the shape, no copy).
+  /// The lazy single-token decode entry rejects a NON-lazy (multi-element) token
+  /// tensor up front: it advances exactly one token, so a multi-token tensor is a
+  /// typed `ShapePairMismatch`, not a silent multi-token decode through
+  /// `decode_tokens`.
   #[test]
   #[ignore = "needs the local WhisperKit tiny .mlmodelc bundle; runs on the ANE"]
-  fn coreml_decode_token_lazy_rejects_over_cap_up_front() {
+  fn coreml_decode_token_lazy_rejects_multi_token() {
     let dir = tiny_dir();
     if !CoreMlWhisper::is_present(&dir) {
-      eprintln!("SKIP coreml_decode_token_lazy_rejects_over_cap_up_front: {dir:?} has no bundle");
+      eprintln!("SKIP coreml_decode_token_lazy_rejects_multi_token: {dir:?} has no bundle");
       return;
     }
     let backend = CoreMlWhisper::load(&dir).expect("load CoreML whisper-tiny");
     let (ctx, state) = (backend.dims().n_audio_ctx(), backend.dims().n_audio_state());
     let enc = Array::full::<f32>(&[1, ctx as i32, state as i32], 0.0).expect("enc");
-    // A token tensor carrying MAX_DECODER_CTX + 1 valid ids overruns the cache.
-    let over = vec![50258u32; MAX_DECODER_CTX + 1];
-    let token = Array::from_slice::<u32>(&over, &[1, (MAX_DECODER_CTX + 1) as i32]).expect("token");
-    let result = WhisperInference::decode_token_lazy(&backend, &token, &enc, None);
+    // A 2-token tensor violates the single-next-token lazy contract.
+    let multi = Array::from_slice::<u32>(&[50258u32, 50259], &[1, 2]).expect("token");
+    let result = WhisperInference::decode_token_lazy(&backend, &multi, &enc, None);
     assert!(
-      matches!(result, Err(Error::CapExceeded(_))),
-      "an over-cap lazy token must be rejected up front with CapExceeded"
+      matches!(result, Err(Error::ShapePairMismatch(_))),
+      "a multi-element lazy token must be rejected with ShapePairMismatch"
     );
   }
 
