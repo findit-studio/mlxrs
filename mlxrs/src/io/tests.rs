@@ -897,3 +897,589 @@ fn gguf_save_metadata_list_entry_with_interior_nul_is_rejected() {
   }
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────── load_weights_from_dir: feature-neutral discovery ───────────────────
+//
+// The feature-neutral checkpoint discovery (`io::load_weights_from_dir`),
+// covering each resolution tier. INDEPENDENT closed-form oracles: every
+// expected weight name / value / dtype is a literal written into the fixture,
+// never produced by the function under test.
+
+/// Tier 1 — `model.safetensors.index.json` (authoritative manifest). A tiny
+/// **2-shard** checkpoint: shard 1 holds `a.weight`, shard 2 holds `b.weight`,
+/// and the index `weight_map` binds each weight to its shard. The merged load
+/// must carry BOTH keys with their literal values. A stray
+/// `model-stale.safetensors` NOT listed in the index is ignored.
+#[cfg(feature = "serde_json")]
+#[test]
+fn load_weights_from_dir_index_driven_merges_two_shards() {
+  let dir = fresh_dir("lw-index-2shard");
+
+  let a = Array::from_slice::<f32>(&[1.0_f32, 2.0], &(2usize,)).unwrap();
+  let mut shard1: HashMap<String, Array> = HashMap::new();
+  shard1.insert("a.weight".to_string(), a);
+  save_safetensors(&dir.join("model-00001-of-00002.safetensors"), &shard1).unwrap();
+
+  let b = Array::from_slice::<i32>(&[10_i32, 20, 30], &(3usize,)).unwrap();
+  let mut shard2: HashMap<String, Array> = HashMap::new();
+  shard2.insert("b.weight".to_string(), b);
+  save_safetensors(&dir.join("model-00002-of-00002.safetensors"), &shard2).unwrap();
+
+  // A stale shard NOT named in the index — must be invisible to the load.
+  let stale = Array::from_slice::<f32>(&[999.0_f32], &(1usize,)).unwrap();
+  let mut stale_map: HashMap<String, Array> = HashMap::new();
+  stale_map.insert("stale.weight".to_string(), stale);
+  save_safetensors(&dir.join("model-stale.safetensors"), &stale_map).unwrap();
+
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"metadata":{"total_size":20},"weight_map":{"a.weight":"model-00001-of-00002.safetensors","b.weight":"model-00002-of-00002.safetensors"}}"#,
+  )
+  .unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(
+    loaded.len(),
+    2,
+    "exactly the two indexed weights are loaded"
+  );
+  assert_eq!(
+    loaded.get_mut("a.weight").unwrap().to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0]
+  );
+  assert_eq!(
+    loaded.get_mut("b.weight").unwrap().to_vec::<i32>().unwrap(),
+    vec![10, 20, 30]
+  );
+  assert!(
+    !loaded.contains_key("stale.weight"),
+    "a shard not listed in the index must be ignored"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 2 — a single un-sharded `model.safetensors` (no index). Loaded
+/// directly with its literal weights.
+#[test]
+fn load_weights_from_dir_single_model_safetensors() {
+  let dir = fresh_dir("lw-single");
+  let w = Array::from_slice::<f32>(&[3.0_f32, 4.0, 5.0], &(3usize,)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("only.weight".to_string(), w);
+  save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(loaded.len(), 1);
+  assert_eq!(
+    loaded
+      .get_mut("only.weight")
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap(),
+    vec![3.0, 4.0, 5.0]
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 3 — legacy `weights.safetensors` (pre-HF naming). A directory
+/// carrying ONLY this name still loads.
+#[test]
+fn load_weights_from_dir_legacy_weights_safetensors() {
+  let dir = fresh_dir("lw-legacy");
+  let w = Array::from_slice::<i32>(&[7_i32, 8], &(2usize,)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("legacy.weight".to_string(), w);
+  save_safetensors(&dir.join("weights.safetensors"), &weights).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(loaded.len(), 1);
+  assert_eq!(
+    loaded
+      .get_mut("legacy.weight")
+      .unwrap()
+      .to_vec::<i32>()
+      .unwrap(),
+    vec![7, 8]
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory holding `model-*.safetensors` shards but NO index manifest is an
+/// INCOMPLETE checkpoint (a partial/failed `save_model` writes `model-gen-*`
+/// shards before the index-rename commit point). There is deliberately no
+/// unindexed-`model*.safetensors`-glob fallback, so it fails closed with the
+/// typed no-weights error rather than merging uncommitted shards — matching
+/// mlx-lm's index-or-single-file contract.
+#[test]
+fn load_weights_from_dir_sharded_without_index_fails_closed() {
+  let dir = fresh_dir("lw-noindex-shards");
+  let p1 = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut m1: HashMap<String, Array> = HashMap::new();
+  m1.insert("p1.weight".to_string(), p1);
+  save_safetensors(&dir.join("model-00001-of-00002.safetensors"), &m1).unwrap();
+
+  let p2 = Array::from_slice::<f32>(&[2.0_f32], &(1usize,)).unwrap();
+  let mut m2: HashMap<String, Array> = HashMap::new();
+  m2.insert("p2.weight".to_string(), p2);
+  save_safetensors(&dir.join("model-00002-of-00002.safetensors"), &m2).unwrap();
+
+  assert!(
+    !dir.join("model.safetensors.index.json").exists(),
+    "the no-index sharded case is what this test exercises"
+  );
+  assert!(
+    load_weights_from_dir(&dir).is_err(),
+    "sharded `model-*.safetensors` without an index manifest is incomplete and \
+     must fail closed (no unindexed-glob fallback)"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without `serde_json`, a present `model.safetensors.index.json` — even a
+/// NON-REGULAR one (here a directory) — must fail closed rather than fall
+/// through and load a stale single `model.safetensors`. `path_is_file`
+/// would miss the non-regular entry; `symlink_metadata` catches it.
+#[cfg(not(feature = "serde_json"))]
+#[test]
+fn load_weights_from_dir_no_serde_nonregular_index_fails_closed() {
+  let dir = fresh_dir("lw-noserde-nonreg-index");
+  // A DIRECTORY named like the index sentinel (a non-regular entry).
+  std::fs::create_dir(dir.join("model.safetensors.index.json")).unwrap();
+  // A stale single-file checkpoint that must NOT be loaded while the sentinel is present.
+  let a = Array::from_slice::<f32>(&[9.0_f32], &(1usize,)).unwrap();
+  let mut m: HashMap<String, Array> = HashMap::new();
+  m.insert("stale.weight".to_string(), a);
+  save_safetensors(&dir.join("model.safetensors"), &m).unwrap();
+
+  assert!(
+    load_weights_from_dir(&dir).is_err(),
+    "a present (even non-regular) index sentinel must fail closed without serde_json"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `serde_json`, a DANGLING `model.safetensors.index.json` symlink (the
+/// sentinel exists but its target is missing) must fail closed in `load_via_index`
+/// rather than be treated as absent and fall through to a stale `model.safetensors`.
+#[cfg(all(feature = "serde_json", unix))]
+#[test]
+fn load_weights_from_dir_serde_dangling_index_symlink_fails_closed() {
+  let dir = fresh_dir("lw-dangling-index");
+  // Dangling symlink: the sentinel exists but points at a missing target.
+  std::os::unix::fs::symlink(
+    dir.join("missing-target.json"),
+    dir.join("model.safetensors.index.json"),
+  )
+  .unwrap();
+  // A stale single-file checkpoint that must NOT be loaded while the sentinel exists.
+  let a = Array::from_slice::<f32>(&[7.0_f32], &(1usize,)).unwrap();
+  let mut m: HashMap<String, Array> = HashMap::new();
+  m.insert("stale.weight".to_string(), a);
+  save_safetensors(&dir.join("model.safetensors"), &m).unwrap();
+
+  assert!(
+    load_weights_from_dir(&dir).is_err(),
+    "a dangling index sentinel must fail closed, not fall through to the stale model.safetensors"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 6 — a single NumPy `.npz` (the mlx-community-native multi-array
+/// format). With no safetensors / gguf, `model.npz` is loaded via
+/// `load_npz`. Round-trips the literal weights.
+#[cfg(feature = "npz")]
+#[test]
+fn load_weights_from_dir_npz_model() {
+  let dir = fresh_dir("lw-npz");
+  let w = Array::from_slice::<f32>(&[6.0_f32, 7.0], &(2usize,)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("npz.weight".to_string(), w);
+  save_npz(&dir.join("model.npz"), &mut weights).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(loaded.len(), 1);
+  assert_eq!(
+    loaded
+      .get_mut("npz.weight")
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap(),
+    vec![6.0, 7.0]
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 6 — a sole `*.npz` that is NOT named `model.npz` / `weights.npz` is
+/// still picked up (the "else the sole `.npz`" branch).
+#[cfg(feature = "npz")]
+#[test]
+fn load_weights_from_dir_npz_sole_arbitrary_name() {
+  let dir = fresh_dir("lw-npz-arb");
+  let w = Array::from_slice::<i32>(&[5_i32], &(1usize,)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("w.weight".to_string(), w);
+  save_npz(&dir.join("checkpoint.npz"), &mut weights).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(
+    loaded.get_mut("w.weight").unwrap().to_vec::<i32>().unwrap(),
+    vec![5]
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 5 — a single `*.gguf` (mlx-lm's GGUF path) is loaded when no
+/// safetensors is present. Round-trips the literal weight.
+#[cfg(feature = "gguf")]
+#[test]
+fn load_weights_from_dir_gguf_single_file() {
+  let dir = fresh_dir("lw-gguf");
+  let w = Array::from_slice::<f32>(&[8.0_f32, 9.0, 10.0, 11.0], &(2usize, 2)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("blk.0.weight".to_string(), w);
+  let metadata: HashMap<String, GgufMetadata> = HashMap::new();
+  save_gguf(&dir.join("model.gguf"), &weights, &metadata).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(loaded.len(), 1);
+  assert_eq!(
+    loaded
+      .get_mut("blk.0.weight")
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap(),
+    vec![8.0, 9.0, 10.0, 11.0]
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier 1 takes priority over a sole `*.gguf`: when BOTH an index-driven
+/// safetensors checkpoint and a `*.gguf` live in the same directory, the
+/// safetensors index wins (gguf is the fallback only when no safetensors is
+/// present). Proves the resolution ORDER, not just each tier in isolation.
+#[cfg(all(feature = "serde_json", feature = "gguf"))]
+#[test]
+fn load_weights_from_dir_safetensors_index_beats_gguf() {
+  let dir = fresh_dir("lw-order");
+  let st = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut st_map: HashMap<String, Array> = HashMap::new();
+  st_map.insert("st.weight".to_string(), st);
+  save_safetensors(&dir.join("model-00001-of-00001.safetensors"), &st_map).unwrap();
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"weight_map":{"st.weight":"model-00001-of-00001.safetensors"}}"#,
+  )
+  .unwrap();
+  // A decoy gguf that must be ignored because safetensors resolves first.
+  let g = Array::from_slice::<f32>(&[2.0_f32], &(1usize,)).unwrap();
+  let mut g_map: HashMap<String, Array> = HashMap::new();
+  g_map.insert("gguf.weight".to_string(), g);
+  let meta: HashMap<String, GgufMetadata> = HashMap::new();
+  save_gguf(&dir.join("model.gguf"), &g_map, &meta).unwrap();
+
+  let loaded = load_weights_from_dir(&dir).unwrap();
+  assert!(
+    loaded.contains_key("st.weight") && !loaded.contains_key("gguf.weight"),
+    "the safetensors index tier must win over the gguf fallback"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No weights of any layout → the terminal typed [`Error::FileIo`] (`Open`,
+/// `NotFound`) whose static `context()` lists every layout the resolver
+/// considered (at minimum each safetensors tier).
+#[test]
+fn load_weights_from_dir_no_weights_is_typed_error() {
+  let dir = fresh_dir("lw-empty");
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::FileIo(p)) = r else {
+    panic!("an empty dir must be Error::FileIo, got {r:?}");
+  };
+  assert_eq!(p.path(), dir.as_path());
+  assert_eq!(p.op(), FileOp::Open);
+  assert_eq!(p.inner().kind(), std::io::ErrorKind::NotFound);
+  let ctx = p.context();
+  assert!(
+    ctx.contains("model.safetensors.index.json")
+      && ctx.contains("model.safetensors")
+      && ctx.contains("weights.safetensors"),
+    "the context must list each safetensors tier, got: {ctx}"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without the `gguf` feature, a directory whose only weight file is a
+/// `*.gguf` (no safetensors) reports the gguf-unsupported typed error
+/// (`Error::LayerKeyed` naming the file, inner `InvariantViolation` about
+/// the `gguf` feature). With the feature on, that same directory loads — so
+/// this asserts the not-`gguf` arm specifically.
+#[cfg(not(feature = "gguf"))]
+#[test]
+fn load_weights_from_dir_gguf_present_without_feature_is_unsupported() {
+  let dir = fresh_dir("lw-gguf-unsupported");
+  std::fs::write(dir.join("model.gguf"), b"GGUF placeholder").unwrap();
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("expected Error::LayerKeyed for an unsupported gguf, got {r:?}");
+  };
+  assert!(p.layer().contains("model.gguf"));
+  assert!(matches!(p.inner(), Error::InvariantViolation(iv)
+      if iv.context().contains("GGUF") && iv.requirement().contains("enabled")));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────────── load_weights_from_dir: index is TENSOR-authoritative ─────────────────
+//
+// The `model.safetensors.index.json` `weight_map` is authoritative at the
+// tensor level: exactly the mapped tensors load, each from its assigned shard.
+// A tensor present in a shard but unlisted for it must NOT leak in; a listed
+// tensor absent from its shard, or a doubly-bound tensor name, is a typed
+// error. INDEPENDENT closed-form oracles: every expected name/value is a
+// literal written into the fixture, never produced by the function under test.
+
+/// A shard carrying an EXTRA tensor that the index does NOT bind to it: only
+/// the `weight_map`-listed tensor is returned, the extra is dropped (it cannot
+/// leak in, nor clobber a same-named tensor the index assigned elsewhere).
+#[cfg(feature = "serde_json")]
+#[test]
+fn load_weights_from_dir_index_drops_unlisted_shard_tensor() {
+  let dir = fresh_dir("lw-index-extra");
+
+  // The single shard holds BOTH `kept.weight` and an unlisted `extra.weight`.
+  let kept = Array::from_slice::<f32>(&[1.0_f32, 2.0], &(2usize,)).unwrap();
+  let extra = Array::from_slice::<f32>(&[9.0_f32], &(1usize,)).unwrap();
+  let mut shard: HashMap<String, Array> = HashMap::new();
+  shard.insert("kept.weight".to_string(), kept);
+  shard.insert("extra.weight".to_string(), extra);
+  save_safetensors(&dir.join("model-00001-of-00001.safetensors"), &shard).unwrap();
+
+  // The index binds ONLY `kept.weight`.
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"weight_map":{"kept.weight":"model-00001-of-00001.safetensors"}}"#,
+  )
+  .unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(loaded.len(), 1, "only the indexed tensor is returned");
+  assert_eq!(
+    loaded
+      .get_mut("kept.weight")
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap(),
+    vec![1.0, 2.0]
+  );
+  assert!(
+    !loaded.contains_key("extra.weight"),
+    "a tensor present in the shard but unlisted in weight_map must be dropped"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `weight_map` that assigns a tensor to a shard which does NOT contain it
+/// is a malformed checkpoint: `Error::LayerKeyed` (keyed by the shard name)
+/// wrapping `Error::MissingKey` (the absent tensor name).
+#[cfg(feature = "serde_json")]
+#[test]
+fn load_weights_from_dir_index_missing_tensor_in_shard_is_typed_error() {
+  let dir = fresh_dir("lw-index-missing");
+
+  // The shard holds only `present.weight`; the index also demands
+  // `absent.weight` from the same shard.
+  let present = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut shard: HashMap<String, Array> = HashMap::new();
+  shard.insert("present.weight".to_string(), present);
+  save_safetensors(&dir.join("model-00001-of-00001.safetensors"), &shard).unwrap();
+
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"weight_map":{"present.weight":"model-00001-of-00001.safetensors","absent.weight":"model-00001-of-00001.safetensors"}}"#,
+  )
+  .unwrap();
+
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("a tensor missing from its assigned shard must be Error::LayerKeyed, got {r:?}");
+  };
+  assert!(
+    p.layer().contains("model-00001-of-00001.safetensors"),
+    "the LayerKeyed layer must name the offending shard, got: {}",
+    p.layer()
+  );
+  let Error::MissingKey(mk) = p.inner() else {
+    panic!("inner must be Error::MissingKey, got {:?}", p.inner());
+  };
+  assert_eq!(mk.key(), "absent.weight");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `weight_map` that binds the SAME tensor name twice is a malformed index
+/// (a `serde_json::Value` object would silently keep the last; the order-
+/// preserving parse instead surfaces it): `Error::LayerKeyed` (keyed by the
+/// tensor name) wrapping an `Error::InvariantViolation` about a duplicate
+/// binding. The duplicate must be caught BEFORE any shard is opened.
+#[cfg(feature = "serde_json")]
+#[test]
+fn load_weights_from_dir_index_duplicate_binding_is_typed_error() {
+  let dir = fresh_dir("lw-index-dup");
+
+  // A real shard so the failure is the duplicate check, not a missing shard.
+  let w = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut shard: HashMap<String, Array> = HashMap::new();
+  shard.insert("dup.weight".to_string(), w);
+  save_safetensors(&dir.join("model-00001-of-00002.safetensors"), &shard).unwrap();
+
+  // `dup.weight` is bound twice (to two different shards). JSON permits the
+  // duplicate object key; the loader must reject it rather than keep one.
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"weight_map":{"dup.weight":"model-00001-of-00002.safetensors","dup.weight":"model-00002-of-00002.safetensors"}}"#,
+  )
+  .unwrap();
+
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("a duplicate weight_map binding must be Error::LayerKeyed, got {r:?}");
+  };
+  assert_eq!(p.layer(), "dup.weight");
+  assert!(matches!(p.inner(), Error::InvariantViolation(iv)
+      if iv.context().contains("tensor name") && iv.requirement().contains("more than once")));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without `serde_json`, the index tier is compiled out — but an
+/// `model.safetensors.index.json` must still FAIL CLOSED rather than fall
+/// through to the lower tiers and mask the sharded checkpoint. The directory
+/// carries both an index and a stray `model-*.safetensors` shard; the load
+/// returns the typed unsupported-feature error (`Error::LayerKeyed` naming the
+/// index, inner `InvariantViolation` about the `serde_json` feature) instead of
+/// the generic no-weights error.
+#[cfg(not(feature = "serde_json"))]
+#[test]
+fn load_weights_from_dir_index_without_serde_json_fails_closed() {
+  let dir = fresh_dir("lw-index-noserde");
+  // A stray `model-*.safetensors` shard alongside the index sentinel.
+  let stray = Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap();
+  let mut m: HashMap<String, Array> = HashMap::new();
+  m.insert("stray.weight".to_string(), stray);
+  save_safetensors(&dir.join("model-00001-of-00001.safetensors"), &m).unwrap();
+  std::fs::write(
+    dir.join("model.safetensors.index.json"),
+    br#"{"weight_map":{"stray.weight":"model-00001-of-00001.safetensors"}}"#,
+  )
+  .unwrap();
+
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("an index without serde_json must fail closed (Error::LayerKeyed), got {r:?}");
+  };
+  assert!(
+    p.layer().contains("model.safetensors.index.json"),
+    "the error must name the index file, got: {}",
+    p.layer()
+  );
+  assert!(matches!(p.inner(), Error::InvariantViolation(iv)
+      if iv.context().contains("index.json") && iv.context().contains("serde_json")
+        && iv.requirement().contains("must be enabled")));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────────── load_weights_from_dir: gguf / npz cardinality ─────────────────
+
+/// Multiple `*.gguf` candidates (and no safetensors) is ambiguous: there is no
+/// canonical name to pick one, so the resolver refuses with a typed
+/// `Error::LayerKeyed` whose runtime key names every colliding file and whose
+/// inner `InvariantViolation` explains the single-file contract. Feature-
+/// agnostic: the cardinality check fires BEFORE any gguf load, so placeholder
+/// files suffice and the error is identical with or without the `gguf` feature.
+#[test]
+fn load_weights_from_dir_multiple_gguf_is_ambiguous() {
+  let dir = fresh_dir("lw-gguf-ambig");
+  std::fs::write(dir.join("a-model.gguf"), b"GGUF placeholder A").unwrap();
+  std::fs::write(dir.join("b-model.gguf"), b"GGUF placeholder B").unwrap();
+
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("multiple *.gguf must be Error::LayerKeyed (ambiguous), got {r:?}");
+  };
+  assert!(
+    p.layer().contains("a-model.gguf") && p.layer().contains("b-model.gguf"),
+    "the ambiguity error must name both gguf candidates, got: {}",
+    p.layer()
+  );
+  assert!(matches!(p.inner(), Error::InvariantViolation(iv)
+      if iv.context().contains("multiple `*.gguf`") && iv.requirement().contains("exactly one")));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Multiple NON-canonical `*.npz` candidates (neither `model.npz` nor
+/// `weights.npz`, no safetensors / gguf) is ambiguous: `Error::LayerKeyed`
+/// naming both, inner `InvariantViolation` about the single-file contract.
+#[cfg(feature = "npz")]
+#[test]
+fn load_weights_from_dir_multiple_arbitrary_npz_is_ambiguous() {
+  let dir = fresh_dir("lw-npz-ambig");
+  let mut m1: HashMap<String, Array> = HashMap::new();
+  m1.insert(
+    "a.weight".to_string(),
+    Array::from_slice::<f32>(&[1.0_f32], &(1usize,)).unwrap(),
+  );
+  save_npz(&dir.join("alpha.npz"), &mut m1).unwrap();
+  let mut m2: HashMap<String, Array> = HashMap::new();
+  m2.insert(
+    "b.weight".to_string(),
+    Array::from_slice::<f32>(&[2.0_f32], &(1usize,)).unwrap(),
+  );
+  save_npz(&dir.join("beta.npz"), &mut m2).unwrap();
+
+  let r = load_weights_from_dir(&dir);
+  let Err(Error::LayerKeyed(p)) = r else {
+    panic!("multiple arbitrary *.npz must be Error::LayerKeyed (ambiguous), got {r:?}");
+  };
+  assert!(
+    p.layer().contains("alpha.npz") && p.layer().contains("beta.npz"),
+    "the ambiguity error must name both npz candidates, got: {}",
+    p.layer()
+  );
+  assert!(matches!(p.inner(), Error::InvariantViolation(iv)
+      if iv.context().contains("non-canonical `*.npz`")));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A canonical `model.npz` ALONGSIDE a non-canonical `*.npz` is NOT ambiguous:
+/// the canonical name wins (the cardinality check only governs the arbitrary-
+/// name fallback). Proves the preference order survives the new guard.
+#[cfg(feature = "npz")]
+#[test]
+fn load_weights_from_dir_canonical_npz_beats_arbitrary() {
+  let dir = fresh_dir("lw-npz-canon");
+  let mut canon: HashMap<String, Array> = HashMap::new();
+  canon.insert(
+    "canon.weight".to_string(),
+    Array::from_slice::<i32>(&[7_i32], &(1usize,)).unwrap(),
+  );
+  save_npz(&dir.join("model.npz"), &mut canon).unwrap();
+  // A decoy arbitrary npz that must be ignored because `model.npz` wins.
+  let mut decoy: HashMap<String, Array> = HashMap::new();
+  decoy.insert(
+    "decoy.weight".to_string(),
+    Array::from_slice::<i32>(&[8_i32], &(1usize,)).unwrap(),
+  );
+  save_npz(&dir.join("decoy.npz"), &mut decoy).unwrap();
+
+  let mut loaded = load_weights_from_dir(&dir).unwrap();
+  assert_eq!(
+    loaded
+      .get_mut("canon.weight")
+      .unwrap()
+      .to_vec::<i32>()
+      .unwrap(),
+    vec![7]
+  );
+  assert!(
+    !loaded.contains_key("decoy.weight"),
+    "the canonical model.npz must win over an arbitrary-name npz"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
