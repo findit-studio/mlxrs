@@ -814,9 +814,27 @@ impl super::inference::WhisperInference for CoreMlWhisper {
       Some(c) => clone_cache(c)?,
       None => CoreMlKvCache::new(self.kv_width)?,
     };
+    // Fail fast at the backend primitive BEFORE materializing encoder states or
+    // reserving the `T * n_vocab` logits buffer: a direct `WhisperBackend` /
+    // `WhisperInference` caller (bypassing `DecodingTask`'s clamps) could otherwise
+    // drive those allocations with an over-cap prefix and only trip the cap one
+    // token at a time inside `decode_one`. Bound the whole request against the
+    // decoder-cache ceiling up front (the warm-cache columns plus the new tokens).
+    let t = tokens.len();
+    let projected = cache
+      .cache_length
+      .checked_add(t)
+      .ok_or_else(|| dim_overflow("CoreMlWhisper::decode_tokens: cache_length + T"))?;
+    if projected > self.max_decoder_ctx {
+      return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
+        "CoreMlWhisper::decode_tokens: decoder context",
+        "max_decoder_ctx",
+        self.max_decoder_ctx as u64,
+        projected as u64,
+      )));
+    }
     let enc_chw = self.encoder_states_to_chw(encoder_states)?;
     let n_vocab = self.dims.n_vocab();
-    let t = tokens.len();
     let plane = t
       .checked_mul(n_vocab)
       .ok_or_else(|| dim_overflow("CoreMlWhisper::decode_tokens: T * n_vocab"))?;
@@ -1245,6 +1263,32 @@ mod tests {
     assert!(
       matches!(result, Err(Error::ShapePairMismatch(_))),
       "a transposed encoder-state shape must be rejected with ShapePairMismatch"
+    );
+  }
+
+  /// The CoreML decode primitive rejects an over-cap request UP FRONT: calling
+  /// `decode_tokens` directly with more than the decoder-cache ceiling of valid
+  /// tokens is a typed [`Error::CapExceeded`] BEFORE any encoder-state
+  /// materialization or `T * n_vocab` logits allocation — not a per-token trip
+  /// deep inside the decode loop.
+  #[test]
+  #[ignore = "needs the local WhisperKit tiny .mlmodelc bundle; runs on the ANE"]
+  fn coreml_decode_rejects_over_cap_prefix_up_front() {
+    let dir = tiny_dir();
+    if !CoreMlWhisper::is_present(&dir) {
+      eprintln!("SKIP coreml_decode_rejects_over_cap_prefix_up_front: {dir:?} has no bundle");
+      return;
+    }
+    let backend = CoreMlWhisper::load(&dir).expect("load CoreML whisper-tiny");
+    let (ctx, state) = (backend.dims().n_audio_ctx(), backend.dims().n_audio_state());
+    // A correctly-shaped encoder-states tensor, so the CAP guard (not the shape
+    // guard) is what rejects; `MAX_DECODER_CTX + 1` valid tokens overruns the cache.
+    let enc = Array::full::<f32>(&[1, ctx as i32, state as i32], 0.0).expect("enc");
+    let over = vec![50258u32; MAX_DECODER_CTX + 1];
+    let result = backend.decode_tokens(&over, &enc, None);
+    assert!(
+      matches!(result, Err(Error::CapExceeded(_))),
+      "an over-cap prefix must be rejected up front with CapExceeded"
     );
   }
 
