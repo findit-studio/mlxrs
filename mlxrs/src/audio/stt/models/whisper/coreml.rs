@@ -803,6 +803,14 @@ impl super::inference::WhisperInference for CoreMlWhisper {
         "CoreMlWhisper::decode_tokens: tokens",
       )));
     }
+    // Fail-fast guard BEFORE any cache allocation, encoder-state materialization,
+    // or `T * n_vocab` logits reservation: bound the request against the decoder
+    // cache ceiling and require the exact encoder-state shape, so a direct
+    // `WhisperBackend` / `WhisperInference` caller (bypassing `DecodingTask`'s
+    // clamps) cannot drive those allocations with an over-cap or wrong-shaped
+    // request before the per-token `decode_one` would trip the cap.
+    self.precheck_decode(cache, tokens.len(), encoder_states)?;
+    let t = tokens.len();
     // The WhisperKit decoder advances exactly one token per prediction. A fresh
     // (no-cache) call therefore replays the whole prefix one token at a time,
     // carrying the cache forward; a warm call advances only the new tail. Each
@@ -814,25 +822,6 @@ impl super::inference::WhisperInference for CoreMlWhisper {
       Some(c) => clone_cache(c)?,
       None => CoreMlKvCache::new(self.kv_width)?,
     };
-    // Fail fast at the backend primitive BEFORE materializing encoder states or
-    // reserving the `T * n_vocab` logits buffer: a direct `WhisperBackend` /
-    // `WhisperInference` caller (bypassing `DecodingTask`'s clamps) could otherwise
-    // drive those allocations with an over-cap prefix and only trip the cap one
-    // token at a time inside `decode_one`. Bound the whole request against the
-    // decoder-cache ceiling up front (the warm-cache columns plus the new tokens).
-    let t = tokens.len();
-    let projected = cache
-      .cache_length
-      .checked_add(t)
-      .ok_or_else(|| dim_overflow("CoreMlWhisper::decode_tokens: cache_length + T"))?;
-    if projected > self.max_decoder_ctx {
-      return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
-        "CoreMlWhisper::decode_tokens: decoder context",
-        "max_decoder_ctx",
-        self.max_decoder_ctx as u64,
-        projected as u64,
-      )));
-    }
     let enc_chw = self.encoder_states_to_chw(encoder_states)?;
     let n_vocab = self.dims.n_vocab();
     let plane = t
@@ -885,8 +874,16 @@ impl super::inference::WhisperInference for CoreMlWhisper {
     // The MLX backend keeps the next token on-device to avoid a per-step
     // GPU→host readback; the CoreML decode crosses the host boundary every step
     // regardless (the prediction runs off-device), so there is nothing to keep
-    // lazy — materialize the `(1, 1)` token to a host id and forward through
-    // `decode_tokens`.
+    // lazy — materialize the token to host ids and forward through `decode_tokens`.
+    // Guard BEFORE the host materialization (`to_vec`) so an over-cap or
+    // wrong-shaped request is rejected without first copying the token tensor; the
+    // element count is read from the shape (no allocation).
+    let n_tokens = token
+      .shape()
+      .iter()
+      .copied()
+      .fold(1usize, usize::saturating_mul);
+    self.precheck_decode(cache, n_tokens, encoder_states)?;
     let mut t = token.try_clone()?;
     let ids = t.to_vec::<u32>()?;
     self.decode_tokens(&ids, encoder_states, cache)
@@ -961,11 +958,47 @@ impl CoreMlWhisper {
   /// n_audio_ctx]` host f32 layout.
   fn encoder_states_to_chw(&self, encoder_states: &Array) -> Result<Vec<f32>> {
     let (ctx, state) = (self.dims.n_audio_ctx(), self.dims.n_audio_state());
-    // Mirror the MLX decoder's encoder-state contract: EXACTLY
-    // `(1, n_audio_ctx, n_audio_state)`, validated before materializing. A
-    // same-length but wrong-shaped tensor (e.g. a transposed `(1, state, ctx)`)
-    // would otherwise be reinterpreted into the channel-major layout below and
-    // silently corrupt logits instead of raising a typed shape error.
+    // The exact `(1, n_audio_ctx, n_audio_state)` shape is pre-validated by
+    // `precheck_decode` at every decode entry point (before this conversion runs),
+    // so the channel-major transpose below can assume it.
+    let mut e = encoder_states.try_clone()?;
+    let host = e.to_vec::<f32>()?; // row-major over (1, ctx, state)
+    let mut chw = vec![0.0f32; state * ctx];
+    for t in 0..ctx {
+      for s in 0..state {
+        chw[s * ctx + t] = host[t * state + s];
+      }
+    }
+    Ok(chw)
+  }
+
+  /// Fail-fast guard for every decode entry point, run BEFORE any cache
+  /// allocation, token materialization, or logits reservation: bound the request
+  /// against the decoder-cache ceiling (`cache_length + n_tokens`) and require the
+  /// exact `(1, n_audio_ctx, n_audio_state)` encoder-state shape. Centralizes what
+  /// would otherwise be scattered, post-allocation checks across `decode_tokens`
+  /// and `decode_token_lazy`, so neither the cache, the `T * n_vocab` logits
+  /// buffer, nor the token host copy is materialized for an over-cap or
+  /// wrong-shaped request.
+  fn precheck_decode(
+    &self,
+    cache: Option<&CoreMlKvCache>,
+    n_tokens: usize,
+    encoder_states: &Array,
+  ) -> Result<()> {
+    let cache_len = cache.map_or(0, |c| c.cache_length);
+    let projected = cache_len
+      .checked_add(n_tokens)
+      .ok_or_else(|| dim_overflow("CoreMlWhisper::precheck_decode: cache_length + T"))?;
+    if projected > self.max_decoder_ctx {
+      return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
+        "CoreMlWhisper: decoder context",
+        "max_decoder_ctx",
+        self.max_decoder_ctx as u64,
+        projected as u64,
+      )));
+    }
+    let (ctx, state) = (self.dims.n_audio_ctx(), self.dims.n_audio_state());
     let shape = encoder_states.shape();
     if shape.len() != 3 || shape[0] != 1 || shape[1] != ctx || shape[2] != state {
       return Err(Error::ShapePairMismatch(
@@ -976,15 +1009,7 @@ impl CoreMlWhisper {
         ),
       ));
     }
-    let mut e = encoder_states.try_clone()?;
-    let host = e.to_vec::<f32>()?; // row-major over (1, ctx, state)
-    let mut chw = vec![0.0f32; state * ctx];
-    for t in 0..ctx {
-      for s in 0..state {
-        chw[s * ctx + t] = host[t * state + s];
-      }
-    }
-    Ok(chw)
+    Ok(())
   }
 
   /// Run one `TextDecoder` step for `tok` against the channel-major encoder
@@ -1289,6 +1314,30 @@ mod tests {
     assert!(
       matches!(result, Err(Error::CapExceeded(_))),
       "an over-cap prefix must be rejected up front with CapExceeded"
+    );
+  }
+
+  /// The lazy single-token decode entry point also guards UP FRONT: an over-cap
+  /// token tensor is rejected by `precheck_decode` before the host `to_vec`
+  /// materialization (the element count is read from the shape, no copy).
+  #[test]
+  #[ignore = "needs the local WhisperKit tiny .mlmodelc bundle; runs on the ANE"]
+  fn coreml_decode_token_lazy_rejects_over_cap_up_front() {
+    let dir = tiny_dir();
+    if !CoreMlWhisper::is_present(&dir) {
+      eprintln!("SKIP coreml_decode_token_lazy_rejects_over_cap_up_front: {dir:?} has no bundle");
+      return;
+    }
+    let backend = CoreMlWhisper::load(&dir).expect("load CoreML whisper-tiny");
+    let (ctx, state) = (backend.dims().n_audio_ctx(), backend.dims().n_audio_state());
+    let enc = Array::full::<f32>(&[1, ctx as i32, state as i32], 0.0).expect("enc");
+    // A token tensor carrying MAX_DECODER_CTX + 1 valid ids overruns the cache.
+    let over = vec![50258u32; MAX_DECODER_CTX + 1];
+    let token = Array::from_slice::<u32>(&over, &[1, (MAX_DECODER_CTX + 1) as i32]).expect("token");
+    let result = WhisperInference::decode_token_lazy(&backend, &token, &enc, None);
+    assert!(
+      matches!(result, Err(Error::CapExceeded(_))),
+      "an over-cap lazy token must be rejected up front with CapExceeded"
     );
   }
 
