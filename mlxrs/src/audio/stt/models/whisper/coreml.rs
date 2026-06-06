@@ -943,17 +943,23 @@ impl CoreMlWhisper {
   /// n_audio_ctx]` host f32 layout.
   fn encoder_states_to_chw(&self, encoder_states: &Array) -> Result<Vec<f32>> {
     let (ctx, state) = (self.dims.n_audio_ctx(), self.dims.n_audio_state());
-    let mut e = encoder_states.try_clone()?;
-    let host = e.to_vec::<f32>()?; // row-major over (1, ctx, state)
-    if host.len() != ctx * state {
-      return Err(Error::LengthMismatch(
-        crate::error::LengthMismatchPayload::new(
-          "CoreMlWhisper: encoder states element count",
-          ctx * state,
-          host.len(),
+    // Mirror the MLX decoder's encoder-state contract: EXACTLY
+    // `(1, n_audio_ctx, n_audio_state)`, validated before materializing. A
+    // same-length but wrong-shaped tensor (e.g. a transposed `(1, state, ctx)`)
+    // would otherwise be reinterpreted into the channel-major layout below and
+    // silently corrupt logits instead of raising a typed shape error.
+    let shape = encoder_states.shape();
+    if shape.len() != 3 || shape[0] != 1 || shape[1] != ctx || shape[2] != state {
+      return Err(Error::ShapePairMismatch(
+        crate::error::ShapePairMismatchPayload::new(
+          "CoreMlWhisper: encoder states must be (1, n_audio_ctx, n_audio_state)",
+          vec![1usize, ctx, state],
+          shape.to_vec(),
         ),
       ));
     }
+    let mut e = encoder_states.try_clone()?;
+    let host = e.to_vec::<f32>()?; // row-major over (1, ctx, state)
     let mut chw = vec![0.0f32; state * ctx];
     for t in 0..ctx {
       for s in 0..state {
@@ -1165,33 +1171,37 @@ fn decoder_key_cache_shape(model: &MLModel) -> Option<(usize, usize)> {
 
 // ───────────────────────────── small helpers ───────────────────────────────
 
-/// Read + parse a required JSON file from the model directory.
+/// Read + parse a REQUIRED JSON config file from the model directory, through
+/// the shared bounded reader [`crate::io::read_bounded_config_file`] (the same
+/// 16 MiB cap + non-regular-reject discipline the rest of the loader applies to
+/// `config.json`), so auto-attaching a CoreML-capable checkpoint cannot force an
+/// unbounded allocation before backend selection.
 fn read_json(dir: &Path, name: &str) -> Result<serde_json::Value> {
-  let path = dir.join(name);
-  let body = std::fs::read_to_string(&path).map_err(|e| {
+  read_json_opt(dir, name)?.ok_or_else(|| {
     Error::FileIo(crate::error::FileIoPayload::new(
       "CoreMlWhisper::load: read config",
-      crate::error::FileOp::Read,
-      path.clone(),
-      e,
+      crate::error::FileOp::Open,
+      dir.join(name),
+      std::io::Error::from(std::io::ErrorKind::NotFound),
     ))
-  })?;
-  serde_json::from_str(&body).map_err(|e| {
+  })
+}
+
+/// Read + parse an OPTIONAL JSON config file (`Ok(None)` if absent), through the
+/// same shared bounded reader as [`read_json`].
+fn read_json_opt(dir: &Path, name: &str) -> Result<Option<serde_json::Value>> {
+  let path = dir.join(name);
+  let Some(body) = crate::io::read_bounded_config_file(&path, "CoreMlWhisper::load: read config")?
+  else {
+    return Ok(None);
+  };
+  serde_json::from_str(&body).map(Some).map_err(|e| {
     Error::Parse(crate::error::ParsePayload::new(
       "CoreMlWhisper::load: config json",
       "json",
       e,
     ))
   })
-}
-
-/// Read + parse an optional JSON file (`Ok(None)` if absent).
-fn read_json_opt(dir: &Path, name: &str) -> Result<Option<serde_json::Value>> {
-  let path = dir.join(name);
-  if !path.exists() {
-    return Ok(None);
-  }
-  read_json(dir, name).map(Some)
 }
 
 /// The shared `i32` dimension-overflow error.
@@ -1212,6 +1222,30 @@ mod tests {
       .join("models")
       .join("whisperkit")
       .join("openai_whisper-tiny")
+  }
+
+  /// The CoreML decode path rejects encoder states that are not EXACTLY
+  /// `(1, n_audio_ctx, n_audio_state)`: a same-length but transposed tensor is a
+  /// typed [`Error::ShapePairMismatch`], not silently-corrupted logits.
+  #[test]
+  #[ignore = "needs the local WhisperKit tiny .mlmodelc bundle; runs on the ANE"]
+  fn coreml_decode_rejects_wrong_shaped_encoder_states() {
+    let dir = tiny_dir();
+    if !CoreMlWhisper::is_present(&dir) {
+      eprintln!("SKIP coreml_decode_rejects_wrong_shaped_encoder_states: {dir:?} has no bundle");
+      return;
+    }
+    let backend = CoreMlWhisper::load(&dir).expect("load CoreML whisper-tiny");
+    let (ctx, state) = (backend.dims().n_audio_ctx(), backend.dims().n_audio_state());
+    // Transposed `(1, n_audio_state, n_audio_ctx)`: same element count, wrong shape.
+    let wrong = Array::full::<f32>(&[1, state as i32, ctx as i32], 0.0).expect("wrong enc");
+    // `decode_tokens`' Ok type holds a `CoreMlKvCache` (not `Debug`), so match the
+    // `Result` directly rather than `expect_err` (which would require Ok: Debug).
+    let result = backend.decode_tokens(&[50258u32], &wrong, None);
+    assert!(
+      matches!(result, Err(Error::ShapePairMismatch(_))),
+      "a transposed encoder-state shape must be rejected with ShapePairMismatch"
+    );
   }
 
   /// End-to-end ANE path: load the CoreML backend, run the `AudioEncoder` on a
