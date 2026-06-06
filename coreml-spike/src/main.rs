@@ -5,6 +5,7 @@
 //!   2. build `MLMultiArray` inputs and run `prediction(from:)`,
 //!   3. request the Neural Engine via `MLModelConfiguration.computeUnits`,
 //!   4. drive a stateful model through `MLState` (the KV-cache path),
+//!
 //! all without an Objective-C shim.
 //!
 //! Models used: the WhisperKit `openai_whisper-tiny` bundle
@@ -225,7 +226,7 @@ mod apple {
         &dict,
       )
     }
-    .map(|p| ProtocolObject::from_retained(p))
+    .map(ProtocolObject::from_retained)
     .map_err(|e| format!("feature provider init failed: {e:?}"))
   }
 
