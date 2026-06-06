@@ -38,6 +38,7 @@
 //!   alignment-head infrastructure.
 
 pub mod audio;
+pub mod backend;
 pub mod config;
 pub(crate) mod decoder;
 pub mod decoding;

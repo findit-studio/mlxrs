@@ -38,19 +38,19 @@ use crate::{
 
 use super::{
   audio::{CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, SAMPLE_RATE, pad_or_trim},
-  decoder::DecoderKvCache,
   inference::WhisperInference,
   timing,
   tokenizer::HFTokenizerWrapper,
 };
 
-/// The model-forward backend the decode pipeline drives, as a trait object
-/// pinned to the MLX decoder KV cache — the abstraction boundary every encode /
-/// decode call routes through ([`WhisperInference`]). The MLX
-/// [`WhisperModel`](super::model::WhisperModel) is the only implementation today
-/// and coerces to this at every call site, so the pipeline runs byte-identically
-/// while staying open to a non-MLX backend.
-pub type WhisperBackend = dyn WhisperInference<Cache = DecoderKvCache>;
+/// The concrete model-forward backend the decode pipeline drives — re-exported
+/// from [`super::backend`]. An enum over the MLX
+/// [`WhisperModel`](super::model::WhisperModel) and (on Apple Silicon) the
+/// CoreML [`CoreMlWhisper`](super::coreml::CoreMlWhisper) backends, implementing
+/// [`WhisperInference`] by dispatching to the active variant. The pipeline's
+/// free functions take `&WhisperBackend<'_>`, built at the public entry exactly
+/// where a `&WhisperModel` was used before.
+pub use super::backend::{WhisperBackend, WhisperCache};
 
 // Diagnostic split timers (encoder vs decode wall-time + decode step count),
 // accumulated across every `run()` call when `MLXRS_TIMING2` is set. Read and
@@ -1349,7 +1349,7 @@ type ParityResult = ((Vec<u32>, f64), (Vec<u32>, f64));
 /// in one batched forward and the [`MaximumLikelihoodRanker`] selects the best;
 /// otherwise it runs the single-sequence greedy/categorical path.
 pub struct DecodingTask<'a> {
-  model: &'a WhisperBackend,
+  model: &'a WhisperBackend<'a>,
   tokenizer: &'a HFTokenizerWrapper<'a>,
   options: DecodingOptions,
   /// `n_text_ctx` — the decode context ceiling.
@@ -1392,7 +1392,7 @@ impl<'a> DecodingTask<'a> {
   ///   `max_initial_timestamp` rounds out of range;
   /// - propagates the `SuppressBlank` encode error.
   pub fn new(
-    model: &'a WhisperBackend,
+    model: &'a WhisperBackend<'a>,
     tokenizer: &'a HFTokenizerWrapper<'a>,
     options: DecodingOptions,
   ) -> Result<Self> {
@@ -2709,7 +2709,7 @@ fn dim_overflow(which: &'static str) -> Error {
 ///   whose `logit - logsumexp` is `NaN`, silently selecting the first code);
 /// - propagates the encoder / decoder / softmax op errors.
 pub fn detect_language<'a>(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'a>,
   audio_features: &Array,
 ) -> Result<(&'a str, Vec<(&'a str, f64)>)> {
@@ -2802,7 +2802,7 @@ pub fn detect_language<'a>(
 /// # Errors
 /// Propagates [`detect_language`]'s op errors.
 fn resolve_language(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   audio_features: &Array,
   requested: Option<&str>,
@@ -2832,7 +2832,7 @@ fn resolve_language(
 /// Propagates the encoder forward, [`detect_language`], [`DecodingTask::new`],
 /// and [`DecodingTask::run`] errors.
 pub fn decode(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   options: DecodingOptions,
@@ -2861,7 +2861,7 @@ pub fn decode(
 /// # Errors
 /// Propagates [`DecodingTask::new`] / [`DecodingTask::run`].
 fn decode_resolved(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   audio_features: &Array,
   options: DecodingOptions,
@@ -2878,7 +2878,7 @@ fn decode_resolved(
 ///
 /// # Errors
 /// Propagates the encoder forward op errors.
-fn encode_once(model: &WhisperBackend, mel: &Array) -> Result<Array> {
+fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
   let dims = model.dims();
   let shape = mel.shape();
   let is_encoded = matches!(
@@ -2961,7 +2961,7 @@ pub const DEFAULT_NO_SPEECH_THRESHOLD: f64 = 0.6;
 /// Propagates the encoder forward / [`DecodingTask`] errors.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_with_fallback(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   base_options: &DecodingOptions,
@@ -3437,7 +3437,7 @@ fn compute_seek_clips(
 /// - propagates [`detect_language`], [`decode_with_fallback`], the initial-
 ///   prompt encode, and the mel-slice op errors.
 pub fn transcribe(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   content_frames: usize,
@@ -3699,7 +3699,7 @@ struct WordTimestampOutcome {
 /// Propagates [`timing::add_word_timestamps`].
 #[allow(clippy::too_many_arguments)]
 fn apply_word_timestamps(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel_segment: &Array,
   segment_size: usize,

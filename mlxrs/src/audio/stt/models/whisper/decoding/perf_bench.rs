@@ -14,7 +14,7 @@
 use std::{path::Path, time::Instant};
 
 use super::{
-  ApplyTimestampRules, GreedyDecoder, HFTokenizerWrapper, Task, TranscribeOptions,
+  ApplyTimestampRules, GreedyDecoder, HFTokenizerWrapper, Task, TranscribeOptions, WhisperBackend,
   last_position_row, transcribe,
 };
 use crate::{
@@ -296,13 +296,13 @@ fn encoder_per_window_timing() -> Result<()> {
   transforms::eval(&[&mel])?;
 
   for _ in 0..3 {
-    let f = super::encode_once(&model, &mel)?;
+    let f = super::encode_once(&WhisperBackend::Mlx(&model), &mel)?;
     transforms::eval(&[&f])?;
   }
   let mut times = Vec::with_capacity(20);
   for _ in 0..20 {
     let t0 = Instant::now();
-    let f = super::encode_once(&model, &mel)?;
+    let f = super::encode_once(&WhisperBackend::Mlx(&model), &mel)?;
     transforms::eval(&[&f])?;
     times.push(t0.elapsed().as_secs_f64() * 1e3);
   }
@@ -865,7 +865,13 @@ fn fixture_transcribe_rtf() -> Result<()> {
 
   // full transcribe (encoder + decode loop + pipeline).
   let t2 = Instant::now();
-  let result = transcribe(&model, &wrapper, &mel, content_frames, &options)?;
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &wrapper,
+    &mel,
+    content_frames,
+    &options,
+  )?;
   let tr_secs = t2.elapsed().as_secs_f64();
   let total = mel_secs + tr_secs;
   let enc_est = enc_one * n_windows as f64;

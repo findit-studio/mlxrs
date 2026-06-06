@@ -27,6 +27,7 @@ use crate::{
 use super::{
   audio::{HOP_LENGTH, SAMPLE_RATE, TOKENS_PER_SECOND},
   decoding::{Segment, WhisperBackend, Word},
+  inference::WhisperInference,
   tokenizer::HFTokenizerWrapper,
 };
 
@@ -294,7 +295,7 @@ fn dtw(x: &HostMatrix) -> Result<(Vec<i64>, Vec<i64>)> {
 /// would index past the `[0, eot)` probability columns the per-token
 /// probabilities gather over) or if a dimension overflows `i32`.
 pub fn find_alignment(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   text_tokens: &[u32],
   mel: &Array,
@@ -455,7 +456,7 @@ pub fn find_alignment(
 ///   buffer cannot be reserved;
 /// - propagates the stack / softmax-free normalize / median-filter op errors.
 pub(crate) fn alignatt_frame_attention(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   cross_qk: &[Option<Array>],
   content_frames: usize,
 ) -> Result<Vec<usize>> {
@@ -547,7 +548,7 @@ pub(crate) fn alignatt_frame_attention(
 /// Propagates [`find_alignment`].
 #[allow(clippy::too_many_arguments)]
 pub fn add_word_timestamps(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   segments: &mut [Segment],
   mel: &Array,
@@ -875,7 +876,7 @@ fn text_token_probabilities(
 /// Stack the alignment heads' cross-attention into `(heads, tokens, frames)`,
 /// keeping the first `frames` columns — `timing.py:142-146`.
 fn stack_alignment_heads(
-  model: &WhisperBackend,
+  model: &WhisperBackend<'_>,
   cross_qk: &[Option<Array>],
   frames: usize,
 ) -> Result<Array> {

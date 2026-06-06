@@ -148,6 +148,7 @@ use crate::{
 
 use super::{
   audio::{N_FRAMES, N_SAMPLES, log_mel_spectrogram_whisper},
+  backend::WhisperBackend,
   config::{AlignmentHeads, ModelDimensions},
   decoder::{DecoderKvCache, TextDecoder},
   decoding::{self, DecodingOptions, SuppressSpec, TranscribeOptions as WhisperTranscribeOptions},
@@ -495,6 +496,19 @@ impl WhisperModel {
   #[inline(always)]
   pub fn alignment_heads(&self) -> &AlignmentHeads {
     &self.alignment_heads
+  }
+
+  /// The concrete inference [`WhisperBackend`] the decode pipeline drives.
+  ///
+  /// The high-level [`Transcribe`] entry points build the backend through this
+  /// one chokepoint and hand `&backend` to the [`super::decoding`] free
+  /// functions, so backend selection lives in a single place. Today this is
+  /// always [`WhisperBackend::Mlx`] (byte-identical to the pre-backend
+  /// pipeline); the CoreML / Neural-Engine auto-selection is wired in here with
+  /// the CoreML backend.
+  #[inline]
+  pub fn backend(&self) -> WhisperBackend<'_> {
+    WhisperBackend::Mlx(self)
   }
 
   /// Load a Whisper model from a local model directory: read the
@@ -1150,7 +1164,13 @@ impl WhisperModel {
     let content_frames = mel.shape()[0].saturating_sub(N_FRAMES);
 
     let whisper_opts = self.whisper_transcribe_options(opts);
-    let result = decoding::transcribe(self, &wrapper, &mel, content_frames, &whisper_opts)?;
+    let result = decoding::transcribe(
+      &self.backend(),
+      &wrapper,
+      &mel,
+      content_frames,
+      &whisper_opts,
+    )?;
     Ok(WhisperTranscription::from_result(result))
   }
 }
@@ -2601,7 +2621,13 @@ impl Transcribe for WhisperModel {
     let content_frames = total_frames.saturating_sub(N_FRAMES);
 
     let whisper_opts = self.whisper_transcribe_options(opts);
-    let result = decoding::transcribe(self, &wrapper, &mel, content_frames, &whisper_opts)?;
+    let result = decoding::transcribe(
+      &self.backend(),
+      &wrapper,
+      &mel,
+      content_frames,
+      &whisper_opts,
+    )?;
 
     // Convert the Whisper transcribe result into the universal `Transcription`
     // (text + language + segment spans). The richer per-segment fields (token
