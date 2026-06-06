@@ -356,8 +356,88 @@ mod apple {
     // ---- MLState probe: can we create + use an MLState from Rust at all?
     probe_mlstate(&dec_model);
 
+    // ---- Step 5: ANE confirmation (best-effort, no sudo).
+    enumerate_compute_devices();
+    bench_encoder_ane(&enc_model, &mel);
+
     println!("\n== spike complete: load + predict + KV-step all RAN ==");
     Ok(())
+  }
+
+  /// Best-effort ANE confirmation #1: enumerate the compute devices CoreML can
+  /// schedule onto, and report whether an `MLNeuralEngineComputeDevice` exists
+  /// (+ its core count). Synchronous, no entitlements/sudo required.
+  fn enumerate_compute_devices() {
+    println!("\n[5a] Compute-device enumeration (MLAllComputeDevices)");
+    // SAFETY: `MLAllComputeDevices` is a plain C function returning a retained,
+    // non-null NSArray of compute-device protocol objects.
+    let devices = unsafe { objc2_core_ml::MLAllComputeDevices() };
+    let mut saw_ane = false;
+    for i in 0..devices.count() {
+      let dev = devices.objectAtIndex(i);
+      let any: &AnyObject = dev.as_ref();
+      // Identify each device by class membership.
+      if let Some(ane) = any.downcast_ref::<objc2_core_ml::MLNeuralEngineComputeDevice>() {
+        // SAFETY: `totalCoreCount` is a readonly property on the ANE device.
+        let cores = unsafe { ane.totalCoreCount() };
+        println!("    device[{i}] = NeuralEngine (ANE), totalCoreCount = {cores}");
+        saw_ane = true;
+      } else if any
+        .downcast_ref::<objc2_core_ml::MLGPUComputeDevice>()
+        .is_some()
+      {
+        println!("    device[{i}] = GPU");
+      } else if any
+        .downcast_ref::<objc2_core_ml::MLCPUComputeDevice>()
+        .is_some()
+      {
+        println!("    device[{i}] = CPU");
+      } else {
+        println!("    device[{i}] = <other compute device>");
+      }
+    }
+    println!(
+      "    => Neural Engine available as a CoreML scheduling target: {}",
+      if saw_ane { "YES" } else { "no" }
+    );
+  }
+
+  /// Best-effort ANE confirmation #2: time many encoder predictions. A human can
+  /// run `sudo powermetrics --samplers ane_power` (or Instruments' Neural Engine
+  /// track) alongside this to observe ANE residency; the throughput itself is
+  /// also far above what CPU-only Float16 conv attention would yield on tiny.
+  fn bench_encoder_ane(enc_model: &MLModel, mel: &MLMultiArray) {
+    use std::time::Instant;
+    const ITERS: u32 = 300;
+    println!("\n[5b] AudioEncoder timing loop ({ITERS} iters, watch ANE externally)");
+    let provider = match feature_provider(&[("melspectrogram_features", mel)]) {
+      Ok(p) => p,
+      Err(e) => {
+        println!("    (skipped: {e})");
+        return;
+      }
+    };
+    // Warm up (first run triggers ANE program specialization/caching).
+    // SAFETY: input matches the model schema.
+    if let Err(e) = unsafe { enc_model.predictionFromFeatures_error(&provider) } {
+      println!("    (warmup failed: {e:?})");
+      return;
+    }
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+      // SAFETY: input matches the model schema; result is dropped each iter.
+      if unsafe { enc_model.predictionFromFeatures_error(&provider) }.is_err() {
+        println!("    (a prediction failed mid-loop)");
+        return;
+      }
+    }
+    let dt = t0.elapsed();
+    let per = dt.as_secs_f64() * 1e3 / f64::from(ITERS);
+    println!(
+      "    {ITERS} encoder predictions in {:.2}s => {per:.3} ms/encode ({:.1} enc/s)",
+      dt.as_secs_f64(),
+      f64::from(ITERS) / dt.as_secs_f64()
+    );
   }
 
   /// argmax over a Float16 logits array (small enough for tiny whisper vocab).
