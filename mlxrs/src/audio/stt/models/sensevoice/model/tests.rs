@@ -1158,3 +1158,144 @@ fn extract_features_applies_cmvn_when_present() {
     "CMVN must change the features"
   );
 }
+
+// ──────────── frame_argmax batching A/B (rich-info optimization) ────────────
+
+/// The per-frame argmax form of the rich-info heads, kept verbatim as the A/B
+/// reference: slice the single row `[frame, frame+1)` -> reshape `(vocab,)` ->
+/// `argmax` (no axis) -> `item::<u32>()` — one GPU→CPU sync per frame, three
+/// calls for the three query rows (`sensevoice.py:468/479/493`). Shares no code
+/// with the batched `query_argmax_ids` (one slice + one `argmax(axis=1)` + one
+/// host copy); the A/B asserts the two give identical ids.
+fn frame_argmax_reference(log_probs: &Array, frame: i32) -> u32 {
+  let vocab = log_probs.shape()[1] as i32;
+  let row = ops::indexing::slice(log_probs, &[frame, 0], &[frame + 1, vocab], &[1, 1]).unwrap();
+  let row = ops::shape::reshape(&row, &[vocab]).unwrap();
+  let mut arg = ops::misc::argmax(&row, None, false).unwrap();
+  arg.item::<u32>().unwrap()
+}
+
+/// CORRECTNESS A/B for the batched rich-info argmax: `query_argmax_ids` must
+/// return EXACTLY the three ids the per-frame reference computes, for real label
+/// ids, unknown ids, and — crucially — a TIE row (two equal maxima), since
+/// argmax tie-breaking (first index, U32) must be identical batched vs per-row.
+#[test]
+fn query_argmax_batched_matches_per_frame_reference() {
+  // Each row: a distinct argmax. Row 4+ are present but ignored by the heads.
+  // Cases mix real ids, an unknown id, and a deliberate tie in a query row.
+  let cases: &[Vec<u32>] = &[
+    vec![24884, 25001, 24993, 0],     // zh / happy / Speech.
+    vec![24885, 25004, 24995, 17],    // en / neutral / BGM + a text row.
+    vec![24888, 25009, 24997, 24999], // yue / unk / Laughter.
+    vec![999, 12345, 0, 5],           // all-unknown query ids.
+  ];
+  for peaks in cases {
+    let grid = rich_grid(peaks);
+    let batched = SenseVoiceModel::query_argmax_ids(&grid).unwrap();
+    let want = [
+      frame_argmax_reference(&grid, 0),
+      frame_argmax_reference(&grid, 1),
+      frame_argmax_reference(&grid, 2),
+    ];
+    assert_eq!(batched, want, "batched ids differ for peaks {peaks:?}");
+  }
+}
+
+/// A grid with an explicit TIE in query row 1 (two columns share the max value):
+/// both the batched and per-frame argmax must pick the SAME (lowest) index, so
+/// the resulting label is identical. Pins tie-breaking parity directly.
+#[test]
+fn query_argmax_tie_breaks_identically() {
+  let vocab: i32 = 25_055;
+  let frames = 4i32;
+  let mut data = vec![0.0f32; (frames * vocab) as usize];
+  // Row 0: clean peak at 24884.
+  data[24884] = 10.0;
+  // Row 1: TIE — equal maxima at 25001 and 25006 (argmax must pick 25001).
+  data[vocab as usize + 25001] = 7.5;
+  data[vocab as usize + 25006] = 7.5;
+  // Row 2: clean peak at 24993.
+  data[2 * vocab as usize + 24993] = 10.0;
+  let grid = Array::from_slice::<f32>(&data, &[frames, vocab]).unwrap();
+
+  let batched = SenseVoiceModel::query_argmax_ids(&grid).unwrap();
+  let want = [
+    frame_argmax_reference(&grid, 0),
+    frame_argmax_reference(&grid, 1),
+    frame_argmax_reference(&grid, 2),
+  ];
+  assert_eq!(batched, want);
+  assert_eq!(batched[1], 25001, "tie must resolve to the lowest index");
+}
+
+/// End-to-end `rich_info` parity: the labels the (now batched) `rich_info`
+/// produces must equal the labels assembled from the three per-frame reference
+/// argmaxes — confirming the batching change preserves the full rich-info
+/// output, not just raw ids.
+#[test]
+fn rich_info_labels_unchanged_by_batching() {
+  let model = tiny_model(SenseVoiceTokenizer::id_join());
+  let grid = rich_grid(&[24885, 25004, 24993, 0]);
+  let rich = model.rich_info(&grid).unwrap();
+  // Reference labels via the per-frame argmax + the same label maps.
+  let want_lang = lid_label(frame_argmax_reference(&grid, 0));
+  let want_emo = emotion_label(frame_argmax_reference(&grid, 1));
+  let want_event = event_label(frame_argmax_reference(&grid, 2));
+  assert_eq!(rich.language(), want_lang);
+  assert_eq!(rich.emotion(), want_emo);
+  assert_eq!(rich.event(), want_event);
+}
+
+/// PERF A/B for the batched rich-info argmax: `query_argmax_ids` (one device
+/// sync) vs three per-frame `frame_argmax_reference` calls (three syncs) at the
+/// real vocab width, over many calls. Reports best-of-N min for both; batched
+/// must be no slower (fewer GPU→CPU round-trips).
+///
+/// `#[ignore]`d: timing is machine/thermal-dependent. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing micro-bench — run with --ignored --nocapture"]
+fn bench_rich_argmax_batched_vs_per_frame() {
+  use std::time::Instant;
+  // The real rich-info grid is the encoder output's first rows at the full
+  // CTC vocab. Build a representative (8, 25055) grid.
+  let grid = rich_grid(&[24884, 25001, 24993, 0, 1, 2, 3, 4]);
+  crate::transforms::eval(&[&grid]).unwrap();
+
+  let per_frame = |g: &Array| {
+    [
+      frame_argmax_reference(g, 0),
+      frame_argmax_reference(g, 1),
+      frame_argmax_reference(g, 2),
+    ]
+  };
+  for _ in 0..5 {
+    let _ = per_frame(&grid);
+    let _ = SenseVoiceModel::query_argmax_ids(&grid).unwrap();
+  }
+  let bench = |label: &str, f: &dyn Fn() -> [u32; 3]| {
+    let mut times = Vec::with_capacity(50);
+    for _ in 0..50 {
+      let t0 = Instant::now();
+      let ids = f();
+      std::hint::black_box(ids);
+      times.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+      "  {label:<16} min={:.4}ms median={:.4}ms",
+      times[0],
+      times[times.len() / 2]
+    );
+    times[0]
+  };
+  println!("\nrich-info argmax (3 query rows, vocab=25055):");
+  let per_min = bench("per-frame (3x)", &|| per_frame(&grid));
+  let batched_min = bench("batched (1x)", &|| {
+    SenseVoiceModel::query_argmax_ids(&grid).unwrap()
+  });
+  println!(
+    "  speedup (per-frame/batched) = {:.2}x",
+    per_min / batched_min
+  );
+}
