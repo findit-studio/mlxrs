@@ -1322,5 +1322,760 @@ pub fn save_gguf(
   Ok(())
 }
 
+// ─────────────────────── checkpoint weight discovery ───────────────────────
+//
+// Feature-neutral HF/safetensors checkpoint discovery, ported from the
+// weight-loading half of `mlx_lm.utils.load_model`. Lives here (always
+// compiled) rather than in the `lm`-gated `crate::lm::load` so every
+// consumer — `embeddings`, `vlm`, `audio`, and the LM loader — reaches the
+// *same* sharding-aware multi-format loader instead of hand-rolling a
+// weaker single-`model.safetensors` probe. `crate::lm::load::load_weights`
+// delegates here.
+
+/// Upper bound on a `config.json`-style file read into memory, mirroring
+/// `embeddings::config`'s `MAX_ST_POOLING_CONFIG_BYTES`. A real model's
+/// `config.json` is well under 1 MiB; a hostile model dir cannot make us
+/// allocate unbounded memory by planting a huge `config.json`.
+///
+/// `pub(crate)` so the `crate::lm::load` / `crate::lm::factory` config-read
+/// path shares the *one* bound (rather than restating it) — they all read
+/// `config.json` through the same cap. `#[allow(dead_code)]`: this shared
+/// bounded-IO surface is exercised by the feature-gated config readers
+/// (`lm` / `vlm` / `audio`), so a minimal feature build leaves it unused.
+#[allow(dead_code)]
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1 << 20;
+
+/// Upper bound on a `model.safetensors.index.json` read into memory. The
+/// index carries one `weight_name -> shard_name` entry per tensor; even a
+/// Llama-3-405B-class model lists well under 100 000 tensors, comfortably
+/// under 16 MiB of JSON. A hostile model directory cannot OOM us by planting
+/// a multi-GB index. Twin of [`MAX_CONFIG_BYTES`] for the larger
+/// per-tensor-keyed index file. Gated on `serde_json` — the only reader is
+/// the JSON index path [`load_via_index`].
+#[cfg(feature = "serde_json")]
+const MAX_INDEX_BYTES: u64 = 16 << 20;
+
+/// Discover and merge a model's weights from `dir`, mirroring the
+/// weight-loading half of `mlx_lm.utils.load_model` while honoring the
+/// HF/safetensors `model.safetensors.index.json` weight-map as the
+/// **authoritative** shard manifest.
+///
+/// **Feature-neutral.** Lives in the always-compiled `io` module (not the
+/// `lm`-gated `crate::lm::load`) so every consumer — `embeddings`, `vlm`,
+/// `audio`, and the LM loader — reuses the same sharding-aware loader rather
+/// than hand-rolling a single-filename probe. `crate::lm::load::load_weights`
+/// is a thin delegate to this function.
+///
+/// Resolution order (first match wins):
+///
+/// 1. **`model.safetensors.index.json` (authoritative).** When the index
+///    file is present, it is the SINGLE source of truth for which shards
+///    belong to the checkpoint. The unique shard filenames listed in its
+///    `weight_map` are loaded from `<dir>/<shard>` and merged. Stale
+///    `model*.safetensors` files in `dir` whose names are NOT in the index
+///    are **ignored** (the standard HF safetensors-sharded convention, and
+///    the safe foundation for the [`crate::lm::load::save_model`]
+///    index-rename single-commit-point). Parsing the index requires JSON
+///    support (the `serde_json` feature); without it this tier is skipped —
+///    a present index then fails closed (it is the authoritative manifest and
+///    must not be bypassed), while an index-less directory still resolves via
+///    the single-file tiers below.
+/// 2. **Single `model.safetensors`** (no index). The HF un-sharded
+///    convention: load the one file directly.
+/// 3. **Legacy `weights.safetensors`.** Pre-HF-convention back-compat: a
+///    directory carrying only this name still loads.
+/// 4. **`*.gguf`** (`gguf` feature): a single `*.gguf` is loaded via
+///    `load_gguf` (mlx-lm's GGUF path). Without the feature, a present
+///    `*.gguf` is reported as unsupported.
+/// 5. **`*.npz`** (`npz` feature): a single NumPy `.npz` (the
+///    mlx-community-native multi-array format) is loaded via `load_npz`,
+///    preferring `model.npz` / `weights.npz`, else the sole `.npz` in `dir`.
+///
+/// There is deliberately **no unindexed `model*.safetensors` glob fallback**:
+/// a complete sharded checkpoint always ships its
+/// `model.safetensors.index.json` manifest, so a directory holding
+/// `model-*.safetensors` shards but no index is INCOMPLETE (a partial/failed
+/// `save_model`, which writes `model-gen-*` shards before the index-rename
+/// commit point) and is treated as having no weights rather than glob-merged —
+/// matching mlx-lm's index-or-single-file contract.
+///
+/// No safetensors and no usable GGUF/NPZ → [`Error::FileIo`] (mlx-lm's
+/// `FileNotFoundError("No safetensors found in {model_path}")`). Keys are
+/// returned **verbatim** (no remap/sanitize).
+///
+/// The index is parsed with the same bounded-IO / `O_NONBLOCK` /
+/// non-regular-reject discipline the shared `read_bounded_config_file`
+/// primitive uses for `config.json` (capped at 16 MiB — well above a
+/// Llama-3-405B-class index); a malformed or out-of-spec index is a
+/// recoverable typed error.
+pub fn load_weights_from_dir(dir: &Path) -> Result<HashMap<String, Array>> {
+  // 1. Index-honoring path: the index, if present, IS the authoritative
+  //    shard manifest. Stale `model*.safetensors` files NOT listed in the
+  //    index are invisible to load. Gated on JSON support — when the
+  //    `serde_json` feature is off (e.g. a bare `embeddings` build) the
+  //    index cannot be parsed, so this tier is skipped — a present index then
+  //    fails closed (1b below) rather than being silently bypassed.
+  #[cfg(feature = "serde_json")]
+  if let Some(weights) = load_via_index(dir)? {
+    return Ok(weights);
+  }
+
+  // 1b. Fail closed on an index we cannot honor. Without `serde_json` the
+  //     index tier above is compiled out, but a `model.safetensors.index.json`
+  //     is still the authoritative manifest — silently falling through to the
+  //     single-file tiers would load a stale `model.safetensors` (or miss the
+  //     sharded checkpoint entirely). So when an index file is present but JSON
+  //     support is absent, refuse rather than fall through to the lower tiers.
+  #[cfg(not(feature = "serde_json"))]
+  {
+    let index_path = dir.join("model.safetensors.index.json");
+    // Fail closed on ANY existing index entry — regular file, directory, FIFO,
+    // or symlink (including a dangling one) — not just a regular file: a present
+    // index sentinel means the checkpoint is sharded-by-manifest and must NOT be
+    // bypassed without `serde_json`. `symlink_metadata` stats the entry itself
+    // (so a dangling symlink still counts as present), unlike `is_file`/`exists`.
+    if std::fs::symlink_metadata(&index_path).is_ok() {
+      return Err(Error::LayerKeyed(crate::error::LayerKeyedPayload::new(
+        index_path.display().to_string(),
+        Error::InvariantViolation(crate::error::InvariantViolationPayload::new(
+          "load_weights: `model.safetensors.index.json` present but the `serde_json` feature",
+          "must be enabled to honor a sharded-checkpoint index",
+        )),
+      )));
+    }
+  }
+
+  // 2. Single, un-sharded `model.safetensors` (HF convention without an
+  //    index file).
+  let single = dir.join("model.safetensors");
+  if path_is_file(&single)? {
+    return load_safetensors(&single);
+  }
+
+  // 3. Legacy back-compat: a `weights.safetensors`-only directory (pre-HF
+  //    naming). Kept so a hand-rolled or older checkpoint that uses this
+  //    name still loads.
+  let legacy = dir.join("weights.safetensors");
+  if path_is_file(&legacy)? {
+    return load_safetensors(&legacy);
+  }
+
+  // No unindexed `model*.safetensors` glob fallback: a complete sharded
+  // checkpoint always ships its `model.safetensors.index.json` manifest, so a
+  // directory with `model-*.safetensors` shards but no index is INCOMPLETE — an
+  // in-progress or failed `save_model` (which writes `model-gen-*` shards before
+  // the index-rename commit point) or a malformed checkout. Globbing those would
+  // return weights from an uncommitted/partial checkpoint, so we fail closed and
+  // fall through to the gguf / npz tiers and the typed no-weights error —
+  // matching mlx-lm's index-or-single-file contract.
+
+  // 4. No safetensors → try a single `*.gguf` (mlx-lm's GGUF load path). The
+  //    contract is a SINGLE gguf; if several are present there is no canonical
+  //    name to disambiguate them, so refuse rather than silently load whichever
+  //    sorts first.
+  let ggufs = collect_sorted(dir, |name| name.ends_with(".gguf"))?;
+  if ggufs.len() > 1 {
+    return Err(Error::LayerKeyed(crate::error::LayerKeyedPayload::new(
+      ambiguity_list(&ggufs),
+      Error::InvariantViolation(crate::error::InvariantViolationPayload::new(
+        "load_weights: multiple `*.gguf` weight files in the directory",
+        "exactly one `*.gguf` is supported (no canonical name to disambiguate)",
+      )),
+    )));
+  }
+  if let Some(gguf) = ggufs.first() {
+    #[cfg(feature = "gguf")]
+    {
+      let (weights, _meta) = load_gguf(gguf)?;
+      return Ok(weights);
+    }
+    #[cfg(not(feature = "gguf"))]
+    {
+      return Err(Error::LayerKeyed(crate::error::LayerKeyedPayload::new(
+        gguf.display().to_string(),
+        Error::InvariantViolation(crate::error::InvariantViolationPayload::new(
+          "load_weights: GGUF weight file present but `gguf` feature",
+          "must be enabled to load GGUF checkpoints",
+        )),
+      )));
+    }
+  }
+
+  // 5. No safetensors and no GGUF → try a single NumPy `*.npz` (the
+  //    mlx-community-native multi-array weight format). Prefer the
+  //    conventional `model.npz` / `weights.npz`; otherwise the sole `.npz`.
+  #[cfg(feature = "npz")]
+  {
+    let preferred = dir.join("model.npz");
+    if path_is_file(&preferred)? {
+      return load_npz(&preferred);
+    }
+    let legacy_npz = dir.join("weights.npz");
+    if path_is_file(&legacy_npz)? {
+      return load_npz(&legacy_npz);
+    }
+    // Arbitrary-name fallback: the SOLE `*.npz`. With neither canonical name
+    // present, several non-canonical `.npz` files have no preference order, so
+    // refuse rather than silently load whichever sorts first.
+    let npzs = collect_sorted(dir, |name| name.ends_with(".npz"))?;
+    if npzs.len() > 1 {
+      return Err(Error::LayerKeyed(crate::error::LayerKeyedPayload::new(
+        ambiguity_list(&npzs),
+        Error::InvariantViolation(crate::error::InvariantViolationPayload::new(
+          "load_weights: multiple non-canonical `*.npz` weight files in the directory",
+          "name one `model.npz` / `weights.npz`, or keep exactly one `*.npz`",
+        )),
+      )));
+    }
+    if let Some(npz) = npzs.first() {
+      return load_npz(npz);
+    }
+  }
+
+  Err(Error::FileIo(FileIoPayload::new(
+    NO_WEIGHTS_CONTEXT,
+    FileOp::Open,
+    dir.to_path_buf(),
+    std::io::Error::from(std::io::ErrorKind::NotFound),
+  )))
+}
+
+/// Static `context()` label for the no-weights terminal error, listing every
+/// layout the resolver considered (the safetensors tiers always, plus
+/// `*.gguf` / `*.npz` when those features are compiled in). The
+/// `crate::lm::load` discovery tests assert this lists each safetensors tier.
+#[cfg(all(feature = "gguf", feature = "npz"))]
+const NO_WEIGHTS_CONTEXT: &str = "load_weights: no model weights file (expected `model.safetensors.index.json`, \
+   `model.safetensors`, `weights.safetensors`, a single `*.gguf`, \
+   or a single `*.npz`)";
+#[cfg(all(feature = "gguf", not(feature = "npz")))]
+const NO_WEIGHTS_CONTEXT: &str = "load_weights: no model weights file (expected `model.safetensors.index.json`, \
+   `model.safetensors`, `weights.safetensors`, or a single `*.gguf`)";
+#[cfg(all(not(feature = "gguf"), feature = "npz"))]
+const NO_WEIGHTS_CONTEXT: &str = "load_weights: no model weights file (expected `model.safetensors.index.json`, \
+   `model.safetensors`, `weights.safetensors`, or a single `*.npz`)";
+#[cfg(all(not(feature = "gguf"), not(feature = "npz")))]
+const NO_WEIGHTS_CONTEXT: &str = "load_weights: no model weights file (expected `model.safetensors.index.json`, \
+   `model.safetensors`, or `weights.safetensors`)";
+
+/// The deserialized shape of a `model.safetensors.index.json` — only its
+/// `weight_map` is read (any sibling key such as `metadata` is ignored). The
+/// field is optional so an *absent* `weight_map` (`None`) is distinguished
+/// from a present one, letting the loader raise the precise "must contain a
+/// `weight_map`" diagnostic.
+#[cfg(feature = "serde_json")]
+#[derive(serde::Deserialize)]
+struct IndexFile {
+  #[serde(default)]
+  weight_map: Option<RawWeightMap>,
+}
+
+/// The raw `weight_map` value, tolerant of a non-object so the loader can emit
+/// the precise "`weight_map` must be an object" diagnostic itself (rather than
+/// a generic serde type error). [`RawWeightMap::Object`] is tried first; a
+/// non-object (string, array, number, …) falls to [`RawWeightMap::Other`],
+/// whose [`IgnoredAny`] consumes the value without retaining it (it is only a
+/// "this was not an object" marker).
+///
+/// [`IgnoredAny`]: serde::de::IgnoredAny
+#[cfg(feature = "serde_json")]
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawWeightMap {
+  Object(IndexEntries),
+  Other(serde::de::IgnoredAny),
+}
+
+/// The `weight_map` object as an **order-preserving** `Vec<(tensor_name,
+/// shard_value)>` rather than a deduplicating map. A `serde_json::Value`/map
+/// object collapses duplicate JSON keys (serde keeps the last), which would
+/// hide a malformed index that binds one tensor name twice; visiting via
+/// [`MapAccess`] instead yields *every* entry in on-disk order, so
+/// [`load_via_index`] sees — and rejects — the duplicate. The shard value is
+/// kept as a raw [`serde_json::Value`] (not forced to `String`) so a
+/// non-string value is reported by `load_via_index` as a precise typed
+/// [`Error::InvariantViolation`] rather than a generic serde parse error.
+/// (Mirrors `lm::lora`'s `OrderedPattern`: the behavior does not depend on
+/// `serde_json`'s `preserve_order` feature.)
+///
+/// [`MapAccess`]: serde::de::MapAccess
+#[cfg(feature = "serde_json")]
+struct IndexEntries(Vec<(String, serde_json::Value)>);
+
+#[cfg(feature = "serde_json")]
+impl<'de> serde::Deserialize<'de> for IndexEntries {
+  fn deserialize<D: serde::Deserializer<'de>>(
+    deserializer: D,
+  ) -> std::result::Result<Self, D::Error> {
+    struct EntriesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+      type Value = Vec<(String, serde_json::Value)>;
+
+      fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a `weight_map` JSON object {tensor_name: shard_file_name}")
+      }
+
+      fn visit_map<M: serde::de::MapAccess<'de>>(
+        self,
+        mut access: M,
+      ) -> std::result::Result<Self::Value, M::Error> {
+        // `next_entry` yields entries in on-disk order WITHOUT collapsing a
+        // duplicate key (unlike building a `Value` map), so a doubly-bound
+        // tensor name survives for `load_via_index` to reject.
+        let mut out = Vec::with_capacity(access.size_hint().unwrap_or(0));
+        while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
+          out.push((k, v));
+        }
+        Ok(out)
+      }
+    }
+
+    deserializer
+      .deserialize_map(EntriesVisitor)
+      .map(IndexEntries)
+  }
+}
+
+/// Load a checkpoint via its `model.safetensors.index.json`, if present.
+///
+/// Returns `Ok(Some(weights))` when an index file is found and successfully
+/// drives the load; `Ok(None)` when no index file is present (the caller's
+/// "try the next candidate" signal); `Err` on any structural problem
+/// (malformed index, missing referenced shard, IO failure).
+///
+/// The index is the HF/safetensors authoritative weight manifest: its
+/// `weight_map` lists every weight-name → shard-file-name binding, and the
+/// load is authoritative at the **tensor** level — exactly the `weight_map`
+/// tensors are returned, each taken from its assigned shard. Each referenced
+/// shard is loaded once (in sorted filename order for determinism), but only
+/// the tensors the index assigned to that shard are inserted into the result;
+/// any extra tensor present in a shard but NOT bound to it by `weight_map` is
+/// dropped (stale duplicates cannot leak in or clobber an index-assigned
+/// tensor). The contract is enforced both ways:
+///
+/// - a shard file named in the index but absent on disk → [`Error::FileIo`]
+///   naming the offending shard;
+/// - a weight key the index assigns to a shard but whose tensor is NOT in that
+///   shard → [`Error::LayerKeyed`] (keyed by shard) wrapping an
+///   [`Error::MissingKey`] (the absent tensor name);
+/// - the same weight key assigned/inserted twice → [`Error::LayerKeyed`]
+///   wrapping an [`Error::InvariantViolation`] (a duplicate `weight_map`
+///   binding for one tensor name).
+///
+/// The index body is bounded at [`MAX_INDEX_BYTES`] via the shared
+/// [`read_bounded_text_file`] primitive.
+#[cfg(feature = "serde_json")]
+fn load_via_index(dir: &Path) -> Result<Option<HashMap<String, Array>>> {
+  use crate::error::{
+    InvariantViolationPayload, LayerKeyedPayload, MissingKeyPayload, ParsePayload,
+  };
+
+  let index_path = dir.join("model.safetensors.index.json");
+  // Detect index PRESENCE with `symlink_metadata` (lstat), mirroring the
+  // no-serde sentinel guard: a present sentinel — INCLUDING a dangling symlink —
+  // must gate the lower single-file tiers and fail CLOSED if unreadable,
+  // not be treated as absent. `read_bounded_text_file` opens the target, so a
+  // dangling symlink would otherwise yield `NotFound` → `Ok(None)` → a silent
+  // fall-through that loads a stale `model.safetensors` despite the sentinel.
+  // Only a true lstat `NotFound` (no entry at all) means "no index".
+  if matches!(std::fs::symlink_metadata(&index_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+  {
+    return Ok(None);
+  }
+  let text = read_bounded_text_file(&index_path, "model weight index", MAX_INDEX_BYTES)?
+    .ok_or_else(|| {
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        index_path.display().to_string(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: `model.safetensors.index.json` sentinel present but unreadable",
+          "a present index (e.g. a dangling symlink) must be a readable manifest, not fall through to lower tiers",
+        )),
+      ))
+    })?;
+
+  // Parse the index, reading its `weight_map` (the authoritative tensor→shard
+  // manifest) through a visitor that yields entries in on-disk order. A
+  // `serde_json::Value` object would silently *collapse* a duplicate tensor
+  // key (serde keeps the last binding), so a malformed index with two bindings
+  // for one tensor would load the later one undetected; the ordered
+  // [`IndexEntries`] visitor instead preserves every entry so the
+  // duplicate-binding check below can reject it.
+  let index: IndexFile = serde_json::from_str(&text).map_err(|e| {
+    Error::LayerKeyed(LayerKeyedPayload::new(
+      index_path.display().to_string(),
+      Error::Parse(ParsePayload::new(
+        "load_via_index: model weight index",
+        "JSON",
+        e,
+      )),
+    ))
+  })?;
+  // An absent `weight_map`, or one that is not a JSON object, is a malformed
+  // index (the index MUST carry the tensor→shard manifest as an object).
+  let weight_map = match index.weight_map {
+    Some(RawWeightMap::Object(entries)) => entries,
+    None | Some(RawWeightMap::Other(_)) => {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        index_path.display().to_string(),
+        Error::MissingKey(MissingKeyPayload::new(
+          "load_via_index: model weight index must contain a `weight_map` object",
+          "weight_map",
+        )),
+      )));
+    }
+  };
+
+  // Invert `weight_map` into shard-basename → the set of tensor keys the index
+  // assigns to that shard. A `BTreeMap` keyed on the shard name keeps the load
+  // order deterministic (sorted-filename order), and lets a shard be opened
+  // exactly once even when it
+  // holds many tensors. Reject an empty shard name, or one carrying a path
+  // separator / `.` / `..` (an absolute or parent-traversing shard name would
+  // escape `dir`; the HF convention is bare basenames living in the same
+  // directory). A tensor key bound twice across the (order-preserving) entries
+  // is a malformed index — two bindings for one tensor name — and is rejected.
+  let mut shard_tensors: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+    std::collections::BTreeMap::new();
+  // Tensor names seen across ALL entries — the duplicate check is GLOBAL, not
+  // per-shard: a tensor name bound to two *different* shards is precisely the
+  // "stale duplicate overwrites the index-assigned tensor" hazard this guard
+  // closes, so it must be caught even though the two bindings land in distinct
+  // per-shard sets.
+  let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  for (weight_key, shard_value) in &weight_map.0 {
+    let weight_key = weight_key.as_str();
+    let shard = shard_value.as_str().ok_or_else(|| {
+      Error::LayerKeyed(LayerKeyedPayload::new(
+        format!("weight_map[{weight_key}]"),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: weight_map shard value",
+          "must be a string",
+        )),
+      ))
+    })?;
+    if shard.is_empty()
+      || shard.contains('/')
+      || shard.contains('\\')
+      || shard == "."
+      || shard == ".."
+    {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        format!("weight_map[{weight_key}] -> {shard:?}"),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: weight_map shard name",
+          "must be a bare basename (no path separators or `.`/`..`; lives in the same directory as the index)",
+        )),
+      )));
+    }
+    if !seen.insert(weight_key) {
+      return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+        weight_key.to_string(),
+        Error::InvariantViolation(InvariantViolationPayload::new(
+          "load_via_index: weight_map tensor name",
+          "is assigned more than once (a duplicate `weight_map` binding)",
+        )),
+      )));
+    }
+    shard_tensors.entry(shard).or_default().insert(weight_key);
+  }
+
+  // The index is authoritative at the TENSOR level: open each referenced
+  // shard once and pull out exactly the tensors the index bound to it. An
+  // extra tensor that happens to live in the shard but is unlisted for it is
+  // dropped (a stale duplicate cannot leak in or clobber an index-assigned
+  // tensor in another shard). A listed tensor that is absent from its assigned
+  // shard is a malformed checkpoint.
+  let mut weights: HashMap<String, Array> = HashMap::with_capacity(weight_map.0.len());
+  for (shard, expected) in &shard_tensors {
+    let shard_path = dir.join(shard);
+    if !path_is_file(&shard_path)? {
+      return Err(Error::FileIo(FileIoPayload::new(
+        "load_via_index: shard listed by the model weight index is missing on disk",
+        FileOp::Stat,
+        shard_path,
+        std::io::Error::from(std::io::ErrorKind::NotFound),
+      )));
+    }
+    let mut part = load_safetensors(&shard_path)?;
+    for &key in expected {
+      let Some(tensor) = part.remove(key) else {
+        return Err(Error::LayerKeyed(LayerKeyedPayload::new(
+          shard.to_string(),
+          Error::MissingKey(MissingKeyPayload::new(
+            "load_via_index: tensor assigned by the model weight index is missing from its shard",
+            key,
+          )),
+        )));
+      };
+      // A unique-per-name `weight_map` (enforced above) means no key can be
+      // produced twice across shards, so this insert never overwrites.
+      weights.insert(key.to_string(), tensor);
+    }
+  }
+  Ok(Some(weights))
+}
+
+/// Render a sorted candidate list (from [`collect_sorted`]) as a single
+/// comma-separated string of base names for an ambiguity diagnostic, e.g.
+/// `"a.gguf, b.gguf"`. Base names are used (not full paths) so the message
+/// names the colliding files without leaking the absolute temp/cache prefix;
+/// the directory is already named by the surrounding `load_weights` context.
+/// Carried in a [`LayerKeyedPayload`]'s runtime-key channel — the project's
+/// typed-error idiom for a dynamic identifier — so the static
+/// [`InvariantViolationPayload`] phrase stays allocation-free.
+fn ambiguity_list(paths: &[std::path::PathBuf]) -> String {
+  let mut names: Vec<&str> = paths
+    .iter()
+    .map(|p| {
+      p.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<non-utf8>")
+    })
+    .collect();
+  names.sort_unstable();
+  names.join(", ")
+}
+
+/// Whether `path` exists AND its (symlink-resolved) target is a regular
+/// file. A symlink whose target is a regular file qualifies (HF Hub snapshot
+/// dirs store these as symlinks into `blobs/<hash>`, the same convention the
+/// [`collect_sorted`] / [`read_bounded_config_file`] paths intentionally
+/// follow). A missing path is `Ok(false)`; any other stat failure is an
+/// [`Error::FileIo`] (`Stat`).
+///
+/// `pub(crate)` so `crate::lm::load`'s discovery tests reach it via the
+/// shared module path.
+pub(crate) fn path_is_file(path: &Path) -> Result<bool> {
+  match std::fs::metadata(path) {
+    Ok(m) => Ok(m.is_file()),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+    Err(e) => Err(Error::FileIo(FileIoPayload::new(
+      "path_is_file",
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
+    ))),
+  }
+}
+
+/// List the entries of `dir` whose file name matches `pred`, returning their
+/// full paths sorted by name. A non-readable directory (absent / not a
+/// directory / permission) maps to [`Error::FileIo`] (`Read`). Only regular
+/// files are considered (a directory named `model….safetensors` is ignored).
+///
+/// `pub(crate)` so `crate::lm::load`'s discovery tests reach it via the
+/// shared module path.
+pub(crate) fn collect_sorted(
+  dir: &Path,
+  pred: impl Fn(&str) -> bool,
+) -> Result<Vec<std::path::PathBuf>> {
+  let entries = std::fs::read_dir(dir).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "cannot read model directory",
+      FileOp::Read,
+      dir.to_path_buf(),
+      e,
+    ))
+  })?;
+  let mut out = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        "cannot read an entry of",
+        FileOp::Read,
+        dir.to_path_buf(),
+        e,
+      ))
+    })?;
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { continue };
+    if !pred(name) {
+      continue;
+    }
+    // Require the *resolved* target to be a regular file (a hostile dir
+    // could name a subdir / FIFO `model.safetensors`; mlx-c would then fail
+    // opaquely on open). `DirEntry::file_type()` does NOT follow symlinks,
+    // but HF Hub snapshot dirs store weight files as symlinks into
+    // `blobs/<hash>` (mlx-lm's `glob(...) + mx.load(wf)` follows them) — so
+    // resolve via `fs::metadata` (follows symlinks) and gate on the target.
+    // The original (possibly-symlink) path is passed through; the IO loader
+    // opens it, following the link.
+    match std::fs::metadata(entry.path()) {
+      Ok(m) if m.is_file() => out.push(entry.path()),
+      Ok(_) => continue,
+      Err(e) => {
+        return Err(Error::FileIo(FileIoPayload::new(
+          "collect_sorted: cannot stat entry",
+          FileOp::Stat,
+          entry.path(),
+          e,
+        )));
+      }
+    }
+  }
+  out.sort();
+  Ok(out)
+}
+
+/// Bounded, TOCTOU-closed read of a config-style file at `path`.
+///
+/// Shared bounded-config-file primitive used by every config-JSON reader in
+/// the loader (`config.json`, `generation_config.json`,
+/// `(pre)processor_config.json`, VLM base-config). Behavior:
+///
+/// - `Ok(Some(text))` on a successful, bounded, valid-UTF-8 read.
+/// - `Ok(None)` if the file is absent (`ENOENT`) — the caller's "try the
+///   next candidate" / "absent is OK" signal. The caller decides whether
+///   absence is a hard error or simply *no override*.
+/// - `Err(Error::FileIo)` / `Err(Error::CapExceeded)` / `Err(Error::LayerKeyed)`
+///   on every other failure (open failure other than `NotFound`, not a
+///   regular file, oversized, IO failure during read, non-UTF-8).
+///
+/// Discipline mirrors `embeddings::config`'s pooling-config read: open
+/// **once** with `O_NONBLOCK | O_CLOEXEC` on unix (so a planted FIFO returns
+/// immediately and never hangs the loader), post-open `is_file()` fstat
+/// rejects non-regular targets even when reached via a symlink (HF Hub
+/// snapshot caches store these files as symlinks into `blobs/<hash>`, which
+/// is intentionally followed since the post-open stat enforces the
+/// guarantee on the *resolved* target), and the body is capped at
+/// [`MAX_CONFIG_BYTES`] via `Read::take` so a hostile model directory
+/// cannot OOM us by planting a huge config.
+///
+/// `pub(crate)` so `crate::lm::load` / `crate::vlm::load` / `crate::audio`
+/// readers funnel through the one hardened path. `#[allow(dead_code)]`: a
+/// minimal feature build with no config readers leaves this shared surface
+/// unused.
+#[allow(dead_code)]
+pub(crate) fn read_bounded_config_file(path: &Path, label: &'static str) -> Result<Option<String>> {
+  read_bounded_text_file(path, label, MAX_CONFIG_BYTES)
+}
+
+/// Shared bounded-text-file primitive parametrized on the byte cap. Identical
+/// hardening (open-once + non-regular-reject + `O_NONBLOCK | O_CLOEXEC` on
+/// unix + cap-via-`Read::take`) as [`read_bounded_config_file`]; factored out
+/// so the larger [`MAX_INDEX_BYTES`] cap for `model.safetensors.index.json`
+/// can reuse the *one* hardening path rather than restating it.
+///
+/// Adds a UTF-8 validation pass on top of the shared
+/// [`read_bounded_bytes_file`] byte read (a non-UTF-8 body is a typed parse
+/// error); the byte primitive owns the open/stat/cap hardening so both the
+/// text and the binary-asset readers share the *one* path.
+///
+/// `pub(crate)` so `crate::lm::load`'s discovery tests exercise the explicit
+/// `max_bytes` cap directly. `#[allow(dead_code)]`: a minimal feature build
+/// with no config/index reader leaves this shared primitive unused.
+#[allow(dead_code)]
+pub(crate) fn read_bounded_text_file(
+  path: &Path,
+  label: &'static str,
+  max_bytes: u64,
+) -> Result<Option<String>> {
+  let Some(bytes) = read_bounded_bytes_file(path, label, max_bytes)? else {
+    return Ok(None);
+  };
+  let text = String::from_utf8(bytes).map_err(|e| {
+    Error::LayerKeyed(crate::error::LayerKeyedPayload::new(
+      path.display().to_string(),
+      Error::Parse(crate::error::ParsePayload::new(label, "UTF-8", e)),
+    ))
+  })?;
+  Ok(Some(text))
+}
+
+/// Shared bounded-**bytes**-file primitive parametrized on the byte cap — the
+/// binary-asset twin of [`read_bounded_text_file`], returning the raw bytes
+/// (no UTF-8 validation) for files that are not text (e.g. a SentencePiece
+/// `.model` protobuf).
+///
+/// Identical TOCTOU-closed hardening as [`read_bounded_config_file`]: open
+/// **once** with `O_NONBLOCK | O_CLOEXEC` on unix (so a planted FIFO returns
+/// immediately and never hangs the loader), post-open `is_file()` fstat
+/// rejects non-regular targets even when reached via a symlink, and the body
+/// is capped at `max_bytes` via `Read::take` so a hostile model directory
+/// cannot OOM the loader by planting a huge file.
+///
+/// `Ok(Some(bytes))` on a successful bounded read, `Ok(None)` if the file is
+/// absent (`ENOENT`), `Err` on every other failure (open failure other than
+/// `NotFound`, not a regular file, oversized, IO failure during read).
+///
+/// `pub(crate)` so a per-usecase asset reader (e.g. the SenseVoice SPM
+/// `.model` loader) can read a binary asset through the *one* bounded-read
+/// path with its own generous cap, rather than restating the hardening.
+/// `#[allow(dead_code)]`: a minimal feature build with no asset reader
+/// leaves this shared primitive unused.
+#[allow(dead_code)]
+pub(crate) fn read_bounded_bytes_file(
+  path: &Path,
+  label: &'static str,
+  max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+  use std::io::Read;
+
+  #[cfg(unix)]
+  let open_result = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+  };
+  #[cfg(not(unix))]
+  let open_result = std::fs::File::open(path);
+
+  let file = match open_result {
+    Ok(f) => f,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => {
+      return Err(Error::FileIo(FileIoPayload::new(
+        label,
+        FileOp::Open,
+        path.to_path_buf(),
+        e,
+      )));
+    }
+  };
+
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Stat,
+      path.to_path_buf(),
+      e,
+    ))
+  })?;
+  if !meta.is_file() {
+    return Err(Error::FileIo(FileIoPayload::new(
+      label,
+      FileOp::Stat,
+      path.to_path_buf(),
+      std::io::Error::from(std::io::ErrorKind::InvalidInput),
+    )));
+  }
+
+  let mut bytes = Vec::new();
+  file
+    .take(max_bytes + 1)
+    .read_to_end(&mut bytes)
+    .map_err(|e| {
+      Error::FileIo(FileIoPayload::new(
+        label,
+        FileOp::Read,
+        path.to_path_buf(),
+        e,
+      ))
+    })?;
+  if bytes.len() as u64 > max_bytes {
+    return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
+      label,
+      "max_bytes",
+      max_bytes,
+      bytes.len() as u64,
+    )));
+  }
+
+  Ok(Some(bytes))
+}
+
 #[cfg(test)]
 mod tests;
