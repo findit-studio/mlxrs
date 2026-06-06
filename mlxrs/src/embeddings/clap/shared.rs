@@ -1510,6 +1510,13 @@ mod swin {
   /// Even blocks use `shift = 0` (W-MSA), odd blocks `shift = window/2` (SW-MSA);
   /// the caller passes the resolved `shift`. The two `LayerNorm`s are
   /// `layernorm_before` / `layernorm_after`.
+  ///
+  /// The block's spatial resolution `(height, width)` is fixed at construction
+  /// (each Swin stage has one resolution), so a shifted block precomputes its
+  /// SW-MSA [`shifted_window_mask`] **once** here — mirroring the construction-time
+  /// [`RelativePositionBias`] gather — rather than rebuilding it on every forward
+  /// (the mask depends only on the padded resolution, window, and shift, all
+  /// construction-fixed).
   pub(crate) struct SwinBlock {
     layernorm_before: LayerNorm,
     attention: WindowAttention,
@@ -1518,6 +1525,14 @@ mod swin {
     window: i32,
     /// `0` for an even (W-MSA) block, `window/2` for an odd (SW-MSA) block.
     shift: i32,
+    /// This block's (construction-fixed) input resolution `(height, width)`; the
+    /// forward asserts its argument matches it (the cached SW-MSA mask is pinned
+    /// to this resolution).
+    height: i32,
+    width: i32,
+    /// The SW-MSA mask `(1, num_windows, 1, window², window²)`, precomputed once at
+    /// construction for a shifted block (`shift > 0`); `None` for a W-MSA block.
+    shift_mask: Option<Array>,
   }
 
   impl SwinBlock {
@@ -1527,7 +1542,8 @@ mod swin {
     /// `attention.output.dense`, `layernorm_after`, `intermediate.dense`, and
     /// `output.dense`. `dim` is the stage channel width, `num_heads` the stage
     /// head count, `shift` the resolved cyclic shift (`0` or `window/2`),
-    /// `hidden = mlp_ratio · dim`.
+    /// `hidden = mlp_ratio · dim`, `(height, width)` the stage's (fixed) input
+    /// resolution — used to precompute the SW-MSA mask for a shifted block.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_weights(
       weights: &mut HashMap<String, Array>,
@@ -1536,6 +1552,8 @@ mod swin {
       num_heads: i32,
       window: i32,
       shift: i32,
+      height: i32,
+      width: i32,
       hidden: i32,
       eps: f32,
       quant: Option<&PerLayerQuantization>,
@@ -1561,6 +1579,15 @@ mod swin {
       let layernorm_after =
         build_layer_norm(weights, &format!("{prefix}.layernorm_after"), dim, eps)?;
       let mlp = SwinMlp::from_weights(weights, prefix, dim, hidden, quant)?;
+      // Precompute the SW-MSA mask once for a shifted block (the padded resolution,
+      // window, and shift are all construction-fixed) — the `RelativePositionBias`
+      // caching pattern. The forward pins its `(height, width)` argument to these.
+      let shift_mask = if shift > 0 {
+        let (height_pad, width_pad) = padded_resolution(height, width, window)?;
+        Some(shifted_window_mask(height_pad, width_pad, window, shift)?)
+      } else {
+        None
+      };
       Ok(Self {
         layernorm_before,
         attention,
@@ -1568,12 +1595,24 @@ mod swin {
         mlp,
         window,
         shift,
+        height,
+        width,
+        shift_mask,
       })
     }
 
     /// Run the block on `(B, L = H·W, C)` given the spatial `(height, width)` —
-    /// the HF `ClapAudioLayer.forward`. Returns `(B, H·W, C)`.
+    /// the HF `ClapAudioLayer.forward`. Returns `(B, H·W, C)`. `(height, width)`
+    /// must equal the block's construction resolution (the cached SW-MSA mask is
+    /// pinned to it).
     pub(crate) fn forward(&self, x: &Array, height: i32, width: i32) -> Result<Array> {
+      if height != self.height || width != self.width {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "clap Swin SwinBlock: forward (height, width)",
+          "must equal the block's construction resolution (the cached SW-MSA mask is pinned to it)",
+          smol_str::format_smolstr!("({height}, {width}) != ({}, {})", self.height, self.width),
+        )));
+      }
       let shape = x.shape();
       let b = dim_i32(&shape, 0, "clap Swin SwinBlock: batch")?;
       let c = dim_i32(&shape, 2, "clap Swin SwinBlock: channels")?;
@@ -1593,24 +1632,12 @@ mod swin {
         h
       };
 
-      // Partition → (nw·B, win², C), attend, reverse.
+      // Partition → (nw·B, win², C), attend, reverse. The SW-MSA mask depends only
+      // on the (construction-fixed) padded resolution, window, and shift, so it was
+      // precomputed once at construction (the `RelativePositionBias` pattern, #365)
+      // rather than rebuilt here each forward.
       let windows = window_partition(&shifted, self.window)?;
-      // The SW-MSA mask depends only on the (fixed-per-stage) padded resolution,
-      // window, and shift, so it could be precomputed at construction (like
-      // `RelativePositionBias`) rather than rebuilt each forward. Deferred: the
-      // per-stage padded dims are not currently threaded into `from_weights`, so
-      // caching is a constructor refactor, not a local change (see #365).
-      let shift_mask = if self.shift > 0 {
-        Some(shifted_window_mask(
-          height_pad,
-          width_pad,
-          self.window,
-          self.shift,
-        )?)
-      } else {
-        None
-      };
-      let attn = self.attention.forward(&windows, shift_mask.as_ref())?;
+      let attn = self.attention.forward(&windows, self.shift_mask.as_ref())?;
       let attn = window_reverse(&attn, self.window, height_pad, width_pad)?;
 
       // Reverse cyclic shift.
@@ -1792,6 +1819,37 @@ mod swin {
       "window",
       window,
     )
+  }
+
+  /// The window-multiple **padded** resolution `(height_pad, width_pad)` HF
+  /// `ClapAudioLayer.maybe_pad` produces (right/bottom pad only): each axis is
+  /// rounded **up** to the next multiple of `window`. Kept as the single source of
+  /// the pad arithmetic [`SwinBlock::maybe_pad`] applies at forward time, so the
+  /// construction-time cached SW-MSA mask is built at the exact padded resolution
+  /// the forward windows.
+  fn padded_resolution(height: i32, width: i32, window: i32) -> Result<(i32, i32)> {
+    require_window(window)?;
+    crate::model_validation::require_positive("clap Swin padded_resolution: height", height)?;
+    crate::model_validation::require_positive("clap Swin padded_resolution: width", width)?;
+    let pad_bottom = (window - height % window) % window;
+    let pad_right = (window - width % window) % window;
+    let height_pad = height
+      .checked_add(pad_bottom)
+      .ok_or_else(|| pad_overflow("height", height, pad_bottom))?;
+    let width_pad = width
+      .checked_add(pad_right)
+      .ok_or_else(|| pad_overflow("width", width, pad_right))?;
+    Ok((height_pad, width_pad))
+  }
+
+  /// The typed overflow error `padded_resolution` raises if an axis + its pad
+  /// exceeds `i32::MAX` (unreachable for the HTSAT resolutions; a soundness guard).
+  fn pad_overflow(axis: &'static str, extent: i32, pad: i32) -> Error {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "clap Swin padded_resolution: padded extent",
+      "extent + pad must not overflow i32",
+      smol_str::format_smolstr!("{axis}: {extent} + {pad}"),
+    ))
   }
 
   /// The `(H/window, W/window)` window-block counts, erroring if `H` / `W` is

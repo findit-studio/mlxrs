@@ -556,3 +556,73 @@ fn tower_loads_and_forwards_quantized_checkpoint() {
     "quantized tower forward is finite"
   );
 }
+
+// ════════════════════════ SW-MSA mask-cache perf bench ════════════════════════
+
+/// `#[ignore]` timing bench for the SW-MSA shifted-window-mask cache (#365): the
+/// real-config HTSAT tower has 5 shifted (SW-MSA) Swin blocks per forward (stages
+/// 0/1: 1 each, stage 2: 3, stage 3: 0 — its `8 == window` resolution zeroes the
+/// shift), so the un-cached path rebuilds `shifted_window_mask` 5× per forward.
+/// This times the whole audio-tower forward at the real `(1,1,1001,64)` shape,
+/// best-of-N (min, to cut GPU scheduling noise). The mask path is
+/// weight-independent, so the synthetic-weight tower is representative.
+///
+/// Run with:
+/// `cargo test -p mlxrs --features clap --lib -- --ignored --nocapture
+/// embeddings::clap::audio::tests::bench_audio_tower_forward`
+#[test]
+#[ignore = "perf bench — run with --ignored --nocapture (SW-MSA mask-cache, #365)"]
+fn bench_audio_tower_forward() {
+  use std::time::Instant;
+  const WARMUP: usize = 8;
+  const ITERS: usize = 60;
+
+  let cfg = clap_config();
+  let mut w = htsat_weights();
+  let tower = HtsatAudioTower::from_weights(&cfg, &mut w).unwrap();
+  let mel = synthetic_mel(1001, NUM_MELS);
+
+  for _ in 0..WARMUP {
+    let mut out = tower.forward(&mel).unwrap();
+    out.eval().unwrap();
+  }
+  let mut times = Vec::with_capacity(ITERS);
+  for _ in 0..ITERS {
+    let t0 = Instant::now();
+    let mut out = tower.forward(&mel).unwrap();
+    out.eval().unwrap();
+    times.push(t0.elapsed().as_secs_f64() * 1e3);
+  }
+  times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+  let min = times[0];
+  let median = times[times.len() / 2];
+  println!(
+    "\nMLXRS clap HTSAT audio-tower forward (1x1x1001x64, 5 SW-MSA blocks): \
+     min={min:.3}ms median={median:.3}ms  (best of {ITERS})"
+  );
+}
+
+/// Numerics witness for the SW-MSA mask cache (#365): the real-config tower
+/// forward (which exercises all 5 shifted SW-MSA blocks) must be **bit-identical**
+/// whether the mask is rebuilt each forward or precomputed once at construction.
+/// These reference values were captured on the pre-cache forward; the post-cache
+/// forward must reproduce them exactly (the cache changes *when* the same mask is
+/// built, never its contents).
+#[test]
+fn audio_tower_forward_numerics_witness() {
+  let cfg = clap_config();
+  let mut w = htsat_weights();
+  let tower = HtsatAudioTower::from_weights(&cfg, &mut w).unwrap();
+  let mel = synthetic_mel(1001, NUM_MELS);
+  let v = read_f32(&tower.forward(&mel).unwrap());
+  assert_eq!(v.len(), 768);
+  let sum: f64 = v.iter().map(|&x| x as f64).sum();
+  // Captured on the pre-cache (mask-rebuilt-per-forward) implementation.
+  assert!(
+    (sum - 15.525_256_737_6).abs() < 1e-6,
+    "pooled-feature sum drifted: {sum}"
+  );
+  assert!((v[0]).abs() < 1e-9, "v[0] = {}", v[0]);
+  assert!((v[1] - (-0.005_061_477_4)).abs() < 1e-7, "v[1] = {}", v[1]);
+  assert!((v[767] - 0.001_040_554).abs() < 1e-7, "v[767] = {}", v[767]);
+}
