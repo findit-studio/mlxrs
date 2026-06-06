@@ -510,9 +510,25 @@ impl WhisperModel {
     &self.alignment_heads
   }
 
-  /// The concrete inference [`WhisperBackend`] the decode pipeline drives —
-  /// the CoreML / Neural-Engine sibling when one was loaded alongside this
-  /// checkpoint (Apple Silicon), else the MLX path.
+  /// Whether the CoreML / Neural-Engine backend should drive a decode with the
+  /// given `word_timestamps` request: iff a CoreML sibling is loaded
+  /// (`has_coreml`) AND word timestamps are NOT requested.
+  ///
+  /// CoreML is skipped for a word-timestamp request because its
+  /// `alignment_heads_weights` cross-attention does not expose the per-head
+  /// `cross_qk` the word-timing DTW ([`super::timing::find_alignment`]) consumes,
+  /// so such a transcription falls back to the MLX backend until the CoreML path
+  /// exposes compatible cross-attention.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  fn prefers_coreml(has_coreml: bool, word_timestamps: bool) -> bool {
+    has_coreml && !word_timestamps
+  }
+
+  /// The concrete inference [`WhisperBackend`] the decode pipeline drives for a
+  /// request with the given `word_timestamps` flag — the CoreML / Neural-Engine
+  /// sibling when one was loaded alongside this checkpoint (Apple Silicon) AND
+  /// word timestamps are not requested (see `prefers_coreml`), else the
+  /// MLX path.
   ///
   /// The high-level [`Transcribe`] entry points build the backend through this
   /// one chokepoint and hand `&backend` to the [`super::decoding`] free
@@ -520,10 +536,13 @@ impl WhisperModel {
   /// (and whenever no `.mlmodelc` bundle was present) this is always
   /// [`WhisperBackend::Mlx`], byte-identical to the pre-backend pipeline.
   #[inline]
-  pub fn backend(&self) -> WhisperBackend<'_> {
+  pub fn backend(&self, word_timestamps: bool) -> WhisperBackend<'_> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(coreml) = self.coreml.as_deref() {
-      return WhisperBackend::CoreMl(coreml);
+    if Self::prefers_coreml(self.coreml.is_some(), word_timestamps) {
+      // `prefers_coreml` returned true ⇒ a CoreML sibling IS loaded; bind it.
+      if let Some(coreml) = self.coreml.as_deref() {
+        return WhisperBackend::CoreMl(coreml);
+      }
     }
     WhisperBackend::Mlx(self)
   }
@@ -1196,7 +1215,7 @@ impl WhisperModel {
 
     let whisper_opts = self.whisper_transcribe_options(opts);
     let result = decoding::transcribe(
-      &self.backend(),
+      &self.backend(whisper_opts.word_timestamps),
       &wrapper,
       &mel,
       content_frames,
@@ -2675,7 +2694,7 @@ impl Transcribe for WhisperModel {
 
     let whisper_opts = self.whisper_transcribe_options(opts);
     let result = decoding::transcribe(
-      &self.backend(),
+      &self.backend(whisper_opts.word_timestamps),
       &wrapper,
       &mel,
       content_frames,

@@ -1,5 +1,32 @@
 use super::*;
 
+// ──────────────────── backend selection (word timestamps) ───────────────────
+
+/// CoreML drives a decode only when a `.mlmodelc` sibling is loaded AND word
+/// timestamps are NOT requested — a word-timestamp request falls back to MLX
+/// because CoreML's cross-attention does not expose the per-head `cross_qk` the
+/// word-timing DTW consumes. Guards the `model.backend(word_timestamps)` choice.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn coreml_drives_decode_only_without_word_timestamps() {
+  assert!(
+    WhisperModel::prefers_coreml(true, false),
+    "coreml + no word ts → coreml"
+  );
+  assert!(
+    !WhisperModel::prefers_coreml(true, true),
+    "word timestamps fall back to mlx"
+  );
+  assert!(
+    !WhisperModel::prefers_coreml(false, false),
+    "no coreml → mlx"
+  );
+  assert!(
+    !WhisperModel::prefers_coreml(false, true),
+    "no coreml → mlx"
+  );
+}
+
 // ───────────────────────── sanitize ───────────────────────────────────────
 
 /// A rank-3 conv weight `(out, in, k)` (HF layout) with sequential values, so
