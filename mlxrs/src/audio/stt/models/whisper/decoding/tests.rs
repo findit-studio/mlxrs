@@ -1,5 +1,8 @@
 use super::*;
-use crate::{audio::stt::models::whisper::config::ModelDimensions, tokenizer::Tokenizer};
+use crate::{
+  audio::stt::models::whisper::{config::ModelDimensions, model::WhisperModel},
+  tokenizer::Tokenizer,
+};
 use serde_json::json;
 use std::{
   collections::HashMap,

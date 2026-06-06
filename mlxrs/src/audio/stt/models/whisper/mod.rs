@@ -42,6 +42,7 @@ pub mod config;
 pub(crate) mod decoder;
 pub mod decoding;
 pub(crate) mod encoder;
+pub mod inference;
 pub(crate) mod layers;
 pub mod model;
 pub mod streaming;

@@ -14,12 +14,15 @@
 use std::{path::Path, time::Instant};
 
 use super::{
-  ApplyTimestampRules, GreedyDecoder, HFTokenizerWrapper, Task, TranscribeOptions, WhisperModel,
+  ApplyTimestampRules, GreedyDecoder, HFTokenizerWrapper, Task, TranscribeOptions,
   last_position_row, transcribe,
 };
 use crate::{
   Array, Dtype, Result,
-  audio::stt::{model::AutoregressiveStt, models::whisper::config::ModelDimensions},
+  audio::stt::{
+    model::AutoregressiveStt,
+    models::whisper::{config::ModelDimensions, model::WhisperModel},
+  },
   ops,
   tokenizer::Tokenizer,
   transforms,
