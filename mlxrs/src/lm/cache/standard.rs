@@ -20,9 +20,9 @@ const STEP: usize = 256;
 ///
 /// Faithful port of mlx-lm `KVCache` (`mlx_lm/models/cache.py:325`) and swift
 /// `KVCacheSimple` (`MLXLMCommon/KVCache.swift`), which are byte-identical: a
-/// **pre-allocated step buffer**. [`keys`](Self::keys) / [`values`](Self::values)
+/// **pre-allocated step buffer**. `keys` / `values`
 /// are buffers whose sequence axis is `>= offset`, rounded up to a multiple of
-/// [`STEP`]; `offset` is the logical length, so the live content is
+/// `STEP`; `offset` is the logical length, so the live content is
 /// `keys[.., :offset, :]`. Each [`update`](KvCache::update) writes the new `S`
 /// keys/values into the `[offset, offset + S)` slot **in place** (`slice_update`,
 /// which mlx evaluates as an in-place buffer donation when the input is unshared
@@ -38,10 +38,10 @@ const STEP: usize = 256;
 /// serialized form is identical to the old append-and-fetch cache.
 #[derive(Default)]
 pub struct StandardKvCache {
-  /// Key buffer; its sequence axis is `>= offset`, rounded to a [`STEP`]
+  /// Key buffer; its sequence axis is `>= offset`, rounded to a `STEP`
   /// multiple. The logical keys are `keys[.., :offset, :]`.
   keys: Option<Array>,
-  /// Value buffer (paired with [`Self::keys`]).
+  /// Value buffer (paired with `keys`).
   values: Option<Array>,
   /// Logical cached sequence length (mlx-lm `KVCache.offset`).
   offset: usize,
@@ -59,7 +59,7 @@ impl StandardKvCache {
   /// `template`, so the appended block carries the buffer's own
   /// batch/n_kv_heads/head_dim and `concat_seq` matches. `template` is an
   /// already-rank-checked 4-D array. The FIRST allocation instead uses
-  /// [`first_blocks`], which derives the value buffer's batch/n_kv_heads from
+  /// `first_blocks`, which derives the value buffer's batch/n_kv_heads from
   /// `keys` (not `values`).
   fn make_zero_block(template: &Array, block: usize) -> Result<Array> {
     let sh = template.shape();
