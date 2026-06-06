@@ -185,17 +185,20 @@ impl SileroVadBranch {
   ///
   /// [silero]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/models/silero_vad/silero_vad.py#L61-L90
   pub fn forward(&self, x: &Array, state: Option<&Array>) -> Result<(Array, Array)> {
-    // x.ndim == 1 → x[None, :]
+    // x.ndim == 1 → x[None, :]. A rank-2 input is used by reference (the
+    // reflect-pad below produces a fresh array regardless), so it is not cloned.
+    let promoted;
     let x = if x.ndim() == 1 {
-      ops::shape::expand_dims_axes(x, &[0])?
+      promoted = ops::shape::expand_dims_axes(x, &[0])?;
+      &promoted
     } else {
-      x.try_clone()?
+      x
     };
 
     let (hidden, cell) = split_state(state)?;
 
     // _reflect_pad_right(x, pad) then stft_conv(x[..., None]).
-    let x = reflect_pad_right(&x, self.config.pad())?;
+    let x = reflect_pad_right(x, self.config.pad())?;
     // x[..., None]: (B, T) → (B, T, 1) channels-last for the stride-`hop` conv.
     let x = ops::shape::expand_dims_axes(&x, &[-1])?;
     let x = ops::conv::conv1d(
@@ -305,18 +308,23 @@ fn slice_last_axis(x: &Array, lo: i32, hi: i32) -> Result<Array> {
 /// ([`recurrent.py`][lstm], the layer Silero's `SileroVADBranch` instantiates
 /// as `nn.LSTM(128, 128)`).
 ///
-/// Weights match `mlx.nn.LSTM`: `wx` is `(4H, D)`, `wh` is `(4H, H)`, `bias`
-/// is `(4H,)`. The per-step gate order is `i, f, g, o` (the split of the `4H`
-/// pre-activation), with `c = f*c + i*g`, `h = o*tanh(c)`. The pre-activation
-/// `x @ wxᵀ (+ bias)` is computed once for the whole sequence, then the
-/// recurrence runs step-by-step over the time axis.
+/// `mlx.nn.LSTM` stores `Wx` as `(4H, D)`, `Wh` as `(4H, H)`, `bias` as
+/// `(4H,)`, and per call forms `x @ Wx.T` / `hidden @ Wh.T`. Both transposes
+/// are loop-invariant, so they are taken once at construction and the
+/// `(D, 4H)` / `(H, 4H)` transposed views are stored here — the `addmm` inputs
+/// are byte-identical to taking `Wx.T` per call, only the (lazy, zero-copy)
+/// transpose node is shared instead of rebuilt every frame. The per-step gate
+/// order is `i, f, g, o` (the split of the `4H` pre-activation), with
+/// `c = f*c + i*g`, `h = o*tanh(c)`. The `x @ Wxᵀ (+ bias)` pre-activation is
+/// computed once for the whole sequence, then the recurrence runs step-by-step
+/// over the time axis.
 ///
 /// [lstm]: https://github.com/ml-explore/mlx/blob/main/python/mlx/nn/layers/recurrent.py
 struct Lstm {
-  /// Input-to-hidden weight `(4H, D)`.
-  wx: Array,
-  /// Hidden-to-hidden weight `(4H, H)`.
-  wh: Array,
+  /// Transposed input-to-hidden weight `Wx.T` = `(D, 4H)`.
+  wx_t: Array,
+  /// Transposed hidden-to-hidden weight `Wh.T` = `(H, 4H)`.
+  wh_t: Array,
   /// Gate bias `(4H,)`.
   bias: Array,
   /// Hidden size `H`.
@@ -333,10 +341,10 @@ impl Lstm {
     hidden: Option<&Array>,
     cell: Option<&Array>,
   ) -> Result<(Array, Array)> {
-    // x = addmm(bias, x, wx.T)  →  (…, L, 4H). The bias broadcasts over the
-    // leading axes; addmm with alpha=beta=1 is `bias + x @ wxᵀ`.
-    let wx_t = ops::shape::swapaxes(&self.wx, -2, -1)?;
-    let pre = x.addmm(&self.bias, &wx_t, 1.0, 1.0)?;
+    // x = addmm(bias, x, Wx.T)  →  (…, L, 4H). The bias broadcasts over the
+    // leading axes; addmm with alpha=beta=1 is `bias + x @ Wxᵀ`. `wx_t` / `wh_t`
+    // are the loop-invariant transposed weights, taken once at construction.
+    let pre = x.addmm(&self.bias, &self.wx_t, 1.0, 1.0)?;
 
     let time_axis = pre.ndim() - 2;
     let seq_len = i32::try_from(pre.shape()[time_axis]).map_err(|_| {
@@ -348,7 +356,6 @@ impl Lstm {
     })?;
     let time_axis_i = time_axis as i32;
 
-    let wh_t = ops::shape::swapaxes(&self.wh, -2, -1)?;
     let h = self.hidden_size;
     let split_points = [h, 2 * h, 3 * h];
 
@@ -372,7 +379,7 @@ impl Lstm {
       // hidden @ wh.T. In mlxrs `a.addmm(c, b)` = a @ b + c, so `a = hidden`,
       // `c = ifgo`, `b = wh_t`.
       if let Some(prev_h) = &hidden {
-        ifgo = prev_h.addmm(&ifgo, &wh_t, 1.0, 1.0)?;
+        ifgo = prev_h.addmm(&ifgo, &self.wh_t, 1.0, 1.0)?;
       }
       let parts = ops::shape::split_sections(&ifgo, &split_points, -1)?;
       let i = ops::arithmetic::sigmoid(&parts[0])?;
@@ -847,6 +854,10 @@ pub fn sanitize(weights: HashMap<String, Array>) -> HashMap<String, Array> {
 /// Internal helper for the loader: assemble a [`SileroVadBranch`] from its
 /// already-extracted weight tensors. Kept here (next to [`SileroVadBranch`]'s
 /// private fields) so the struct stays fully encapsulated.
+///
+/// The two LSTM weights are transposed once here (`Wx.T` / `Wh.T`) so the
+/// per-frame forward reuses the loop-invariant transposed views instead of
+/// rebuilding them every chunk.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_branch(
   config: BranchConfig,
@@ -855,13 +866,15 @@ pub(super) fn build_branch(
   conv2: (Array, Array),
   conv3: (Array, Array),
   conv4: (Array, Array),
-  lstm_wx: Array,
-  lstm_wh: Array,
+  lstm_wx: &Array,
+  lstm_wh: &Array,
   lstm_bias: Array,
   final_conv_weight: Array,
   final_conv_bias: Array,
-) -> SileroVadBranch {
-  SileroVadBranch {
+) -> Result<SileroVadBranch> {
+  let wx_t = ops::shape::swapaxes(lstm_wx, -2, -1)?;
+  let wh_t = ops::shape::swapaxes(lstm_wh, -2, -1)?;
+  Ok(SileroVadBranch {
     config,
     stft_conv_weight,
     conv1: ConvBlock {
@@ -889,12 +902,12 @@ pub(super) fn build_branch(
       padding: 1,
     },
     lstm: Lstm {
-      wx: lstm_wx,
-      wh: lstm_wh,
+      wx_t,
+      wh_t,
       bias: lstm_bias,
       hidden_size: 128,
     },
     final_conv_weight,
     final_conv_bias,
-  }
+  })
 }

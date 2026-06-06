@@ -163,9 +163,9 @@ fn build_branch_from_weights(
   let final_w = take_weight(weights, branch, "final_conv.weight")?;
   let final_b = take_weight(weights, branch, "final_conv.bias")?;
 
-  Ok(build_branch(
-    config, stft, conv1, conv2, conv3, conv4, lstm_wx, lstm_wh, lstm_bias, final_w, final_b,
-  ))
+  build_branch(
+    config, stft, conv1, conv2, conv3, conv4, &lstm_wx, &lstm_wh, lstm_bias, final_w, final_b,
+  )
 }
 
 /// Remove the `<branch>.<suffix>` tensor from the weight map, or return a typed
