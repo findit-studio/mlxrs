@@ -359,9 +359,59 @@ mod apple {
     // ---- Step 5: ANE confirmation (best-effort, no sudo).
     enumerate_compute_devices();
     bench_encoder_ane(&enc_model, &mel);
+    bench_cpu_vs_ane(&enc_path, &mel);
 
     println!("\n== spike complete: load + predict + KV-step all RAN ==");
     Ok(())
+  }
+
+  /// Best-effort ANE confirmation #3: a CPU-only vs Neural-Engine differential.
+  /// We load the SAME encoder twice — once `computeUnits = .cpuOnly`, once
+  /// `.cpuAndNeuralEngine` — and time each. A clear speedup on the ANE config is
+  /// direct evidence the Neural Engine is actually executing the graph (not just
+  /// being listed as available). This needs no sudo/entitlement.
+  fn bench_cpu_vs_ane(enc_path: &Path, mel: &MLMultiArray) {
+    use std::time::Instant;
+    const ITERS: u32 = 200;
+    println!("\n[5c] CPU-only vs ANE differential (same AudioEncoder, {ITERS} iters)");
+
+    let time_under = |units: MLComputeUnits, label: &str| -> Option<f64> {
+      let model = match load_model(enc_path, units) {
+        Ok(m) => m,
+        Err(e) => {
+          println!("    ({label} load failed: {e})");
+          return None;
+        }
+      };
+      let provider = feature_provider(&[("melspectrogram_features", mel)]).ok()?;
+      // warmup
+      // SAFETY: input matches the model schema.
+      let _ = unsafe { model.predictionFromFeatures_error(&provider) };
+      let t0 = Instant::now();
+      for _ in 0..ITERS {
+        // SAFETY: input matches the model schema.
+        if unsafe { model.predictionFromFeatures_error(&provider) }.is_err() {
+          return None;
+        }
+      }
+      let per = t0.elapsed().as_secs_f64() * 1e3 / f64::from(ITERS);
+      println!("    {label:<22} {per:.3} ms/encode");
+      Some(per)
+    };
+
+    let cpu = time_under(MLComputeUnits::CPUOnly, "CPUOnly");
+    let ane = time_under(MLComputeUnits::CPUAndNeuralEngine, "CPUAndNeuralEngine");
+    if let (Some(cpu), Some(ane)) = (cpu, ane) {
+      let speedup = cpu / ane;
+      println!(
+        "    => ANE speedup vs CPU-only: {speedup:.2}x  ({})",
+        if speedup >= 1.15 {
+          "Neural Engine is doing work"
+        } else {
+          "inconclusive — CoreML may have kept this graph on CPU/GPU"
+        }
+      );
+    }
   }
 
   /// Best-effort ANE confirmation #1: enumerate the compute devices CoreML can
