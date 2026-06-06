@@ -1399,6 +1399,12 @@ impl<'a> DecodingTask<'a> {
     let dims = model.dims();
     let n_ctx = dims.n_text_ctx();
     let sample_len = options.sample_len.unwrap_or(n_ctx / 2);
+    // The active backend's decoder-cache ceiling (the MLX backend returns
+    // `n_text_ctx`, so the cap below is a no-op there — byte-identical; a backend
+    // with a smaller fixed cache, e.g. the CoreML/ANE `TextDecoder` at 224,
+    // returns that cap so the decode loop stops cleanly at the cache bound rather
+    // than overrunning it mid-segment).
+    let max_decoder_ctx = model.max_decoder_context();
 
     // `_verify_options` (`decoding.py:510-523`) + the `n_group` resolution
     // (`:459`). Beam search is not implemented, so `beam_size` is rejected
@@ -1414,8 +1420,16 @@ impl<'a> DecodingTask<'a> {
       tokenizer.sot_sequence()
     };
 
-    let initial_tokens =
-      build_initial_tokens(tokenizer, &sot_sequence, &options, n_ctx, sample_len);
+    // Truncate prompt/prefix to the BACKEND's decoder-context budget (the cache
+    // ceiling), not just `n_text_ctx`, so the prefill cannot overrun a bounded
+    // cache. `max_decoder_ctx == n_text_ctx` on the MLX backend (byte-identical).
+    let initial_tokens = build_initial_tokens(
+      tokenizer,
+      &sot_sequence,
+      &options,
+      max_decoder_ctx,
+      sample_len,
+    );
     // Fail-fast on a caller-supplied `prompt` / `prefix` id `>= n_vocab` BEFORE
     // any forward: those ids flow through `initial_tokens` into the prefill
     // `decode_tokens` and then the decoder token-embedding gather, where an
@@ -1425,6 +1439,34 @@ impl<'a> DecodingTask<'a> {
     // initial-token boundary. Shares the model's `validate_token_ids` helper.
     model.validate_token_ids("DecodingTask: initial token", &initial_tokens)?;
     let sample_begin = initial_tokens.len();
+    // Soundness backstop: the prefill consumes `sample_begin` cache slots, so it
+    // must leave room for at least one sampled token within the backend's
+    // decoder-cache ceiling. `build_initial_tokens` already truncated prompt and
+    // prefix to `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence
+    // could still fill it; reject at task construction (before the encoder runs)
+    // rather than overrun the cache mid-prefill inside `decode_tokens`. On the MLX
+    // backend `max_decoder_ctx == n_text_ctx`, far above any real prefill, so this
+    // never fires (byte-identical).
+    if sample_begin >= max_decoder_ctx {
+      return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
+        "DecodingTask: initial-token prefill",
+        "max_decoder_ctx",
+        max_decoder_ctx as u64,
+        sample_begin as u64,
+      )));
+    }
+    // Cap the sampled-token budget so the prompt + sampled tail never exceeds the
+    // backend's decoder-cache ceiling: the warm loops run `1..sample_len` and the
+    // prefill already consumes `sample_begin` cache slots, so bounding
+    // `sample_len <= max_decoder_ctx - sample_begin` makes every loop terminate
+    // by its own count at (or before) the cache bound. On the MLX backend
+    // `max_decoder_ctx == n_text_ctx`, so for any realistic `sample_begin` this
+    // `min` selects the original `sample_len` unchanged (byte-identical); on the
+    // CoreML backend it stops the loop cleanly at the 224-slot cache instead of
+    // reaching a mid-segment `CapExceeded`. `build_initial_tokens` above already
+    // ran with the ORIGINAL `sample_len`, so prompt/prefix truncation is
+    // unaffected by this cap.
+    let sample_len = sample_len.min(max_decoder_ctx.saturating_sub(sample_begin));
     let sot_index = initial_tokens
       .iter()
       .position(|&t| t == tokenizer.sot())
@@ -2511,11 +2553,17 @@ pub(crate) struct AlignedDecode {
 
 /// Build the `(prompt) + sot_sequence + (prefix)` initial token prefix —
 /// `_get_initial_tokens` (`decoding.py:525-551`).
+///
+/// `ctx_budget` is the EFFECTIVE decoder-context budget the prompt and prefix
+/// are tail-truncated to fit (`decoding.py` uses `self.n_ctx`). On an unbounded
+/// backend it is `n_text_ctx`; on a cache-bounded backend (CoreML's 224-slot
+/// `TextDecoder`) it is the cache ceiling, so the prefill cannot overrun the
+/// cache. The two are equal on the MLX backend, keeping this byte-identical.
 fn build_initial_tokens(
   tokenizer: &HFTokenizerWrapper<'_>,
   sot_sequence: &[u32],
   options: &DecodingOptions,
-  n_ctx: usize,
+  ctx_budget: usize,
   sample_len: usize,
 ) -> Vec<u32> {
   let mut tokens: Vec<u32> = sot_sequence.to_vec();
@@ -2523,7 +2571,7 @@ fn build_initial_tokens(
   // prefix: forced after the sot sequence, tail-truncated to leave room
   // (`decoding.py:528-537`).
   if !options.prefix.is_empty() {
-    let max_prefix_len = (n_ctx / 2).saturating_sub(sample_len);
+    let max_prefix_len = (ctx_budget / 2).saturating_sub(sample_len);
     let prefix = &options.prefix;
     let start = prefix.len().saturating_sub(max_prefix_len);
     tokens.extend_from_slice(&prefix[start..]);
@@ -2532,7 +2580,7 @@ fn build_initial_tokens(
   // prompt: prepended (with sot_prev) before the sot sequence, tail-truncated
   // (`decoding.py:539-549`).
   if !options.prompt.is_empty() {
-    let keep = (n_ctx / 2).saturating_sub(1);
+    let keep = (ctx_budget / 2).saturating_sub(1);
     let prompt = &options.prompt;
     let start = prompt.len().saturating_sub(keep);
     let mut prefixed = Vec::with_capacity(1 + (prompt.len() - start) + tokens.len());

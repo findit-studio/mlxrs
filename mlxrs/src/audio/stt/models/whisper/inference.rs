@@ -133,6 +133,18 @@ pub trait WhisperInference {
   /// The model dimensions.
   fn dims(&self) -> &ModelDimensions;
 
+  /// The maximum decoder-cache context (in tokens) this backend can hold —
+  /// the ceiling the decode loop must not overrun. The MLX backend keeps a
+  /// per-block KV cache that grows to the model's text context, so this is
+  /// `dims().n_text_ctx()` (`448` for released Whisper, the default); a backend
+  /// whose decoder cache is a fixed smaller width (e.g. the WhisperKit CoreML
+  /// `TextDecoder`, capped at its `key_cache` extent) returns that cap so the
+  /// shared loop stops cleanly at the cache bound instead of overrunning it.
+  #[inline]
+  fn max_decoder_context(&self) -> usize {
+    self.dims().n_text_ctx()
+  }
+
   /// The word-timing alignment heads — the `(layer, head)` cross-attention
   /// heads the word-timestamp DTW averages.
   fn alignment_heads(&self) -> &AlignmentHeads;

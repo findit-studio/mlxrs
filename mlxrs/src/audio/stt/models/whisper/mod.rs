@@ -40,6 +40,8 @@
 pub mod audio;
 pub mod backend;
 pub mod config;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod coreml;
 pub(crate) mod decoder;
 pub mod decoding;
 pub(crate) mod encoder;

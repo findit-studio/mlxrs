@@ -247,6 +247,16 @@ pub struct WhisperModel {
   /// `generation_config.json` ([`WhisperModel::with_alignment_heads`], loaded by
   /// [`WhisperModel::load`]).
   alignment_heads: AlignmentHeads,
+  /// The CoreML / Neural-Engine sibling backend, when the loaded checkpoint
+  /// directory carried a `.mlmodelc` bundle (Apple Silicon only) — see
+  /// [`super::coreml::CoreMlWhisper`]. When present, the high-level
+  /// [`Transcribe`] entry point drives transcription on the Neural Engine
+  /// (selected by [`Self::backend`]); the MLX weights this struct also holds
+  /// remain available and unchanged. `None` ⇒ the MLX path, byte-identical to
+  /// before this field existed. Boxed to keep [`WhisperModel`] small (the
+  /// loaded `MLModel` handles are large relative to the rest of the struct).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  coreml: Option<Box<super::coreml::CoreMlWhisper>>,
 }
 
 impl fmt::Debug for WhisperModel {
@@ -395,6 +405,8 @@ impl WhisperModel {
       tokenizer: None,
       eot_token: None,
       alignment_heads,
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      coreml: None,
     })
   }
 
@@ -498,17 +510,34 @@ impl WhisperModel {
     &self.alignment_heads
   }
 
-  /// The concrete inference [`WhisperBackend`] the decode pipeline drives.
+  /// The concrete inference [`WhisperBackend`] the decode pipeline drives —
+  /// the CoreML / Neural-Engine sibling when one was loaded alongside this
+  /// checkpoint (Apple Silicon), else the MLX path.
   ///
   /// The high-level [`Transcribe`] entry points build the backend through this
   /// one chokepoint and hand `&backend` to the [`super::decoding`] free
-  /// functions, so backend selection lives in a single place. Today this is
-  /// always [`WhisperBackend::Mlx`] (byte-identical to the pre-backend
-  /// pipeline); the CoreML / Neural-Engine auto-selection is wired in here with
-  /// the CoreML backend.
+  /// functions, so backend selection lives in a single place. Off Apple Silicon
+  /// (and whenever no `.mlmodelc` bundle was present) this is always
+  /// [`WhisperBackend::Mlx`], byte-identical to the pre-backend pipeline.
   #[inline]
   pub fn backend(&self) -> WhisperBackend<'_> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(coreml) = self.coreml.as_deref() {
+      return WhisperBackend::CoreMl(coreml);
+    }
     WhisperBackend::Mlx(self)
+  }
+
+  /// Attach a loaded CoreML / Neural-Engine sibling backend, so the high-level
+  /// [`Transcribe`] entry point drives transcription on the ANE
+  /// ([`Self::backend`]). Apple Silicon only; applied automatically by
+  /// [`WhisperModel::load`] when the model directory carries a `.mlmodelc`
+  /// bundle. Returns `self` for chaining.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[inline]
+  pub fn with_coreml(mut self, coreml: super::coreml::CoreMlWhisper) -> Self {
+    self.coreml = Some(Box::new(coreml));
+    self
   }
 
   /// Load a Whisper model from a local model directory: read the
@@ -524,7 +553,8 @@ impl WhisperModel {
   pub fn load(dir: &std::path::Path, dims: ModelDimensions, dtype: Dtype) -> Result<Self> {
     let weights = load_all_safetensors(dir)?;
     let model = Self::from_weights(dims, weights, dtype)?;
-    apply_dir_alignment_heads(model, dir)
+    let model = apply_dir_alignment_heads(model, dir)?;
+    maybe_attach_coreml(model, dir)
   }
 
   /// Load a Whisper model from a local model directory **with** an optional
@@ -554,7 +584,8 @@ impl WhisperModel {
   ) -> Result<Self> {
     let weights = load_all_safetensors(dir)?;
     let model = Self::from_weights_quantized(dims, weights, dtype, quantization)?;
-    apply_dir_alignment_heads(model, dir)
+    let model = apply_dir_alignment_heads(model, dir)?;
+    maybe_attach_coreml(model, dir)
   }
 
   /// The model dimensions.
@@ -1479,6 +1510,28 @@ fn apply_dir_alignment_heads(model: WhisperModel, dir: &std::path::Path) -> Resu
     Some(heads) => model.with_alignment_heads(heads),
     None => Ok(model),
   }
+}
+
+/// Auto-attach a CoreML / Neural-Engine sibling backend if `dir` carries a
+/// `.mlmodelc` bundle (Apple Silicon) — the load-time arm of the backend
+/// auto-selection. Off Apple Silicon (and whenever no bundle is present) this is
+/// an identity pass-through, so the MLX path is byte-identical.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn maybe_attach_coreml(model: WhisperModel, dir: &std::path::Path) -> Result<WhisperModel> {
+  if super::coreml::CoreMlWhisper::is_present(dir) {
+    let coreml = super::coreml::CoreMlWhisper::load(dir)?;
+    Ok(model.with_coreml(coreml))
+  } else {
+    Ok(model)
+  }
+}
+
+/// Off-Apple-Silicon stub: no CoreML backend exists, so the model is returned
+/// unchanged (the MLX path).
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[inline]
+fn maybe_attach_coreml(model: WhisperModel, _dir: &std::path::Path) -> Result<WhisperModel> {
+  Ok(model)
 }
 
 // ───────────────────────── sanitize (whisper.py:539-606) ──────────────────

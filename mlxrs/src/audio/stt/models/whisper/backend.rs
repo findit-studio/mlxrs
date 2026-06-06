@@ -4,7 +4,7 @@
 //! Phase 1 ([`super::inference::WhisperInference`]) named the model-forward
 //! surface as a trait so the decode + word-timestamp pipeline could drive any
 //! backend. The pipeline was pinned to the single MLX
-//! [`WhisperModel`](super::model::WhisperModel) through a `dyn
+//! [`WhisperModel`] through a `dyn
 //! WhisperInference<Cache = DecoderKvCache>` trait-object alias, which can hold
 //! exactly one `Cache` type and so cannot carry a second backend whose cache is
 //! a different type.
@@ -35,28 +35,51 @@ use super::{
   model::{WhisperDecodeCache, WhisperModel},
 };
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::coreml::{CoreMlKvCache, CoreMlWhisper};
+
 /// The per-block decoder KV cache the decode primitives thread by value — the
 /// [`WhisperInference::Cache`] for [`WhisperBackend`].
 ///
 /// One variant per backend, so each backend threads its cache in its own native
 /// form with no cross-backend conversion. The always-present variant is the MLX
-/// backend's crate-private [`DecoderKvCache`] (the per-block on-device K/V); the
+/// backend's crate-private `DecoderKvCache` (the per-block on-device K/V); the
 /// MLX decode path round-trips through [`WhisperCache::Mlx`]. On Apple Silicon a
 /// second `CoreMl` variant carries the CoreML decoder's explicit host-side KV
 /// tensors (added with the CoreML backend).
 pub enum WhisperCache {
   /// The MLX decoder's per-block on-device KV cache.
   Mlx(DecoderKvCache),
+  /// The CoreML decoder's explicit host-side KV cache — Apple Silicon only.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  CoreMl(CoreMlKvCache),
 }
 
 impl WhisperCache {
-  /// Borrow the MLX inner cache — the helper the MLX dispatch arm uses to
-  /// unwrap the caller-threaded [`WhisperCache`] before forwarding to
-  /// [`WhisperModel`].
+  /// Borrow the MLX inner cache, or `None` if this is another backend's
+  /// variant — the helper the MLX dispatch arm uses to unwrap the
+  /// caller-threaded [`WhisperCache`] before forwarding to [`WhisperModel`].
+  ///
+  /// The pipeline only ever pairs an MLX backend with an MLX cache (it builds
+  /// the cache from the same backend it dispatches on), so the cross-variant
+  /// `None` is an internal-invariant guard, not a reachable state.
   #[inline]
-  fn as_mlx(&self) -> &DecoderKvCache {
+  fn as_mlx(&self) -> Option<&DecoderKvCache> {
     match self {
-      Self::Mlx(c) => c,
+      Self::Mlx(c) => Some(c),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(_) => None,
+    }
+  }
+
+  /// Borrow the CoreML inner cache, or `None` if this is another backend's
+  /// variant — the [`Self::as_mlx`] analogue for the CoreML dispatch arm.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[inline]
+  fn as_coreml(&self) -> Option<&CoreMlKvCache> {
+    match self {
+      Self::CoreMl(c) => Some(c),
+      Self::Mlx(_) => None,
     }
   }
 }
@@ -72,6 +95,9 @@ impl WhisperCache {
 pub enum WhisperBackend<'a> {
   /// The MLX (Metal) backend.
   Mlx(&'a WhisperModel),
+  /// The CoreML / Neural-Engine backend — Apple Silicon only.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  CoreMl(&'a CoreMlWhisper),
 }
 
 impl WhisperInference for WhisperBackend<'_> {
@@ -81,6 +107,8 @@ impl WhisperInference for WhisperBackend<'_> {
   fn encode(&self, mel: &Array) -> Result<Array> {
     match self {
       Self::Mlx(m) => m.encode(mel),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.encode(mel),
     }
   }
 
@@ -92,9 +120,13 @@ impl WhisperInference for WhisperBackend<'_> {
   ) -> Result<(Array, Self::Cache)> {
     match self {
       Self::Mlx(m) => {
-        let (logits, c) =
-          m.decode_tokens(tokens, encoder_states, cache.map(WhisperCache::as_mlx))?;
+        let (logits, c) = m.decode_tokens(tokens, encoder_states, mlx_cache_arg(cache)?)?;
         Ok((logits, WhisperCache::Mlx(c)))
+      }
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => {
+        let (logits, c) = m.decode_tokens(tokens, encoder_states, coreml_cache_arg(cache)?)?;
+        Ok((logits, WhisperCache::CoreMl(c)))
       }
     }
   }
@@ -108,13 +140,15 @@ impl WhisperInference for WhisperBackend<'_> {
   ) -> Result<(Array, Self::Cache)> {
     match self {
       Self::Mlx(m) => {
-        let (logits, c) = m.decode_tokens_batched(
-          tokens,
-          n_group,
-          encoder_states,
-          cache.map(WhisperCache::as_mlx),
-        )?;
+        let (logits, c) =
+          m.decode_tokens_batched(tokens, n_group, encoder_states, mlx_cache_arg(cache)?)?;
         Ok((logits, WhisperCache::Mlx(c)))
+      }
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => {
+        let (logits, c) =
+          m.decode_tokens_batched(tokens, n_group, encoder_states, coreml_cache_arg(cache)?)?;
+        Ok((logits, WhisperCache::CoreMl(c)))
       }
     }
   }
@@ -127,9 +161,13 @@ impl WhisperInference for WhisperBackend<'_> {
   ) -> Result<(Array, Self::Cache)> {
     match self {
       Self::Mlx(m) => {
-        let (logits, c) =
-          m.decode_token_lazy(token, encoder_states, cache.map(WhisperCache::as_mlx))?;
+        let (logits, c) = m.decode_token_lazy(token, encoder_states, mlx_cache_arg(cache)?)?;
         Ok((logits, WhisperCache::Mlx(c)))
+      }
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => {
+        let (logits, c) = m.decode_token_lazy(token, encoder_states, coreml_cache_arg(cache)?)?;
+        Ok((logits, WhisperCache::CoreMl(c)))
       }
     }
   }
@@ -143,6 +181,8 @@ impl WhisperInference for WhisperBackend<'_> {
   ) -> Result<(Array, Vec<Option<Array>>)> {
     match self {
       Self::Mlx(m) => m.decode_step_with_cross_qk(cache, enc, tokens),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.decode_step_with_cross_qk(cache, enc, tokens),
     }
   }
 
@@ -154,6 +194,8 @@ impl WhisperInference for WhisperBackend<'_> {
   ) -> Result<(Array, Vec<Option<Array>>)> {
     match self {
       Self::Mlx(m) => m.forward_with_cross_qk(mel, tokens),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.forward_with_cross_qk(mel, tokens),
     }
   }
 
@@ -161,6 +203,8 @@ impl WhisperInference for WhisperBackend<'_> {
   fn broadcast_encoder_states(&self, enc: &Array, n_group: usize) -> Result<Array> {
     match self {
       Self::Mlx(m) => m.broadcast_encoder_states(enc, n_group),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.broadcast_encoder_states(enc, n_group),
     }
   }
 
@@ -168,6 +212,17 @@ impl WhisperInference for WhisperBackend<'_> {
   fn dims(&self) -> &ModelDimensions {
     match self {
       Self::Mlx(m) => m.dims(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.dims(),
+    }
+  }
+
+  #[inline]
+  fn max_decoder_context(&self) -> usize {
+    match self {
+      Self::Mlx(m) => m.max_decoder_context(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.max_decoder_context(),
     }
   }
 
@@ -175,6 +230,8 @@ impl WhisperInference for WhisperBackend<'_> {
   fn alignment_heads(&self) -> &AlignmentHeads {
     match self {
       Self::Mlx(m) => m.alignment_heads(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.alignment_heads(),
     }
   }
 
@@ -182,6 +239,41 @@ impl WhisperInference for WhisperBackend<'_> {
   fn validate_token_ids(&self, context: &'static str, tokens: &[u32]) -> Result<()> {
     match self {
       Self::Mlx(m) => m.validate_token_ids(context, tokens),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::CoreMl(m) => m.validate_token_ids(context, tokens),
     }
   }
+}
+
+/// Unwrap a caller-threaded [`WhisperCache`] to its MLX inner cache for an MLX
+/// dispatch arm. `None` (no prior step) passes through; a `Some` carrying
+/// another backend's variant is an internal-invariant violation (the pipeline
+/// never mixes a backend with another backend's cache).
+#[inline]
+fn mlx_cache_arg(cache: Option<&WhisperCache>) -> Result<Option<&DecoderKvCache>> {
+  match cache {
+    None => Ok(None),
+    Some(c) => c.as_mlx().map(Some).ok_or_else(cache_variant_mismatch),
+  }
+}
+
+/// Unwrap a caller-threaded [`WhisperCache`] to its CoreML inner cache for a
+/// CoreML dispatch arm — the [`mlx_cache_arg`] analogue.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+fn coreml_cache_arg(cache: Option<&WhisperCache>) -> Result<Option<&CoreMlKvCache>> {
+  match cache {
+    None => Ok(None),
+    Some(c) => c.as_coreml().map(Some).ok_or_else(cache_variant_mismatch),
+  }
+}
+
+/// The typed error for a backend/cache variant mismatch — an internal-invariant
+/// guard the cross-variant unwrap surfaces rather than panic.
+#[inline]
+fn cache_variant_mismatch() -> crate::Error {
+  crate::Error::InvariantViolation(crate::error::InvariantViolationPayload::new(
+    "WhisperBackend",
+    "decode cache variant does not match the active backend (internal invariant violation)",
+  ))
 }
