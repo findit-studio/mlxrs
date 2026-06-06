@@ -28,8 +28,8 @@ use crate::{
   array::Array,
   audio::features::{KaldiWindow, PreemphBoundary, compute_fbank_kaldi},
   error::{
-    Error, InvariantViolationPayload, MalformedDataPayload, OutOfRangePayload, RankMismatchPayload,
-    Result,
+    EmptyInputPayload, Error, InvariantViolationPayload, MalformedDataPayload, OutOfRangePayload,
+    RankMismatchPayload, Result,
   },
   model_validation::{checked_mul, reserve_or_error},
   ops,
@@ -202,66 +202,66 @@ pub fn apply_lfr(feats: &Array, lfr_m: i32, lfr_n: i32) -> Result<Array> {
     feats.try_clone()?
   };
   let t_padded = padded.shape()[0];
-  let t_padded_i32 = i32::try_from(t_padded).map_err(|_| {
-    Error::OutOfRange(OutOfRangePayload::new(
-      "apply_lfr: padded T",
-      "must fit in i32",
-      format_smolstr!("{t_padded}"),
+
+  // Gather every LFR frame in ONE op instead of a per-window slice/reshape/stack
+  // loop. Frame `i`, position `j` of the reference reads padded row `start + j`
+  // (`start = i * lfr_n`) for a full window, and the LAST padded row
+  // (`feats[-1:]`, i.e. row `t_padded - 1`) for any position past the end of a
+  // partial final window (`sensevoice.py:58-70`). Both branches collapse to
+  //   idx(i, j) = min(i * lfr_n + j, t_padded - 1),
+  // because a full window never overruns (so the `min` is inert) and a partial
+  // window's overrun positions `j >= t_padded - start` are exactly the ones the
+  // reference fills with copies of the last row. Building this `(t_lfr, lfr_m)`
+  // index grid and a single `take(axis=0)` -> `(t_lfr, lfr_m, D)` -> reshape
+  // `(t_lfr, lfr_m * D)` is bit-identical to the loop for every frame (the
+  // reshape concatenates the `lfr_m` rows row-major, matching `reshape(-1)`).
+  let lfr_m_usize = lfr_m as usize;
+  // An empty feature matrix (zero frames, e.g. empty or sub-window audio) leaves
+  // `t_padded == 0` after the clamped left-pad; reject it with a typed error
+  // (the loop reference likewise cannot stack zero windows) instead of
+  // underflowing the tail-clamp `last_row`.
+  let last_row = t_padded.checked_sub(1).ok_or_else(|| {
+    Error::EmptyInput(EmptyInputPayload::new(
+      "apply_lfr: feature matrix has zero frames",
     ))
   })?;
-
-  // The last frame of the padded sequence, used to right-pad a partial final
-  // window (`feats[-1:]` in `sensevoice.py:68`).
-  let last = ops::indexing::slice(&padded, &[t_padded_i32 - 1, 0], &[t_padded_i32, d], &[1, 1])?;
-
-  // The LFR window count `t_lfr` is bounded by the fbank frame count `T`; reserve
-  // it FALLIBLY (typed `AllocFailure`) rather than the abort `Vec::with_capacity`
-  // would raise under allocator pressure on a long utterance.
-  let lfr_m_usize = lfr_m as usize;
-  let mut frames: Vec<Array> = Vec::new();
-  reserve_or_error(&mut frames, "sensevoice apply_lfr: LFR frames", t_lfr)?;
+  // Pre-build the flat index grid over host integers (bounded by `t_lfr * lfr_m`,
+  // both already validated to fit `i32` / the reserve cap); reserve FALLIBLY so a
+  // long utterance reports a typed `AllocFailure` rather than aborting.
+  let mut idx_flat: Vec<i32> = Vec::new();
+  reserve_or_error(
+    &mut idx_flat,
+    "sensevoice apply_lfr: gather indices",
+    checked_mul(
+      "apply_lfr: t_lfr * lfr_m",
+      "t_lfr",
+      t_lfr as i32,
+      "lfr_m",
+      lfr_m,
+    )? as usize,
+  )?;
   for i in 0..t_lfr {
     let start = i * lfr_n_usize;
-    let end = start + lfr_m_usize;
-    let start_i32 = i32::try_from(start).map_err(|_| {
-      Error::OutOfRange(OutOfRangePayload::new(
-        "apply_lfr: window start",
-        "must fit in i32",
-        format_smolstr!("{start}"),
-      ))
-    })?;
-    let stacked = if end <= t_padded {
-      // Full window: `feats[start:end].reshape(-1)` (`sensevoice.py:62`).
-      let end_i32 = start_i32 + lfr_m;
-      let window = ops::indexing::slice(&padded, &[start_i32, 0], &[end_i32, d], &[1, 1])?;
-      ops::shape::reshape(&window, &[lfr_width])?
-    } else {
-      // Partial final window: take what is available and right-pad with copies
-      // of the last frame (`sensevoice.py:64-70`).
-      let available = ops::indexing::slice(&padded, &[start_i32, 0], &[t_padded_i32, d], &[1, 1])?;
-      let avail_rows = t_padded - start;
-      let pad_count = i32::try_from(lfr_m_usize - avail_rows).map_err(|_| {
-        Error::OutOfRange(OutOfRangePayload::new(
-          "apply_lfr: right-pad count",
-          "must fit in i32",
-          format_smolstr!("{}", lfr_m_usize - avail_rows),
-        ))
-      })?;
-      let tail = ops::shape::tile(&last, &[pad_count, 1])?;
-      let window = ops::shape::concatenate(&[&available, &tail], 0)?;
-      ops::shape::reshape(&window, &[lfr_width])?
-    };
-    frames.push(stacked);
+    for j in 0..lfr_m_usize {
+      // `min(start + j, t_padded - 1)`, clamped in `usize` then narrowed: the
+      // clamp guarantees the result is a valid `[0, t_padded)` row, and
+      // `t_padded` already fits `i32` (`t_padded_i32` above).
+      let row = (start + j).min(last_row);
+      idx_flat.push(row as i32);
+    }
   }
-
-  // Borrow each stacked frame for `stack`. The reference vector is `frames.len()`
-  // long; reserve it FALLIBLY then fill (no infallible `collect` growth).
-  let mut refs: Vec<&Array> = Vec::new();
-  reserve_or_error(&mut refs, "sensevoice apply_lfr: frame refs", frames.len())?;
-  for frame in &frames {
-    refs.push(frame);
-  }
-  ops::shape::stack(&refs)
+  let t_lfr_i32 = i32::try_from(t_lfr).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "apply_lfr: T_lfr",
+      "must fit in i32",
+      format_smolstr!("{t_lfr}"),
+    ))
+  })?;
+  let indices = Array::from_slice::<i32>(&idx_flat, &[t_lfr_i32, lfr_m])?;
+  // `padded[indices]` along axis 0 -> (t_lfr, lfr_m, D); flatten the per-frame
+  // `(lfr_m, D)` to the stacked `(t_lfr, lfr_m * D)` width.
+  let gathered = ops::indexing::take_axis(&padded, &indices, 0)?;
+  ops::shape::reshape(&gathered, &[t_lfr_i32, lfr_width])
 }
 
 /// Apply global CMVN, mirroring `_apply_cmvn` (`sensevoice.py:75-80`):

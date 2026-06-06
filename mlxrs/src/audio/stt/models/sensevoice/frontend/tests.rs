@@ -133,6 +133,17 @@ fn lfr_first_frame_is_left_padded_first_row() {
   assert_eq!(&flat[9..12], rows[0].as_slice());
 }
 
+/// An empty feature matrix (zero frames — empty or sub-window audio) leaves
+/// `t_padded == 0`; `apply_lfr` must reject it with a typed `EmptyInput` error
+/// rather than underflow the tail-clamp index (a panic under overflow checks).
+/// The loop reference likewise cannot stack zero windows, so rejecting is the
+/// behavior-preserving choice.
+#[test]
+fn lfr_rejects_empty_input() {
+  let empty = Array::from_slice::<f32>(&[], &[0, 8]).unwrap();
+  assert!(matches!(apply_lfr(&empty, 7, 6), Err(Error::EmptyInput(_))));
+}
+
 #[test]
 fn lfr_rejects_non_rank2() {
   let bad = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]).unwrap();
@@ -369,4 +380,147 @@ fn sanitize_passes_through_unrelated_keys() {
   );
   let out = sanitize(w).unwrap();
   assert!(out.contains_key("encoder.after_norm.weight"));
+}
+
+// ──────────── apply_lfr vectorization A/B (gather optimization) ────────────
+
+/// The per-frame slice / reshape / (concat-tail) / stack loop form of
+/// `_apply_lfr` (`sensevoice.py:57-72`), kept verbatim as the A/B reference for
+/// the single-`take` vectorized `apply_lfr`. Shares no code with the production
+/// helper; the A/B asserts the two are bit-identical for every shape.
+fn apply_lfr_loop_reference(feats: &Array, lfr_m: i32, lfr_n: i32) -> Array {
+  let shape = feats.shape();
+  let t = shape[0];
+  let d = shape[1] as i32;
+  let lfr_n_usize = lfr_n as usize;
+  let lfr_m_usize = lfr_m as usize;
+  let lfr_width = lfr_m * d;
+  let t_lfr = t.div_ceil(lfr_n_usize);
+
+  let left_pad = (lfr_m - 1) / 2;
+  let first = ops::indexing::slice(feats, &[0, 0], &[1, d], &[1, 1]).unwrap();
+  let padded = if left_pad > 0 {
+    let head = ops::shape::tile(&first, &[left_pad, 1]).unwrap();
+    ops::shape::concatenate(&[&head, feats], 0).unwrap()
+  } else {
+    feats.try_clone().unwrap()
+  };
+  let t_padded = padded.shape()[0];
+  let t_padded_i32 = t_padded as i32;
+  let last =
+    ops::indexing::slice(&padded, &[t_padded_i32 - 1, 0], &[t_padded_i32, d], &[1, 1]).unwrap();
+
+  let mut frames: Vec<Array> = Vec::with_capacity(t_lfr);
+  for i in 0..t_lfr {
+    let start = i * lfr_n_usize;
+    let end = start + lfr_m_usize;
+    let start_i32 = start as i32;
+    let stacked = if end <= t_padded {
+      let end_i32 = start_i32 + lfr_m;
+      let window = ops::indexing::slice(&padded, &[start_i32, 0], &[end_i32, d], &[1, 1]).unwrap();
+      ops::shape::reshape(&window, &[lfr_width]).unwrap()
+    } else {
+      let available =
+        ops::indexing::slice(&padded, &[start_i32, 0], &[t_padded_i32, d], &[1, 1]).unwrap();
+      let avail_rows = t_padded - start;
+      let pad_count = (lfr_m_usize - avail_rows) as i32;
+      let tail = ops::shape::tile(&last, &[pad_count, 1]).unwrap();
+      let window = ops::shape::concatenate(&[&available, &tail], 0).unwrap();
+      ops::shape::reshape(&window, &[lfr_width]).unwrap()
+    };
+    frames.push(stacked);
+  }
+  let refs: Vec<&Array> = frames.iter().collect();
+  ops::shape::stack(&refs).unwrap()
+}
+
+/// CORRECTNESS A/B for the LFR gather: the vectorized `apply_lfr` (single
+/// `take`) must be BIT-IDENTICAL to the per-frame loop reference for every shape
+/// — a single off-by-one in the gather index would silently corrupt frames.
+/// Covers the real config, exact-multiple (no tail pad), a heavy tail-clamp, a
+/// no-left-pad case, and `lfr_m == 1` (degenerate stack width).
+#[test]
+fn lfr_vectorized_is_bit_identical_to_loop() {
+  // (T, D, lfr_m, lfr_n): each row a distinct edge.
+  let cases: &[(usize, usize, i32, i32)] = &[
+    (20, 80, 7, 6), // real SenseVoice front-end (560-wide frames).
+    (12, 4, 2, 2),  // exact multiple, no right-pad needed.
+    (10, 3, 7, 6),  // small with left-pad + a partial tail window.
+    (5, 6, 7, 6),   // T < lfr_m: the FIRST window already overruns -> tail clamp.
+    (8, 4, 4, 1),   // stride 1, no left-pad rounding, many overlapping windows.
+    (9, 5, 1, 3),   // lfr_m == 1: no left-pad, each frame is a single row.
+    (1, 4, 7, 6),   // single input frame: everything clamps to the one row.
+    (13, 7, 6, 5),  // odd-ish T with a non-trivial right-pad.
+  ];
+  for &(t, d, lfr_m, lfr_n) in cases {
+    let (arr, _rows) = ramp_feats(t, d);
+    let mut got = apply_lfr(&arr, lfr_m, lfr_n).unwrap();
+    let mut want = apply_lfr_loop_reference(&arr, lfr_m, lfr_n);
+    assert_eq!(
+      got.shape(),
+      want.shape(),
+      "shape mismatch for (T={t},D={d},m={lfr_m},n={lfr_n})"
+    );
+    assert_eq!(
+      got.to_vec::<f32>().unwrap(),
+      want.to_vec::<f32>().unwrap(),
+      "vectorized vs loop differ for (T={t},D={d},m={lfr_m},n={lfr_n})"
+    );
+  }
+}
+
+/// The vectorized `apply_lfr` must also match the from-scratch Vec oracle on the
+/// hard tail-clamp case (T < lfr_m), independently confirming the gather index
+/// clamp reproduces the reference's last-row right-padding.
+#[test]
+fn lfr_vectorized_tail_clamp_matches_vec_reference() {
+  let (arr, rows) = ramp_feats(5, 6);
+  let mut got = apply_lfr(&arr, 7, 6).unwrap();
+  let want = lfr_reference(&rows, 7, 6);
+  assert_eq!(got.shape(), vec![want.len(), want[0].len()]);
+  assert_eq!(
+    got.to_vec::<f32>().unwrap(),
+    want.iter().flatten().copied().collect::<Vec<_>>()
+  );
+}
+
+/// PERF A/B for the LFR gather: the single-`take` `apply_lfr` vs the per-frame
+/// loop reference at the real front-end shape over many calls. Reports best-of-N
+/// min for both; the vectorized form must be no slower.
+///
+/// `#[ignore]`d: timing is machine/thermal-dependent. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing micro-bench — run with --ignored --nocapture"]
+fn bench_lfr_vectorized_vs_loop() {
+  use std::time::Instant;
+  // A long-ish utterance: ~10 s of fbank (1000 frames) at D=80, lfr 7/6.
+  let (arr, _rows) = ramp_feats(1000, 80);
+  crate::transforms::eval(&[&arr]).unwrap();
+
+  for _ in 0..5 {
+    let a = apply_lfr(&arr, 7, 6).unwrap();
+    let b = apply_lfr_loop_reference(&arr, 7, 6);
+    crate::transforms::eval(&[&a, &b]).unwrap();
+  }
+  let bench = |label: &str, f: &dyn Fn() -> Array| {
+    let mut times = Vec::with_capacity(30);
+    for _ in 0..30 {
+      let t0 = Instant::now();
+      let out = f();
+      crate::transforms::eval(&[&out]).unwrap();
+      times.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+      "  {label:<14} min={:.4}ms median={:.4}ms",
+      times[0],
+      times[times.len() / 2]
+    );
+    times[0]
+  };
+  println!("\napply_lfr (T=1000, D=80, m=7, n=6 -> 167 frames x 560):");
+  let loop_min = bench("loop", &|| apply_lfr_loop_reference(&arr, 7, 6));
+  let vec_min = bench("take (vectorized)", &|| apply_lfr(&arr, 7, 6).unwrap());
+  println!("  speedup (loop/take) = {:.2}x", loop_min / vec_min);
 }

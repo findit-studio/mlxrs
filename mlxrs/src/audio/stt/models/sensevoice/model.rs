@@ -517,29 +517,44 @@ impl SenseVoiceModel {
       )));
     }
 
-    // Argmax over the vocab axis of frames 0 / 1 / 2 (`sensevoice.py:468/479/493`).
-    let language = lid_label(Self::frame_argmax(log_probs, 0)?);
-    let emotion = emotion_label(Self::frame_argmax(log_probs, 1)?);
-    let event = event_label(Self::frame_argmax(log_probs, 2)?);
+    // Argmax over the vocab axis of frames 0 / 1 / 2 (`sensevoice.py:468/479/493`),
+    // batched into ONE GPU→CPU sync: slice the three query rows `[0, 3)` into a
+    // `(3, vocab)` block, take a single `argmax(axis=1)` -> `(3,)`, and read all
+    // three ids with one `eval` + one host copy. mlx `argmax` is deterministic
+    // (first-max index, U32 result) per row and independent of batching, so the
+    // three batched ids equal the three per-row argmaxes the reference takes.
+    let ids = Self::query_argmax_ids(log_probs)?;
+    let language = lid_label(ids[0]);
+    let emotion = emotion_label(ids[1]);
+    let event = event_label(ids[2]);
     Ok(RichInfo::new(language, emotion, event))
   }
 
-  /// Argmax over the vocab axis of a single frame row `frame` of a rank-2
-  /// `(frames, vocab)` grid (`mx.argmax(log_probs[frame]).item()`,
-  /// `sensevoice.py:468`).
-  fn frame_argmax(log_probs: &Array, frame: i32) -> Result<u32> {
+  /// Argmax over the vocab axis of each of the first three query rows of a
+  /// rank-2 `(frames, vocab)` grid, returned as `[lid, emotion, event]` token
+  /// ids — the batched form of three `mx.argmax(log_probs[i]).item()` calls
+  /// (`sensevoice.py:468/479/493`), folded into a single device round-trip.
+  ///
+  /// The caller has already pinned `frames >= QUERY_FRAMES` (so rows `[0, 3)`
+  /// exist) and rank-2-ness.
+  ///
+  /// # Errors
+  /// - [`Error::OutOfRange`] if `vocab` exceeds `i32::MAX`;
+  /// - propagates the slice / argmax / eval / host-copy op errors.
+  fn query_argmax_ids(log_probs: &Array) -> Result<[u32; 3]> {
     let vocab = i32::try_from(log_probs.shape()[1]).map_err(|_| {
       Error::OutOfRange(OutOfRangePayload::new(
-        "SenseVoiceModel::frame_argmax: vocab",
+        "SenseVoiceModel::query_argmax_ids: vocab",
         "must fit in i32",
         format_smolstr!("{}", log_probs.shape()[1]),
       ))
     })?;
-    // `log_probs[frame]` — slice the single frame row -> (1, vocab) -> (vocab,).
-    let row = ops::indexing::slice(log_probs, &[frame, 0], &[frame + 1, vocab], &[1, 1])?;
-    let row = ops::shape::reshape(&row, &[vocab])?;
-    let mut arg = ops::misc::argmax(&row, None, false)?;
-    arg.item::<u32>()
+    // `log_probs[0:3]` — the language / emotion / event query rows -> (3, vocab).
+    let rows = ops::indexing::slice(log_probs, &[0, 0], &[3, vocab], &[1, 1])?;
+    // `argmax(axis=1)` -> (3,) U32, one fused per-row reduction.
+    let mut args = ops::misc::argmax(&rows, Some(1), false)?;
+    let ids = args.as_slice::<u32>()?;
+    Ok([ids[0], ids[1], ids[2]])
   }
 
   /// The speech-only `(T', vocab)` log-probs — the full utterance grid with the
