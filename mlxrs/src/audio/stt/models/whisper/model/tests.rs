@@ -2,27 +2,33 @@ use super::*;
 
 // ──────────────────── backend selection (word timestamps) ───────────────────
 
-/// CoreML drives a decode only when a `.mlmodelc` sibling is loaded AND word
-/// timestamps are NOT requested — a word-timestamp request falls back to MLX
-/// because CoreML's cross-attention does not expose the per-head `cross_qk` the
-/// word-timing DTW consumes. Guards the `model.backend(word_timestamps)` choice.
+/// CoreML drives a decode only when a `.mlmodelc` sibling is loaded AND neither
+/// word timestamps NOR best-of-N (`best_of > 1`) is requested — word timestamps
+/// need the per-head `cross_qk` CoreML's cross-attention does not expose, and
+/// best-of-N needs a batched-candidate decode the single-token WhisperKit
+/// decoder cannot do; either falls back to MLX. Guards `model.backend(..)`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn coreml_drives_decode_only_without_word_timestamps() {
+fn coreml_drives_decode_only_without_word_timestamps_or_best_of() {
+  // (has_coreml, word_timestamps, best_of)
   assert!(
-    WhisperModel::prefers_coreml(true, false),
-    "coreml + no word ts → coreml"
+    WhisperModel::prefers_coreml(true, false, None),
+    "coreml + plain decode → coreml"
   );
   assert!(
-    !WhisperModel::prefers_coreml(true, true),
+    WhisperModel::prefers_coreml(true, false, Some(1)),
+    "best_of=1 is a single candidate, not best-of-N → coreml"
+  );
+  assert!(
+    !WhisperModel::prefers_coreml(true, true, None),
     "word timestamps fall back to mlx"
   );
   assert!(
-    !WhisperModel::prefers_coreml(false, false),
-    "no coreml → mlx"
+    !WhisperModel::prefers_coreml(true, false, Some(5)),
+    "best-of-N falls back to mlx"
   );
   assert!(
-    !WhisperModel::prefers_coreml(false, true),
+    !WhisperModel::prefers_coreml(false, false, None),
     "no coreml → mlx"
   );
 }

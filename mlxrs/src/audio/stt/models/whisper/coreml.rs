@@ -774,11 +774,23 @@ impl super::inference::WhisperInference for CoreMlWhisper {
         shape,
       )));
     }
-    let frames = shape[0].min(N_AUDIO_FRAMES);
+    // Enforce the exact frame contract BEFORE materializing the mel to host: the
+    // AudioEncoder takes a fixed N_AUDIO_FRAMES-frame input (the pipeline pads to
+    // it), matching the MLX encoder's `frames == N_FRAMES` requirement. Rejecting
+    // a wrong frame count up front also keeps an oversized mel from being copied.
+    if shape[0] != N_AUDIO_FRAMES {
+      return Err(Error::ShapePairMismatch(
+        crate::error::ShapePairMismatchPayload::new(
+          "CoreMlWhisper::encode: mel frame count must equal N_AUDIO_FRAMES (the AudioEncoder's fixed input length)",
+          vec![N_AUDIO_FRAMES, n_mels],
+          shape.to_vec(),
+        ),
+      ));
+    }
     let mut mel32 = mel.try_clone()?;
-    let host = mel32.to_vec::<f32>()?; // row-major over (frames, mels)
+    let host = mel32.to_vec::<f32>()?; // row-major over (N_AUDIO_FRAMES, mels)
     let mut chw = vec![0.0f32; n_mels * N_AUDIO_FRAMES];
-    for t in 0..frames {
+    for t in 0..N_AUDIO_FRAMES {
       for m in 0..n_mels {
         // dst[m, t] (channel-major, padded width 3000) ← src[t, m].
         chw[m * N_AUDIO_FRAMES + t] = host[t * n_mels + m];

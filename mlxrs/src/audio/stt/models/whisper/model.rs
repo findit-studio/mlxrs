@@ -510,25 +510,25 @@ impl WhisperModel {
     &self.alignment_heads
   }
 
-  /// Whether the CoreML / Neural-Engine backend should drive a decode with the
-  /// given `word_timestamps` request: iff a CoreML sibling is loaded
-  /// (`has_coreml`) AND word timestamps are NOT requested.
+  /// Whether the CoreML / Neural-Engine backend should drive a decode: iff a
+  /// CoreML sibling is loaded (`has_coreml`) AND neither word timestamps NOR
+  /// best-of-N (`best_of > 1`) is requested.
   ///
   /// CoreML is skipped for a word-timestamp request because its
   /// `alignment_heads_weights` cross-attention does not expose the per-head
-  /// `cross_qk` the word-timing DTW ([`super::timing::find_alignment`]) consumes,
-  /// so such a transcription falls back to the MLX backend until the CoreML path
-  /// exposes compatible cross-attention.
+  /// `cross_qk` the word-timing DTW ([`super::timing::find_alignment`]) consumes;
+  /// and for a best-of-N request because the WhisperKit explicit-cache decoder
+  /// advances a single token per step and cannot batch the candidate dimension.
+  /// Either falls back to the MLX backend until the CoreML path supports it.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-  fn prefers_coreml(has_coreml: bool, word_timestamps: bool) -> bool {
-    has_coreml && !word_timestamps
+  fn prefers_coreml(has_coreml: bool, word_timestamps: bool, best_of: Option<usize>) -> bool {
+    has_coreml && !word_timestamps && !best_of.is_some_and(|n| n > 1)
   }
 
   /// The concrete inference [`WhisperBackend`] the decode pipeline drives for a
-  /// request with the given `word_timestamps` flag — the CoreML / Neural-Engine
-  /// sibling when one was loaded alongside this checkpoint (Apple Silicon) AND
-  /// word timestamps are not requested (see `prefers_coreml`), else the
-  /// MLX path.
+  /// request — the CoreML / Neural-Engine sibling when one was loaded alongside
+  /// this checkpoint (Apple Silicon) AND neither word timestamps nor best-of-N
+  /// (`best_of > 1`) is requested (see `prefers_coreml`), else the MLX path.
   ///
   /// The high-level [`Transcribe`] entry points build the backend through this
   /// one chokepoint and hand `&backend` to the [`super::decoding`] free
@@ -536,9 +536,9 @@ impl WhisperModel {
   /// (and whenever no `.mlmodelc` bundle was present) this is always
   /// [`WhisperBackend::Mlx`], byte-identical to the pre-backend pipeline.
   #[inline]
-  pub fn backend(&self, word_timestamps: bool) -> WhisperBackend<'_> {
+  pub fn backend(&self, word_timestamps: bool, best_of: Option<usize>) -> WhisperBackend<'_> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if Self::prefers_coreml(self.coreml.is_some(), word_timestamps) {
+    if Self::prefers_coreml(self.coreml.is_some(), word_timestamps, best_of) {
       // `prefers_coreml` returned true ⇒ a CoreML sibling IS loaded; bind it.
       if let Some(coreml) = self.coreml.as_deref() {
         return WhisperBackend::CoreMl(coreml);
@@ -1215,7 +1215,7 @@ impl WhisperModel {
 
     let whisper_opts = self.whisper_transcribe_options(opts);
     let result = decoding::transcribe(
-      &self.backend(whisper_opts.word_timestamps),
+      &self.backend(whisper_opts.word_timestamps, whisper_opts.decode.best_of),
       &wrapper,
       &mel,
       content_frames,
@@ -2694,7 +2694,7 @@ impl Transcribe for WhisperModel {
 
     let whisper_opts = self.whisper_transcribe_options(opts);
     let result = decoding::transcribe(
-      &self.backend(whisper_opts.word_timestamps),
+      &self.backend(whisper_opts.word_timestamps, whisper_opts.decode.best_of),
       &wrapper,
       &mel,
       content_frames,
