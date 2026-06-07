@@ -95,6 +95,24 @@ memmapix = { version = "0.9", optional = true } # memory-map .npy / .npz files o
 [target.'cfg(unix)'.dependencies]
 xattr = { version = "1", optional = true }
 
+# CoreML / Neural-Engine Whisper backend (Apple Silicon only). Pure objc2-core-ml
+# (no Objective-C shim): drives the compiled WhisperKit `.mlmodelc` MelSpectrogram
+# / AudioEncoder / TextDecoder models on the ANE. Platform-gated (not a cargo
+# feature) and selected at load time by the checkpoint shape, like the lfm/embedder
+# on-device backends. objc2 0.3.x framework crates over the objc2 0.6.x core; all
+# CoreML classes live behind per-class cargo features that are ON by default.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+  "NSArray",
+  "NSDictionary",
+  "NSString",
+  "NSValue",     # NSNumber
+  "NSError",
+  "NSURL",
+] }
+objc2-core-ml = "0.3"
+
 [dev-dependencies]
 approx.workspace = true
 trybuild.workspace = true

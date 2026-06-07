@@ -34,6 +34,7 @@ use crate::{
   Array, Dtype,
   audio::stt::models::whisper::{
     audio::N_FRAMES,
+    backend::WhisperBackend,
     config::ModelDimensions,
     decoding::alignatt_should_commit,
     model::WhisperModel,
@@ -189,7 +190,8 @@ fn alignatt_frame_attention_tracks_the_peak() {
 
   for &peak in &[10usize, 200, 700, n_audio_ctx - 5] {
     let cross_qk = synthetic_cross_qk(model.dims().n_text_head(), t, n_audio_ctx, peak);
-    let frames = alignatt_frame_attention(&model, &cross_qk, n_audio_ctx).unwrap();
+    let frames =
+      alignatt_frame_attention(&WhisperBackend::Mlx(&model), &cross_qk, n_audio_ctx).unwrap();
     assert_eq!(frames.len(), t, "one frame per token position");
     let got = frames[t - 1];
     // The argmax of the last token's row must be within the plateau (±2) of the
@@ -211,7 +213,8 @@ fn alignatt_frame_attention_clamps_content_frames() {
   let n_audio_ctx = model.dims().n_audio_ctx();
   let cross_qk = synthetic_cross_qk(model.dims().n_text_head(), 3, n_audio_ctx, 50);
   // content_frames hugely over the width → clamped.
-  let frames = alignatt_frame_attention(&model, &cross_qk, n_audio_ctx * 10).unwrap();
+  let frames =
+    alignatt_frame_attention(&WhisperBackend::Mlx(&model), &cross_qk, n_audio_ctx * 10).unwrap();
   assert_eq!(frames.len(), 3);
   assert!(frames.iter().all(|&f| f < n_audio_ctx));
 }
@@ -222,7 +225,7 @@ fn alignatt_frame_attention_rejects_zero_content_frames() {
   // panic / zero-width slice.
   let model = WhisperModel::from_weights(stream_dims(), stream_weights(13), Dtype::F32).unwrap();
   let cross_qk = synthetic_cross_qk(model.dims().n_text_head(), 2, model.dims().n_audio_ctx(), 5);
-  let err = alignatt_frame_attention(&model, &cross_qk, 0).unwrap_err();
+  let err = alignatt_frame_attention(&WhisperBackend::Mlx(&model), &cross_qk, 0).unwrap_err();
   assert!(
     matches!(err, crate::Error::OutOfRange(_)),
     "zero content frames must be OutOfRange, got {err:?}"
@@ -289,7 +292,8 @@ fn cached_committed(
     without_timestamps: true,
     max_initial_timestamp: None,
   };
-  let task = DecodingTask::new(model, &wrapper, decode).unwrap();
+  let backend = WhisperBackend::Mlx(model);
+  let task = DecodingTask::new(&backend, &wrapper, decode).unwrap();
   let aligned = task
     .decode_aligned(&enc, content_frames, frame_threshold)
     .unwrap();

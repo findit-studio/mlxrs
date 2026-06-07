@@ -19,7 +19,7 @@
 //! ## Building blocks reused
 //! - `WhisperModel::decode_tokens` — the `Inference.logits` analogue (decoder
 //!   forward with a caller-owned KV cache);
-//! - [`AutoregressiveStt::encode`] — the encoder forward;
+//! - [`encode`](crate::audio::stt::model::AutoregressiveStt::encode) — the encoder forward;
 //! - [`super::tokenizer::HFTokenizerWrapper`] — the special-token ids +
 //!   `sot_sequence` + `encode` / `decode`;
 //! - [`crate::lm::sample::categorical_sampling`] — the `temperature > 0`
@@ -32,17 +32,25 @@ use smol_str::format_smolstr;
 
 use crate::{
   Array, Dtype, Error, Result,
-  audio::stt::model::AutoregressiveStt,
   error::{InvariantViolationPayload, OutOfRangePayload},
   ops,
 };
 
 use super::{
   audio::{CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, SAMPLE_RATE, pad_or_trim},
-  model::WhisperModel,
+  inference::WhisperInference,
   timing,
   tokenizer::HFTokenizerWrapper,
 };
+
+/// The concrete model-forward backend the decode pipeline drives — re-exported
+/// from [`super::backend`]. An enum over the MLX
+/// [`WhisperModel`](super::model::WhisperModel) and (on Apple Silicon) the
+/// CoreML [`CoreMlWhisper`](super::coreml::CoreMlWhisper) backends, implementing
+/// [`WhisperInference`] by dispatching to the active variant. The pipeline's
+/// free functions take `&WhisperBackend<'_>`, built at the public entry exactly
+/// where a `&WhisperModel` was used before.
+pub use super::backend::{WhisperBackend, WhisperCache};
 
 // Diagnostic split timers (encoder vs decode wall-time + decode step count),
 // accumulated across every `run()` call when `MLXRS_TIMING2` is set. Read and
@@ -1341,7 +1349,7 @@ type ParityResult = ((Vec<u32>, f64), (Vec<u32>, f64));
 /// in one batched forward and the [`MaximumLikelihoodRanker`] selects the best;
 /// otherwise it runs the single-sequence greedy/categorical path.
 pub struct DecodingTask<'a> {
-  model: &'a WhisperModel,
+  model: &'a WhisperBackend<'a>,
   tokenizer: &'a HFTokenizerWrapper<'a>,
   options: DecodingOptions,
   /// `n_text_ctx` — the decode context ceiling.
@@ -1384,13 +1392,19 @@ impl<'a> DecodingTask<'a> {
   ///   `max_initial_timestamp` rounds out of range;
   /// - propagates the `SuppressBlank` encode error.
   pub fn new(
-    model: &'a WhisperModel,
+    model: &'a WhisperBackend<'a>,
     tokenizer: &'a HFTokenizerWrapper<'a>,
     options: DecodingOptions,
   ) -> Result<Self> {
     let dims = model.dims();
     let n_ctx = dims.n_text_ctx();
     let sample_len = options.sample_len.unwrap_or(n_ctx / 2);
+    // The active backend's decoder-cache ceiling (the MLX backend returns
+    // `n_text_ctx`, so the cap below is a no-op there — byte-identical; a backend
+    // with a smaller fixed cache, e.g. the CoreML/ANE `TextDecoder` at 224,
+    // returns that cap so the decode loop stops cleanly at the cache bound rather
+    // than overrunning it mid-segment).
+    let max_decoder_ctx = model.max_decoder_context();
 
     // `_verify_options` (`decoding.py:510-523`) + the `n_group` resolution
     // (`:459`). Beam search is not implemented, so `beam_size` is rejected
@@ -1406,8 +1420,16 @@ impl<'a> DecodingTask<'a> {
       tokenizer.sot_sequence()
     };
 
-    let initial_tokens =
-      build_initial_tokens(tokenizer, &sot_sequence, &options, n_ctx, sample_len);
+    // Truncate prompt/prefix to the BACKEND's decoder-context budget (the cache
+    // ceiling), not just `n_text_ctx`, so the prefill cannot overrun a bounded
+    // cache. `max_decoder_ctx == n_text_ctx` on the MLX backend (byte-identical).
+    let initial_tokens = build_initial_tokens(
+      tokenizer,
+      &sot_sequence,
+      &options,
+      max_decoder_ctx,
+      sample_len,
+    );
     // Fail-fast on a caller-supplied `prompt` / `prefix` id `>= n_vocab` BEFORE
     // any forward: those ids flow through `initial_tokens` into the prefill
     // `decode_tokens` and then the decoder token-embedding gather, where an
@@ -1417,6 +1439,34 @@ impl<'a> DecodingTask<'a> {
     // initial-token boundary. Shares the model's `validate_token_ids` helper.
     model.validate_token_ids("DecodingTask: initial token", &initial_tokens)?;
     let sample_begin = initial_tokens.len();
+    // Soundness backstop: the prefill consumes `sample_begin` cache slots, so it
+    // must leave room for at least one sampled token within the backend's
+    // decoder-cache ceiling. `build_initial_tokens` already truncated prompt and
+    // prefix to `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence
+    // could still fill it; reject at task construction (before the encoder runs)
+    // rather than overrun the cache mid-prefill inside `decode_tokens`. On the MLX
+    // backend `max_decoder_ctx == n_text_ctx`, far above any real prefill, so this
+    // never fires (byte-identical).
+    if sample_begin >= max_decoder_ctx {
+      return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
+        "DecodingTask: initial-token prefill",
+        "max_decoder_ctx",
+        max_decoder_ctx as u64,
+        sample_begin as u64,
+      )));
+    }
+    // Cap the sampled-token budget so the prompt + sampled tail never exceeds the
+    // backend's decoder-cache ceiling: the warm loops run `1..sample_len` and the
+    // prefill already consumes `sample_begin` cache slots, so bounding
+    // `sample_len <= max_decoder_ctx - sample_begin` makes every loop terminate
+    // by its own count at (or before) the cache bound. On the MLX backend
+    // `max_decoder_ctx == n_text_ctx`, so for any realistic `sample_begin` this
+    // `min` selects the original `sample_len` unchanged (byte-identical); on the
+    // CoreML backend it stops the loop cleanly at the 224-slot cache instead of
+    // reaching a mid-segment `CapExceeded`. `build_initial_tokens` above already
+    // ran with the ORIGINAL `sample_len`, so prompt/prefix truncation is
+    // unaffected by this cap.
+    let sample_len = sample_len.min(max_decoder_ctx.saturating_sub(sample_begin));
     let sot_index = initial_tokens
       .iter()
       .position(|&t| t == tokenizer.sot())
@@ -2503,11 +2553,17 @@ pub(crate) struct AlignedDecode {
 
 /// Build the `(prompt) + sot_sequence + (prefix)` initial token prefix —
 /// `_get_initial_tokens` (`decoding.py:525-551`).
+///
+/// `ctx_budget` is the EFFECTIVE decoder-context budget the prompt and prefix
+/// are tail-truncated to fit (`decoding.py` uses `self.n_ctx`). On an unbounded
+/// backend it is `n_text_ctx`; on a cache-bounded backend (CoreML's 224-slot
+/// `TextDecoder`) it is the cache ceiling, so the prefill cannot overrun the
+/// cache. The two are equal on the MLX backend, keeping this byte-identical.
 fn build_initial_tokens(
   tokenizer: &HFTokenizerWrapper<'_>,
   sot_sequence: &[u32],
   options: &DecodingOptions,
-  n_ctx: usize,
+  ctx_budget: usize,
   sample_len: usize,
 ) -> Vec<u32> {
   let mut tokens: Vec<u32> = sot_sequence.to_vec();
@@ -2515,7 +2571,7 @@ fn build_initial_tokens(
   // prefix: forced after the sot sequence, tail-truncated to leave room
   // (`decoding.py:528-537`).
   if !options.prefix.is_empty() {
-    let max_prefix_len = (n_ctx / 2).saturating_sub(sample_len);
+    let max_prefix_len = (ctx_budget / 2).saturating_sub(sample_len);
     let prefix = &options.prefix;
     let start = prefix.len().saturating_sub(max_prefix_len);
     tokens.extend_from_slice(&prefix[start..]);
@@ -2524,7 +2580,7 @@ fn build_initial_tokens(
   // prompt: prepended (with sot_prev) before the sot sequence, tail-truncated
   // (`decoding.py:539-549`).
   if !options.prompt.is_empty() {
-    let keep = (n_ctx / 2).saturating_sub(1);
+    let keep = (ctx_budget / 2).saturating_sub(1);
     let prompt = &options.prompt;
     let start = prompt.len().saturating_sub(keep);
     let mut prefixed = Vec::with_capacity(1 + (prompt.len() - start) + tokens.len());
@@ -2596,8 +2652,8 @@ fn last_position_matrix(logits3d: &Array, n_group: usize) -> Result<Array> {
 /// arithmetic: `n_group` and `row_len` must each fit in `i32` ([`dim_overflow`],
 /// since both become MLX array dims) and their product must not wrap
 /// ([`Error::ArithmeticOverflow`]). A wrapped count would mis-size the row-major
-/// prefill buffer and feed [`WhisperModel::decode_tokens_batched`] a length that
-/// disagrees with `(n_group, T)`. Factored out (mirroring
+/// prefill buffer and feed [`decode_tokens_batched`](WhisperInference::decode_tokens_batched)
+/// a length that disagrees with `(n_group, T)`. Factored out (mirroring
 /// [`BatchedGreedyDecoder::split_count`]) so the arithmetic guard is unit-testable
 /// without realizing the giant buffer.
 fn flat_token_count(n_group: usize, row_len: usize) -> Result<usize> {
@@ -2615,8 +2671,9 @@ fn flat_token_count(n_group: usize, row_len: usize) -> Result<usize> {
 }
 
 /// Flatten per-row token histories into a single row-major `(n_group * T)`
-/// slice for [`WhisperModel::decode_tokens_batched`]. Every row must have the
-/// same length `T` (the batched decode keeps all rows in lockstep).
+/// slice for [`decode_tokens_batched`](WhisperInference::decode_tokens_batched).
+/// Every row must have the same length `T` (the batched decode keeps all rows in
+/// lockstep).
 ///
 /// The flat length scales with `n_group` (the consumer's `best_of`); compute it
 /// with [`flat_token_count`]'s checked arithmetic and reserve it fallibly so a
@@ -2700,7 +2757,7 @@ fn dim_overflow(which: &'static str) -> Error {
 ///   whose `logit - logsumexp` is `NaN`, silently selecting the first code);
 /// - propagates the encoder / decoder / softmax op errors.
 pub fn detect_language<'a>(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'a>,
   audio_features: &Array,
 ) -> Result<(&'a str, Vec<(&'a str, f64)>)> {
@@ -2793,7 +2850,7 @@ pub fn detect_language<'a>(
 /// # Errors
 /// Propagates [`detect_language`]'s op errors.
 fn resolve_language(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   audio_features: &Array,
   requested: Option<&str>,
@@ -2823,7 +2880,7 @@ fn resolve_language(
 /// Propagates the encoder forward, [`detect_language`], [`DecodingTask::new`],
 /// and [`DecodingTask::run`] errors.
 pub fn decode(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   options: DecodingOptions,
@@ -2852,7 +2909,7 @@ pub fn decode(
 /// # Errors
 /// Propagates [`DecodingTask::new`] / [`DecodingTask::run`].
 fn decode_resolved(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   audio_features: &Array,
   options: DecodingOptions,
@@ -2869,7 +2926,7 @@ fn decode_resolved(
 ///
 /// # Errors
 /// Propagates the encoder forward op errors.
-fn encode_once(model: &WhisperModel, mel: &Array) -> Result<Array> {
+fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
   let dims = model.dims();
   let shape = mel.shape();
   let is_encoded = matches!(
@@ -2952,7 +3009,7 @@ pub const DEFAULT_NO_SPEECH_THRESHOLD: f64 = 0.6;
 /// Propagates the encoder forward / [`DecodingTask`] errors.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_with_fallback(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   base_options: &DecodingOptions,
@@ -3428,7 +3485,7 @@ fn compute_seek_clips(
 /// - propagates [`detect_language`], [`decode_with_fallback`], the initial-
 ///   prompt encode, and the mel-slice op errors.
 pub fn transcribe(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel: &Array,
   content_frames: usize,
@@ -3690,7 +3747,7 @@ struct WordTimestampOutcome {
 /// Propagates [`timing::add_word_timestamps`].
 #[allow(clippy::too_many_arguments)]
 fn apply_word_timestamps(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   mel_segment: &Array,
   segment_size: usize,

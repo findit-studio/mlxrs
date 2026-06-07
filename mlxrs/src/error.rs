@@ -354,6 +354,50 @@ impl std::fmt::Display for EmptyInputPayload {
 
 impl std::error::Error for EmptyInputPayload {}
 
+/// Payload for [`Error::CoreMl`]: a failing `objc2-core-ml` call site and the
+/// underlying reason. Apple Silicon only.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMlPayload {
+  context: &'static str,
+  detail: SmolStr,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CoreMlPayload {
+  /// Construct a new payload from the failing call-site `context` and a
+  /// `detail` string (an `NSError` description, or a static reason).
+  pub fn new(context: &'static str, detail: impl Into<SmolStr>) -> Self {
+    Self {
+      context,
+      detail: detail.into(),
+    }
+  }
+
+  /// The failing call site (e.g. `"CoreMlWhisper::encode: AudioEncoder predict"`).
+  #[inline(always)]
+  pub const fn context(&self) -> &'static str {
+    self.context
+  }
+
+  /// The underlying reason (the `NSError` description, or a static reason for a
+  /// non-`NSError` failure such as a NULL output feature).
+  #[inline(always)]
+  pub fn detail(&self) -> &str {
+    self.detail.as_str()
+  }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Display for CoreMlPayload {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "CoreML: {} failed: {}", self.context, self.detail)
+  }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::error::Error for CoreMlPayload {}
+
 /// Payload for [`Error::InvariantViolation`]: the call-site context and the
 /// violated requirement.
 ///
@@ -1177,6 +1221,18 @@ pub enum Error {
   #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
   #[error(transparent)]
   ConvertDurabilityWarnings(#[from] ConvertDurabilityWarnings),
+
+  /// A CoreML / Neural-Engine operation failed at the `objc2-core-ml` boundary
+  /// — a model load (`MLModel modelWithContentsOfURL:`), an `MLMultiArray`
+  /// allocation, a prediction (`predictionFromFeatures:`), or a missing /
+  /// wrong-typed model output feature. `context` names the failing call site
+  /// (e.g. `"CoreMlWhisper::encode: AudioEncoder predict"`); `detail` carries
+  /// the underlying `NSError` description (or a static reason for a non-NSError
+  /// failure such as a NULL output feature). Constructed only on the
+  /// Apple-Silicon CoreML Whisper backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[error(transparent)]
+  CoreMl(CoreMlPayload),
 }
 
 // M8 / M10 (#257): pin the `Error` enum size. It is feature-INVARIANT (no

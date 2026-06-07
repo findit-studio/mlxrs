@@ -1,5 +1,8 @@
 use super::*;
-use crate::{audio::stt::models::whisper::config::ModelDimensions, tokenizer::Tokenizer};
+use crate::{
+  audio::stt::models::whisper::{config::ModelDimensions, model::WhisperModel},
+  tokenizer::Tokenizer,
+};
 use serde_json::json;
 use std::{
   collections::HashMap,
@@ -1154,7 +1157,7 @@ fn greedy_decode_runs_and_emits_target_then_eot() {
   };
   options.language = Some("en".into());
 
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   // Every sampled token is the biased target.
   assert!(!result.tokens.is_empty());
   assert!(
@@ -1191,7 +1194,8 @@ fn pipelined_loop_matches_serial() {
       ..Default::default()
     };
     options.language = Some("en".into());
-    let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+    let backend = WhisperBackend::Mlx(&model);
+    let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
 
     let (s_tokens, s_sum, s_ns) = task.main_loop(&enc).unwrap();
     let (p_tokens, p_sum, p_ns) = task.main_loop_pipelined(&enc).unwrap();
@@ -1277,7 +1281,7 @@ fn greedy_decode_stops_at_eot() {
   };
   options.language = Some("en".into());
 
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   assert!(result.tokens.is_empty(), "tokens={:?}", result.tokens);
   assert_eq!(result.text, "");
 }
@@ -1306,7 +1310,7 @@ fn greedy_decode_sample_len_zero_emits_no_token() {
   };
   options.language = Some("en".into());
 
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   assert!(
     result.tokens.is_empty(),
     "sample_len == 0 must emit no token, got {:?}",
@@ -1338,7 +1342,7 @@ fn greedy_decode_sample_len_one_emits_exactly_one_token() {
   };
   options.language = Some("en".into());
 
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   assert_eq!(
     result.tokens,
     vec![target],
@@ -1370,7 +1374,7 @@ fn decode_auto_detects_language_when_none() {
     language: None, // <- trigger detection
     ..Default::default()
   };
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   assert_eq!(
     result.language, "zh",
     "decode must detect + report the language when none is supplied"
@@ -1397,7 +1401,7 @@ fn decode_uses_supplied_language_without_detection() {
     language: Some("en".into()),
     ..Default::default()
   };
-  let result = decode(&model, &wrapper, &enc, options).unwrap();
+  let result = decode(&WhisperBackend::Mlx(&model), &wrapper, &enc, options).unwrap();
   assert_eq!(result.language, "en");
 }
 
@@ -1413,7 +1417,8 @@ fn initial_tokens_include_sot_sequence_and_prompt() {
     prompt: vec![12, 13], // "c d"
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   // sot_sequence(en, transcribe) = [sot=3, en=4, transcribe=7], + notimestamps
   // (11) since without_timestamps; prompt prepends [sot_prev=9, 12, 13].
   let it = &task.initial_tokens;
@@ -1468,7 +1473,7 @@ fn decoding_task_rejects_out_of_vocab_prompt_or_prefix() {
     ..Default::default()
   };
   expect_oob(
-    DecodingTask::new(&model, &wrapper, options),
+    DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
     "an out-of-vocab prompt id",
   );
 
@@ -1480,7 +1485,7 @@ fn decoding_task_rejects_out_of_vocab_prompt_or_prefix() {
     ..Default::default()
   };
   expect_oob(
-    DecodingTask::new(&model, &wrapper, options),
+    DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
     "an out-of-vocab prefix id",
   );
 
@@ -1491,7 +1496,7 @@ fn decoding_task_rejects_out_of_vocab_prompt_or_prefix() {
     prompt: vec![12, 13],
     ..Default::default()
   };
-  assert!(DecodingTask::new(&model, &wrapper, options).is_ok());
+  assert!(DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options).is_ok());
 }
 
 #[test]
@@ -1513,7 +1518,7 @@ fn detect_language_picks_a_language_code() {
   let mel = tiny_mel();
   let enc = model.encode(&mel).unwrap();
 
-  let (best, probs) = detect_language(&model, &wrapper, &enc).unwrap();
+  let (best, probs) = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &enc).unwrap();
   assert_eq!(best, "en");
   // probs cover the checkpoint's languages (en, zh) and sum to ~1.
   let total: f64 = probs.iter().map(|(_, p)| p).sum();
@@ -1605,7 +1610,7 @@ fn detect_language_rejects_out_of_vocab_language_ids() {
   let mel = tiny_mel();
   let enc = model.encode(&mel).unwrap();
 
-  let err = detect_language(&model, &wrapper, &enc).unwrap_err();
+  let err = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &enc).unwrap_err();
   assert!(
     matches!(&err, Error::OutOfRange(p)
       if p.context() == "detect_language: language token id"),
@@ -1633,7 +1638,7 @@ fn decode_with_fallback_accepts_first_acceptable() {
     ..Default::default()
   };
   let result = decode_with_fallback(
-    &model,
+    &WhisperBackend::Mlx(&model),
     &wrapper,
     &enc,
     &base,
@@ -1677,7 +1682,7 @@ fn decode_with_fallback_drops_best_of_at_greedy_temperature() {
     ..Default::default()
   };
   let result = decode_with_fallback(
-    &model,
+    &WhisperBackend::Mlx(&model),
     &wrapper,
     &enc,
     &base,
@@ -1718,7 +1723,7 @@ fn decode_with_fallback_best_of_traverses_full_schedule() {
   // An unsatisfiable logprob threshold → every attempt "needs fallback", so the
   // loop runs through all of DEFAULT_TEMPERATURES and returns the last result.
   let result = decode_with_fallback(
-    &model,
+    &WhisperBackend::Mlx(&model),
     &wrapper,
     &enc,
     &base,
@@ -1749,7 +1754,8 @@ fn audio_features_passes_through_encoded() {
     without_timestamps: true,
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
 
   // (n_audio_ctx, n_audio_state) = (1500, 4): recognized as already-encoded and
   // lifted to (1, 1500, 4) without re-running the encoder.
@@ -1814,7 +1820,8 @@ fn batched_n_group_1_is_bit_identical_to_single_sequence() {
     sample_len: Some(5),
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   assert_eq!(task.n_group, 1, "default options are single-group");
 
   let ((single_tokens, single_sum), (batched_tokens, batched_sum)) =
@@ -1851,7 +1858,8 @@ fn batched_n_group_1_parity_without_timestamps() {
     sample_len: Some(6),
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   let ((s_tok, s_sum), (b_tok, b_sum)) = task.run_both_for_parity(&enc).unwrap();
   assert_eq!(s_tok, b_tok);
   assert_eq!(s_sum.to_bits(), b_sum.to_bits());
@@ -1881,7 +1889,8 @@ fn batched_n_group_1_parity_at_positive_temperature() {
     sample_len: Some(6),
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   assert_eq!(task.n_group, 1, "no best_of ⇒ single-group");
   let ((s_tok, s_sum), (b_tok, b_sum)) = task.run_both_for_parity(&enc).unwrap();
   assert_eq!(
@@ -1965,7 +1974,7 @@ fn impossible_best_of_is_rejected_at_construction_before_allocation() {
     sample_len: Some(4),
     ..Default::default()
   };
-  match DecodingTask::new(&model, &wrapper, options) {
+  match DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options) {
     Err(Error::OutOfRange(_)) | Err(Error::ArithmeticOverflow(_)) => {}
     Err(e) => {
       panic!("expected OutOfRange/ArithmeticOverflow for an impossible best_of, got {e:?}")
@@ -2301,7 +2310,7 @@ fn best_of_and_beam_size_together_is_typed_error() {
     ..Default::default()
   };
   expect_task_invariant(
-    DecodingTask::new(&model, &wrapper, options),
+    DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
     "best_of + beam_size together",
   );
 }
@@ -2321,7 +2330,7 @@ fn best_of_with_temperature_zero_is_typed_error() {
     ..Default::default()
   };
   expect_task_invariant(
-    DecodingTask::new(&model, &wrapper, options),
+    DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
     "best_of with temperature 0",
   );
 }
@@ -2340,7 +2349,7 @@ fn beam_size_alone_is_unsupported_typed_error() {
     ..Default::default()
   };
   expect_task_invariant(
-    DecodingTask::new(&model, &wrapper, options),
+    DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
     "beam_size alone (unsupported)",
   );
 }
@@ -2361,7 +2370,7 @@ fn length_penalty_out_of_range_is_typed_error() {
       ..Default::default()
     };
     expect_task_oob(
-      DecodingTask::new(&model, &wrapper, options),
+      DecodingTask::new(&WhisperBackend::Mlx(&model), &wrapper, options),
       "length_penalty out of [0,1]",
     );
   }
@@ -2391,7 +2400,8 @@ fn best_of_n_end_to_end_decodes_and_ranks() {
     sample_len: Some(4),
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   assert_eq!(task.n_group, 5, "best_of resolves n_group");
 
   let result = task.run(&enc, "en").unwrap();
@@ -2429,7 +2439,8 @@ fn best_of_n_all_eot_yields_empty() {
     sample_len: Some(5),
     ..Default::default()
   };
-  let task = DecodingTask::new(&model, &wrapper, options).unwrap();
+  let backend = WhisperBackend::Mlx(&model);
+  let task = DecodingTask::new(&backend, &wrapper, options).unwrap();
   let result = task.run(&enc, "en").unwrap();
   assert!(
     result.tokens.is_empty(),
@@ -2662,7 +2673,14 @@ fn transcribe_rejects_non_2d_mel() {
   let w = HFTokenizerWrapper::new(&tok, true, 2, Some("en"), Task::Transcribe).unwrap();
   let model = tiny_model(13);
   let mel3d = Array::ones::<f32>(&(1usize, 4usize, 4usize)).unwrap();
-  let err = transcribe(&model, &w, &mel3d, 0, &TranscribeOptions::default()).unwrap_err();
+  let err = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel3d,
+    0,
+    &TranscribeOptions::default(),
+  )
+  .unwrap_err();
   assert!(matches!(err, Error::RankMismatch(_)));
 }
 
@@ -2689,7 +2707,14 @@ fn transcribe_seek_loop_excludes_trailing_padding() {
   let mut options = TranscribeOptions::default();
   options.decode.language = Some("en".into());
 
-  let result = transcribe(&model, &w, &mel, /* content_frames */ 0, &options).unwrap();
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    /* content_frames */ 0,
+    &options,
+  )
+  .unwrap();
   assert!(
     result.segments.is_empty(),
     "trailing padding must not be decoded as content; got {} segment(s)",
@@ -2724,7 +2749,11 @@ fn transcribe_no_word_timestamps_leaves_words_empty() {
   assert!(!options.word_timestamps);
 
   let result = transcribe(
-    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    /* content_frames */ N_FRAMES,
+    &options,
   )
   .unwrap();
   assert!(!result.segments.is_empty());
@@ -2760,7 +2789,11 @@ fn transcribe_word_timestamps_attaches_monotonic_words() {
   options.word_timestamps = true;
 
   let result = transcribe(
-    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    /* content_frames */ N_FRAMES,
+    &options,
   )
   .unwrap();
   assert!(!result.segments.is_empty());
@@ -3034,7 +3067,11 @@ fn transcribe_initial_prompt_absent_from_final_text() {
   options.initial_prompt = Some("d".to_string()); // "d" is id 13
 
   let result = transcribe(
-    &model, &w, &mel, /* content_frames */ N_FRAMES, &options,
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    /* content_frames */ N_FRAMES,
+    &options,
   )
   .unwrap();
   assert!(
@@ -3072,7 +3109,7 @@ fn transcribe_condition_on_previous_text_runs_both_modes() {
     options.condition_on_previous_text = condition;
 
     let result = transcribe(
-      &model,
+      &WhisperBackend::Mlx(&model),
       &w,
       &mel,
       /* content_frames */ 2 * N_FRAMES,
@@ -3351,7 +3388,7 @@ fn transcribe_clip_timestamps_restricts_windows() {
   options.clip_timestamps = vec![clip_start_secs, clip_end_secs];
 
   let result = transcribe(
-    &model,
+    &WhisperBackend::Mlx(&model),
     &w,
     &mel,
     /* content_frames */ 2 * N_FRAMES,
@@ -3398,11 +3435,25 @@ fn transcribe_empty_clip_timestamps_matches_full_audio() {
   };
 
   // Default options (clip_timestamps already empty).
-  let full = transcribe(&model, &w, &mel, 2 * N_FRAMES, &base()).unwrap();
+  let full = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &base(),
+  )
+  .unwrap();
   // Explicit empty clip list → must match.
   let mut clipped = base();
   clipped.clip_timestamps = Vec::new();
-  let same = transcribe(&model, &w, &mel, 2 * N_FRAMES, &clipped).unwrap();
+  let same = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &clipped,
+  )
+  .unwrap();
 
   assert_eq!(full.text, same.text);
   assert_eq!(full.segments.len(), same.segments.len());
@@ -3448,7 +3499,14 @@ fn transcribe_earlier_overlong_clip_terminates_bounded() {
   // points: [0, 999900, 1, 2]; first end overshoots content_frames=2*N_FRAMES.
   options.clip_timestamps = vec![0.0, 9999.0, 0.01, 0.02];
 
-  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &options,
+  )
+  .unwrap();
   // The clamped first clip spans the whole audio ⇒ at most two `N_FRAMES`
   // windows. Each window emits at least one segment but the total is bounded:
   // assert termination with a finite, small segment count.
@@ -3475,7 +3533,14 @@ fn transcribe_clip_start_beyond_eof_contributes_no_windows() {
   let mut options = clip_test_options();
   options.clip_timestamps = vec![9999.0, 10000.0]; // start (and end) past EOF
 
-  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &options,
+  )
+  .unwrap();
   assert!(
     result.segments.is_empty(),
     "a clip starting past EOF must contribute no windows, got {} segments",
@@ -3496,7 +3561,14 @@ fn transcribe_fully_out_of_range_clip_list_terminates_empty() {
   let mut options = clip_test_options();
   options.clip_timestamps = vec![1000.0, 2000.0, 3000.0, 4000.0];
 
-  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &options,
+  )
+  .unwrap();
   assert!(
     result.segments.is_empty(),
     "a fully out-of-range clip list must yield no segments, got {}",
@@ -3519,7 +3591,14 @@ fn transcribe_inverted_clip_is_skipped() {
   let mut options = clip_test_options();
   options.clip_timestamps = vec![full_secs, 0.0, 0.0, full_secs];
 
-  let result = transcribe(&model, &w, &mel, 2 * N_FRAMES, &options).unwrap();
+  let result = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &options,
+  )
+  .unwrap();
   assert!(
     !result.segments.is_empty() && result.segments.len() <= 4,
     "inverted clip skipped, the valid clip decodes a bounded window count, got {}",
@@ -3614,7 +3693,7 @@ fn transcribe_decode_prompt_conditions_first_window() {
 
   // And the full transcribe runs to completion with that seed (no panic, the
   // prompt is not rejected).
-  let result = transcribe(&model, &w, &mel, N_FRAMES, &options).unwrap();
+  let result = transcribe(&WhisperBackend::Mlx(&model), &w, &mel, N_FRAMES, &options).unwrap();
   assert!(
     !result.segments.is_empty(),
     "the window should still decode"
@@ -3654,7 +3733,7 @@ fn transcribe_oversized_decode_prompt_is_byte_identical_to_bounded_tail() {
   let run = |prompt: Vec<u32>| {
     let mut o = clip_test_options();
     o.decode.prompt = prompt;
-    transcribe(&model, &w, &mel, 2 * N_FRAMES, &o).unwrap()
+    transcribe(&WhisperBackend::Mlx(&model), &w, &mel, 2 * N_FRAMES, &o).unwrap()
   };
 
   let big = run(oversized);
@@ -3738,13 +3817,27 @@ fn transcribe_oversized_initial_prompt_is_byte_identical_to_bounded_tail() {
   // Run A: the oversized initial prompt (bounded internally to its tail).
   let mut opts_initial = clip_test_options();
   opts_initial.initial_prompt = Some(words);
-  let from_initial = transcribe(&model, &w, &mel, 2 * N_FRAMES, &opts_initial).unwrap();
+  let from_initial = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &opts_initial,
+  )
+  .unwrap();
 
   // Run B: the same tail fed as the lower-level decode.prompt (no initial_prompt)
   // — seeds the identical `all_tokens`, so the decode must match exactly.
   let mut opts_tail = clip_test_options();
   opts_tail.decode.prompt = tail;
-  let from_tail = transcribe(&model, &w, &mel, 2 * N_FRAMES, &opts_tail).unwrap();
+  let from_tail = transcribe(
+    &WhisperBackend::Mlx(&model),
+    &w,
+    &mel,
+    2 * N_FRAMES,
+    &opts_tail,
+  )
+  .unwrap();
 
   assert_eq!(from_initial.text, from_tail.text);
   assert_eq!(from_initial.segments.len(), from_tail.segments.len());
@@ -3836,8 +3929,15 @@ fn find_alignment_subtoken_window_yields_no_words() {
 
   // `num_frames < 2` ⇒ `num_frames / 2 == 0`: a sub-token window.
   for num_frames in [0usize, 1] {
-    let words = find_alignment(&model, &w, &text_tokens, &mel, num_frames, 1.0)
-      .expect("sub-token window must not error");
+    let words = find_alignment(
+      &WhisperBackend::Mlx(&model),
+      &w,
+      &text_tokens,
+      &mel,
+      num_frames,
+      1.0,
+    )
+    .expect("sub-token window must not error");
     assert!(
       words.is_empty(),
       "sub-token window (num_frames={num_frames}) must yield no word timings, got {words:?}"
@@ -3846,7 +3946,8 @@ fn find_alignment_subtoken_window_yields_no_words() {
 
   // A non-degenerate window (`num_frames / 2 >= 1`) still aligns and never
   // emits a negative timestamp.
-  let words = find_alignment(&model, &w, &text_tokens, &mel, 4, 1.0).expect("alignment");
+  let words = find_alignment(&WhisperBackend::Mlx(&model), &w, &text_tokens, &mel, 4, 1.0)
+    .expect("alignment");
   for word in &words {
     assert!(
       word.start >= 0.0,
@@ -3876,7 +3977,7 @@ fn find_alignment_rejects_text_token_at_or_above_eot() {
 
   // A text token == eot: the first id that indexes past the `[0, eot)` columns.
   let at_eot = [1u32, eot];
-  let err = find_alignment(&model, &w, &at_eot, &mel, 4, 1.0).unwrap_err();
+  let err = find_alignment(&WhisperBackend::Mlx(&model), &w, &at_eot, &mel, 4, 1.0).unwrap_err();
   assert!(
     matches!(&err, Error::OutOfRange(p)
       if p.context() == "Whisper word timestamps: alignment text token"),
@@ -3890,7 +3991,7 @@ fn find_alignment_rejects_text_token_at_or_above_eot() {
     w.timestamp_begin() >= eot && (w.timestamp_begin() as usize) < N_VOCAB,
     "fixture: timestamp id must sit in [eot, n_vocab)"
   );
-  let err = find_alignment(&model, &w, &timestamp, &mel, 4, 1.0).unwrap_err();
+  let err = find_alignment(&WhisperBackend::Mlx(&model), &w, &timestamp, &mel, 4, 1.0).unwrap_err();
   assert!(
     matches!(&err, Error::OutOfRange(p)
       if p.context() == "Whisper word timestamps: alignment text token"),
@@ -3899,7 +4000,8 @@ fn find_alignment_rejects_text_token_at_or_above_eot() {
 
   // A valid (`< eot`) text stream still produces alignments (the guard does not
   // reject real text tokens).
-  let words = find_alignment(&model, &w, &[1u32], &mel, 4, 1.0).expect("valid alignment");
+  let words = find_alignment(&WhisperBackend::Mlx(&model), &w, &[1u32], &mel, 4, 1.0)
+    .expect("valid alignment");
   for word in &words {
     assert!(
       word.start >= 0.0,

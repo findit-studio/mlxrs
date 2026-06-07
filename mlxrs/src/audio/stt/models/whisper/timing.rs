@@ -26,8 +26,8 @@ use crate::{
 
 use super::{
   audio::{HOP_LENGTH, SAMPLE_RATE, TOKENS_PER_SECOND},
-  decoding::{Segment, Word},
-  model::WhisperModel,
+  decoding::{Segment, WhisperBackend, Word},
+  inference::WhisperInference,
   tokenizer::HFTokenizerWrapper,
 };
 
@@ -295,7 +295,7 @@ fn dtw(x: &HostMatrix) -> Result<(Vec<i64>, Vec<i64>)> {
 /// would index past the `[0, eot)` probability columns the per-token
 /// probabilities gather over) or if a dimension overflows `i32`.
 pub fn find_alignment(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   text_tokens: &[u32],
   mel: &Array,
@@ -421,8 +421,8 @@ pub fn find_alignment(
 ///
 /// Given the per-decoder-layer `cross_qk` of one forward (each `(1,
 /// n_text_head, T, n_audio_ctx)`, from
-/// [`WhisperModel::decode_step_with_cross_qk`] /
-/// [`WhisperModel::forward_with_cross_qk`]) this stacks the model's alignment
+/// [`decode_step_with_cross_qk`](super::inference::WhisperInference::decode_step_with_cross_qk) /
+/// [`forward_with_cross_qk`](super::inference::WhisperInference::forward_with_cross_qk)) this stacks the model's alignment
 /// heads, normalizes the weights exactly as the word-timestamp alignment does,
 /// restricts to the `content_frames` real (non-pad) encoder frames, and returns
 /// `argmax_frame[t]` — the encoder frame each token position `t` most attends
@@ -456,7 +456,7 @@ pub fn find_alignment(
 ///   buffer cannot be reserved;
 /// - propagates the stack / softmax-free normalize / median-filter op errors.
 pub(crate) fn alignatt_frame_attention(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   cross_qk: &[Option<Array>],
   content_frames: usize,
 ) -> Result<Vec<usize>> {
@@ -548,7 +548,7 @@ pub(crate) fn alignatt_frame_attention(
 /// Propagates [`find_alignment`].
 #[allow(clippy::too_many_arguments)]
 pub fn add_word_timestamps(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   tokenizer: &HFTokenizerWrapper<'_>,
   segments: &mut [Segment],
   mel: &Array,
@@ -876,7 +876,7 @@ fn text_token_probabilities(
 /// Stack the alignment heads' cross-attention into `(heads, tokens, frames)`,
 /// keeping the first `frames` columns — `timing.py:142-146`.
 fn stack_alignment_heads(
-  model: &WhisperModel,
+  model: &WhisperBackend<'_>,
   cross_qk: &[Option<Array>],
   frames: usize,
 ) -> Result<Array> {

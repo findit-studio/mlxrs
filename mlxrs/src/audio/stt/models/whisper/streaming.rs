@@ -63,6 +63,7 @@ use super::{
     N_FRAMES, N_SAMPLES, N_SAMPLES_PER_TOKEN, SAMPLE_RATE, TOKENS_PER_SECOND,
     log_mel_spectrogram_whisper,
   },
+  backend::WhisperBackend,
   decoding::{DecodingOptions, DecodingTask, SuppressSpec},
   model::WhisperModel,
   tokenizer::{HFTokenizerWrapper, Task as WhisperTask},
@@ -651,7 +652,12 @@ impl<'a> WhisperStreaming<'a> {
       without_timestamps: true,
       max_initial_timestamp: None,
     };
-    let task = DecodingTask::new(self.model, &self.tokenizer, decode)?;
+    // Streaming runs its own AlignAtt trajectory against the MLX model
+    // directly, so it drives the MLX backend (the CoreML auto-selection is on
+    // the batch [`Transcribe`] entry, not the streaming chunk loop). The
+    // backend is bound here so it outlives the borrowing `task`.
+    let backend = WhisperBackend::Mlx(self.model);
+    let task = DecodingTask::new(&backend, &self.tokenizer, decode)?;
 
     // The EFFECTIVE AlignAtt threshold for this chunk: the looser
     // `last_chunk_frame_threshold` on the final chunk (so the tail is not held
