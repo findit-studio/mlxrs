@@ -19,7 +19,7 @@
 //! 2. **Model graph** ([`model`]) — `SileroVadBranch` (reflect-pad → STFT-conv
 //!    → magnitude → 4 conv blocks → LSTM → `sigmoid` head), the recurrent
 //!    chunking / streaming `feed`, and the `probs_to_timestamps` segment
-//!    extractor — all byte-faithful to `silero_vad.py`.
+//!    extractor — all faithful to `silero_vad.py`.
 //! 3. **Loader** ([`loader`]) — `sanitize` (drop `val_*`), the weight-map →
 //!    branch assembly, the safetensors shard walk, and the
 //!    [`loader::load`] → [`crate::audio::vad::VadModel`] factory the VAD
@@ -37,7 +37,10 @@ pub mod model;
 
 pub use config::{BranchConfig, MODEL_TYPE, ModelConfig};
 pub use loader::{has_relevant_scales, load};
-pub use model::{SileroVadBranch, SileroVadModel, SileroVadState, probs_to_timestamps, sanitize};
+pub use model::{
+  SileroVadBranch, SileroVadModel, SileroVadState, SpeechTimestampOptions, probs_to_timestamps,
+  sanitize,
+};
 
 #[cfg(test)]
 mod tests;

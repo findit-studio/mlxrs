@@ -15,7 +15,8 @@
 //!
 //! mlx-audio's `MODEL_REMAPPING` table ([vad-utils.py:8-11][vad-utils-remap])
 //! routes per-architecture aliases (`silero` → `silero_vad`, `silero-vad`
-//! → `silero_vad`) into the `mlx_audio.vad.models.<arch>` namespace; per
+//! → `silero_vad`, `fsmn` → `fsmn`) into the `mlx_audio.vad.models.<arch>`
+//! namespace; per
 //! the no-per-model-arch rule mlxrs returns a [`VadModel`] trait object
 //! (`Box<dyn VadModel>`) the per-architecture loader's caller constructs
 //! itself, so the remap table is the **caller's** responsibility — this
@@ -47,8 +48,11 @@ use crate::{
 /// aliases here when the upstream table changes.
 ///
 /// [vad-utils-remap]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/utils.py#L8-L11
-pub const MODEL_REMAPPING: &[(&str, &str)] =
-  &[("silero", "silero_vad"), ("silero-vad", "silero_vad")];
+pub const MODEL_REMAPPING: &[(&str, &str)] = &[
+  ("silero", "silero_vad"),
+  ("silero-vad", "silero_vad"),
+  ("fsmn", "fsmn"),
+];
 
 /// The trait every per-architecture VAD model implements — the analogue
 /// of mlx-audio's per-arch `Model` class's

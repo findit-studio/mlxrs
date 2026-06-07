@@ -515,3 +515,340 @@ fn predict_proba_preserves_f16_dtype() -> Result<()> {
   assert_eq!(probs.shape(), vec![3]);
   Ok(())
 }
+
+// ─────────────────── batched / 8 kHz / boundary coverage ───────────────────
+
+/// A batched `(B, T)` input returns per-row frame probabilities `(B, n_frames)`
+/// (the reference's batched `_predict_proba_array` path).
+#[test]
+fn predict_proba_batched_returns_per_row_frames() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[2, 1024])?; // (B=2, T=1024)
+  let mut probs = model.predict_proba(&audio, 16_000)?;
+  probs.eval()?;
+  assert_eq!(probs.shape(), vec![2, 2]); // (B, n_frames) with 1024/512 = 2
+  Ok(())
+}
+
+/// The 8 kHz path uses a 256-sample chunk: 1024 samples → 4 frames.
+#[test]
+fn predict_proba_8k_chunk_count() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[1024])?;
+  let mut probs = model.predict_proba(&audio, 8_000)?;
+  probs.eval()?;
+  assert_eq!(probs.shape(), vec![4]); // 1024 / 256
+  Ok(())
+}
+
+/// Exactly `EVAL_EVERY` (16) chunks: the 1-based `async_eval` cadence fires the
+/// final in-loop eval on the last chunk (the off-by-one the fix guards — a
+/// 0-based `step` would never reach 16 and the tail also skips the
+/// exact-multiple case). The frame count is invariant to the eval cadence, so
+/// this exercises the exact-multiple boundary without asserting eval timing.
+#[test]
+fn predict_proba_exact_eval_every_multiple() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[16 * 512])?;
+  let mut probs = model.predict_proba(&audio, 16_000)?;
+  probs.eval()?;
+  assert_eq!(probs.shape(), vec![16]);
+  Ok(())
+}
+
+// ─────────────────────── loader robustness (#2, #5/#8) ──────────────────────
+
+/// A checkpoint carrying a `<prefix>.scales` sibling (a quantized layout) is
+/// rejected — Silero is dense-only, so loading it dense would misinterpret the
+/// packed weights (the `has_relevant_scales` fail-closed gate).
+#[test]
+fn from_weights_rejects_quantized_checkpoint() {
+  let config = ModelConfig::default();
+  let mut weights = HashMap::new();
+  insert_branch_weights(&mut weights, config.branch_16k(), "vad_16k", config.dtype());
+  insert_branch_weights(&mut weights, config.branch_8k(), "vad_8k", config.dtype());
+  // A `.scales` sibling for an existing `.weight` ⇒ looks quantized.
+  weights.insert("vad_16k.conv1.scales".to_string(), zeros(&[128, 1]));
+  assert!(matches!(
+    SileroVadModel::from_weights(config, weights),
+    Err(crate::error::Error::OutOfRange(_))
+  ));
+}
+
+/// An LSTM `Wx` whose leading dim is not a positive multiple of 4 (the `4*H`
+/// gate stack) is rejected by `build_branch` — the hidden size is inferred from
+/// `Wx.shape[0] / 4`, so a malformed shape fails closed instead of mis-splitting
+/// the gates.
+#[test]
+fn from_weights_rejects_malformed_lstm_shape() {
+  let config = ModelConfig::default();
+  let mut weights = HashMap::new();
+  insert_branch_weights(&mut weights, config.branch_16k(), "vad_16k", config.dtype());
+  insert_branch_weights(&mut weights, config.branch_8k(), "vad_8k", config.dtype());
+  // 513 is not a multiple of 4.
+  weights.insert(
+    "vad_16k.lstm.Wx".to_string(),
+    zeros_dtype(&[513, 128], config.dtype()),
+  );
+  assert!(SileroVadModel::from_weights(config, weights).is_err());
+}
+
+// ───────────────────── prepare_audio (#3) + seconds (#4) ─────────────────────
+
+/// `prepare_audio` downmixes a `(T, C)` stereo/multichannel clip (`C <= 8 < T`)
+/// to mono `(T,)`, but leaves a `(B, T)` batch (trailing `T > 8`) untouched —
+/// the reference's `ndim == 2 and shape[-1] <= 8 < shape[0]` discriminator.
+#[test]
+fn prepare_audio_downmixes_stereo_and_keeps_batch() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let stereo = Array::zeros::<f32>(&[1000, 2])?;
+  let (prepared, sr) = model.prepare_audio(&stereo, 16_000)?;
+  assert_eq!(prepared.shape(), vec![1000]);
+  assert_eq!(sr, 16_000);
+
+  let batched = Array::zeros::<f32>(&[2, 1000])?;
+  let (prepared_b, _) = model.prepare_audio(&batched, 16_000)?;
+  assert_eq!(prepared_b.shape(), vec![2, 1000]);
+  Ok(())
+}
+
+/// `prepare_audio` resamples a non-8/16 kHz input to 16 kHz (the reference's
+/// `target_sr = sr if sr in (8000, 16000) else 16000` net), resolving the rate
+/// and shrinking a 32 kHz clip to roughly half the samples.
+#[test]
+fn prepare_audio_resamples_unsupported_rate_to_16k() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[1024])?;
+  let (prepared, sr) = model.prepare_audio(&audio, 32_000)?;
+  assert_eq!(sr, 16_000);
+  let n = prepared.shape()[0];
+  assert!(
+    (400..=600).contains(&n),
+    "32k→16k resample of 1024 → ~512, got {n}"
+  );
+  Ok(())
+}
+
+/// [`SpeechSegment::start_seconds`] / [`SpeechSegment::end_seconds`] convert
+/// sample indices to seconds at the inference rate (the reference's
+/// `return_seconds=True` view).
+#[test]
+fn speech_segment_seconds_accessors() {
+  let seg = SpeechSegment::new(16_000, 32_000);
+  assert_eq!(seg.start_seconds(16_000), 1.0);
+  assert_eq!(seg.end_seconds(16_000), 2.0);
+  assert_eq!(seg.start_seconds(8_000), 2.0);
+}
+
+// ───────────── get_speech_timestamps + predict / reset_state (#6/#7/#10) ─────
+
+/// `get_speech_timestamps` runs the full prepare → predict → segment pipeline
+/// and honors a per-call threshold override (the reference's keyword args). A
+/// zero-weight model's sigmoid head is 0.5 everywhere: threshold 0.5 (default)
+/// ⇒ all-speech (one segment), threshold 0.6 ⇒ silence (empty).
+#[test]
+fn get_speech_timestamps_default_and_override() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[16 * 512])?;
+
+  let segs = model.get_speech_timestamps(&audio, 16_000, SpeechTimestampOptions::default())?;
+  assert!(!segs.is_empty(), "all-0.5 probs at threshold 0.5 → speech");
+
+  let opts = SpeechTimestampOptions {
+    threshold: Some(0.6),
+    ..Default::default()
+  };
+  let none = model.get_speech_timestamps(&audio, 16_000, opts)?;
+  assert!(none.is_empty(), "all-0.5 probs at threshold 0.6 → silence");
+  Ok(())
+}
+
+/// `predict` (the public prepare + probabilities entry) and `reset_state` (the
+/// `initial_state` alias) are wired through correctly.
+#[test]
+fn predict_and_reset_state_smoke() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[1024])?;
+  let mut probs = model.predict(&audio, 16_000)?;
+  probs.eval()?;
+  assert_eq!(probs.shape(), vec![2]); // 1024 / 512
+
+  let state = model.reset_state(1, 16_000)?;
+  assert_eq!(state.context().shape(), vec![1, 64]);
+  assert!(state.state().is_none());
+  Ok(())
+}
+
+// ─────────────────── per-call override + gate hardening ───────────────────
+
+/// A negative per-call duration/padding override is rejected with a typed error
+/// (the override path validates like `ModelConfig` does at load), so it cannot
+/// produce a `start > end` segment from the padding step.
+#[test]
+fn get_speech_timestamps_rejects_negative_override() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[4 * 512])?;
+  let opts = SpeechTimestampOptions {
+    speech_pad_ms: Some(-100),
+    ..Default::default()
+  };
+  assert!(matches!(
+    model.get_speech_timestamps(&audio, 16_000, opts),
+    Err(crate::error::Error::OutOfRange(_))
+  ));
+  Ok(())
+}
+
+/// A quantized LSTM checkpoint (a `lstm.Wx.scales` sibling — NOT a `*.weight`
+/// key) is still rejected: the dense-only gate detects ANY `.scales` tensor.
+#[test]
+fn from_weights_rejects_quantized_lstm_scales() {
+  let config = ModelConfig::default();
+  let mut weights = HashMap::new();
+  insert_branch_weights(&mut weights, config.branch_16k(), "vad_16k", config.dtype());
+  insert_branch_weights(&mut weights, config.branch_8k(), "vad_8k", config.dtype());
+  weights.insert("vad_16k.lstm.Wx.scales".to_string(), zeros(&[512, 1]));
+  assert!(matches!(
+    SileroVadModel::from_weights(config, weights),
+    Err(crate::error::Error::OutOfRange(_))
+  ));
+}
+
+/// A rank-2 zero-row batch `(0, T)` at an unsupported sample rate returns an
+/// empty prepared batch at the resolved 16 kHz rate instead of crashing in the
+/// resample row-loop's empty concatenate.
+#[test]
+fn prepare_audio_zero_row_batch_at_unsupported_rate() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let empty_batch = Array::zeros::<f32>(&[0, 1000])?;
+  let (prepared, sr) = model.prepare_audio(&empty_batch, 32_000)?;
+  assert_eq!(sr, 16_000);
+  assert_eq!(prepared.shape()[0], 0);
+  Ok(())
+}
+
+/// Empty batches of EITHER layout — zero rows `(0, T)` or zero width `(B, 0)`
+/// — flow through the PUBLIC timestamp paths end-to-end: `generate` and
+/// `get_speech_timestamps` return no timestamps instead of failing on the
+/// batched `probs[0]` row-take (a zero-row rank-2 probability array has no
+/// row 0) or on a zero-length downmix reduction. Covers supported and
+/// unsupported rates (the resample path).
+#[test]
+fn empty_batches_yield_empty_timestamps_end_to_end() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  for (r, c) in [(0usize, 1000usize), (2, 0)] {
+    for rate in [16_000u32, 32_000] {
+      let audio = Array::zeros::<f32>(&[r as i32, c as i32])?;
+      let out = model.generate(&audio, rate)?;
+      assert!(
+        out.timestamps.is_empty(),
+        "generate on ({r}, {c}) at {rate} Hz must yield no timestamps"
+      );
+      let segs = model.get_speech_timestamps(&audio, rate, SpeechTimestampOptions::default())?;
+      assert!(
+        segs.is_empty(),
+        "get_speech_timestamps on ({r}, {c}) at {rate} Hz must yield no segments"
+      );
+    }
+  }
+  Ok(())
+}
+
+/// A zero-ROW batch with a nonzero width at an UNSUPPORTED rate resolves its
+/// time axis to the resampled width, so the probability frame count reflects
+/// the resolved 16 kHz timeline (1000 samples at 32 kHz resample to ~500 at
+/// 16 kHz → zero frames of 512 would differ from the un-resampled 1000's one
+/// frame — the shape contract must track the resolved rate, not the original).
+#[test]
+fn zero_row_unsupported_rate_resolves_resampled_width() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let audio = Array::zeros::<f32>(&[0, 1000])?;
+  let (prepared, sr) = model.prepare_audio(&audio, 32_000)?;
+  assert_eq!(sr, 16_000);
+  let w = prepared.shape()[1];
+  assert!(
+    (400..=600).contains(&w),
+    "the empty batch's width must be the RESAMPLED length (~500), got {w}"
+  );
+  // End-to-end: the probability frame count follows the resolved timeline.
+  let out = model.generate(&audio, 32_000)?;
+  let frames = *out.probabilities.shape().last().unwrap_or(&usize::MAX);
+  assert_eq!(
+    frames,
+    w.div_ceil(512),
+    "probability frames must chunk the resampled width"
+  );
+  assert!(out.timestamps.is_empty());
+  Ok(())
+}
+
+/// The empty-batch resampled width is pure shape ARITHMETIC: a data-less
+/// zero-row batch with a huge width must resolve instantly (no
+/// width-proportional dummy allocation) to the arithmetically-resampled
+/// width.
+#[test]
+fn zero_row_huge_width_is_shape_arithmetic_only() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let huge = 1_000_000_000i32; // 1e9 samples — 4 GB if materialized as f32
+  let audio = Array::zeros::<f32>(&[0, huge])?;
+  let (prepared, sr) = model.prepare_audio(&audio, 32_000)?;
+  assert_eq!(sr, 16_000);
+  assert_eq!(
+    prepared.shape(),
+    vec![0, (huge as usize) / 2],
+    "width must be the arithmetic in*to/from resample length"
+  );
+  Ok(())
+}
+
+/// A zero-row batch short-circuits `predict_proba` to the reference's
+/// `(0, ceil(total / chunk))` frame contract WITHOUT running the chunk loop
+/// (a `(0, huge)` input would otherwise iterate millions of empty windows).
+#[test]
+fn zero_row_predict_proba_short_circuits_frame_shape() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let huge = 1_000_000_000i32;
+  let audio = Array::zeros::<f32>(&[0, huge])?;
+  let probs = model.predict_proba(&audio, 16_000)?;
+  assert_eq!(
+    probs.shape(),
+    vec![0, (huge as usize).div_ceil(512)],
+    "zero-row probabilities must carry the reference frame count"
+  );
+  Ok(())
+}
+
+/// A zero sample rate is a typed error from `prepare_audio` — never an
+/// integer divide-by-zero — for empty AND non-empty inputs alike.
+#[test]
+fn zero_sample_rate_is_typed_error() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  for shape in [[0i32, 1000], [2, 1000]] {
+    let audio = Array::zeros::<f32>(&shape)?;
+    assert!(
+      matches!(
+        model.prepare_audio(&audio, 0),
+        Err(crate::error::Error::OutOfRange(_))
+      ),
+      "sample_rate 0 on {shape:?} must be a typed error"
+    );
+  }
+  Ok(())
+}
+
+/// The stereo-downmix predicate is the EXACT reference heuristic
+/// (`shape[-1] <= 8 < shape[0]`, silero_vad.py:338): a small `(3, 2)` batch —
+/// whose row count does NOT exceed 8 — stays a batch, it is not collapsed to
+/// a mono `(3,)` signal even though its column count is small.
+#[test]
+fn prepare_audio_small_batch_is_not_downmixed() -> Result<()> {
+  let model = synthetic_model(ModelConfig::default());
+  let small = Array::zeros::<f32>(&[3, 2])?;
+  let (prepared, _) = model.prepare_audio(&small, 16_000)?;
+  assert_eq!(
+    prepared.shape(),
+    vec![3, 2],
+    "rows <= 8 must not trigger the stereo downmix (reference: 8 < rows)"
+  );
+  Ok(())
+}
