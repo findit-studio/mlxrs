@@ -58,10 +58,18 @@ use crate::{
 ///    port's builder reads. Keys that are **not** under `audio_tower.` after
 ///    the `thinker.` strip (the text decoder, `lm_head`, ...) are dropped —
 ///    this is the audio tower only.
-/// 3. A 4-D `conv2d*.weight` is transposed PyTorch `(out, in, kH, kW)` → MLX
-///    channels-last `(out, kH, kW, in)` via `transpose(0, 2, 3, 1)`, matching
-///    the reference's conv2d handling (and the crate's channels-last conv
-///    convention).
+/// 3. **Only for a raw HF/PyTorch checkpoint**, a 4-D `conv2d*.weight` is
+///    transposed PyTorch `(out, in, kH, kW)` → MLX channels-last
+///    `(out, kH, kW, in)` via `transpose(0, 2, 3, 1)`. Raw is detected exactly
+///    as the reference does (`is_formatted = not any(k.startswith("thinker.")
+///    for k in weights)`): the checkpoint is raw iff **any** input key carries
+///    the `thinker.` wrapper, evaluated over the **whole** map before any
+///    per-key rewrite. An already-converted checkpoint — e.g. the released
+///    `mlx-community/Qwen3-ForcedAligner-0.6B-8bit`, whose index has no
+///    `thinker.` keys and whose conv kernels are already channels-last —
+///    passes through untransposed; re-transposing would permute the kernels to
+///    `(out, kW, in, kH)` and the shape-pinned conv loader
+///    ([`AudioEncoder::from_weights`]) would reject the load.
 /// 4. A duplicate destination key is rejected with [`Error::KeyCollision`]
 ///    (via [`insert_unique`]) rather than letting an arbitrary (per-run
 ///    nondeterministic) survivor win — e.g. a checkpoint carrying both the
@@ -70,6 +78,13 @@ use crate::{
 /// [`Error::KeyCollision`]: crate::error::Error::KeyCollision
 #[cfg_attr(docsrs, doc(cfg(feature = "qwen3-asr")))]
 pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array>> {
+  // The reference's formatted-checkpoint gate (`is_formatted = not
+  // any(k.startswith("thinker.") for k in weights)`), computed over the whole
+  // input map BEFORE the per-key loop: one `thinker.` key anywhere marks the
+  // checkpoint raw-HF (every 4-D conv kernel is transposed, prefixed or not);
+  // none — including the empty map, vacuously formatted — skips the transpose
+  // globally.
+  let is_formatted = !weights.keys().any(|k| k.starts_with("thinker."));
   let mut out = HashMap::with_capacity(weights.len());
   for (mut k, mut v) in weights {
     // 1. Drop a leading `thinker.` wrapper prefix.
@@ -83,10 +98,12 @@ pub fn sanitize(weights: HashMap<String, Array>) -> Result<HashMap<String, Array
     };
     k = rest.to_string();
 
-    // 3. PyTorch Conv2d weight (out, in, kH, kW) → MLX channels-last
-    //    (out, kH, kW, in). Only the 4-D conv2d kernels need it; biases and the
-    //    1-D/2-D weights pass through unchanged.
-    if k.starts_with("conv2d") && k.ends_with(".weight") && v.ndim() == 4 {
+    // 3. Raw-HF checkpoints only: PyTorch Conv2d weight (out, in, kH, kW) →
+    //    MLX channels-last (out, kH, kW, in). Only the 4-D conv2d kernels need
+    //    it; biases and the 1-D/2-D weights pass through unchanged. A
+    //    formatted checkpoint's kernels are already channels-last and must not
+    //    be re-permuted (the conv loader pins the channels-last shape).
+    if !is_formatted && k.starts_with("conv2d") && k.ends_with(".weight") && v.ndim() == 4 {
       v = transpose_axes(&v, &[0, 2, 3, 1])?;
     }
 
