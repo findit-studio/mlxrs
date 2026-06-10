@@ -277,6 +277,137 @@ fn padded_pixel_rows_do_not_affect_pooled_output() {
 }
 
 #[test]
+fn fp_mode_quantized_patch_embed_does_not_cast_pixel_values() {
+  // An `mxfp4`-quantized patch embed carries **U8 (e8m0) scales** — packed
+  // exponents, NOT a compute dtype (`validate_quantized_triple` enforces U8
+  // for the fp modes). The pixel-values cast must therefore be float-gated:
+  // an ungated `astype(scales.dtype())` would feed a `uint8` x into the
+  // non-affine `quantized_matmul`, which rejects non-float inputs (vendored
+  // `mlx/ops.cpp` "Only real floating types") — turning a checkpoint that
+  // forwards fine without the cast (F32 compute) into a first-forward error.
+  // With the gate, the F32 input passes through uncast, exactly the pre-cast
+  // behavior.
+  //
+  // Fixture: `patch = 8`, `channels = 3` → `patch_feature_dim = 192`, a whole
+  // multiple of the mxfp4 group size 32, so the patch embed quantizes; the
+  // rest of the tower stays dense F32 (`skip_vision`-style mixed checkpoint).
+  const FP_PATCH: i32 = 8;
+  const FP_HIDDEN: i32 = 32;
+  const FP_INTER: i32 = 64;
+  const FP_FEAT: i32 = FP_PATCH * FP_PATCH * CHANNELS; // 192 = 6 * 32
+  let json = format!(
+    r#"{{
+      "model_type": "siglip2_vision_model",
+      "image_size": 16,
+      "patch_size": {FP_PATCH},
+      "num_channels": {CHANNELS},
+      "hidden_size": {FP_HIDDEN},
+      "intermediate_size": {FP_INTER},
+      "num_attention_heads": {HEADS},
+      "num_hidden_layers": {LAYERS},
+      "layer_norm_eps": 1e-6,
+      "vision_use_head": false,
+      "num_patches": {NUM_PATCHES},
+      "max_num_patches": {NUM_PATCHES}
+    }}"#
+  );
+  let cfg = VisionConfig::from_json(&json).unwrap();
+
+  let mut w: HashMap<String, Array> = HashMap::new();
+  // The mxfp4-quantized patch embed: pack the dense (32, 192) kernel into the
+  // real `quantize` triple (scale-only — fp modes write no `.biases`).
+  let dense_patch = mat(FP_HIDDEN, FP_FEAT);
+  let (w_q, scales, fp_biases) =
+    crate::ops::quantized::quantize(&dense_patch, 32, 4, "mxfp4", None).unwrap();
+  assert!(fp_biases.is_none(), "fp modes are scale-only");
+  assert_eq!(
+    scales.dtype().unwrap(),
+    Dtype::U8,
+    "precondition: mxfp4 scales are packed e8m0 uint8 — not a compute dtype"
+  );
+  w.insert("embeddings.patch_embedding.weight".to_string(), w_q);
+  w.insert("embeddings.patch_embedding.scales".to_string(), scales);
+  w.insert(
+    "embeddings.patch_embedding.bias".to_string(),
+    vec1(FP_HIDDEN),
+  );
+  // Dense remainder, sized to the fp config's dims.
+  w.insert(
+    "embeddings.position_embedding.weight".to_string(),
+    mat(NUM_PATCHES, FP_HIDDEN),
+  );
+  let dims_mat = |r: i32, c: i32| mat(r, c);
+  for p in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+    w.insert(
+      format!("encoder.layers.0.self_attn.{p}.weight"),
+      dims_mat(FP_HIDDEN, FP_HIDDEN),
+    );
+    w.insert(
+      format!("encoder.layers.0.self_attn.{p}.bias"),
+      vec1(FP_HIDDEN),
+    );
+  }
+  for ln in [
+    "encoder.layers.0.layer_norm1",
+    "encoder.layers.0.layer_norm2",
+    "post_layernorm",
+  ] {
+    w.insert(format!("{ln}.weight"), vec1(FP_HIDDEN));
+    w.insert(format!("{ln}.bias"), vec1(FP_HIDDEN));
+  }
+  w.insert(
+    "encoder.layers.0.mlp.fc1.weight".to_string(),
+    dims_mat(FP_INTER, FP_HIDDEN),
+  );
+  w.insert("encoder.layers.0.mlp.fc1.bias".to_string(), vec1(FP_INTER));
+  w.insert(
+    "encoder.layers.0.mlp.fc2.weight".to_string(),
+    dims_mat(FP_HIDDEN, FP_INTER),
+  );
+  w.insert("encoder.layers.0.mlp.fc2.bias".to_string(), vec1(FP_HIDDEN));
+
+  let quant = crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization {
+    group_size: 32,
+    bits: 4,
+    mode: crate::lm::quant::QuantMode::Mxfp4,
+  });
+  let tower = VisionTower::from_weights_quantized(&cfg, &mut w, Some(&quant))
+    .expect("an mxfp4-quantized patch embed must load");
+
+  // Hand-built full-budget inputs (2x2 active grid, per-patch width 192).
+  let per_patch = FP_FEAT as usize;
+  let pv: Vec<f32> = (0..NUM_PATCHES as usize * per_patch)
+    .map(|i| ((i % 7) as f32) * 0.01 + 0.01)
+    .collect();
+  let inputs = NaflexInputs {
+    pixel_values: Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap(),
+    pixel_attention_mask: Array::from_slice::<i32>(
+      &vec![1i32; NUM_PATCHES as usize],
+      &(NUM_PATCHES as usize,),
+    )
+    .unwrap(),
+    spatial_shapes: Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap(),
+  };
+
+  // The forward must NOT error (no uint8 cast into the fp quantized_matmul)
+  // and must keep the F32 input precision (the dense remainder is F32).
+  let (last_hidden, pooled) = tower
+    .forward(&inputs)
+    .expect("fp-mode patch embed: F32 pixel_values must forward uncast");
+  assert!(pooled.is_none(), "vision_use_head=false");
+  assert_eq!(
+    last_hidden.dtype().unwrap(),
+    Dtype::F32,
+    "no float parameter dtype exists for an fp-mode patch embed — the input \
+     F32 passes through uncast"
+  );
+  assert!(
+    eval_to_vec(&last_hidden).iter().all(|x| x.is_finite()),
+    "fp-mode forward must be finite"
+  );
+}
+
+#[test]
 fn vision_tower_output_shapes_square_grid() {
   let cfg = tiny_vision_config(true);
   let mut w = tiny_vision_weights(true);

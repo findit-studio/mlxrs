@@ -80,8 +80,13 @@
 //! mlx-embeddings `siglip.py` (`get_image_features`:
 //! `pixel_values.astype(patch_embedding.weight.dtype)`) — and
 //! [`VisionTower::forward`] restores that cast (the patch-embed weight dtype;
-//! a quantized patch embed resolves its `scales` dtype). A same-dtype `astype`
-//! is a no-op, so an `F32` checkpoint pays nothing.
+//! an **affine**-quantized patch embed resolves its float `scales` dtype). A
+//! same-dtype `astype` is a no-op, so an `F32` checkpoint pays nothing. The
+//! resolution is **float-gated**: an fp-mode (`mxfp4` / `mxfp8` / `nvfp4`)
+//! quantized patch embed carries packed e8m0 `uint8` scales — not a compute
+//! precision — so no cast is applied there (the non-affine `quantized_matmul`
+//! rejects an integer input; the F32 pixels pass through unchanged, the
+//! pre-cast behavior).
 
 use std::collections::HashMap;
 
@@ -263,12 +268,17 @@ pub struct VisionTower {
   /// The loaded config's per-patch feature width (`P^2 * C`); `forward` pins
   /// the runtime `pixel_values` last axis to it.
   patch_feature_dim: usize,
-  /// The model compute dtype — the patch-embed projection's parameter dtype
-  /// (the dense weight's dtype, or the `scales` dtype for a quantized patch
-  /// embed), resolved once at load. [`forward`](Self::forward) casts the
-  /// (always-`F32`) runtime `pixel_values` to it so a reduced-precision
-  /// checkpoint runs in its own precision (see the module docs).
-  dtype: Dtype,
+  /// The model compute dtype — the patch-embed projection's **float**
+  /// parameter dtype (the dense weight's dtype, or the `scales` dtype for an
+  /// affine-quantized patch embed), resolved once at load.
+  /// [`forward`](Self::forward) casts the (always-`F32`) runtime
+  /// `pixel_values` to it so a reduced-precision checkpoint runs in its own
+  /// precision (see the module docs). `None` when no float parameter dtype
+  /// exists — an **fp-mode** (`mxfp4` / `mxfp8` / `nvfp4`) quantized patch
+  /// embed carries packed e8m0 `uint8` scales, which are not a compute
+  /// precision; `forward` then leaves the input dtype untouched (casting to
+  /// `uint8` would be rejected by the non-affine `quantized_matmul`).
+  dtype: Option<Dtype>,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -368,11 +378,13 @@ impl VisionTower {
         proj: QuantLinear::dense(patch_weight, Some(patch_bias)),
       }
     };
-    // The model compute dtype: the patch-embed projection's parameter dtype
-    // (dense weight dtype / quantized scales dtype) — the same resolution the
-    // references use for the pixel-values cast (HF `modeling_siglip2.py`'s
-    // `target_dtype = patch_embedding.weight.dtype`; mlx-embeddings
-    // `siglip.py`'s `patch_embedding.weight.dtype`). Resolved once here so
+    // The model compute dtype: the patch-embed projection's FLOAT parameter
+    // dtype (dense weight dtype / affine-quantized scales dtype) — the same
+    // resolution the references use for the pixel-values cast (HF
+    // `modeling_siglip2.py`'s `target_dtype = patch_embedding.weight.dtype`;
+    // mlx-embeddings `siglip.py`'s `patch_embedding.weight.dtype`). `None`
+    // for an fp-mode quantized patch embed (uint8 e8m0 scales — not a compute
+    // precision; `forward` then skips the cast). Resolved once here so
     // `forward` pays no per-call metadata lookup.
     let dtype = patch_embed.proj.param_dtype()?;
 
@@ -527,7 +539,15 @@ impl VisionTower {
     // astype is a no-op, so an `F32` checkpoint (or a pre-cast input) pays
     // nothing. The key mask below is BOOLEAN precisely so it stays valid for
     // any model dtype (see `build_attention_mask`).
-    let pixel_values = inputs.pixel_values.astype(self.dtype)?;
+    let pixel_values = match self.dtype {
+      Some(dt) => inputs.pixel_values.astype(dt)?,
+      // No float parameter dtype to pin to (an fp-mode quantized patch embed —
+      // uint8 e8m0 scales): leave the input dtype untouched, the pre-cast
+      // behavior. The non-affine `quantized_matmul` itself requires a float
+      // `x`, so casting to the scales' integer dtype would error; `try_clone`
+      // is a cheap refcounted handle copy (no data copy).
+      None => inputs.pixel_values.try_clone()?,
+    };
     // (max_num_patches, P^2*C) → (1, max_num_patches, P^2*C).
     let pixel_values = ops::shape::expand_dims_axes(&pixel_values, &[0])?;
     // (1, max_num_patches, hidden).
