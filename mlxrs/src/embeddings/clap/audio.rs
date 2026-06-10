@@ -68,11 +68,23 @@
 //! Every `nn.Linear` (the window q/k/v/output, the Swin MLP fc1/fc2, the
 //! patch-merge reductions) is quantize-aware via the shared blocks'
 //! `QuantLinear` (the `.scales`-sibling `class_predicate`), so a quantized CLAP
-//! checkpoint loads
-//! with a byte-identical dense path. The mel→image fold, the batch-norm affine,
-//! and the relative-position bias are cast back to the activation dtype before
-//! they meet the activations, so an f16/bf16 checkpoint is not silently promoted
-//! to f32 (the recurring activation-dtype-preservation faithfulness bug).
+//! checkpoint loads with a byte-identical dense path.
+//!
+//! [`HtsatAudioTower::forward`] casts the incoming mel to the tower's
+//! **computation dtype** — the patch-embed conv weight dtype, floating-gated
+//! (`PatchEmbed::compute_dtype`) — at its entry: the [`super::mel`] front-end
+//! always produces `F32`, MLX type promotion only widens (`f16 op f32 → f32`),
+//! and the PyTorch reference relies on `model.half()` to convert the input
+//! implicitly, so a port must cast explicitly (the whisper `encode` mel-cast
+//! precedent, commit `1723a5c`). The in-tower constants then *follow* that
+//! activation dtype — the batch-norm affine, the relative-position bias, and
+//! the SW-MSA `-100` shift mask are each cast to the activation dtype before
+//! they meet the activations (mlx's fast SDPA rejects a mask that would widen
+//! the output dtype, `fast.cpp` `promote_types(mask, out) == out`) — so an
+//! f16/bf16 checkpoint runs in its own dtype end-to-end instead of being
+//! silently promoted to f32 (the recurring activation-dtype-preservation
+//! faithfulness bug). An `F32` checkpoint is byte-unchanged (a same-dtype
+//! astype is a no-op).
 //!
 //! ## Scope
 //!
@@ -86,6 +98,7 @@ use std::collections::HashMap;
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   embeddings::clap::{
     config::ClapConfig,
     shared::{PatchMerging, SwinBlock, build_layer_norm, dim_i32, take_shaped},
@@ -176,6 +189,14 @@ impl EncoderBatchNorm {
 
   /// `(B, 1, time, freq) → (B, 1, time, freq)`: `x * scale + shift` broadcast
   /// over the last (`freq`) axis, in the activation dtype.
+  ///
+  /// [`HtsatAudioTower::forward`] has already cast `x` to the tower's
+  /// computation (model) dtype, so following the *activation* dtype here is
+  /// the correct direction: for a uniform checkpoint this cast is a no-op, and
+  /// for a mixed one (e.g. f32 batch-norm buffers in an f16 checkpoint) it
+  /// down-casts the affine rather than promoting the activations. Without the
+  /// entry cast this same follow-the-activation cast would do the opposite —
+  /// pin the tower to the front-end's `F32` mel and upcast every weight.
   fn forward(&self, x: &Array) -> Result<Array> {
     let dtype = x.dtype()?;
     let scale = ops::misc::astype(&self.scale, dtype)?;
@@ -290,6 +311,26 @@ impl PatchEmbed {
     let flat = flat.add(&bias)?;
     let normed = self.norm.forward(&flat)?;
     Ok((normed, h_grid, w_grid))
+  }
+
+  /// The stem's — and therefore the tower's — floating **computation dtype**:
+  /// the conv `proj.weight` dtype, or `None` when that dtype is not a float
+  /// (the mel must never be cast to a non-float dtype).
+  ///
+  /// The conv weight is the model-dtype witness because it is the first weight
+  /// the activations meet, and it always loads **dense**: `sanitize` only
+  /// transposes its layout, and the quantize path never wraps the conv (see
+  /// [`HtsatAudioTower::from_weights_quantized`] — a conv is not a quantized
+  /// `Linear`), so for a real checkpoint this is simply the checkpoint dtype.
+  /// The float gate is defense in depth, mirroring the LFM2-VL
+  /// `compute_dtype` precedent: should the patch embed ever become
+  /// quantizable, an `fp`-mode (mxfp4/mxfp8/nvfp4) layer's scales are packed
+  /// `uint8` — reading a dtype off a quantized representation and casting the
+  /// activations to it would corrupt the mel, so a non-float dtype yields
+  /// `None` (no cast) instead.
+  fn compute_dtype(&self) -> Result<Option<Dtype>> {
+    let dt = self.proj_weight.dtype()?;
+    Ok(matches!(dt, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64).then_some(dt))
   }
 }
 
@@ -594,6 +635,17 @@ impl HtsatAudioTower {
   /// mean-pool. `input_features` is pinned to rank-4 `(B, 1, T, F)` (the public
   /// forward accepts an untrusted array; every downstream reshape assumes that
   /// shape).
+  ///
+  /// The mel is cast to the tower's computation dtype (the patch-embed conv
+  /// weight dtype, floating-gated — `PatchEmbed::compute_dtype`) first: the
+  /// [`super::mel`] front-end always produces an `F32` mel, MLX type promotion
+  /// only widens (`f16 op f32 → f32`), and the PyTorch reference converts the
+  /// input implicitly via `model.half()`, so without this explicit cast an
+  /// f16/bf16 checkpoint would silently run the whole tower in `F32`,
+  /// upcasting every weight on every forward (the whisper `encode` mel-cast
+  /// precedent). A same-dtype astype is a no-op, so an `F32` checkpoint (or an
+  /// already-cast mel) pays nothing; a non-float weight dtype leaves the mel
+  /// untouched.
   pub fn forward(&self, input_features: &Array) -> Result<Array> {
     let shape = input_features.shape();
     if shape.len() != 4 {
@@ -620,8 +672,20 @@ impl HtsatAudioTower {
       )));
     }
 
+    // 0. Cast the mel to the tower's computation dtype — the patch-embed conv
+    //    weight dtype, floating-gated (see the forward doc + the module's
+    //    `Quant + dtype` section). Both `ClapModel` entries (`embed_audio` and
+    //    `embed_mel` / `Embed<AudioInput>`) funnel through this forward, so the
+    //    single entry cast covers every caller; the in-tower constants (the
+    //    batch-norm affine, the relative-position bias, the SW-MSA `-100`
+    //    mask) all follow the activation dtype from here on.
+    let input_features = match self.patch_embed.compute_dtype()? {
+      Some(dtype) => ops::misc::astype(input_features, dtype)?,
+      None => input_features.try_clone()?,
+    };
+
     // 1. encoder batch-norm (per-mel-bin affine over the running statistics).
-    let normalized = self.batch_norm.forward(input_features)?;
+    let normalized = self.batch_norm.forward(&input_features)?;
 
     // 2. reshape_mel2img: fold the mel into the (spec_size, spec_size) image.
     let image = reshape_mel2img(&normalized, self.spec_size, self.freq_ratio)?;

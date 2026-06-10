@@ -477,6 +477,78 @@ fn tower_preserves_bf16() {
   assert_tower_preserves_dtype(Dtype::BF16);
 }
 
+/// Production hands the tower the mel front-end's output verbatim
+/// (`MelFrontEnd::extract` is pinned to `Dtype::F32` — `ClapModel::embed_audio`
+/// / `embed_mel` never pre-cast it), so the tower must own the cast to its
+/// compute dtype (the patch-embed conv weight dtype). MLX type promotion only
+/// widens (`f16 op f32 → f32`): without the entry cast an f16/bf16 checkpoint
+/// silently runs the whole Swin tower in F32, upcasting every weight on every
+/// forward — the whisper `encode` mel-cast precedent (commit 1723a5c).
+fn assert_f32_mel_runs_in_model_dtype(dtype: Dtype) {
+  let cfg = clap_config();
+  let mut w = htsat_weights();
+  for v in w.values_mut() {
+    *v = v.astype(dtype).unwrap();
+  }
+  let tower = HtsatAudioTower::from_weights(&cfg, &mut w).unwrap();
+  // The mel exactly as the production front-end produces it: F32, NOT pre-cast.
+  let mel = synthetic_mel(1001, NUM_MELS);
+  assert_eq!(mel.dtype().unwrap(), Dtype::F32, "fixture mel is F32");
+  let out = tower.forward(&mel).unwrap();
+  assert_eq!(
+    out.dtype().unwrap(),
+    dtype,
+    "an F32 mel on a {dtype:?} tower must run (and pool) in {dtype:?}"
+  );
+  assert_eq!(out.shape(), vec![1, 768]);
+}
+
+#[test]
+fn f32_mel_on_f16_tower_runs_in_f16() {
+  assert_f32_mel_runs_in_model_dtype(Dtype::F16);
+}
+
+#[test]
+fn f32_mel_on_bf16_tower_runs_in_bf16() {
+  assert_f32_mel_runs_in_model_dtype(Dtype::BF16);
+}
+
+#[test]
+fn patch_embed_compute_dtype_is_floating_gated() {
+  // The model-dtype witness is the patch-embed conv weight dtype, floating
+  // gated: a float weight yields its dtype (the mel cast target), a non-float
+  // weight yields `None` (no cast). The `None` arm is the fp-mode-quantization
+  // guard (mxfp4/mxfp8/nvfp4 scales are packed `uint8`): should the patch
+  // embed ever load a quantized representation, the mel must never be cast to
+  // an integer dtype.
+  let build = |dtype: Dtype| {
+    let mut w = HashMap::new();
+    let hidden = 6;
+    let conv = Array::full::<f32>(
+      &(hidden as usize, PATCH as usize, PATCH as usize, 1usize),
+      0.01,
+    )
+    .unwrap()
+    .astype(dtype)
+    .unwrap();
+    w.insert("patch_embed.proj.weight".to_string(), conv);
+    w.insert("patch_embed.proj.bias".to_string(), vec1(hidden));
+    put_layer_norm(&mut w, "patch_embed.norm", hidden);
+    PatchEmbed::from_weights(&mut w, 1, hidden, PATCH, EPS).unwrap()
+  };
+  assert_eq!(build(Dtype::F16).compute_dtype().unwrap(), Some(Dtype::F16));
+  assert_eq!(
+    build(Dtype::BF16).compute_dtype().unwrap(),
+    Some(Dtype::BF16)
+  );
+  assert_eq!(build(Dtype::F32).compute_dtype().unwrap(), Some(Dtype::F32));
+  assert_eq!(
+    build(Dtype::U8).compute_dtype().unwrap(),
+    None,
+    "a non-float conv weight must not become a mel cast target"
+  );
+}
+
 // ════════════════════════ quantized load + forward ════════════════════════════
 
 /// Affine group size for the synthetic quantized checkpoint (divides every Swin

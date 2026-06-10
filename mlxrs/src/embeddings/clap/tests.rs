@@ -351,7 +351,11 @@ fn embed_via_audio_input_matches_embed_audio() {
 
 #[test]
 fn embed_audio_preserves_f16_dtype() {
-  // An f16 checkpoint stays f16 end-to-end (no silent f32 promotion).
+  // An f16 checkpoint stays f16 end-to-end through the FULL production path:
+  // `embed_audio` hands the audio tower the front-end's `F32` mel verbatim
+  // ([`MelFrontEnd::extract`] is pinned to `Dtype::F32`), and the tower owns
+  // the cast to the model dtype at its entry — the caller must NOT have to
+  // pre-cast the mel (no silent f32 promotion of the whole tower).
   let cfg = clap_config();
   let mut raw = full_checkpoint();
   for v in raw.values_mut() {
@@ -359,13 +363,7 @@ fn embed_audio_preserves_f16_dtype() {
   }
   let weights = sanitize(raw).unwrap();
   let model = ClapModel::from_weights(cfg, weights).unwrap();
-  let mel = model
-    .mel_front_end()
-    .extract(&samples())
-    .unwrap()
-    .astype(Dtype::F16)
-    .unwrap();
-  let emb = model.embed_mel(&mel).unwrap();
+  let emb = model.embed_audio(&samples()).unwrap();
   assert_eq!(
     emb.array().dtype().unwrap(),
     Dtype::F16,
