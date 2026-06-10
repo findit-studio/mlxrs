@@ -365,3 +365,270 @@ fn cmudict_loader_accepts_well_known_word_after_fix() {
   let entry = dict.lookup("hello").expect("hello in dict");
   assert_eq!(entry.phonemes_slice(), ["h", "ə", "l", "oʊ"]);
 }
+
+// ============================================================
+// Inline `#` comment stripping — the canonical cmusphinx
+// `cmudict.dict` carries inline comments on the pronunciation side
+// (22 rows in master, e.g. `aalborg AO1 L B AO0 R G # place, danish`).
+// Pre-fix, the `#` and the comment words leaked into the ARPAbet token
+// list, the strict converter rejected `#` as a BadArpabetToken, and the
+// WHOLE canonical-file load failed on its first commented row (line 29).
+// ============================================================
+
+/// Verbatim line 29 of canonical cmusphinx/cmudict `cmudict.dict`.
+#[test]
+fn parse_line_strips_inline_hash_comment() {
+  let entry = parse_line("aalborg AO1 L B AO0 R G # place, danish", 29)
+    .unwrap()
+    .expect("entry");
+  assert_eq!(entry.word(), "aalborg");
+  assert_eq!(entry.arpabet(), ["AO1", "L", "B", "AO0", "R", "G"]);
+  assert_eq!(entry.variant(), None);
+}
+
+/// Verbatim line 28252 of canonical cmudict.dict — a `(N)` variant row
+/// carrying an inline comment. The variant suffix must still parse.
+#[test]
+fn parse_line_strips_inline_comment_on_variant_row() {
+  let entry = parse_line("dail(2) D OY1 L # org, irish", 28252)
+    .unwrap()
+    .expect("entry");
+  assert_eq!(entry.word(), "dail");
+  assert_eq!(entry.variant(), Some(2));
+  assert_eq!(entry.arpabet(), ["D", "OY1", "L"]);
+}
+
+/// A `#` glued directly to comment text (` #place`) still starts a
+/// comment — the comment marker is any whitespace-delimited token that
+/// BEGINS with `#`, not only a lone `#`.
+#[test]
+fn parse_line_strips_hash_comment_glued_to_text() {
+  let entry = parse_line("aalborg AO1 L B AO0 R G #place,danish", 1)
+    .unwrap()
+    .expect("entry");
+  assert_eq!(entry.arpabet(), ["AO1", "L", "B", "AO0", "R", "G"]);
+}
+
+/// After comment stripping, the converted IPA must be identical to the
+/// same row WITHOUT the comment (the comment must not perturb phonemes).
+#[test]
+fn inline_comment_entry_converts_same_as_uncommented() {
+  let commented = parse("aalborg AO1 L B AO0 R G # place, danish", true).unwrap();
+  let plain = parse("aalborg AO1 L B AO0 R G", true).unwrap();
+  let dict_commented = CMUDict::from_raw_entries(commented).unwrap();
+  let dict_plain = CMUDict::from_raw_entries(plain).unwrap();
+  let a = dict_commented
+    .lookup("aalborg")
+    .expect("aalborg (commented)");
+  let b = dict_plain.lookup("aalborg").expect("aalborg (plain)");
+  assert_eq!(a.phonemes_slice(), b.phonemes_slice());
+  assert_eq!(a.phonemes_slice(), ["ɔ", "l", "b", "ɔ", "ɹ", "ɡ"]);
+}
+
+/// A row whose pronunciation is ONLY a comment has no phonemes — that is
+/// a malformed row and must error (with the 1-indexed line number), not
+/// silently produce an empty-pronunciation lexicon entry.
+#[test]
+fn parse_line_comment_only_pronunciation_errors() {
+  let err = parse_line("ghost # comment only", 9).unwrap_err();
+  let Error::OutOfRange(payload) = &err else {
+    panic!("comment-only pronunciation must be OutOfRange, got: {err:?}");
+  };
+  assert_eq!(
+    payload.value(),
+    "9",
+    "OutOfRange payload value must carry the 1-indexed line number"
+  );
+}
+
+/// A `#` glued to the TAIL of a token (`G#`) is NOT a comment start: the
+/// token is kept as-is so the strict ARPAbet converter still rejects it
+/// loudly (preserving the anti-corruption value of the strict path), and
+/// the error still carries the word + token + 1-indexed line number.
+#[test]
+fn hash_glued_to_token_tail_is_not_a_comment_and_fails_strict() {
+  let entry = parse_line("weird AO1 G# L", 5).unwrap().expect("entry");
+  assert_eq!(entry.arpabet(), ["AO1", "G#", "L"]);
+  let err = CMUDict::from_raw_entries(vec![entry]).unwrap_err();
+  let msg = err.to_string();
+  assert!(msg.contains("weird"), "expected word in {msg:?}");
+  assert!(msg.contains("G#"), "expected offending token in {msg:?}");
+  assert!(msg.contains("line 5"), "expected line number in {msg:?}");
+}
+
+/// A `#` in the WORD column is part of the word, never a comment
+/// (cmudict-0.7b ships punctuation names like `#hash-mark`). Only the
+/// pronunciation side is comment-stripped.
+#[test]
+fn hash_in_word_column_is_not_a_comment() {
+  let entry = parse_line("#hash-mark HH AE1 SH M AA2 R K", 3)
+    .unwrap()
+    .expect("entry");
+  assert_eq!(entry.word(), "#hash-mark");
+  assert_eq!(entry.arpabet(), ["HH", "AE1", "SH", "M", "AA2", "R", "K"]);
+}
+
+/// Loader-level regression for the issue's exact failure mode: rows with
+/// inline comments (verbatim from the canonical file) must load — pre-fix
+/// the first `#` token failed the whole `CMUDictLoader::load`.
+#[test]
+fn loader_loads_rows_with_inline_comments() {
+  let dir = temp_dir("loader_inline_comments");
+  fs::write(
+    dir.join("cmudict.dict"),
+    "aalborg AO1 L B AO0 R G # place, danish\n\
+     aalborg(2) AA1 L B AO0 R G\n\
+     aalburg AE1 L B ER0 G # place, dutch\n",
+  )
+  .unwrap();
+  let dict =
+    CMUDictLoader::load(&dir).expect("canonical-style rows with inline comments must load");
+  assert_eq!(
+    dict.lookup("aalborg").expect("aalborg").phonemes_slice(),
+    ["ɔ", "l", "b", "ɔ", "ɹ", "ɡ"]
+  );
+  assert_eq!(
+    dict.lookup("aalburg").expect("aalburg").phonemes_slice(),
+    ["æ", "l", "b", "ɚ", "ɡ"]
+  );
+}
+
+/// Integration smoke over the first 100 lines of the canonical
+/// cmusphinx/cmudict `cmudict.dict` (master @ 7479086), embedded verbatim
+/// below — no network. The slice carries five inline `# place/name`
+/// comment rows (29, 31, 32, 36, 37) and eight `(N)` variant rows.
+#[test]
+fn loader_smoke_canonical_head_100() {
+  assert_eq!(
+    CANONICAL_CMUDICT_HEAD_100.lines().count(),
+    100,
+    "fixture must be exactly the canonical head-100"
+  );
+
+  let dir = temp_dir("loader_canonical_head100");
+  fs::write(dir.join("cmudict.dict"), CANONICAL_CMUDICT_HEAD_100).unwrap();
+  let dict = CMUDictLoader::load(&dir).expect("canonical cmudict.dict head-100 must load");
+
+  // 100 rows − 8 `(N)` variant rows (primary_only=true) = 92 graphemes.
+  assert_eq!(dict.len(), 92);
+
+  // Commented rows resolve to comment-free phonemes.
+  assert_eq!(
+    dict.lookup("aalborg").expect("aalborg").phonemes_slice(),
+    ["ɔ", "l", "b", "ɔ", "ɹ", "ɡ"]
+  );
+  // `aalto AA1 L T OW2 # name, finnish`.
+  assert_eq!(
+    dict.lookup("aalto").expect("aalto").phonemes_slice(),
+    ["ɑ", "l", "t", "oʊ"]
+  );
+  // Primary `a  AH0` wins over the filtered `a(2)  EY1` variant.
+  assert_eq!(dict.lookup("a").expect("a").phonemes_slice(), ["ə"]);
+  // Apostrophe-leading and dotted words survive the strict word parse.
+  assert!(dict.lookup("'bout").is_some());
+  assert!(dict.lookup("a.d.").is_some());
+}
+
+/// First 100 lines of canonical cmusphinx/cmudict `cmudict.dict`
+/// (<https://github.com/cmusphinx/cmudict>, master @ 7479086), verbatim.
+const CANONICAL_CMUDICT_HEAD_100: &str = r"'bout B AW1 T
+'cause K AH0 Z
+'course K AO1 R S
+'cuse K Y UW1 Z
+'em AH0 M
+'frisco F R IH1 S K OW0
+'gain G EH1 N
+'kay K EY1
+'m AH0 M
+'n AH0 N
+'round R AW1 N D
+'s EH1 S
+'til T IH1 L
+'tis T IH1 Z
+'twas T W AH1 Z
+a AH0
+a(2) EY1
+a's EY1 Z
+a. EY1
+a.'s EY1 Z
+a.d. EY2 D IY1
+a.m. EY2 EH1 M
+a.s EY1 Z
+aaa T R IH2 P AH0 L EY1
+aaberg AA1 B ER0 G
+aachen AA1 K AH0 N
+aachener AA1 K AH0 N ER0
+aaker AA1 K ER0
+aalborg AO1 L B AO0 R G # place, danish
+aalborg(2) AA1 L B AO0 R G
+aalburg AE1 L B ER0 G # place, dutch
+aalen AE1 L AH0 N # place, german
+aalen(2) AA1 L AH0 N
+aaliyah AA2 L IY1 AA2
+aalseth AA1 L S EH0 TH
+aalsmeer AA1 L S M IH0 R # place, dutch
+aalto AA1 L T OW2 # name, finnish
+aamodt AA1 M AH0 T
+aancor AA1 N K AO2 R
+aardema AA0 R D EH1 M AH0
+aardvark AA1 R D V AA2 R K
+aardvarks AA1 R D V AA2 R K S
+aargh AA1 R G
+aarhus AA2 HH UW1 S
+aaron EH1 R AH0 N
+aaron's EH1 R AH0 N Z
+aarons EH1 R AH0 N Z
+aaronson EH1 R AH0 N S AH0 N
+aaronson(2) AA1 R AH0 N S AH0 N
+aaronson's EH1 R AH0 N S AH0 N Z
+aaronson's(2) AA1 R AH0 N S AH0 N Z
+aarti AA1 R T IY2
+aase AA1 S
+aasen AA1 S AH0 N
+ab AE1 B
+ab(2) EY1 B IY1
+aba EY2 B IY2 EY1
+ababa AH0 B AA1 B AH0
+ababa(2) AA1 B AH0 B AH0
+abacha AE1 B AH0 K AH0
+aback AH0 B AE1 K
+abaco AE1 B AH0 K OW2
+abacus AE1 B AH0 K AH0 S
+abad AH0 B AA1 D
+abadaka AH0 B AE1 D AH0 K AH0
+abadi AH0 B AE1 D IY0
+abadie AH0 B AE1 D IY0
+abair AH0 B EH1 R
+abalkin AH0 B AA1 L K IH0 N
+abalone AE2 B AH0 L OW1 N IY0
+abalones AE2 B AH0 L OW1 N IY0 Z
+abalos AA0 B AA1 L OW0 Z
+abandon AH0 B AE1 N D AH0 N
+abandoned AH0 B AE1 N D AH0 N D
+abandoning AH0 B AE1 N D AH0 N IH0 NG
+abandonment AH0 B AE1 N D AH0 N M AH0 N T
+abandonments AH0 B AE1 N D AH0 N M AH0 N T S
+abandons AH0 B AE1 N D AH0 N Z
+abanto AH0 B AE1 N T OW0
+abarca AH0 B AA1 R K AH0
+abare AA0 B AA1 R IY0
+abascal AE1 B AH0 S K AH0 L
+abash AH0 B AE1 SH
+abashed AH0 B AE1 SH T
+abasia AH0 B EY1 ZH Y AH0
+abate AH0 B EY1 T
+abated AH0 B EY1 T IH0 D
+abatement AH0 B EY1 T M AH0 N T
+abatements AH0 B EY1 T M AH0 N T S
+abates AH0 B EY1 T S
+abating AH0 B EY1 T IH0 NG
+abattoir AE2 B AH0 T W AA1 R
+abba AE1 B AH0
+abbado AH0 B AA1 D OW0
+abbas AH0 B AA1 S
+abbasi AA0 B AA1 S IY0
+abbate AA1 B EY0 T
+abbatiello AA0 B AA0 T IY0 EH1 L OW0
+abbe AE1 B IY0
+abbe(2) AE0 B EY1
+";
