@@ -320,15 +320,18 @@ fn text_embedder_runs_text_tower() {
 fn text_encoding_declares_fixed_length_sticky_eos_scheme() {
   // SigLIP's `TextEncoding` must declare the fixed-length processor scheme the
   // sticky-EOS tower needs: special tokens on, and `FixedLength` padding to the
-  // text tower's `max_position_embeddings` with the SigLIP pad id `1`, an
-  // all-`1`-mask scheme, and `eos_token_id = Some(1)` so an overlength prompt
-  // keeps the EOS at its final position on truncation (sticky-EOS pooling). The
-  // tokenizer truncation cap is NOT carried in `max_length` here: the
-  // `FixedLength` scheme is itself the truncation cap, and the generic pipeline
-  // derives the effective cap (`length + 1` for this sticky-EOS scheme) CENTRALLY
-  // from the padding mode — so the cap does not depend on this model remembering
-  // to set `max_length`. The fixed length is read from the config (`MAX_POS`
-  // here), NOT hard-coded — so it tracks the checkpoint.
+  // text tower's `max_position_embeddings` with the SigLIP2 Gemma `<pad>` id
+  // `0` (NOT SigLIP1's pad == EOS == 1 — the Gemma tokenizer binds `<pad>` = 0,
+  // `<eos>` = 1, so padding with 1 would fill the pooled last slot of every
+  // short prompt with `<eos>` instead of `<pad>`), an all-`1`-mask scheme, and
+  // `eos_token_id = Some(1)` so an overlength prompt keeps the EOS at its final
+  // position on truncation (sticky-EOS pooling). The tokenizer truncation cap
+  // is NOT carried in `max_length` here: the `FixedLength` scheme is itself the
+  // truncation cap, and the generic pipeline derives the effective cap
+  // (`length + 1` for this sticky-EOS scheme) CENTRALLY from the padding mode —
+  // so the cap does not depend on this model remembering to set `max_length`.
+  // The fixed length is read from the config (`MAX_POS` here), NOT hard-coded —
+  // so it tracks the checkpoint.
   let model = tiny_model();
   let enc = model.text_encoding();
   assert!(enc.add_special_tokens, "siglip encodes with special tokens");
@@ -341,10 +344,34 @@ fn text_encoding_declares_fixed_length_sticky_eos_scheme() {
     enc.padding,
     Padding::FixedLength {
       length: MAX_POS as usize,
-      pad_token_id: 1,
+      pad_token_id: 0,
       eos_token_id: Some(1),
     },
-    "siglip pads/truncates to max_position_embeddings with pad id 1, all-1 mask, EOS-preserving truncation"
+    "siglip2 pads/truncates to max_position_embeddings with the Gemma <pad> id 0, \
+     all-1 mask, EOS-preserving truncation (EOS = 1 is distinct from the pad fill)"
+  );
+}
+
+#[test]
+fn text_pad_token_id_defaults_to_gemma_pad_zero_and_is_overridable() {
+  // A directly-built model (`from_weights`, no tokenizer metadata in reach)
+  // defaults to the SigLIP2 Gemma `<pad>` id 0 — never SigLIP1's `1`, which is
+  // the `<eos>` id under the Gemma vocab. `set_text_pad_token_id` overrides it
+  // (the hook the factory constructor uses for checkpoint-resolved ids), and
+  // the declared `TextEncoding` scheme tracks the override.
+  let mut model = tiny_model();
+  assert_eq!(model.text_pad_token_id(), 0, "default pad id is <pad> = 0");
+  model.set_text_pad_token_id(7);
+  assert_eq!(model.text_pad_token_id(), 7);
+  let enc = model.text_encoding();
+  assert_eq!(
+    enc.padding,
+    Padding::FixedLength {
+      length: MAX_POS as usize,
+      pad_token_id: 7,
+      eos_token_id: Some(1),
+    },
+    "the declared fixed-length scheme pads with the overridden id"
   );
 }
 
@@ -590,6 +617,205 @@ fn constructor_builds_model_from_loaded() {
     .embed_text(&ids(1, 4), &mask(1, 4))
     .unwrap();
   assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
+}
+
+// ───────────────────── pad-id resolution from tokenizer metadata ─────────────────────
+//
+// The factory constructor refines the text pad id from the loaded directory's
+// tokenizer metadata (`tokenizer_config.json` / `special_tokens_map.json`),
+// falling back to the Gemma `<pad> = 0` default on any miss. These pin the
+// resolution order, both HF token shapes (plain string and AddedToken object),
+// and the robustness contract (missing files / malformed JSON never error —
+// the default is already correct).
+
+/// A fresh, writable per-test temp directory (the crate's no-`tempfile`-crate
+/// convention: `temp_dir()` + pid + a process-unique counter so parallel tests
+/// never collide). Created empty.
+fn fresh_dir(tag: &str) -> std::path::PathBuf {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static COUNTER: AtomicU64 = AtomicU64::new(0);
+  let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+  let dir = std::env::temp_dir().join(format!(
+    "mlxrs-siglip2-padid-{tag}-{}-{n}",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  dir
+}
+
+/// The raw (HF-namespaced) weight map the `LoadedEmbeddingModel` carries —
+/// the post-sanitize fixture un-namespaced one level.
+fn raw_tiny_weights() -> HashMap<String, Array> {
+  let post = tiny_model_weights();
+  let mut raw = HashMap::with_capacity(post.len());
+  for (k, v) in post {
+    let raw_key = if let Some(rest) = k.strip_prefix("vision_model.vision_model.") {
+      format!("vision_model.{rest}")
+    } else if let Some(rest) = k.strip_prefix("text_model.text_model.") {
+      format!("text_model.{rest}")
+    } else {
+      k
+    };
+    raw.insert(raw_key, v);
+  }
+  raw
+}
+
+/// Build via the registry constructor from a `LoadedEmbeddingModel` with
+/// `model_dir` attached, and read back the pad id the constructed model's
+/// `TextEncoding` declares.
+fn constructed_pad_id(dir: &std::path::Path) -> u32 {
+  let loaded = LoadedEmbeddingModel::new(
+    "siglip2".to_string(),
+    tiny_config_json(),
+    raw_tiny_weights(),
+  )
+  .with_model_dir(dir);
+  let model = constructor()(&loaded, None).expect("constructor must build the model");
+  let enc = model
+    .as_text_embedder()
+    .expect("siglip exposes the universal text embedder")
+    .text_encoding();
+  match enc.padding {
+    Padding::FixedLength { pad_token_id, .. } => pad_token_id,
+    other => panic!("siglip declares FixedLength padding, got {other:?}"),
+  }
+}
+
+#[test]
+fn constructor_resolves_pad_id_from_tokenizer_config() {
+  // The real `google/siglip2-base-patch16-naflex` layout: a string `pad_token`
+  // plus the `added_tokens_decoder` binding. A NON-zero id (3) proves the value
+  // is read from the metadata, not the 0 default.
+  let dir = fresh_dir("cfg");
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "add_eos_token": true,
+      "added_tokens_decoder": {
+        "3": { "content": "<pad>", "special": true },
+        "1": { "content": "<eos>", "special": true }
+      },
+      "pad_token": "<pad>",
+      "eos_token": "<eos>"
+    }"#,
+  )
+  .unwrap();
+  assert_eq!(constructed_pad_id(&dir), 3, "pad id read from metadata");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn constructor_resolves_pad_id_from_special_tokens_map_fallback() {
+  // `pad_token` absent from tokenizer_config.json but present (in the
+  // AddedToken object shape) in special_tokens_map.json; the id still resolves
+  // through tokenizer_config.json's `added_tokens_decoder`.
+  let dir = fresh_dir("special");
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "added_tokens_decoder": {
+        "5": { "content": "<pad>", "special": true },
+        "1": { "content": "<eos>", "special": true }
+      },
+      "eos_token": "<eos>"
+    }"#,
+  )
+  .unwrap();
+  std::fs::write(
+    dir.join("special_tokens_map.json"),
+    r#"{ "pad_token": { "content": "<pad>", "lstrip": false } }"#,
+  )
+  .unwrap();
+  assert_eq!(
+    constructed_pad_id(&dir),
+    5,
+    "pad token string from special_tokens_map.json resolves via added_tokens_decoder"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn constructor_pad_id_falls_back_to_zero_without_metadata() {
+  // No `model_dir` attached (a hand-built LoadedEmbeddingModel), a dir with no
+  // metadata files, a dir with MALFORMED JSON, and a dir whose metadata cannot
+  // resolve the token to an id — every miss keeps the Gemma `<pad> = 0`
+  // default and never turns the load into an error.
+  // (a) no model_dir attached.
+  let loaded = LoadedEmbeddingModel::new(
+    "siglip2".to_string(),
+    tiny_config_json(),
+    raw_tiny_weights(),
+  );
+  let model = constructor()(&loaded, None).expect("constructor must build without a model_dir");
+  let enc = model.as_text_embedder().unwrap().text_encoding();
+  assert!(
+    matches!(
+      enc.padding,
+      Padding::FixedLength {
+        pad_token_id: 0,
+        ..
+      }
+    ),
+    "no model_dir → default pad id 0"
+  );
+
+  // (b) dir without metadata files.
+  let empty = fresh_dir("empty");
+  assert_eq!(constructed_pad_id(&empty), 0, "no metadata files → 0");
+  let _ = std::fs::remove_dir_all(&empty);
+
+  // (c) malformed JSON in both files.
+  let bad = fresh_dir("malformed");
+  std::fs::write(bad.join("tokenizer_config.json"), "{ not json !!").unwrap();
+  std::fs::write(bad.join("special_tokens_map.json"), "[1, 2,").unwrap();
+  assert_eq!(constructed_pad_id(&bad), 0, "malformed metadata → 0");
+  let _ = std::fs::remove_dir_all(&bad);
+
+  // (d) a pad_token string no added_tokens_decoder entry resolves.
+  let unresolved = fresh_dir("unresolved");
+  std::fs::write(
+    unresolved.join("tokenizer_config.json"),
+    r#"{ "pad_token": "<pad>", "added_tokens_decoder": { "1": { "content": "<eos>" } } }"#,
+  )
+  .unwrap();
+  assert_eq!(
+    constructed_pad_id(&unresolved),
+    0,
+    "unresolvable pad token → 0"
+  );
+  let _ = std::fs::remove_dir_all(&unresolved);
+}
+
+#[test]
+fn read_text_pad_token_id_handles_both_hf_token_shapes() {
+  // The `pad_token` field appears as a plain string OR an AddedToken-style
+  // `{"content": …}` object across HF checkpoints; both must resolve. A
+  // non-u32 decoder key (a corrupt "<id>") is a miss, not a panic.
+  let dir = fresh_dir("shapes");
+  // Object shape in tokenizer_config.json itself.
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": { "content": "<pad>" },
+      "added_tokens_decoder": { "0": { "content": "<pad>" } }
+    }"#,
+  )
+  .unwrap();
+  assert_eq!(super::read_text_pad_token_id(&dir), Some(0));
+
+  // Corrupt (non-numeric) decoder id → None (the caller's 0 default applies).
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": "<pad>",
+      "added_tokens_decoder": { "zero": { "content": "<pad>" } }
+    }"#,
+  )
+  .unwrap();
+  assert_eq!(super::read_text_pad_token_id(&dir), None);
+  let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ───────────────────── quantized-checkpoint loading ─────────────────────

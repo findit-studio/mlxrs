@@ -283,16 +283,42 @@ pub struct LoadedEmbeddingModel {
   /// [`load()`]'s weight discovery); root shards are verbatim. The constructor
   /// applies any further `sanitize`/remap itself.
   weights: EmbeddingWeights,
+  /// The local model directory the checkpoint was resolved from, when known.
+  /// [`load()`] attaches it (via [`with_model_dir`](Self::with_model_dir)); a
+  /// hand-built `LoadedEmbeddingModel` carries `None`. Lets a constructor read
+  /// **sibling tokenizer metadata** the weight map cannot carry (e.g. SigLIP2's
+  /// `tokenizer_config.json` pad-token id) without re-threading the path
+  /// through the constructor signature.
+  model_dir: Option<PathBuf>,
 }
 
 impl LoadedEmbeddingModel {
-  /// Construct a [`LoadedEmbeddingModel`] from its three components.
+  /// Construct a [`LoadedEmbeddingModel`] from its three components (no model
+  /// directory attached — chain [`with_model_dir`](Self::with_model_dir) when
+  /// the source directory is known).
   pub fn new(model_type: String, config_json: String, weights: EmbeddingWeights) -> Self {
     Self {
       model_type,
       config_json,
       weights,
+      model_dir: None,
     }
+  }
+
+  /// Attach the local model directory the checkpoint was loaded from (builder
+  /// form, used by [`load()`]), so a constructor can read sibling metadata
+  /// files (e.g. `tokenizer_config.json`) from the same directory.
+  #[must_use]
+  pub fn with_model_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+    self.model_dir = Some(dir.into());
+    self
+  }
+
+  /// The local model directory the checkpoint was loaded from, when known
+  /// (`None` for a hand-built `LoadedEmbeddingModel`).
+  #[inline(always)]
+  pub fn model_dir(&self) -> Option<&Path> {
+    self.model_dir.as_deref()
   }
 
   /// The checkpoint's canonicalized architecture id.
@@ -647,7 +673,10 @@ pub fn load(
   // bakes its pooling config at construction. `pooling.as_ref()` borrows it for
   // the constructor; the owned `pooling` is moved into the returned context
   // below.
-  let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights);
+  // Attach the resolved model directory so a constructor can read sibling
+  // tokenizer metadata (e.g. SigLIP2's `tokenizer_config.json` pad id).
+  let loaded =
+    LoadedEmbeddingModel::new(model_type, config_json, weights).with_model_dir(model_dir);
   let model = registry.create(&loaded, pooling.as_ref())?;
 
   Ok(LoadedEmbeddingContext {

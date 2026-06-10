@@ -114,6 +114,12 @@ pub struct Siglip2NaflexModel {
   logit_scale: Array,
   /// `logit_bias` `(1,)` — the contrastive bias.
   logit_bias: Array,
+  /// The pad id the fixed-length text scheme fills with. Defaults to the
+  /// SigLIP2 Gemma `<pad>` id
+  /// ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID), `0`);
+  /// the load-factory [`constructor`] refines it from the checkpoint's
+  /// tokenizer metadata via [`set_text_pad_token_id`](Self::set_text_pad_token_id).
+  text_pad_token_id: u32,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -125,23 +131,45 @@ impl Siglip2NaflexModel {
   /// it pins the intent.
   const NORMALIZE_EPS: f32 = SWIFT_L2_EPS;
 
-  /// The token id the SigLIP2 processor right-pads text to its fixed sequence
-  /// length with — the canonical SigLIP sentencepiece pad/EOS id (`1`). The
-  /// sticky-EOS pooling reads a fixed last position regardless of the mask, so
-  /// a shorter prompt's trailing positions hold this pad id (which is exactly
-  /// what the reference processor produces); it is a real, *unmasked* position.
-  const TEXT_PAD_TOKEN_ID: u32 = 1;
+  /// The default token id the SigLIP2 processor right-pads text to its fixed
+  /// sequence length with — the SigLIP2 **Gemma** tokenizer's `<pad>` id (`0`).
+  ///
+  /// SigLIP2 ships a Gemma sentencepiece tokenizer
+  /// (`google/siglip2-base-patch16-naflex`'s `tokenizer_config.json`:
+  /// `tokenizer_class = "GemmaTokenizer"`, `added_tokens_decoder` binding
+  /// `"0" → <pad>` and `"1" → <eos>`, `add_eos_token = true`), and the HF
+  /// `Siglip2Processor` pads with `padding="max_length"` — i.e. with
+  /// `tokenizer.pad_token_id == 0`. This is **not** SigLIP1's convention: the
+  /// original SigLIP sentencepiece used pad == EOS == `1`, and padding a
+  /// SigLIP2 prompt with `1` fills the tail with `<eos>` tokens instead of
+  /// `<pad>`. Because the sticky-EOS pooling reads a fixed **last** position
+  /// regardless of the mask — a *pad* slot for every shorter-than-`seq_len`
+  /// prompt — a wrong pad fill changes the pooled token embedding and shifts
+  /// every short prompt's embedding away from the reference processor's.
+  /// (HF `Siglip2TextConfig` still *declares* `pad_token_id = 1` as a class
+  /// default inherited from SigLIP1's CLIP-vocab defaults; that field is
+  /// unused by the tokenization path and is not what the processor pads with.)
+  ///
+  /// The load-factory [`constructor`] refines this default from the loaded
+  /// directory's tokenizer metadata (`tokenizer_config.json` /
+  /// `special_tokens_map.json` — see [`read_text_pad_token_id`]); `0` is the
+  /// correct fallback when that metadata is unavailable (every published
+  /// SigLIP2 checkpoint uses the Gemma tokenizer's `<pad> = 0`).
+  const DEFAULT_TEXT_PAD_TOKEN_ID: u32 = 0;
 
-  /// The SigLIP2 sentencepiece `<eos>` id (`1`). The text tower pools the
+  /// The SigLIP2 sentencepiece `<eos>` id (`1` — the Gemma tokenizer's
+  /// `added_tokens_decoder` `"1" → <eos>`). The text tower pools the
   /// **last** position under the sticky-EOS invariant ("last token is always
   /// EOS"), so an **overlength** prompt must keep the EOS at its final position
   /// rather than a content token. The HF SigLIP processor enforces this by
   /// head-truncating to `max_length - n_added_tokens` and then appending the
   /// EOS via its post-processor template; this is the id the generic
   /// fixed-length builder forces into the last slot on truncation
-  /// ([`Padding::FixedLength::eos_token_id`]). It coincides with
-  /// [`TEXT_PAD_TOKEN_ID`](Self::TEXT_PAD_TOKEN_ID) for SigLIP (both `1`) but is
-  /// conceptually the EOS, not the pad fill.
+  /// ([`Padding::FixedLength::eos_token_id`]). It is distinct from the pad
+  /// fill ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID),
+  /// `<pad> = 0`): only a *truncated* (overlength) prompt ends in this EOS at
+  /// the fixed last slot; a shorter prompt's last slot is a pad token, exactly
+  /// as the reference processor produces.
   const TEXT_EOS_TOKEN_ID: u32 = 1;
 
   /// The fixed text sequence length the SigLIP2 processor pads / truncates every
@@ -263,6 +291,7 @@ impl Siglip2NaflexModel {
       text,
       logit_scale,
       logit_bias,
+      text_pad_token_id: Self::DEFAULT_TEXT_PAD_TOKEN_ID,
     })
   }
 
@@ -270,6 +299,26 @@ impl Siglip2NaflexModel {
   #[inline(always)]
   pub fn config(&self) -> &Siglip2NaflexConfig {
     &self.config
+  }
+
+  /// The pad id the fixed-length text scheme
+  /// ([`TextEmbedder::text_encoding`]) fills with.
+  #[inline(always)]
+  pub fn text_pad_token_id(&self) -> u32 {
+    self.text_pad_token_id
+  }
+
+  /// Override the pad id the fixed-length text scheme fills with.
+  ///
+  /// Defaults to the SigLIP2 Gemma `<pad>` id
+  /// ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID), `0`).
+  /// The load-factory [`constructor`] calls this with the id resolved from the
+  /// checkpoint's own tokenizer metadata ([`read_text_pad_token_id`]) so the
+  /// pad fill always tracks the tokenizer that produced the checkpoint; a
+  /// caller building the model directly via
+  /// [`from_weights`](Self::from_weights) can do the same.
+  pub fn set_text_pad_token_id(&mut self, id: u32) {
+    self.text_pad_token_id = id;
   }
 
   /// Encode one preprocessed image ([`NaflexInputs`]) to an L2-normalized
@@ -671,11 +720,140 @@ pub fn constructor() -> EmbeddingModelConstructor {
       // native key); a dense checkpoint has none and loads dense. An mlx-community
       // 8-bit SigLIP2 checkpoint loads its quantized projections through here.
       let quantization = parse_quantization(loaded.config_json())?;
-      let model =
+      let mut model =
         Siglip2NaflexModel::from_weights_quantized(config, weights, quantization.as_ref())?;
+      // Refine the text pad id from the checkpoint's OWN tokenizer metadata
+      // (`tokenizer_config.json` / `special_tokens_map.json` in the load
+      // directory), so the fixed-length pad fill tracks the tokenizer that
+      // produced the checkpoint. Best-effort: an absent directory (a hand-built
+      // `LoadedEmbeddingModel`), missing files, or malformed metadata keep the
+      // Gemma `<pad> = 0` default — correct for every published SigLIP2
+      // checkpoint (see `DEFAULT_TEXT_PAD_TOKEN_ID`).
+      if let Some(dir) = loaded.model_dir()
+        && let Some(pad_id) = read_text_pad_token_id(dir)
+      {
+        model.set_text_pad_token_id(pad_id);
+      }
       Ok(Box::new(model))
     },
   )
+}
+
+/// Upper bound on a tokenizer-metadata JSON file read into memory by
+/// [`read_text_pad_token_id`]. A real `tokenizer_config.json` is tens of KB
+/// (`google/siglip2-base-patch16-naflex`'s is ~40 KB; the largest Gemma-family
+/// ones with embedded chat templates stay low-MB) and `special_tokens_map.json`
+/// is under 1 KB; the cap keeps a planted multi-GB file from being slurped
+/// (the same bounded-read discipline as the factory's `config.json` reader).
+#[cfg(feature = "siglip2-naflex")]
+const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
+
+/// Best-effort read of the text **pad token id** from the tokenizer metadata
+/// in a loaded model directory — the id the SigLIP2 processor right-pads with.
+///
+/// Resolution (mirroring how HF's `Siglip2Processor` derives the pad fill —
+/// `tokenizer.pad_token_id`, i.e. the configured `pad_token` string resolved
+/// through the tokenizer's added-token table):
+///
+/// 1. The pad token **string**: `tokenizer_config.json`'s `pad_token`, else
+///    `special_tokens_map.json`'s `pad_token` — each accepted in both HF
+///    shapes, a plain string (`"<pad>"`) or an `AddedToken`-style object
+///    (`{"content": "<pad>", …}`).
+/// 2. The string → **id**: the entry of `tokenizer_config.json`'s
+///    `added_tokens_decoder` (an `"<id>" → {"content": …}` map) whose
+///    `content` equals the pad token. (`google/siglip2-base-patch16-naflex`
+///    binds `"0" → <pad>`.)
+///
+/// Returns `None` — the caller keeps the
+/// [`Siglip2NaflexModel::DEFAULT_TEXT_PAD_TOKEN_ID`] Gemma `<pad> = 0` default
+/// — on **any** miss: an absent or unreadable file, an over-cap file
+/// ([`MAX_TOKENIZER_METADATA_BYTES`]), malformed JSON, a missing `pad_token`
+/// field, or a pad token that no `added_tokens_decoder` entry resolves. The
+/// pad id is a refinement of an already-correct default, so a metadata problem
+/// must not turn a loadable checkpoint into a load error (the tokenizer load
+/// itself — which `embeddings::load` runs separately — still surfaces a
+/// malformed `tokenizer_config.json` as its own typed error). The deliberately
+/// **unconsulted** source is `config.json`'s `text_config.pad_token_id`: HF's
+/// `Siglip2TextConfig` declares `pad_token_id = 1` as a class default
+/// inherited from SigLIP1, which the real tokenization path never uses — the
+/// exact trap this resolution avoids.
+#[cfg(feature = "siglip2-naflex")]
+fn read_text_pad_token_id(dir: &std::path::Path) -> Option<u32> {
+  let tokenizer_config = read_bounded_json(&dir.join("tokenizer_config.json"));
+
+  // 1. The pad token string: tokenizer_config.json first, else
+  //    special_tokens_map.json (read only when needed).
+  let pad_token = tokenizer_config
+    .as_ref()
+    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned))
+    .or_else(|| {
+      let special = read_bounded_json(&dir.join("special_tokens_map.json"))?;
+      token_content(special.get("pad_token")?).map(str::to_owned)
+    })?;
+
+  // 2. Resolve the string to its id via `added_tokens_decoder` ("<id>" →
+  //    {"content": …}). The pad token is always an added special token, so
+  //    this table carries it in every real HF checkpoint layout.
+  let decoder = tokenizer_config.as_ref()?.get("added_tokens_decoder")?;
+  let entries = decoder.as_object()?;
+  for (id_str, entry) in entries {
+    if token_content(entry) == Some(pad_token.as_str()) {
+      return id_str.parse::<u32>().ok();
+    }
+  }
+  None
+}
+
+/// Read `path` as JSON with the [`MAX_TOKENIZER_METADATA_BYTES`] bounded-read
+/// discipline (post-open regular-file check + `Read::take` cap). Any failure —
+/// absent file, not a regular file, I/O error, over-cap size, malformed JSON —
+/// is `None`: this feeds the best-effort [`read_text_pad_token_id`] only.
+#[cfg(feature = "siglip2-naflex")]
+fn read_bounded_json(path: &std::path::Path) -> Option<serde_json::Value> {
+  use std::io::Read;
+
+  // `O_NONBLOCK | O_CLOEXEC` so a planted FIFO cannot hang the open (the same
+  // open discipline as the factory's `config.json` reader).
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .ok()?
+  };
+  #[cfg(not(unix))]
+  let file = std::fs::File::open(path).ok()?;
+
+  // Reject a non-regular file (FIFO/device/directory) after the open.
+  if !file.metadata().ok()?.is_file() {
+    return None;
+  }
+  let mut bytes = Vec::new();
+  file
+    .take(MAX_TOKENIZER_METADATA_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .ok()?;
+  if bytes.len() as u64 > MAX_TOKENIZER_METADATA_BYTES {
+    // Over-cap: a real tokenizer metadata file is far smaller; treat a planted
+    // oversized file as absent rather than parsing a truncated prefix.
+    return None;
+  }
+  serde_json::from_slice(&bytes).ok()
+}
+
+/// The token string of an HF special-token JSON value, accepting both shapes
+/// the HF tokenizer files use: a plain string (`"<pad>"`) or an
+/// `AddedToken`-style object (`{"content": "<pad>", …}`) — the same two shapes
+/// the tokenizer wrapper's `cfg_str` handles. Anything else is `None`.
+#[cfg(feature = "siglip2-naflex")]
+fn token_content(value: &serde_json::Value) -> Option<&str> {
+  match value {
+    serde_json::Value::String(s) => Some(s.as_str()),
+    serde_json::Value::Object(o) => o.get("content")?.as_str(),
+    _ => None,
+  }
 }
 
 /// The reserved (non-layer) keys of a `quantization` block — the three
@@ -1078,7 +1256,12 @@ impl TextEmbedder for Siglip2NaflexModel {
       None,
       Padding::FixedLength {
         length,
-        pad_token_id: Self::TEXT_PAD_TOKEN_ID,
+        // The checkpoint tokenizer's `<pad>` id (Gemma `<pad> = 0` by default;
+        // refined from the loaded directory's tokenizer metadata by the
+        // factory `constructor`). NOT the EOS: a short prompt's pooled last
+        // slot is a pad position, and the reference processor fills it with
+        // `<pad>`, not `<eos>`.
+        pad_token_id: self.text_pad_token_id,
         // Preserve the sticky-EOS invariant on overlength prompts: a truncated
         // row keeps its head to `length - 1` and the EOS is forced into the
         // last position (HF truncate-then-append-EOS), so the pooled last slot

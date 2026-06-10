@@ -158,6 +158,42 @@ fn load_produces_context_via_public_surface() {
 }
 
 #[test]
+fn load_attaches_model_dir_to_loaded_model() {
+  // `load()` must hand the constructor a `LoadedEmbeddingModel` carrying the
+  // resolved model directory (`model_dir()`), so an architecture can read
+  // sibling tokenizer metadata from the SAME directory (SigLIP2 resolves its
+  // text pad id from `tokenizer_config.json` this way). A hand-built
+  // `LoadedEmbeddingModel::new` carries `None` until `with_model_dir`.
+  let dir = temp_dir("model_dir");
+  write_model_dir(&dir, "bert");
+  let expected = dir.clone();
+  let constructor: EmbeddingModelConstructor = Box::new(
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
+      assert_eq!(
+        loaded.model_dir(),
+        Some(expected.as_path()),
+        "load() attaches the resolved model directory for the constructor"
+      );
+      Ok(Box::new(MockEmbedding))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", constructor);
+  load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect("load should succeed (the constructor's model_dir assertion ran)");
+
+  // The builder/accessor round-trip on a hand-built LoadedEmbeddingModel.
+  let hand_built = LoadedEmbeddingModel::new("bert".into(), config_json("bert"), HashMap::new());
+  assert_eq!(hand_built.model_dir(), None, "new() attaches no directory");
+  let with_dir = hand_built.with_model_dir(&dir);
+  assert_eq!(with_dir.model_dir(), Some(dir.as_path()));
+}
+
+#[test]
 fn load_parses_pooling_config_when_present() {
   let dir = temp_dir("pooling");
   write_model_dir(&dir, "bert");
