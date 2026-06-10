@@ -621,8 +621,10 @@ fn constructor_builds_model_from_loaded() {
 
 // ───────────────────── pad-id resolution from tokenizer metadata ─────────────────────
 //
-// The factory constructor refines the text pad id from the loaded directory's
-// tokenizer metadata (`tokenizer_config.json` / `special_tokens_map.json`),
+// The factory constructor refines the text pad id from the loaded TOKENIZER
+// directory's metadata (`tokenizer_config.json` / `special_tokens_map.json` —
+// the same directory `embeddings::load` builds the `Tokenizer` from, so a
+// split `tokenizer_source` resolves from the tokenizer's own directory),
 // falling back to the Gemma `<pad> = 0` default on any miss. These pin the
 // resolution order, both HF token shapes (plain string and AddedToken object),
 // and the robustness contract (missing files / malformed JSON never error —
@@ -662,16 +664,16 @@ fn raw_tiny_weights() -> HashMap<String, Array> {
   raw
 }
 
-/// Build via the registry constructor from a `LoadedEmbeddingModel` with
-/// `model_dir` attached, and read back the pad id the constructed model's
-/// `TextEncoding` declares.
+/// Build via the registry constructor from a `LoadedEmbeddingModel` with the
+/// tokenizer directory attached, and read back the pad id the constructed
+/// model's `TextEncoding` declares.
 fn constructed_pad_id(dir: &std::path::Path) -> u32 {
   let loaded = LoadedEmbeddingModel::new(
     "siglip2".to_string(),
     tiny_config_json(),
     raw_tiny_weights(),
   )
-  .with_model_dir(dir);
+  .with_tokenizer_dir(dir);
   let model = constructor()(&loaded, None).expect("constructor must build the model");
   let enc = model
     .as_text_embedder()
@@ -738,17 +740,17 @@ fn constructor_resolves_pad_id_from_special_tokens_map_fallback() {
 
 #[test]
 fn constructor_pad_id_falls_back_to_zero_without_metadata() {
-  // No `model_dir` attached (a hand-built LoadedEmbeddingModel), a dir with no
-  // metadata files, a dir with MALFORMED JSON, and a dir whose metadata cannot
-  // resolve the token to an id — every miss keeps the Gemma `<pad> = 0`
+  // No tokenizer dir attached (a hand-built LoadedEmbeddingModel), a dir with
+  // no metadata files, a dir with MALFORMED JSON, and a dir whose metadata
+  // cannot resolve the token to an id — every miss keeps the Gemma `<pad> = 0`
   // default and never turns the load into an error.
-  // (a) no model_dir attached.
+  // (a) no tokenizer dir attached.
   let loaded = LoadedEmbeddingModel::new(
     "siglip2".to_string(),
     tiny_config_json(),
     raw_tiny_weights(),
   );
-  let model = constructor()(&loaded, None).expect("constructor must build without a model_dir");
+  let model = constructor()(&loaded, None).expect("constructor must build without a tokenizer dir");
   let enc = model.as_text_embedder().unwrap().text_encoding();
   assert!(
     matches!(
@@ -758,7 +760,7 @@ fn constructor_pad_id_falls_back_to_zero_without_metadata() {
         ..
       }
     ),
-    "no model_dir → default pad id 0"
+    "no tokenizer dir → default pad id 0"
   );
 
   // (b) dir without metadata files.
@@ -792,7 +794,8 @@ fn constructor_pad_id_falls_back_to_zero_without_metadata() {
 fn read_text_pad_token_id_handles_both_hf_token_shapes() {
   // The `pad_token` field appears as a plain string OR an AddedToken-style
   // `{"content": …}` object across HF checkpoints; both must resolve. A
-  // non-u32 decoder key (a corrupt "<id>") is a miss, not a panic.
+  // non-u32 decoder key (a corrupt "<id>") is a SKIPPED entry, not a panic and
+  // not a scan abort.
   let dir = fresh_dir("shapes");
   // Object shape in tokenizer_config.json itself.
   std::fs::write(
@@ -805,7 +808,8 @@ fn read_text_pad_token_id_handles_both_hf_token_shapes() {
   .unwrap();
   assert_eq!(super::read_text_pad_token_id(&dir), Some(0));
 
-  // Corrupt (non-numeric) decoder id → None (the caller's 0 default applies).
+  // ONLY a corrupt (non-numeric) decoder id → None (the caller's 0 default
+  // applies — no numeric-keyed entry resolves the token).
   std::fs::write(
     dir.join("tokenizer_config.json"),
     r#"{
@@ -815,6 +819,26 @@ fn read_text_pad_token_id_handles_both_hf_token_shapes() {
   )
   .unwrap();
   assert_eq!(super::read_text_pad_token_id(&dir), None);
+
+  // A corrupt non-numeric entry ALONGSIDE the legitimate numeric binding: the
+  // corrupt entry is skipped (continue), so the planted junk cannot shadow the
+  // real `"0" → <pad>` binding regardless of map iteration order.
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": "<pad>",
+      "added_tokens_decoder": {
+        "junk": { "content": "<pad>" },
+        "0": { "content": "<pad>" }
+      }
+    }"#,
+  )
+  .unwrap();
+  assert_eq!(
+    super::read_text_pad_token_id(&dir),
+    Some(0),
+    "a corrupt non-numeric decoder entry must not shadow the numeric binding"
+  );
   let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -151,7 +151,7 @@ impl Siglip2NaflexModel {
   /// unused by the tokenization path and is not what the processor pads with.)
   ///
   /// The load-factory [`constructor`] refines this default from the loaded
-  /// directory's tokenizer metadata (`tokenizer_config.json` /
+  /// **tokenizer directory**'s metadata (`tokenizer_config.json` /
   /// `special_tokens_map.json` — see [`read_text_pad_token_id`]); `0` is the
   /// correct fallback when that metadata is unavailable (every published
   /// SigLIP2 checkpoint uses the Gemma tokenizer's `<pad> = 0`).
@@ -722,13 +722,15 @@ pub fn constructor() -> EmbeddingModelConstructor {
       let mut model =
         Siglip2NaflexModel::from_weights_quantized(config, weights, quantization.as_ref())?;
       // Refine the text pad id from the checkpoint's OWN tokenizer metadata
-      // (`tokenizer_config.json` / `special_tokens_map.json` in the load
-      // directory), so the fixed-length pad fill tracks the tokenizer that
-      // produced the checkpoint. Best-effort: an absent directory (a hand-built
-      // `LoadedEmbeddingModel`), missing files, or malformed metadata keep the
-      // Gemma `<pad> = 0` default — correct for every published SigLIP2
-      // checkpoint (see `DEFAULT_TEXT_PAD_TOKEN_ID`).
-      if let Some(dir) = loaded.model_dir()
+      // (`tokenizer_config.json` / `special_tokens_map.json` in the TOKENIZER
+      // directory — the same directory `embeddings::load` builds the
+      // `Tokenizer` from, respecting a split `tokenizer_source`), so the
+      // fixed-length pad fill tracks the tokenizer that actually encodes the
+      // prompts — never a stale copy in the model directory. Best-effort: an
+      // absent directory (a hand-built `LoadedEmbeddingModel`), missing files,
+      // or malformed metadata keep the Gemma `<pad> = 0` default — correct for
+      // every published SigLIP2 checkpoint (see `DEFAULT_TEXT_PAD_TOKEN_ID`).
+      if let Some(dir) = loaded.tokenizer_dir()
         && let Some(pad_id) = read_text_pad_token_id(dir)
       {
         model.set_text_pad_token_id(pad_id);
@@ -748,7 +750,10 @@ pub fn constructor() -> EmbeddingModelConstructor {
 const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
 
 /// Best-effort read of the text **pad token id** from the tokenizer metadata
-/// in a loaded model directory — the id the SigLIP2 processor right-pads with.
+/// in the loaded **tokenizer directory** (the directory `embeddings::load`
+/// builds the [`crate::tokenizer::Tokenizer`] from — the separate
+/// `tokenizer_source` when configured, else the model directory) — the id the
+/// SigLIP2 processor right-pads with.
 ///
 /// Resolution (mirroring how HF's `Siglip2Processor` derives the pad fill —
 /// `tokenizer.pad_token_id`, i.e. the configured `pad_token` string resolved
@@ -760,22 +765,25 @@ const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
 ///    (`{"content": "<pad>", …}`).
 /// 2. The string → **id**: the entry of `tokenizer_config.json`'s
 ///    `added_tokens_decoder` (an `"<id>" → {"content": …}` map) whose
-///    `content` equals the pad token. (`google/siglip2-base-patch16-naflex`
-///    binds `"0" → <pad>`.)
+///    `content` equals the pad token AND whose key parses as a `u32` id.
+///    (`google/siglip2-base-patch16-naflex` binds `"0" → <pad>`.) A
+///    content-matching entry under a corrupt non-numeric key is **skipped**,
+///    not a scan abort — a planted junk entry must not shadow the legitimate
+///    binding elsewhere in the table.
 ///
 /// Returns `None` — the caller keeps the
 /// [`Siglip2NaflexModel::DEFAULT_TEXT_PAD_TOKEN_ID`] Gemma `<pad> = 0` default
 /// — on **any** miss: an absent or unreadable file, an over-cap file
 /// ([`MAX_TOKENIZER_METADATA_BYTES`]), malformed JSON, a missing `pad_token`
-/// field, or a pad token that no `added_tokens_decoder` entry resolves. The
-/// pad id is a refinement of an already-correct default, so a metadata problem
-/// must not turn a loadable checkpoint into a load error (the tokenizer load
-/// itself — which `embeddings::load` runs separately — still surfaces a
-/// malformed `tokenizer_config.json` as its own typed error). The deliberately
-/// **unconsulted** source is `config.json`'s `text_config.pad_token_id`: HF's
-/// `Siglip2TextConfig` declares `pad_token_id = 1` as a class default
-/// inherited from SigLIP1, which the real tokenization path never uses — the
-/// exact trap this resolution avoids.
+/// field, or a pad token no numeric-keyed `added_tokens_decoder` entry
+/// resolves. The pad id is a refinement of an already-correct default, so a
+/// metadata problem must not turn a loadable checkpoint into a load error (the
+/// tokenizer load itself — which `embeddings::load` runs separately — still
+/// surfaces a malformed `tokenizer_config.json` as its own typed error). The
+/// deliberately **unconsulted** source is `config.json`'s
+/// `text_config.pad_token_id`: HF's `Siglip2TextConfig` declares
+/// `pad_token_id = 1` as a class default inherited from SigLIP1, which the
+/// real tokenization path never uses — the exact trap this resolution avoids.
 #[cfg(feature = "siglip2-naflex")]
 fn read_text_pad_token_id(dir: &std::path::Path) -> Option<u32> {
   let tokenizer_config = read_bounded_json(&dir.join("tokenizer_config.json"));
@@ -792,12 +800,19 @@ fn read_text_pad_token_id(dir: &std::path::Path) -> Option<u32> {
 
   // 2. Resolve the string to its id via `added_tokens_decoder` ("<id>" →
   //    {"content": …}). The pad token is always an added special token, so
-  //    this table carries it in every real HF checkpoint layout.
+  //    this table carries it in every real HF checkpoint layout. A
+  //    content-matching entry whose key is not a valid u32 id is SKIPPED
+  //    (continue) rather than aborting the scan: in this best-effort reader a
+  //    corrupt extra entry must not shadow a legitimate numeric binding later
+  //    in the table (real HF tables have unique contents under numeric keys,
+  //    so the skip only ever matters for pathological metadata).
   let decoder = tokenizer_config.as_ref()?.get("added_tokens_decoder")?;
   let entries = decoder.as_object()?;
   for (id_str, entry) in entries {
-    if token_content(entry) == Some(pad_token.as_str()) {
-      return id_str.parse::<u32>().ok();
+    if token_content(entry) == Some(pad_token.as_str())
+      && let Ok(id) = id_str.parse::<u32>()
+    {
+      return Some(id);
     }
   }
   None
@@ -1256,7 +1271,7 @@ impl TextEmbedder for Siglip2NaflexModel {
       Padding::FixedLength {
         length,
         // The checkpoint tokenizer's `<pad>` id (Gemma `<pad> = 0` by default;
-        // refined from the loaded directory's tokenizer metadata by the
+        // refined from the loaded tokenizer directory's metadata by the
         // factory `constructor`). NOT the EOS: a short prompt's pooled last
         // slot is a pad position, and the reference processor fills it with
         // `<pad>`, not `<eos>`.

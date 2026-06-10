@@ -283,42 +283,54 @@ pub struct LoadedEmbeddingModel {
   /// [`load()`]'s weight discovery); root shards are verbatim. The constructor
   /// applies any further `sanitize`/remap itself.
   weights: EmbeddingWeights,
-  /// The local model directory the checkpoint was resolved from, when known.
-  /// [`load()`] attaches it (via [`with_model_dir`](Self::with_model_dir)); a
-  /// hand-built `LoadedEmbeddingModel` carries `None`. Lets a constructor read
-  /// **sibling tokenizer metadata** the weight map cannot carry (e.g. SigLIP2's
+  /// The local **tokenizer directory** the checkpoint's tokenizer is loaded
+  /// from, when known. [`load()`] attaches the SAME directory it builds the
+  /// [`Tokenizer`] from —
+  /// [`EmbeddingModelConfiguration::tokenizer_directory`], i.e. the separate
+  /// [`tokenizer_source`](EmbeddingModelConfiguration::tokenizer_source) when
+  /// set, else the model directory — via
+  /// [`with_tokenizer_dir`](Self::with_tokenizer_dir); a hand-built
+  /// `LoadedEmbeddingModel` carries `None`. Lets a constructor read
+  /// **tokenizer metadata** the weight map cannot carry (e.g. SigLIP2's
   /// `tokenizer_config.json` pad-token id) without re-threading the path
-  /// through the constructor signature.
-  model_dir: Option<PathBuf>,
+  /// through the constructor signature — from the directory the tokenizer
+  /// actually comes from, so a split-tokenizer configuration never resolves
+  /// stale metadata out of the model directory.
+  tokenizer_dir: Option<PathBuf>,
 }
 
 impl LoadedEmbeddingModel {
-  /// Construct a [`LoadedEmbeddingModel`] from its three components (no model
-  /// directory attached — chain [`with_model_dir`](Self::with_model_dir) when
-  /// the source directory is known).
+  /// Construct a [`LoadedEmbeddingModel`] from its three components (no
+  /// tokenizer directory attached — chain
+  /// [`with_tokenizer_dir`](Self::with_tokenizer_dir) when the source
+  /// directory is known).
   pub fn new(model_type: String, config_json: String, weights: EmbeddingWeights) -> Self {
     Self {
       model_type,
       config_json,
       weights,
-      model_dir: None,
+      tokenizer_dir: None,
     }
   }
 
-  /// Attach the local model directory the checkpoint was loaded from (builder
-  /// form, used by [`load()`]), so a constructor can read sibling metadata
-  /// files (e.g. `tokenizer_config.json`) from the same directory.
+  /// Attach the local tokenizer directory the checkpoint's tokenizer is
+  /// loaded from (builder form, used by [`load()`] with the same
+  /// [`tokenizer_directory`](EmbeddingModelConfiguration::tokenizer_directory)
+  /// it builds the [`Tokenizer`] from), so a constructor can read tokenizer
+  /// metadata files (e.g. `tokenizer_config.json` /
+  /// `special_tokens_map.json`) from the directory that actually provides the
+  /// tokenizer.
   #[must_use]
-  pub fn with_model_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-    self.model_dir = Some(dir.into());
+  pub fn with_tokenizer_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+    self.tokenizer_dir = Some(dir.into());
     self
   }
 
-  /// The local model directory the checkpoint was loaded from, when known
-  /// (`None` for a hand-built `LoadedEmbeddingModel`).
+  /// The local tokenizer directory the checkpoint's tokenizer is loaded from,
+  /// when known (`None` for a hand-built `LoadedEmbeddingModel`).
   #[inline(always)]
-  pub fn model_dir(&self) -> Option<&Path> {
-    self.model_dir.as_deref()
+  pub fn tokenizer_dir(&self) -> Option<&Path> {
+    self.tokenizer_dir.as_deref()
   }
 
   /// The checkpoint's canonicalized architecture id.
@@ -673,10 +685,14 @@ pub fn load(
   // bakes its pooling config at construction. `pooling.as_ref()` borrows it for
   // the constructor; the owned `pooling` is moved into the returned context
   // below.
-  // Attach the resolved model directory so a constructor can read sibling
-  // tokenizer metadata (e.g. SigLIP2's `tokenizer_config.json` pad id).
+  // Attach the resolved TOKENIZER directory — the same directory the
+  // `Tokenizer` above was built from (the separate `tokenizer_source` when
+  // set, else the model directory) — so a constructor reading tokenizer
+  // metadata (e.g. SigLIP2's `tokenizer_config.json` pad id) resolves it from
+  // the directory that actually provides the tokenizer, never from a stale
+  // copy in the model directory under a split-tokenizer configuration.
   let loaded =
-    LoadedEmbeddingModel::new(model_type, config_json, weights).with_model_dir(model_dir);
+    LoadedEmbeddingModel::new(model_type, config_json, weights).with_tokenizer_dir(tokenizer_dir);
   let model = registry.create(&loaded, pooling.as_ref())?;
 
   Ok(LoadedEmbeddingContext {
