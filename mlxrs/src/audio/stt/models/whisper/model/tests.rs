@@ -510,6 +510,47 @@ fn checkpoint_encode_stays_dtype(dtype: Dtype) {
   );
 }
 
+/// Production hands `encode` the raw F32 log-mel straight from
+/// [`log_mel_spectrogram_whisper`](crate::audio::stt::models::whisper::audio::log_mel_spectrogram_whisper)
+/// — the reference casts the mel to the model dtype *inside* the decode entry
+/// (`_get_audio_features`, `decoding.py:538-539`: `fp16` ⇒
+/// `mel.astype(mx.float16)`), so the model-side `encode` must own that cast.
+/// Without it, MLX's upward type promotion (`f16 op f32 → f32`) runs the whole
+/// encoder — and, through the cross-attention K/V, the decoder + its KV cache
+/// — in F32 on an f16 checkpoint: ~2× compute/bandwidth on the entire
+/// transcribe hot path.
+#[test]
+fn f32_mel_on_f16_checkpoint_encodes_in_f16() {
+  f32_mel_encode_stays_model_dtype(Dtype::F16);
+}
+
+/// Same for bf16.
+#[test]
+fn f32_mel_on_bf16_checkpoint_encodes_in_bf16() {
+  f32_mel_encode_stays_model_dtype(Dtype::BF16);
+}
+
+fn f32_mel_encode_stays_model_dtype(dtype: Dtype) {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), dtype).unwrap();
+  // The mel exactly as the production front-end produces it: F32, NOT
+  // pre-cast by the caller.
+  let mel = tiny_mel();
+  assert_eq!(
+    mel.dtype().unwrap(),
+    Dtype::F32,
+    "precondition: the raw log-mel is F32"
+  );
+  let enc = model.encode(&mel).unwrap();
+  assert_eq!(enc.shape(), vec![1, TINY.n_audio_ctx, TINY.n_state]);
+  assert_eq!(
+    enc.dtype().unwrap(),
+    dtype,
+    "encode must cast the mel to the model dtype (the reference's \
+     `_get_audio_features` fp16 cast) — an F32 mel must not promote the \
+     encoder graph to F32 on an f16/bf16 checkpoint"
+  );
+}
+
 #[test]
 fn multi_layer_build_reserves_and_fills_every_block() {
   // The encoder / decoder block vectors and the decoder KV cache are reserved

@@ -1715,10 +1715,13 @@ impl<'a> DecodingTask<'a> {
   }
 
   /// Encode the mel (or pass an already-encoded feature tensor straight
-  /// through) — `_get_audio_features` (`decoding.py:553-571`). mlxrs decodes
-  /// in the model dtype rather than forcing fp16, so the dtype cast is
-  /// dropped; the encoder is skipped if `mel` is already the encoder-output
-  /// shape `(n_audio_ctx, n_audio_state)`.
+  /// through) — `_get_audio_features` (`decoding.py:553-571`). The reference's
+  /// fp16 mel cast (`decoding.py:538-539`) lives in
+  /// [`WhisperModel::encode`](super::model::WhisperModel) generalized to the
+  /// model dtype (an `F32` mel would otherwise promote the whole
+  /// encoder+decoder graph to `F32` on an f16/bf16 checkpoint); the encoder is
+  /// skipped if `mel` is already the encoder-output shape
+  /// `(n_audio_ctx, n_audio_state)`.
   fn audio_features(&self, mel: &Array) -> Result<Array> {
     encode_once(self.model, mel)
   }
