@@ -4,11 +4,34 @@
 //! the `ModelArgs` / `RMSNorm` / `TransformerBlock` of `mlx-lm`'s
 //! `models/gemma3_text.py`. The backbone is a Gemma3 text transformer driven as
 //! a **bidirectional encoder**: the public model (see [`super`]) builds an
-//! additive padding mask (`0` on real tokens, `-inf` on pad) and passes it to
-//! **every** layer, so each layer runs full (non-causal) attention over the real
-//! tokens — `gemma3_text.py`'s `Model.__call__` (the mlx-embeddings one) creates
-//! the `extended_attention_mask` from `attention_mask` and feeds it to
-//! `self.model(inputs, extended_attention_mask)`.
+//! additive padding mask (`0` on real tokens, `-inf` on pad) from the `{0,1}`
+//! attention mask, and the backbone derives each layer's mask from it
+//! (non-causal throughout):
+//!
+//! - **Global** (full-attention) layers — [`Gemma3Config::is_global_layer`],
+//!   every `sliding_window_pattern`-th layer — attend over **all** real tokens
+//!   through the padding-only mask.
+//! - **Local** (sliding-window) layers additionally attend through the
+//!   **bidirectional sliding window**: query `i` sees key `j` only when
+//!   `|i - j| < sliding_window` (strict). The band overlay is materialized only
+//!   when `seq_len > sliding_window` ([`build_local_layer_mask`]); a shorter
+//!   sequence skips it entirely, which is *exact* — every distance is then
+//!   `<= seq_len - 1 < sliding_window`, the overlay would be identically zero,
+//!   and `softmax(x + 0) = softmax(x)` — so `<= 512`-token inputs are
+//!   bit-for-bit unaffected.
+//!
+//! **Reference choice**: the window masking follows the google/HF reference —
+//! `transformers`' `modeling_gemma3.py`, whose `_bidirectional_window_overlay`
+//! (`abs(q_idx - kv_idx) < sliding_window`) is OR-composed onto the
+//! `sliding_attention` layers' mask when the checkpoint sets
+//! `use_bidirectional_attention: true` (EmbeddingGemma's `config.json` does) —
+//! and **deliberately deviates from the declared upstream** `mlx-embeddings`
+//! (`models/gemma3_text.py`), whose `Model.__call__` feeds the padding-only
+//! `extended_attention_mask` to every layer (bypassing the imported mlx-lm
+//! window path, which only activates when *no* explicit mask is given). For
+//! `> sliding_window`-token inputs that upstream silently diverges from the
+//! google reference, so window-faithful masking wins here; the per-layer RoPE
+//! base split (below) is unchanged and shared by both references.
 //!
 //! ## Per-layer architecture (`gemma3_text.py` `TransformerBlock`)
 //!
@@ -26,9 +49,10 @@
 //!   `hidden / heads`), **query and key RMSNorm** over the head dimension,
 //!   RoPE, and the fused SDPA with `scale = query_pre_attn_scalar ** -0.5`. The
 //!   RoPE base alternates per layer: the **global** layers (`is_global_layer`)
-//!   use `rope_theta`, the local layers use `rope_local_base_freq` (the only
-//!   effect the sliding-window pattern has here — the attention is bidirectional
-//!   throughout, so the window itself is not applied).
+//!   use `rope_theta`, the local layers use `rope_local_base_freq`. The same
+//!   global/local split selects each layer's mask (padding-only vs banded, see
+//!   above) — both read [`Gemma3Config::is_global_layer`], so the RoPE base and
+//!   the window can never disagree.
 //! - **MLP**: the Gemma gated feed-forward `down(gelu_approx(gate(x)) * up(x))`
 //!   (`gelu_approx` = the `tanh` GELU, `mlx.nn.gelu_approx`).
 //! - **Norms**: four `RMSNorm`s per layer plus a final backbone `RMSNorm`,
@@ -171,8 +195,11 @@ impl Attention {
     })
   }
 
-  /// `(B, L, hidden) → (B, L, hidden)` bidirectional attention with the additive
-  /// padding `mask`. No KV cache (encoder), so RoPE is applied at offset 0.
+  /// `(B, L, hidden) → (B, L, hidden)` bidirectional attention with the
+  /// additive `mask` — padding-only `(B, 1, 1, L)` on global layers, padding +
+  /// sliding-window band `(B, 1, L, L)` on local layers once `L` exceeds the
+  /// window (both broadcast over heads). No KV cache (encoder), so RoPE is
+  /// applied at offset 0.
   fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
     let shape = x.shape();
     let b = dim_i32(&shape, 0, "Gemma3 Attention: batch")?;
@@ -369,6 +396,13 @@ struct TransformerBlock {
   post_attention_layernorm: RMSNorm,
   pre_feedforward_layernorm: RMSNorm,
   post_feedforward_layernorm: RMSNorm,
+  /// `true` for a **global** (full-attention) layer: it attends through the
+  /// padding-only mask, while a local layer gets the banded mask once the
+  /// sequence exceeds the sliding window ([`Gemma3Backbone::forward`]).
+  /// Derived from the SAME [`Gemma3Config::is_global_layer`] that selects the
+  /// RoPE base in [`Attention::from_weights`], so mask and base cannot
+  /// disagree.
+  is_global: bool,
 }
 
 #[cfg(feature = "embeddinggemma")]
@@ -424,6 +458,7 @@ impl TransformerBlock {
       post_attention_layernorm,
       pre_feedforward_layernorm,
       post_feedforward_layernorm,
+      is_global: config.is_global_layer(layer_idx),
     })
   }
 
@@ -455,6 +490,11 @@ pub(crate) struct Gemma3Backbone {
   layers: Vec<TransformerBlock>,
   norm: RMSNorm,
   hidden_size: i32,
+  /// The local layers' bidirectional band half-width
+  /// ([`Gemma3Config::sliding_window`], validated `>= 1`): once
+  /// `seq_len > sliding_window`, [`forward`](Self::forward) builds the banded
+  /// mask the local layers attend through.
+  sliding_window: i32,
 }
 
 #[cfg(feature = "embeddinggemma")]
@@ -518,12 +558,21 @@ impl Gemma3Backbone {
       layers,
       norm,
       hidden_size: hidden,
+      sliding_window: config.sliding_window,
     })
   }
 
   /// Run the backbone over a `(batch, seq_len)` i32 token-id batch and the
   /// `(batch, 1, 1, seq_len)` additive padding `mask`, returning the final
   /// `(batch, seq_len, hidden)` hidden states (post final `RMSNorm`).
+  ///
+  /// Global layers attend through `mask` as-is; once
+  /// `seq_len > sliding_window` the local layers attend through the banded
+  /// `(batch, 1, seq_len, seq_len)` mask derived from it
+  /// ([`build_local_layer_mask`], built once and shared by every local layer).
+  /// At `seq_len <= sliding_window` the band is skipped — exactly equivalent
+  /// (the overlay would be identically zero) and bit-for-bit the pre-window
+  /// behavior (every layer gets the same `mask` object as before).
   ///
   /// `input_ids` is pinned to exactly rank-2 before any op (the public
   /// `embed_text` accepts an untrusted array; the embedding gather + the
@@ -537,6 +586,7 @@ impl Gemma3Backbone {
         shape,
       )));
     }
+    let seq_len = dim_i32(&shape, 1, "Gemma3 backbone: seq_len")?;
 
     // token_embedding(ids): (B, L) → (B, L, hidden) via axis-0 gather (the
     // quantized table dequantizes the gathered rows).
@@ -551,8 +601,24 @@ impl Gemma3Backbone {
     let scale = embedding_scale_like(self.hidden_size as f32, &h)?;
     h = h.multiply(&scale)?;
 
+    // The local layers' banded mask, built ONCE per forward (shared by every
+    // local layer) and only when the sequence actually exceeds the window —
+    // at `seq_len <= sliding_window` the band overlay would be identically
+    // zero (`|i - j| <= seq_len - 1 < window` everywhere), so skipping it is
+    // exact and keeps short inputs on the unchanged padding-only path.
+    let local_mask = if seq_len > self.sliding_window {
+      Some(build_local_layer_mask(mask, seq_len, self.sliding_window)?)
+    } else {
+      None
+    };
+
     for layer in &self.layers {
-      h = layer.forward(&h, mask)?;
+      let layer_mask = if layer.is_global {
+        mask
+      } else {
+        local_mask.as_ref().unwrap_or(mask)
+      };
+      h = layer.forward(&h, layer_mask)?;
     }
     self.norm.forward(&h)
   }
@@ -598,7 +664,9 @@ impl Gemma3Backbone {
 /// `attention_mask` becomes `[:, None, None, :]`, then the boolean is mapped to
 /// the additive `{0, -inf}` form and cast to `dtype`. The result masks **keys**
 /// only (every query attends to every real key — bidirectional), which is the
-/// encoder contract.
+/// encoder contract for the **global** layers; the local layers' banded mask is
+/// derived from it by [`build_local_layer_mask`] once the sequence exceeds the
+/// sliding window.
 #[cfg(feature = "embeddinggemma")]
 pub(crate) fn build_additive_mask(attention_mask: &Array, dtype: DtypeAlias) -> Result<Array> {
   let shape = attention_mask.shape();
@@ -621,6 +689,80 @@ pub(crate) fn build_additive_mask(attention_mask: &Array, dtype: DtypeAlias) -> 
   let mask = ops::logical::select(&keep, &additive_zero, &neg_inf)?;
   // Cast to the hidden dtype so SDPA sees a matching additive mask dtype.
   ops::misc::astype(&mask, dtype)
+}
+
+/// Build the `(1, 1, seq_len, seq_len)` additive **bidirectional
+/// sliding-window overlay**: `0` where `|i - j| < window` (query `i` may see
+/// key `j`), `-inf` elsewhere — the HF Gemma3 `_bidirectional_window_overlay`
+/// (`modeling_gemma3.py`: `abs(q_idx - kv_idx) < sliding_window`, strictly
+/// exclusive at `|i - j| == window`).
+///
+/// The position/distance grid is computed in **f32** and only the finished
+/// `{0, -inf}` overlay is cast to `dtype`: small position integers are exact in
+/// f32, whereas bf16 cannot represent every integer near a real 512 window
+/// (e.g. `511` rounds to `512`), which would corrupt the strict `< window`
+/// comparison at the band edge. The cast itself is exact (`0` and `-inf` are
+/// representable in every float dtype), so SDPA sees a matching-dtype additive
+/// mask — the same dtype discipline as [`build_additive_mask`].
+#[cfg(feature = "embeddinggemma")]
+pub(crate) fn build_sliding_window_overlay(
+  seq_len: i32,
+  window: i32,
+  dtype: DtypeAlias,
+) -> Result<Array> {
+  // Positions 0..seq_len as an f32 ramp, split into a (S, 1) query column and a
+  // (1, S) key row so `q - k` broadcasts to the (S, S) signed-distance grid.
+  let positions = Array::arange::<f32>(0.0, f64::from(seq_len), 1.0)?;
+  let q = ops::shape::reshape(&positions, &[seq_len, 1])?;
+  let k = ops::shape::reshape(&positions, &[1, seq_len])?;
+  let dist = ops::arithmetic::abs(&ops::arithmetic::subtract(&q, &k)?)?;
+  // `|i - j| < window` (strict — HF's exclusive band edge).
+  let window_arr = Array::full::<f32>(&(1,), window as f32)?;
+  let inside = ops::comparison::less(&dist, &window_arr)?;
+  let zero = Array::full::<f32>(&(1,), 0.0)?;
+  let neg_inf = Array::full::<f32>(&(1,), f32::NEG_INFINITY)?;
+  let overlay = ops::logical::select(&inside, &zero, &neg_inf)?;
+  let overlay = ops::misc::astype(&overlay, dtype)?;
+  // (S, S) → (1, 1, S, S): broadcastable over batch and heads.
+  ops::shape::reshape(&overlay, &[1, 1, seq_len, seq_len])
+}
+
+/// Combine the `(batch, 1, 1, seq_len)` additive padding `mask` with the
+/// [`build_sliding_window_overlay`] band into the
+/// `(batch, 1, seq_len, seq_len)` additive mask the **local** layers attend
+/// through: key `j` is visible to query `i` iff it is a real token AND
+/// `|i - j| < window` — the HF Gemma3 bidirectional sliding-window semantics
+/// (window AND padding; in additive form the two `{0, -inf}` masks simply add,
+/// and `-inf + -inf = -inf`, never a `NaN` — there is no `+inf` operand).
+///
+/// A query row left with **no** visible key — only possible at *padded* query
+/// positions, once the right-padding run reaches the window (every real key is
+/// then outside the band; a real query always sees itself, `|i - i| = 0 <
+/// window`) — is reset to fully-visible (all-`0`), mirroring HF
+/// `masking_utils.sdpa_mask`'s fully-masked-row fix (`attention_mask |
+/// torch.all(~attention_mask, dim=-1, keepdim=True)`). Without the reset such a
+/// row softmaxes all-`-inf` logits, and a `NaN` there poisons every REAL token
+/// at the next layer: a real query weights the padded position's `NaN` *value*
+/// by `exp(-inf) = 0`, and `0 × NaN = NaN`. The reset only changes hidden
+/// states at padded query positions, which mean pooling masks out, so the
+/// pooled embedding is unaffected.
+///
+/// Every piece is built in (or cast to) `mask`'s dtype, so SDPA sees one
+/// matching-dtype additive mask — the fast-SDPA mask dtype rule
+/// [`build_additive_mask`] already follows.
+#[cfg(feature = "embeddinggemma")]
+pub(crate) fn build_local_layer_mask(mask: &Array, seq_len: i32, window: i32) -> Result<Array> {
+  let dtype = mask.dtype()?;
+  let overlay = build_sliding_window_overlay(seq_len, window, dtype)?;
+  // (B, 1, 1, S) + (1, 1, S, S) → (B, 1, S, S): the per-batch-row padding
+  // broadcasts down the query axis, the shared band broadcasts over the batch.
+  let combined = mask.add(&overlay)?;
+  // The HF fully-masked-row fix: a row whose max is still -inf has no visible
+  // key — reset exactly those rows to fully-visible.
+  let row_max = ops::reduction::max_axes(&combined, &[-1], true)?;
+  let fully_masked = ops::comparison::isneginf(&row_max)?;
+  let zero = ops::misc::astype(&Array::full::<f32>(&(1,), 0.0)?, dtype)?;
+  ops::logical::select(&fully_masked, &zero, &combined)
 }
 
 #[cfg(all(test, feature = "embeddinggemma"))]
@@ -689,5 +831,158 @@ mod tests {
     let v = to_f32(&out);
     assert_eq!(v[0], 120_000.0, "f32 add is not clamped to the f16 range");
     assert_eq!(v[1], 4.0);
+  }
+
+  // ─────────────── bidirectional sliding-window mask helpers ───────────────
+
+  #[test]
+  fn sliding_window_overlay_matches_hf_band_semantics() {
+    // S = 5, window = 2: visible (0) iff |i - j| < 2 — the strict HF
+    // `_bidirectional_window_overlay` — and -inf everywhere else; (1,1,S,S).
+    let overlay = build_sliding_window_overlay(5, 2, Dtype::F32).expect("overlay");
+    assert_eq!(overlay.shape(), vec![1, 1, 5, 5]);
+    let v = to_f32(&overlay);
+    for i in 0..5usize {
+      for j in 0..5usize {
+        let got = v[i * 5 + j];
+        if (i as i32 - j as i32).abs() < 2 {
+          assert_eq!(got, 0.0, "({i},{j}) inside the band must be visible");
+        } else {
+          assert_eq!(
+            got,
+            f32::NEG_INFINITY,
+            "({i},{j}) outside the band must be -inf"
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn sliding_window_overlay_boundary_is_exclusive() {
+    // |i - j| == window is OUTSIDE the band (HF: `abs(q - kv) < sliding_window`
+    // — strict). Pin both sides of the edge.
+    let overlay = build_sliding_window_overlay(4, 3, Dtype::F32).expect("overlay");
+    let v = to_f32(&overlay);
+    assert_eq!(v[2], 0.0, "|0-2| = 2 < 3 is visible");
+    assert_eq!(
+      v[3],
+      f32::NEG_INFINITY,
+      "|0-3| = 3 == window is masked (exclusive edge)"
+    );
+  }
+
+  #[test]
+  fn sliding_window_overlay_is_identically_zero_when_seq_le_window() {
+    // The mathematical basis for skipping the band at seq <= window: every
+    // distance is `|i - j| <= seq - 1 < window`, so the overlay is the additive
+    // identity (`softmax(x + 0) = softmax(x)`) — skipping is exact.
+    for (s, w) in [(4, 4), (3, 4), (1, 1)] {
+      let overlay = build_sliding_window_overlay(s, w, Dtype::F32).expect("overlay");
+      let v = to_f32(&overlay);
+      assert!(
+        v.iter().all(|x| *x == 0.0),
+        "seq {s} <= window {w} must be an all-zero overlay"
+      );
+    }
+  }
+
+  #[test]
+  fn sliding_window_overlay_computes_band_in_f32_before_cast() {
+    // bf16 cannot represent 511 (it rounds to 512): had the distance grid been
+    // built in bf16, |i - j| = 511 would land on the window edge and the strict
+    // `< 512` comparison would mask a visible position. The grid is computed in
+    // f32 and only the finished {0, -inf} overlay is cast, so the real 512
+    // window is exact in bf16 — and the cast preserves the requested dtype.
+    let s = 515usize;
+    let overlay = build_sliding_window_overlay(s as i32, 512, Dtype::BF16).expect("overlay");
+    assert_eq!(overlay.dtype().unwrap(), Dtype::BF16);
+    let v = to_f32(&overlay);
+    assert_eq!(v[511], 0.0, "|0-511| = 511 < 512 must stay visible in bf16");
+    assert_eq!(v[512], f32::NEG_INFINITY, "|0-512| = 512 is masked");
+    assert_eq!(v[514 * s + 3], 0.0, "|514-3| = 511 < 512 must stay visible");
+    assert_eq!(v[514 * s + 2], f32::NEG_INFINITY, "|514-2| = 512 is masked");
+  }
+
+  #[test]
+  fn local_layer_mask_adds_band_to_padding_and_broadcasts_batch() {
+    // Padding (2,1,1,4) — row 0 unpadded, row 1 pads the last key — + window 2
+    // → (2,1,4,4): each row's padding must combine with the shared band.
+    let pad =
+      Array::from_slice::<f32>(&[1., 1., 1., 1., 1., 1., 1., 0.], &(2usize, 4usize)).unwrap();
+    let additive = build_additive_mask(&pad, Dtype::F32).expect("padding mask");
+    let local = build_local_layer_mask(&additive, 4, 2).expect("local mask");
+    assert_eq!(local.shape(), vec![2, 1, 4, 4]);
+    assert_eq!(local.dtype().unwrap(), Dtype::F32);
+    let v = to_f32(&local);
+    let at = |b: usize, q: usize, k: usize| v[b * 16 + q * 4 + k];
+    // Batch row 0: pure band.
+    assert_eq!(at(0, 0, 1), 0.0, "in-band real key visible");
+    assert_eq!(
+      at(0, 0, 2),
+      f32::NEG_INFINITY,
+      "out-of-band real key masked"
+    );
+    assert_eq!(at(0, 3, 3), 0.0, "diagonal always visible");
+    // Batch row 1: key 3 is padding → masked even inside the band.
+    assert_eq!(
+      at(1, 3, 3),
+      f32::NEG_INFINITY,
+      "padded key masked inside the band"
+    );
+    assert_eq!(at(1, 3, 2), 0.0, "real in-band key visible on padded row");
+    assert_eq!(at(1, 0, 1), 0.0);
+    assert_eq!(at(1, 0, 3), f32::NEG_INFINITY, "padding + band both mask");
+  }
+
+  #[test]
+  fn local_layer_mask_resets_fully_masked_padded_query_rows() {
+    // real_len 1, window 2, seq 4: padded queries 2 and 3 have no real key
+    // inside the band (distance to key 0 >= window) → without the HF
+    // fully-masked-row reset they would softmax all-`-inf` (NaN). The reset
+    // turns exactly those rows fully visible; rows with any visible key are
+    // untouched.
+    let pad = Array::from_slice::<f32>(&[1., 0., 0., 0.], &(1usize, 4usize)).unwrap();
+    let additive = build_additive_mask(&pad, Dtype::F32).expect("padding mask");
+    let local = build_local_layer_mask(&additive, 4, 2).expect("local mask");
+    let v = to_f32(&local);
+    let at = |q: usize, k: usize| v[q * 4 + k];
+    // q0 (real): sees itself; other keys are padding → untouched row.
+    assert_eq!(at(0, 0), 0.0);
+    assert_eq!(at(0, 1), f32::NEG_INFINITY);
+    // q1 (padded) still sees the real in-band key 0 (|1-0| = 1 < 2) → NOT reset.
+    assert_eq!(at(1, 0), 0.0);
+    assert_eq!(at(1, 3), f32::NEG_INFINITY);
+    // q2 / q3 (padded, no visible key) → reset to all-visible.
+    for q in 2..4usize {
+      for k in 0..4usize {
+        assert_eq!(
+          at(q, k),
+          0.0,
+          "fully-masked padded query row must be reset to visible at ({q},{k})"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn local_layer_mask_keeps_model_dtype() {
+    // The banded mask must stay in the model dtype end to end (the fast-SDPA
+    // mask dtype rule): no silent f32 promotion from the band constants, the
+    // row-reset zero, or the combine add.
+    for dt in [Dtype::F16, Dtype::BF16] {
+      let pad = Array::from_slice::<f32>(&[1.0; 6], &(1usize, 6usize)).unwrap();
+      let additive = build_additive_mask(&pad, dt).expect("padding mask");
+      let local = build_local_layer_mask(&additive, 6, 2).expect("local mask");
+      assert_eq!(
+        local.dtype().unwrap(),
+        dt,
+        "banded mask must stay {dt:?} (matching-dtype SDPA mask)"
+      );
+      // The {0, -inf} values survive the half-precision cast exactly.
+      let v = to_f32(&local);
+      assert_eq!(v[1], 0.0, "in-band visible");
+      assert_eq!(v[2], f32::NEG_INFINITY, "out-of-band masked");
+    }
   }
 }
