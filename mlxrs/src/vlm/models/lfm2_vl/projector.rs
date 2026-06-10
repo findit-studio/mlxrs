@@ -392,7 +392,9 @@ impl Lfm2VlMultiModalProjector {
 /// [`Error::LengthMismatch`] on mismatch, mirroring the reference's
 /// `ValueError` at `lfm2_vl.py:173-176` — and replaces every masked position's
 /// embedding with the matching feature row (in row-major mask order). The result
-/// is `(B, T, D)`.
+/// is `(B, T, D)` **in `inputs_embeds`' dtype** (the feature rows are cast to
+/// it, mirroring `masked_scatter`'s assign-into-destination setitem semantics —
+/// F32 features must not promote a bf16/f16 embedding sequence).
 ///
 /// The splice is fully lazy (no in-place mutation): the masked flat positions
 /// are read host-side (a tiny `(B, T)` bool read) only to build the
@@ -491,6 +493,16 @@ pub fn merge_input_ids_with_image_features(
   if n == 0 {
     return inputs_embeds.try_clone();
   }
+
+  // The reference's `masked_scatter` assigns INTO `inputs_embeds`
+  // (`final_embedding_flattened[image_positions] = ...`, `lfm2_vl.py:75-93`) —
+  // mlx setitem implicitly casts the scattered rows to the DESTINATION dtype.
+  // The lazy `select` analogue below instead PROMOTES its branches (bf16
+  // embeds + F32 features → an F32 merge that silently widens the whole LM
+  // forward), so pin the feature rows to the embeddings dtype first. A
+  // same-dtype astype is a no-op.
+  let image_features = ops::misc::astype(image_features, inputs_embeds.dtype()?)?;
+  let image_features = &image_features;
 
   // Build the per-position gather index `(B*T,)`: the k-th masked flat position
   // gathers feature row `k`; every non-masked position gathers row 0 (its
