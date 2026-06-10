@@ -234,8 +234,9 @@ impl Lfm2VlMultiModalProjector {
   ///
   /// Weight keys follow `lfm2_vl.py`'s module tree under the projector prefix
   /// (the VL-level `multi_modal_projector` prefix already stripped):
-  /// `layer_norm.{weight,bias}` (present iff `projector_use_layernorm`),
-  /// `linear_1.{weight,bias,scales,biases}`,
+  /// `layer_norm.{weight,bias}` (REQUIRED iff `projector_use_layernorm`; when
+  /// the flag is `false` any present pair is consumed and **dropped** — see
+  /// below), `linear_1.{weight,bias,scales,biases}`,
   /// `linear_2.{weight,bias,scales,biases}`. The `linear_*.bias` presence is
   /// gated by the authoritative `projector_bias` config flag
   /// (`lfm2_vl.py:20-30` builds both `Linear`s with `bias=config.projector_bias`):
@@ -245,6 +246,19 @@ impl Lfm2VlMultiModalProjector {
   /// dense and quantized paths via
   /// [`MaybeQuantizedLinear::from_weights_with_bias`] (NOT the auto-consuming
   /// `from_weights`).
+  ///
+  /// ## `projector_use_layernorm = false` still consumes `layer_norm.*`
+  ///
+  /// The reference `Lfm2VlMultiModalProjector.__init__` instantiates
+  /// `self.layer_norm = nn.LayerNorm(in_channels)` **unconditionally** and only
+  /// gates its *application* in `__call__` on `projector_use_layernorm` (as does
+  /// the HF-transformers module the published checkpoints are converted from) —
+  /// so a `projector_use_layernorm = false` checkpoint (e.g.
+  /// `LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}`) still carries both
+  /// `layer_norm.{weight,bias}` tensors. They are consumed and dropped here
+  /// (never applied), so the VL-level leftover-weight rejection does not fail
+  /// the load; a flag-`false` checkpoint *without* the pair (an
+  /// `nn.Identity()`-era conversion) loads identically.
   ///
   /// `quant` resolves a layer path's `(group_size, bits, mode)` from the parsed
   /// quantization config (`None` for a dense layer); a quantized layer is
@@ -277,6 +291,17 @@ impl Lfm2VlMultiModalProjector {
         LAYERNORM_DEFAULT_EPS,
       ))
     } else {
+      // `projector_use_layernorm = false` checkpoints STILL carry
+      // `layer_norm.{weight,bias}`: the reference instantiates the LayerNorm
+      // unconditionally and only gates its application in `__call__` (so the
+      // conversion always serializes the pair — the real
+      // `LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}` checkpoints are exactly this
+      // shape). Consume and DROP the pair (it is never applied) so the
+      // VL-level leftover-weight rejection does not hard-fail the load; both
+      // removes are no-ops for a checkpoint without the pair, keeping the
+      // (`nn.Identity()`-era) keyless layout loading unchanged.
+      weights.remove("layer_norm.weight");
+      weights.remove("layer_norm.bias");
       None
     };
 
