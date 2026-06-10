@@ -56,12 +56,32 @@
 //! does **not** apply it — a documented gap). For NaFlex that is a correctness
 //! bug: the padded patch rows would attend and be attended to, contaminating
 //! every real patch's representation (and the attention-pool probe). This port
-//! builds an additive `(1, 1, 1, num_patches)` key mask from
-//! `pixel_attention_mask` (`0` for real, `-inf` for padded) and passes it to
-//! the bidirectional
+//! builds a **boolean** `(1, 1, 1, num_patches)` key mask from
+//! `pixel_attention_mask` (`true` for real, `false` for padded) and passes it
+//! to the bidirectional
 //! [`crate::lm::nn::attention::scaled_dot_product_attention`], so padded
 //! positions contribute nothing — matching the HF native-resolution
-//! implementation the reference fixtures are generated from.
+//! implementation the reference fixtures are generated from. Boolean rather
+//! than additive float (see `build_attention_mask` for the dtype rationale):
+//! the fused SDPA accepts a bool mask for any q/k/v float dtype, whereas an
+//! additive mask must match the computation dtype — load-bearing now that
+//! [`VisionTower::forward`] casts `pixel_values` to the model dtype.
+//!
+//! ## Input dtype (`pixel_values` cast at the forward entry)
+//!
+//! The NaFlex [preprocessing][crate::embeddings::siglip2_naflex::processing]
+//! always emits an `F32` `pixel_values` (the image-processor contract, like
+//! HF's), and MLX type promotion only **widens** (`f16 op f32 → f32`) — so
+//! without a cast an f16/bf16 checkpoint would silently run the whole tower in
+//! `F32`, `astype`-ing every reduced-precision weight up on every forward.
+//! Both references cast at the vision entry — HF `modeling_siglip2.py`
+//! (`Siglip2VisionEmbeddings.forward`: `target_dtype =
+//! patch_embedding.weight.dtype; pixel_values.to(dtype=target_dtype)`) and
+//! mlx-embeddings `siglip.py` (`get_image_features`:
+//! `pixel_values.astype(patch_embedding.weight.dtype)`) — and
+//! [`VisionTower::forward`] restores that cast (the patch-embed weight dtype;
+//! a quantized patch embed resolves its `scales` dtype). A same-dtype `astype`
+//! is a no-op, so an `F32` checkpoint pays nothing.
 
 use std::collections::HashMap;
 
@@ -243,6 +263,12 @@ pub struct VisionTower {
   /// The loaded config's per-patch feature width (`P^2 * C`); `forward` pins
   /// the runtime `pixel_values` last axis to it.
   patch_feature_dim: usize,
+  /// The model compute dtype — the patch-embed projection's parameter dtype
+  /// (the dense weight's dtype, or the `scales` dtype for a quantized patch
+  /// embed), resolved once at load. [`forward`](Self::forward) casts the
+  /// (always-`F32`) runtime `pixel_values` to it so a reduced-precision
+  /// checkpoint runs in its own precision (see the module docs).
+  dtype: Dtype,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -342,6 +368,13 @@ impl VisionTower {
         proj: QuantLinear::dense(patch_weight, Some(patch_bias)),
       }
     };
+    // The model compute dtype: the patch-embed projection's parameter dtype
+    // (dense weight dtype / quantized scales dtype) — the same resolution the
+    // references use for the pixel-values cast (HF `modeling_siglip2.py`'s
+    // `target_dtype = patch_embedding.weight.dtype`; mlx-embeddings
+    // `siglip.py`'s `patch_embedding.weight.dtype`). Resolved once here so
+    // `forward` pays no per-call metadata lookup.
+    let dtype = patch_embed.proj.param_dtype()?;
 
     // ── position embedding table ──
     // Built quantize-aware then materialized to a dense `(num_positions, hidden)`
@@ -404,6 +437,7 @@ impl VisionTower {
       hidden,
       max_num_patches,
       patch_feature_dim,
+      dtype,
     })
   }
 
@@ -483,8 +517,19 @@ impl VisionTower {
       &[2],
     )?;
 
+    // Cast the runtime pixel_values to the model dtype FIRST — the reference
+    // does this at the vision entry (HF `modeling_siglip2.py`:
+    // `pixel_values.to(dtype=patch_embedding.weight.dtype)`; mlx-embeddings
+    // `siglip.py`: `pixel_values.astype(...weight.dtype)`). The preprocessing
+    // always emits `F32`, and MLX promotion only widens (`f16 op f32 → f32`),
+    // so without this cast an f16/bf16 checkpoint silently runs the WHOLE
+    // tower — patch embed, encoder, attention pool — in `F32`. A same-dtype
+    // astype is a no-op, so an `F32` checkpoint (or a pre-cast input) pays
+    // nothing. The key mask below is BOOLEAN precisely so it stays valid for
+    // any model dtype (see `build_attention_mask`).
+    let pixel_values = inputs.pixel_values.astype(self.dtype)?;
     // (max_num_patches, P^2*C) → (1, max_num_patches, P^2*C).
-    let pixel_values = ops::shape::expand_dims_axes(&inputs.pixel_values, &[0])?;
+    let pixel_values = ops::shape::expand_dims_axes(&pixel_values, &[0])?;
     // (1, max_num_patches, hidden).
     let patch_embeds = self.patch_embed.forward(&pixel_values)?;
 
@@ -496,8 +541,9 @@ impl VisionTower {
     let pos = self.resized_position_embedding(h_p, w_p, &patch_embeds.shape())?;
     let mut h = patch_embeds.add(&pos)?;
 
-    // Additive key mask from pixel_attention_mask: 0 for real, -inf for padded,
-    // broadcast to (1, 1, 1, num_patches) for SDPA.
+    // Boolean key mask from pixel_attention_mask: true for real, false for
+    // padded, broadcast to (1, 1, 1, num_patches) for SDPA — dtype-agnostic,
+    // so it pairs with the model-dtype hidden states from the cast above.
     let attn_mask = build_attention_mask(&inputs.pixel_attention_mask)?;
     let mask = Mask::Array(&attn_mask);
 
@@ -604,21 +650,37 @@ fn expect_runtime_shape(actual: &[usize], context: &'static str, expected: &[usi
   Ok(())
 }
 
-/// Build an additive attention key-mask `(1, 1, 1, num_patches)` from the
+/// Build a **boolean** attention key-mask `(1, 1, 1, num_patches)` from the
 /// `(max_num_patches,)` `pixel_attention_mask` (`1` real, `0` padded): real →
-/// `0.0`, padded → `-inf`, so SDPA's softmax zeroes padded keys.
+/// `true` (attend), padded → `false` (masked out), so SDPA's softmax zeroes
+/// padded keys.
+///
+/// Boolean rather than the previous additive `0 / -inf` float mask, because
+/// the mask must stay valid for **any** model dtype now that
+/// [`VisionTower::forward`] casts `pixel_values` to the checkpoint precision:
+///
+/// - the fused SDPA REJECTS an additive mask whose dtype does not promote to
+///   the computation dtype (`mlx/fast.cpp`'s
+///   `promote_types(mask, final_type) != final_type` → "Mask type must promote
+///   to output type") — the old `F32` additive mask would error against
+///   f16/bf16 hidden states, and avoiding that with an additive mask would
+///   couple the mask construction (its `-inf` constant and dtype) to the model
+///   dtype;
+/// - a bool mask is exempt from that check and natively supported on every
+///   path: the fused kernel takes it directly when
+///   `supports_bool_mask()` (else mlx converts it to the `0 / -inf` form **in
+///   the computation dtype** itself), and the unfused fallback applies
+///   `where(mask, scores, finfo(scores.dtype).min)` — numerically identical
+///   for the softmax (a masked key's weight is exactly `0` either way, as with
+///   the old additive mask).
 #[cfg(feature = "siglip2-naflex")]
 fn build_attention_mask(pixel_attention_mask: &Array) -> Result<Array> {
-  // (num_patches,) i32 mask → bool (nonzero = real), then
-  // select(real, 0.0, -inf): real positions keep 0, padded get -inf.
+  // (num_patches,) i32 mask → bool (nonzero = real / attend).
   let mask_bool = ops::misc::astype(pixel_attention_mask, Dtype::Bool)?;
   let shape = pixel_attention_mask.shape();
   let n = dim_i32(&shape, 0, "siglip2 vision: mask length")?;
-  let zeros = Array::zeros::<f32>(&(n as usize,))?;
-  let neg_inf = Array::full::<f32>(&(n as usize,), f32::NEG_INFINITY)?;
-  let additive = ops::logical::select(&mask_bool, &zeros, &neg_inf)?;
   // (num_patches,) → (1, 1, 1, num_patches) to broadcast over (B, heads, L_q, L_kv).
-  ops::shape::reshape(&additive, &[1, 1, 1, n])
+  ops::shape::reshape(&mask_bool, &[1, 1, 1, n])
 }
 
 /// Reshape the patch-embed weight into the flattened Linear kernel

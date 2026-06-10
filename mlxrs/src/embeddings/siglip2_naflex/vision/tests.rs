@@ -161,6 +161,121 @@ fn eval_to_vec(a: &Array) -> Vec<f32> {
   a.to_vec::<f32>().unwrap()
 }
 
+/// Cast every tensor of a weight map to `dtype` — a tiny f16/bf16 "checkpoint"
+/// from the f32 fixture (a real reduced-precision checkpoint ships every float
+/// tensor in the reduced dtype).
+fn cast_weights(w: HashMap<String, Array>, dtype: Dtype) -> HashMap<String, Array> {
+  w.into_iter()
+    .map(|(k, v)| {
+      let cast = v.astype(dtype).unwrap();
+      (k, cast)
+    })
+    .collect()
+}
+
+/// The pixel-values dtype cast + bool-mask regression (the SigLIP2 analogue of
+/// the Whisper mel-dtype fix): an f16/bf16 checkpoint fed the preprocessing's
+/// F32 `pixel_values` must run the WHOLE tower in the model dtype. Before the
+/// `VisionTower::forward` entry cast, MLX promotion (`f16 op f32 → f32`)
+/// silently ran everything in F32 — the output dtype check is RED. (And had
+/// only the cast landed without the bool mask, the additive F32 mask would be
+/// REJECTED by the fused SDPA against f16/bf16 hidden states — mlx `fast.cpp`:
+/// "Mask type must promote to output type" — so this also pins the mask/dtype
+/// pairing.)
+fn assert_forward_runs_in_model_dtype(dtype: Dtype) {
+  let cfg = tiny_vision_config(true);
+  let mut w = cast_weights(tiny_vision_weights(true), dtype);
+  let tower = VisionTower::from_weights(&cfg, &mut w).unwrap();
+
+  // The NaFlex preprocessing always emits F32 pixel_values (the processor
+  // contract, like HF's image processor).
+  let inputs = tiny_inputs(4, 4);
+  assert_eq!(
+    inputs.pixel_values.dtype().unwrap(),
+    Dtype::F32,
+    "precondition: the preprocessing emits F32 pixel_values"
+  );
+
+  let (last_hidden, pooled) = tower
+    .forward(&inputs)
+    .expect("an F32 pixel_values input must forward on a reduced-precision checkpoint");
+  assert_eq!(
+    last_hidden.dtype().unwrap(),
+    dtype,
+    "last_hidden must be in the model dtype (pixel_values cast at the forward entry)"
+  );
+  let pooled = pooled.expect("vision_use_head -> pooled output");
+  assert_eq!(
+    pooled.dtype().unwrap(),
+    dtype,
+    "pooled output must be in the model dtype"
+  );
+  assert!(
+    eval_to_vec(&pooled.astype(Dtype::F32).unwrap())
+      .iter()
+      .all(|x| x.is_finite()),
+    "reduced-precision pooled output must be finite"
+  );
+}
+
+#[test]
+fn f32_pixel_values_on_f16_checkpoint_run_in_f16() {
+  assert_forward_runs_in_model_dtype(Dtype::F16);
+}
+
+#[test]
+fn f32_pixel_values_on_bf16_checkpoint_run_in_bf16() {
+  assert_forward_runs_in_model_dtype(Dtype::BF16);
+}
+
+#[test]
+fn f32_checkpoint_still_runs_in_f32() {
+  // The control: a same-dtype cast is a no-op — the F32 fixture's outputs stay
+  // F32 (no accidental down-cast).
+  assert_forward_runs_in_model_dtype(Dtype::F32);
+}
+
+#[test]
+fn padded_pixel_rows_do_not_affect_pooled_output() {
+  // Pins the attention-mask SEMANTICS across the bool-mask change: the padded
+  // patch rows (mask 0) must contribute NOTHING to any attended output —
+  // garbage in the padded `pixel_values` rows leaves the pooled embedding (the
+  // attention-pool probe attends over the masked keys) bit-identical. This is
+  // exactly what the old additive 0/-inf mask guaranteed; the bool mask must
+  // guarantee the same (mlx converts a bool mask to the 0/-inf form
+  // internally).
+  let cfg = tiny_vision_config(true);
+  let mut w = tiny_vision_weights(true);
+  let tower = VisionTower::from_weights(&cfg, &mut w).unwrap();
+
+  let clean = below_budget_inputs(1, 3); // 3 active rows of the 4-row budget
+  let (_, clean_pooled) = tower.forward(&clean).unwrap();
+  let clean_pooled = eval_to_vec(&clean_pooled.unwrap());
+
+  // Same inputs, with the PADDED row's pixels replaced by garbage.
+  let per_patch = PATCH_FEAT as usize;
+  let mut pv = eval_to_vec(&clean.pixel_values);
+  for slot in pv.iter_mut().skip(3 * per_patch) {
+    *slot = 123.456;
+  }
+  let dirty = NaflexInputs {
+    pixel_values: Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap(),
+    pixel_attention_mask: clean.pixel_attention_mask.try_clone().unwrap(),
+    spatial_shapes: clean.spatial_shapes.try_clone().unwrap(),
+  };
+  let (_, dirty_pooled) = tower.forward(&dirty).unwrap();
+  let dirty_pooled = eval_to_vec(&dirty_pooled.unwrap());
+
+  assert_eq!(clean_pooled.len(), dirty_pooled.len());
+  for (i, (c, d)) in clean_pooled.iter().zip(dirty_pooled.iter()).enumerate() {
+    assert!(
+      c == d,
+      "padded-row garbage leaked into the pooled output at {i}: {c} vs {d} \
+       (the key mask must fully exclude padded patches)"
+    );
+  }
+}
+
 #[test]
 fn vision_tower_output_shapes_square_grid() {
   let cfg = tiny_vision_config(true);

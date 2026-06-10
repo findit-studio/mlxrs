@@ -310,12 +310,11 @@ impl Siglip2NaflexModel {
 
   /// Override the pad id the fixed-length text scheme fills with.
   ///
-  /// Defaults to the SigLIP2 Gemma `<pad>` id
-  /// ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID), `0`).
-  /// The load-factory [`constructor`] calls this with the id resolved from the
-  /// checkpoint's own tokenizer metadata ([`read_text_pad_token_id`]) so the
-  /// pad fill always tracks the tokenizer that produced the checkpoint; a
-  /// caller building the model directly via
+  /// Defaults to the SigLIP2 Gemma `<pad>` id (`DEFAULT_TEXT_PAD_TOKEN_ID`,
+  /// `0`). The load-factory [`constructor`] calls this with the id resolved
+  /// from the checkpoint's own tokenizer metadata (`read_text_pad_token_id`)
+  /// so the pad fill always tracks the tokenizer that produced the checkpoint;
+  /// a caller building the model directly via
   /// [`from_weights`](Self::from_weights) can do the same.
   pub fn set_text_pad_token_id(&mut self, id: u32) {
     self.text_pad_token_id = id;

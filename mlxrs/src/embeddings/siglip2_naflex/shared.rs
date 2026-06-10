@@ -199,6 +199,25 @@ impl QuantLinear {
   pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
     self.inner.forward(x)
   }
+
+  /// The projection's **parameter dtype** — the float precision the layer
+  /// computes in, i.e. what activations should be cast to so a reduced-precision
+  /// checkpoint is not silently widened by MLX type promotion
+  /// (`f16 op f32 → f32`):
+  ///
+  /// - **dense**: the weight's own dtype;
+  /// - **quantized**: the `scales` dtype (the packed weight is `uint32`;
+  ///   `quantized_matmul` dequantizes through the scales' float dtype, which is
+  ///   the checkpoint's compute precision — the same resolution mlx-lm /
+  ///   mlx-embeddings use for a quantized layer's effective dtype).
+  ///
+  /// Reads only dtype metadata (no materialization / eval).
+  pub(crate) fn param_dtype(&self) -> Result<Dtype> {
+    match &self.inner {
+      MaybeQuantizedLinear::Dense(l) => l.weight_ref().dtype(),
+      MaybeQuantizedLinear::Quantized(q) => q.scales_ref().dtype(),
+    }
+  }
 }
 
 /// Validate a quantized layer's packed `<prefix>.weight` + `<prefix>.scales`
