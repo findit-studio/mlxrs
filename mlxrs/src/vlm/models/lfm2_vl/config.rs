@@ -389,9 +389,19 @@ impl VisionConfig {
 /// by [`crate::lm::models::lfm2::resolve_quantization`] (which also accepts the
 /// HuggingFace `quantization_config` key) at load time — the same path the LFM2
 /// LM and the other quantized ports use.
+/// `Deserialize` is **hand-written** (via the private [`RawModelConfig`] mirror)
+/// rather than derived so the top-level `eos_token_id`'s null-coalescing and its
+/// fallback to `text_config.eos_token_id` are applied intrinsically on **every**
+/// deserialization path — a direct `serde_json::from_str::<ModelConfig>`, the
+/// `text_config`-nested path, and [`from_json`](Self::from_json) alike — exactly
+/// as the LFM2 LM [`TextConfig`](crate::lm::models::lfm2::TextConfig) hand-writes
+/// its `Deserialize` to apply `__post_init__` intrinsically. The released
+/// `LFM2-VL` `config.json` carries a top-level `eos_token_id: null` with the real
+/// value (`7`) nested under `text_config`; a derived `Deserialize` over a bare
+/// `i32` would reject the present `null` (and could not see the nested value).
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
   /// Text-tower config (`text_config`) — the LFM2 LM [`TextConfig`].
   pub text_config: TextConfig,
@@ -400,32 +410,24 @@ pub struct ModelConfig {
   /// Top-level architecture id. `config.py`'s default is `"lfm2-vl"`, but the
   /// released mlx-community checkpoints ship `"lfm2_vl"` (underscore); both are
   /// accepted by [`validate`](ModelConfig::validate).
-  #[serde(default = "default_model_type")]
   model_type: String,
   /// Pixel-unshuffle downsample factor applied to the vision grid before the
   /// projector (`2` ⇒ the projector input is `hidden * factor^2 = 3072` wide).
-  #[serde(default = "default_downsample_factor")]
   pub downsample_factor: i32,
   /// The `<image>` placeholder token id spliced with image features (`396`).
-  #[serde(default = "default_image_token_index")]
   pub image_token_index: i32,
   /// Projector hidden width (`2560`): `Linear(hidden*factor^2 -> 2560) -> gelu
   /// -> Linear(2560 -> text hidden)`.
-  #[serde(default = "default_projector_hidden_size")]
   pub projector_hidden_size: i32,
   /// Whether the projector applies a `LayerNorm` on its input (`true`).
-  #[serde(default = "default_true")]
   pub projector_use_layernorm: bool,
   /// Whether the projector `Linear`s carry a bias (`true`).
-  #[serde(default = "default_true")]
   pub projector_bias: bool,
   /// Which vision encoder layer's hidden state feeds the projector (`-1` ⇒ the
   /// last layer; the encoder is truncated to `vision_feature_layer + 1`).
-  #[serde(default = "default_vision_feature_layer")]
   pub vision_feature_layer: i32,
   /// Maximum per-image patch budget for the native-resolution processor
   /// (`1024`).
-  #[serde(default = "default_max_num_patches")]
   pub max_num_patches: i32,
   /// Whether the HuggingFace fast image processor splits an over-budget image
   /// into tiles (`config.py:76`, default `true`). Carried for config parity; the
@@ -434,62 +436,194 @@ pub struct ModelConfig {
   /// `processing_lfm2_vl.py:129-132, 195-196, 270-273, 372-373`), so this flag is
   /// not consumed by [`crate::vlm::models::lfm2_vl::processor`] today. See the
   /// module-level note on the tiling deferral.
-  #[serde(default = "default_true")]
   pub do_image_splitting: bool,
   /// Encoder patch size in pixels used by the tile-grid math of the HF fast image
   /// processor (`config.py:78`, default `16`). Carried for config parity (the
   /// native-resolution patch math uses the vision config's `patch_size`).
-  #[serde(default = "default_encoder_patch_size")]
   pub encoder_patch_size: i32,
   /// Upper bound on the per-image `<image>`-token budget the HF fast processor
   /// targets when choosing a tile grid (`config.py:80`, default `256`).
-  #[serde(default = "default_max_image_tokens")]
   pub max_image_tokens: i32,
   /// Lower bound on the per-image `<image>`-token budget the HF fast processor
   /// targets when choosing a tile grid (`config.py:84`, default `64`).
-  #[serde(default = "default_min_image_tokens")]
   pub min_image_tokens: i32,
   /// Maximum number of tiles the HF fast processor may split an image into
   /// (`config.py:83`, default `10`).
-  #[serde(default = "default_max_tiles")]
   pub max_tiles: i32,
   /// Minimum number of tiles the HF fast processor splits an over-budget image
   /// into (`config.py:85`, default `2`).
-  #[serde(default = "default_min_tiles")]
   pub min_tiles: i32,
   /// Tolerance multiplier on the patch budget before the HF fast processor
   /// triggers a tile split (`config.py:82`, default `2.0`).
-  #[serde(default = "default_max_pixels_tolerance")]
   pub max_pixels_tolerance: f32,
   /// Image-splitting tile size in pixels (`config.py:86`, default `512`).
-  #[serde(default = "default_tile_size")]
   pub tile_size: i32,
   /// Whether the HF fast processor appends a downscaled thumbnail tile when
   /// splitting (`config.py:88`, default `false`). Carried for config parity; not
   /// consumed by the mlx-vlm native-resolution path this port mirrors.
-  #[serde(default)]
   pub use_thumbnail: bool,
   /// Whether the prompt brackets each image with the `image_start` / `image_end`
   /// special tokens around the expanded `<image>` run (`config.py:87`, default
   /// `true`). The actual bracketing is driven by the processor's resolved token
   /// ids (see [`crate::vlm::models::lfm2_vl::processor`]); this carries the config
   /// flag for parity.
-  #[serde(default = "default_true")]
   pub use_image_special_tokens: bool,
   /// The projector activation id (`config.py:91`, default `"gelu"`). Carried for
   /// config parity; the projector forward hard-codes the GELU the reference uses
   /// (`lfm2_vl.py:36`).
-  #[serde(default = "default_projector_hidden_act")]
   pub projector_hidden_act: String,
-  /// End-of-sequence token id (`7`).
-  #[serde(default = "default_eos_token_id")]
-  pub eos_token_id: i32,
+  /// End-of-sequence token id, RESOLVED at deserialization with the precedence
+  /// documented on [`eos_token_id`](ModelConfig::eos_token_id) — a present,
+  /// non-null top-level `eos_token_id` wins; otherwise the nested
+  /// `text_config.eos_token_id` (the canonical home, `7` in the released
+  /// checkpoint); `None` only when neither is present (then the accessor falls
+  /// back to [`DEFAULT_EOS_TOKEN_ID`]).
+  ///
+  /// `Option<i32>` (not a defaulted `i32`) because the canonical
+  /// `LFM2-VL-450M` `config.json` carries a **top-level `eos_token_id: null`**
+  /// (the real value lives under `text_config`) — `#[serde(default = …)]` on a
+  /// bare `i32` fills an *absent* key but REJECTS a present `null`
+  /// (`invalid type: null, expected i32`), which blocked loading the canonical
+  /// checkpoint. The null-coalescing + nested resolution lives in this struct's
+  /// hand-written [`Deserialize`](ModelConfig#impl-Deserialize), so it applies on
+  /// every deserialization path. Read it through
+  /// [`eos_token_id`](ModelConfig::eos_token_id).
+  eos_token_id: Option<i32>,
   /// The raw `quantization` block (`{group_size, bits, mode}`), carried
   /// opaquely and resolved by
   /// [`crate::lm::models::lfm2::resolve_quantization`]. Absent ⇒ a dense
   /// checkpoint.
+  quantization: Option<serde_json::Value>,
+}
+
+/// Private `#[derive(Deserialize)]` mirror of [`ModelConfig`] — one field per
+/// `ModelConfig` field, carrying that field's serde defaults **verbatim**, so the
+/// hand-written [`ModelConfig`] `Deserialize` parses the raw `config.json`
+/// exactly as a derived impl would, then resolves the top-level-vs-nested
+/// `eos_token_id` before handing back the public struct. Keeping the defaults
+/// identical to [`ModelConfig`]'s former derive is load-bearing: any divergence
+/// in a default would change checkpoint parsing.
+///
+/// Two fields differ from a plain mirror to drive the eos resolution:
+///
+/// - `text_config` is captured as a raw [`serde_json::Value`] (not a
+///   [`TextConfig`]) so the nested `eos_token_id` — which [`TextConfig`]
+///   deliberately does not model — survives the first parse; the public
+///   [`TextConfig`] is then produced via `serde_json::from_value`, which still
+///   runs [`TextConfig`]'s own hand-written `Deserialize` (and thus its
+///   `__post_init__` RoPE override) unchanged.
+/// - `eos_token_id` is `Option<i32>` so a top-level `eos_token_id: null` parses
+///   to `None` (the bug: a defaulted bare `i32` rejects a present `null`); an
+///   absent key is also `None` (via `#[serde(default)]`). The resolution against
+///   the nested value happens in the [`ModelConfig`] `Deserialize`.
+#[cfg(feature = "lfm2-vl")]
+#[derive(serde::Deserialize)]
+struct RawModelConfig {
+  text_config: serde_json::Value,
+  vision_config: VisionConfig,
+  #[serde(default = "default_model_type")]
+  model_type: String,
+  #[serde(default = "default_downsample_factor")]
+  downsample_factor: i32,
+  #[serde(default = "default_image_token_index")]
+  image_token_index: i32,
+  #[serde(default = "default_projector_hidden_size")]
+  projector_hidden_size: i32,
+  #[serde(default = "default_true")]
+  projector_use_layernorm: bool,
+  #[serde(default = "default_true")]
+  projector_bias: bool,
+  #[serde(default = "default_vision_feature_layer")]
+  vision_feature_layer: i32,
+  #[serde(default = "default_max_num_patches")]
+  max_num_patches: i32,
+  #[serde(default = "default_true")]
+  do_image_splitting: bool,
+  #[serde(default = "default_encoder_patch_size")]
+  encoder_patch_size: i32,
+  #[serde(default = "default_max_image_tokens")]
+  max_image_tokens: i32,
+  #[serde(default = "default_min_image_tokens")]
+  min_image_tokens: i32,
+  #[serde(default = "default_max_tiles")]
+  max_tiles: i32,
+  #[serde(default = "default_min_tiles")]
+  min_tiles: i32,
+  #[serde(default = "default_max_pixels_tolerance")]
+  max_pixels_tolerance: f32,
+  #[serde(default = "default_tile_size")]
+  tile_size: i32,
+  #[serde(default)]
+  use_thumbnail: bool,
+  #[serde(default = "default_true")]
+  use_image_special_tokens: bool,
+  #[serde(default = "default_projector_hidden_act")]
+  projector_hidden_act: String,
+  #[serde(default)]
+  eos_token_id: Option<i32>,
   #[serde(default)]
   quantization: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "lfm2-vl")]
+impl<'de> serde::Deserialize<'de> for ModelConfig {
+  /// Deserialize a [`ModelConfig`] via the private [`RawModelConfig`] mirror,
+  /// then resolve the `eos_token_id` with the precedence documented on
+  /// [`eos_token_id`](Self::eos_token_id) — so EVERY path that materializes a
+  /// `ModelConfig` (a direct `serde_json::from_str::<ModelConfig>`, the nested
+  /// path, and [`from_json`](Self::from_json)) coalesces a top-level `null` and
+  /// falls back to the nested `text_config.eos_token_id` identically and cannot
+  /// bypass it.
+  fn deserialize<D: serde::Deserializer<'de>>(
+    deserializer: D,
+  ) -> std::result::Result<Self, D::Error> {
+    use serde::de::Error as _;
+    let raw = RawModelConfig::deserialize(deserializer)?;
+    // Pull the nested `text_config.eos_token_id` (the canonical home; `7` in the
+    // released checkpoint) from the raw text-config object BEFORE converting it
+    // to the typed `TextConfig`, which does not model token ids. A non-integer /
+    // absent value yields `None` so the fallback chain continues.
+    let nested_eos = raw
+      .text_config
+      .get("eos_token_id")
+      .and_then(serde_json::Value::as_i64)
+      .and_then(|v| i32::try_from(v).ok());
+    // Convert the captured raw text-config to the typed `TextConfig`. This runs
+    // `TextConfig`'s own hand-written `Deserialize` (and its `__post_init__` RoPE
+    // override) exactly as the former nested-derive path did.
+    let text_config: TextConfig =
+      serde_json::from_value(raw.text_config).map_err(D::Error::custom)?;
+    // Precedence: a present, non-null top-level `eos_token_id` wins; otherwise the
+    // nested `text_config.eos_token_id`. `None` only when NEITHER is present —
+    // then [`eos_token_id`](Self::eos_token_id) backstops with
+    // [`DEFAULT_EOS_TOKEN_ID`].
+    let eos_token_id = raw.eos_token_id.or(nested_eos);
+    Ok(ModelConfig {
+      text_config,
+      vision_config: raw.vision_config,
+      model_type: raw.model_type,
+      downsample_factor: raw.downsample_factor,
+      image_token_index: raw.image_token_index,
+      projector_hidden_size: raw.projector_hidden_size,
+      projector_use_layernorm: raw.projector_use_layernorm,
+      projector_bias: raw.projector_bias,
+      vision_feature_layer: raw.vision_feature_layer,
+      max_num_patches: raw.max_num_patches,
+      do_image_splitting: raw.do_image_splitting,
+      encoder_patch_size: raw.encoder_patch_size,
+      max_image_tokens: raw.max_image_tokens,
+      min_image_tokens: raw.min_image_tokens,
+      max_tiles: raw.max_tiles,
+      min_tiles: raw.min_tiles,
+      max_pixels_tolerance: raw.max_pixels_tolerance,
+      tile_size: raw.tile_size,
+      use_thumbnail: raw.use_thumbnail,
+      use_image_special_tokens: raw.use_image_special_tokens,
+      projector_hidden_act: raw.projector_hidden_act,
+      eos_token_id,
+      quantization: raw.quantization,
+    })
+  }
 }
 
 #[cfg(feature = "lfm2-vl")]
@@ -571,10 +705,18 @@ fn default_max_pixels_tolerance() -> f32 {
 fn default_projector_hidden_act() -> String {
   "gelu".to_string()
 }
+
+/// The reference end-of-sequence token id for `LiquidAI/LFM2-VL-450M`
+/// (`text_config.eos_token_id`, `7`). Used by
+/// [`ModelConfig::eos_token_id`](ModelConfig::eos_token_id) as the last-resort
+/// fallback when neither the top-level nor the nested `text_config.eos_token_id`
+/// is present. The runtime tokenizer EOS set is resolved separately and more
+/// completely by [`crate::vlm::load::load_vlm_base_config`] (top-level →
+/// `text_config`/`llm_config` → `generation_config.json` override); this constant
+/// only backstops the validate-only [`ModelConfig`] field.
 #[cfg(feature = "lfm2-vl")]
-fn default_eos_token_id() -> i32 {
-  7
-}
+#[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
+pub const DEFAULT_EOS_TOKEN_ID: i32 = 7;
 
 #[cfg(feature = "lfm2-vl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lfm2-vl")))]
@@ -585,9 +727,13 @@ impl ModelConfig {
   ///
   /// The nested `text_config` is the LFM2 LM [`TextConfig`], whose hand-written
   /// `Deserialize` applies `__post_init__`'s RoPE-base precedence
-  /// (`lfm2.py:40-42`) intrinsically — so it runs here too, during the
-  /// `ModelConfig` derive's deserialization of `text_config`, and on a direct
-  /// `serde_json::from_str::<ModelConfig>` alike, with no separate step.
+  /// (`lfm2.py:40-42`) intrinsically — so it runs here too, via the
+  /// [`ModelConfig`] hand-written `Deserialize` (which converts the captured raw
+  /// `text_config` through `TextConfig`'s own `Deserialize`), and on a direct
+  /// `serde_json::from_str::<ModelConfig>` alike, with no separate step. The same
+  /// hand-written `Deserialize` resolves [`eos_token_id`](Self::eos_token_id)
+  /// (top-level → nested `text_config` → [`DEFAULT_EOS_TOKEN_ID`]), so a canonical
+  /// checkpoint with a top-level `eos_token_id: null` loads cleanly.
   pub fn from_json(json: &str) -> Result<Self> {
     serde_json::from_str(json).map_err(|e| {
       Error::Parse(ParsePayload::new(
@@ -609,6 +755,28 @@ impl ModelConfig {
   #[inline(always)]
   pub fn quantization(&self) -> Option<&serde_json::Value> {
     self.quantization.as_ref()
+  }
+
+  /// The resolved end-of-sequence token id.
+  ///
+  /// Resolution precedence (applied during deserialization, see the
+  /// [`ModelConfig`] `Deserialize`): a present, non-null top-level
+  /// `config.json` `eos_token_id` wins; otherwise the nested
+  /// `text_config.eos_token_id` (the canonical home — `7` in the released
+  /// `LFM2-VL-450M` checkpoint, whose top-level value is `null`); if NEITHER is
+  /// present, [`DEFAULT_EOS_TOKEN_ID`].
+  ///
+  /// This backs the [`validate`](Self::validate) non-negative check and config
+  /// parity. The *runtime* tokenizer EOS set (what actually stops generation) is
+  /// resolved independently and more completely by
+  /// [`crate::vlm::load::load_vlm_base_config`] (which also honors a
+  /// `generation_config.json` override and a `llm_config` alias).
+  #[inline(always)]
+  pub const fn eos_token_id(&self) -> i32 {
+    match self.eos_token_id {
+      Some(id) => id,
+      None => DEFAULT_EOS_TOKEN_ID,
+    }
   }
 
   /// The resolved feature-layer count `vision_feature_layer + 1` — how many
@@ -766,13 +934,16 @@ impl ModelConfig {
       self.max_pixels_tolerance as f64,
     )?;
     // Token ids index a vocabulary / placeholder set; a negative id is
-    // structurally invalid (it would never match a real token).
+    // structurally invalid (it would never match a real token). `eos_token_id`
+    // is the RESOLVED value (top-level → nested `text_config` → default), so a
+    // checkpoint whose only eos lives under `text_config` is validated against
+    // that real value, not a placeholder.
     for (name, value) in [
       (
         "lfm2_vl::ModelConfig: image_token_index",
         self.image_token_index,
       ),
-      ("lfm2_vl::ModelConfig: eos_token_id", self.eos_token_id),
+      ("lfm2_vl::ModelConfig: eos_token_id", self.eos_token_id()),
     ] {
       if value < 0 {
         return Err(Error::OutOfRange(OutOfRangePayload::new(
