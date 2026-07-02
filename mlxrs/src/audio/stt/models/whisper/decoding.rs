@@ -1440,14 +1440,18 @@ impl<'a> DecodingTask<'a> {
     model.validate_token_ids("DecodingTask: initial token", &initial_tokens)?;
     let sample_begin = initial_tokens.len();
     // Soundness backstop: the prefill consumes `sample_begin` cache slots, so it
-    // must leave room for at least one sampled token within the backend's
-    // decoder-cache ceiling. `build_initial_tokens` already truncated prompt and
-    // prefix to `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence
-    // could still fill it; reject at task construction (before the encoder runs)
-    // rather than overrun the cache mid-prefill inside `decode_tokens`. On the MLX
-    // backend `max_decoder_ctx == n_text_ctx`, far above any real prefill, so this
-    // never fires (byte-identical).
-    if sample_begin >= max_decoder_ctx {
+    // must itself fit within the backend's decoder-cache ceiling.
+    // `build_initial_tokens` already truncated prompt and prefix to
+    // `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence could still
+    // exceed it; reject at task construction (before the encoder runs) rather
+    // than overrun the cache mid-prefill inside `decode_tokens`. A prefill that
+    // EXACTLY fills the ceiling (`==`) is allowed: the first sampled token is
+    // read off the prefill's last-position logits without a further forward (no
+    // extra cache slot), so one token can still be emitted — the reference
+    // `_main_loop` never rejects at construction (its `tokens.shape[-1] >
+    // self.n_ctx` bound is checked after sampling), and the CoreML backend's own
+    // `precheck_decode` allows `==` with the same strict-`>` bound.
+    if sample_begin > max_decoder_ctx {
       return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
         "DecodingTask: initial-token prefill",
         "max_decoder_ctx",
@@ -1455,18 +1459,21 @@ impl<'a> DecodingTask<'a> {
         sample_begin as u64,
       )));
     }
-    // Cap the sampled-token budget so the prompt + sampled tail never exceeds the
-    // backend's decoder-cache ceiling: the warm loops run `1..sample_len` and the
-    // prefill already consumes `sample_begin` cache slots, so bounding
-    // `sample_len <= max_decoder_ctx - sample_begin` makes every loop terminate
-    // by its own count at (or before) the cache bound. On the MLX backend
-    // `max_decoder_ctx == n_text_ctx`, so for any realistic `sample_begin` this
-    // `min` selects the original `sample_len` unchanged (byte-identical); on the
-    // CoreML backend it stops the loop cleanly at the 224-slot cache instead of
-    // reaching a mid-segment `CapExceeded`. `build_initial_tokens` above already
-    // ran with the ORIGINAL `sample_len`, so prompt/prefix truncation is
-    // unaffected by this cap.
-    let sample_len = sample_len.min(max_decoder_ctx.saturating_sub(sample_begin));
+    // Cap the sampled-token budget so the prompt + sampled tail never exceeds
+    // the backend's decoder-cache ceiling. Slot accounting: the prefill consumes
+    // `sample_begin` cache slots; the FIRST sampled token is read off the
+    // prefill's last-position logits without a further forward (no slot); the
+    // warm loops run `1..sample_len`, forwarding `sample_len - 1` more tokens
+    // (one slot each). So the bound is `sample_begin + sample_len - 1 <=
+    // max_decoder_ctx`, i.e. `sample_len <= max_decoder_ctx - sample_begin + 1`
+    // — the subtraction cannot underflow (the guard above ensures `sample_begin
+    // <= max_decoder_ctx`) and the `+ 1` saturates. On the CoreML backend this
+    // stops the loop cleanly at the 224-slot cache instead of reaching a
+    // mid-segment `CapExceeded`; when the prefill exactly fills the cache the
+    // cap is 1 — the prefill-logits token — and the warm loop `1..1` is empty.
+    // `build_initial_tokens` above already ran with the ORIGINAL `sample_len`,
+    // so prompt/prefix truncation is unaffected by this cap.
+    let sample_len = sample_len.min((max_decoder_ctx - sample_begin).saturating_add(1));
     let sot_index = initial_tokens
       .iter()
       .position(|&t| t == tokenizer.sot())
