@@ -472,23 +472,24 @@ pub struct ModelConfig {
   /// config parity; the projector forward hard-codes the GELU the reference uses
   /// (`lfm2_vl.py:36`).
   pub projector_hidden_act: String,
-  /// End-of-sequence token id, RESOLVED at deserialization with the precedence
-  /// documented on [`eos_token_id`](ModelConfig::eos_token_id) — a present,
-  /// non-null top-level `eos_token_id` wins; otherwise the nested
-  /// `text_config.eos_token_id` (the canonical home, `7` in the released
-  /// checkpoint); `None` only when neither is present (then the accessor falls
-  /// back to [`DEFAULT_EOS_TOKEN_ID`]).
+  /// End-of-sequence token id, RESOLVED at deserialization with the documented
+  /// precedence — a present, non-null top-level `eos_token_id` wins; otherwise
+  /// the nested `text_config.eos_token_id` (the canonical home, `7` in the
+  /// released checkpoint); otherwise [`DEFAULT_EOS_TOKEN_ID`]. Always a
+  /// concrete `i32` by the time a `ModelConfig` exists (this struct's fields
+  /// are all public, matching the reference dataclass).
   ///
-  /// `Option<i32>` (not a defaulted `i32`) because the canonical
+  /// The null-tolerance lives in the parse, not the type: the canonical
   /// `LFM2-VL-450M` `config.json` carries a **top-level `eos_token_id: null`**
   /// (the real value lives under `text_config`) — `#[serde(default = …)]` on a
   /// bare `i32` fills an *absent* key but REJECTS a present `null`
   /// (`invalid type: null, expected i32`), which blocked loading the canonical
-  /// checkpoint. The null-coalescing + nested resolution lives in this struct's
-  /// hand-written [`Deserialize`](ModelConfig#impl-Deserialize), so it applies on
-  /// every deserialization path. Read it through
-  /// [`eos_token_id`](ModelConfig::eos_token_id).
-  eos_token_id: Option<i32>,
+  /// checkpoint. The private `RawModelConfig` mirror therefore parses it as
+  /// `Option<i32>` and this struct's hand-written
+  /// [`Deserialize`](ModelConfig#impl-Deserialize) resolves the chain on every
+  /// deserialization path. The [`eos_token_id`](ModelConfig::eos_token_id)
+  /// accessor is retained as a convenience mirror of this field.
+  pub eos_token_id: i32,
   /// The raw `quantization` block (`{group_size, bits, mode}`), carried
   /// opaquely and resolved by
   /// [`crate::lm::models::lfm2::resolve_quantization`]. Absent ⇒ a dense
@@ -594,10 +595,12 @@ impl<'de> serde::Deserialize<'de> for ModelConfig {
     let text_config: TextConfig =
       serde_json::from_value(raw.text_config).map_err(D::Error::custom)?;
     // Precedence: a present, non-null top-level `eos_token_id` wins; otherwise the
-    // nested `text_config.eos_token_id`. `None` only when NEITHER is present —
-    // then [`eos_token_id`](Self::eos_token_id) backstops with
-    // [`DEFAULT_EOS_TOKEN_ID`].
-    let eos_token_id = raw.eos_token_id.or(nested_eos);
+    // nested `text_config.eos_token_id`; otherwise `DEFAULT_EOS_TOKEN_ID` — the
+    // field is a concrete `i32` from here on.
+    let eos_token_id = raw
+      .eos_token_id
+      .or(nested_eos)
+      .unwrap_or(DEFAULT_EOS_TOKEN_ID);
     Ok(ModelConfig {
       text_config,
       vision_config: raw.vision_config,
@@ -773,10 +776,7 @@ impl ModelConfig {
   /// `generation_config.json` override and a `llm_config` alias).
   #[inline(always)]
   pub const fn eos_token_id(&self) -> i32 {
-    match self.eos_token_id {
-      Some(id) => id,
-      None => DEFAULT_EOS_TOKEN_ID,
-    }
+    self.eos_token_id
   }
 
   /// The resolved feature-layer count `vision_feature_layer + 1` — how many

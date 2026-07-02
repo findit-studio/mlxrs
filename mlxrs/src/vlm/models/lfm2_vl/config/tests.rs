@@ -175,6 +175,9 @@ fn model_config_defaults_fill_top_level_fields() {
   // Neither a top-level nor a nested `text_config.eos_token_id` is present, so
   // the resolver backstops with `DEFAULT_EOS_TOKEN_ID`.
   assert_eq!(cfg.eos_token_id(), DEFAULT_EOS_TOKEN_ID);
+  // The field itself stays public (the struct mirrors the reference dataclass;
+  // downstream crates read it directly) and is already resolved.
+  assert_eq!(cfg.eos_token_id, DEFAULT_EOS_TOKEN_ID);
   // Image-splitting / tiling config defaults (config.py:76-88).
   assert!(cfg.do_image_splitting);
   assert_eq!(cfg.encoder_patch_size, 16);
