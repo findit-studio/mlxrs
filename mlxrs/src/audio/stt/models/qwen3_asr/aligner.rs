@@ -632,6 +632,13 @@ impl ForcedAligner {
   /// gather: `combined = concat([flat embeds, audio rows])`, then a host-built
   /// index selects, per flat position, either its own embedding row or its audio
   /// row.
+  ///
+  /// The audio rows are cast to the **embedding dtype** before the concat (the
+  /// reference's `audio_features = audio_features.astype(inputs_embeds.dtype)`),
+  /// so a wider-dtype encoder output — the crate's f32 mel frontend keeps the
+  /// audio tower's rows f32 even over a bf16 checkpoint — cannot promote the
+  /// spliced embeddings (and the decoder + timestamp head after them) past the
+  /// checkpoint dtype.
   fn splice_audio(
     &self,
     input_ids: &Array,
@@ -736,6 +743,18 @@ impl ForcedAligner {
     // `i32::MAX` into a negative / out-of-range row.
     let gather = splice_gather_index(&ids_flat, audio_token_id, seq_elems_i)?;
 
+    // Cast the audio rows to the embedding dtype BEFORE the concat — the
+    // reference casts the encoder output to the embeddings (`audio_features =
+    // audio_features.astype(inputs_embeds.dtype)`, qwen3_forced_aligner.py /
+    // qwen3_asr.py). The crate's mel frontend feeds the audio tower f32 input,
+    // so its rows arrive f32 even over a bf16 checkpoint (a conv over an f32
+    // input promotes a bf16 kernel); concatenated un-cast with bf16
+    // embeddings, MLX would take the common type and the spliced embeddings —
+    // and the whole decoder + lm_head after them — would silently run in f32.
+    // A no-op when the dtypes already match (MLX `astype` returns the input
+    // unchanged), so a dense f32 checkpoint loads/runs byte-for-byte as
+    // before.
+    let flat_audio = flat_audio.astype(flat_embeds.dtype()?)?;
     let combined = concatenate(&[&flat_embeds, &flat_audio], 0)?;
     let idx = Array::from_slice::<i32>(&gather, &(seq_elems,))?;
     let spliced_flat = take_axis(&combined, &idx, 0)?;
