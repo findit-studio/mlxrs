@@ -86,7 +86,7 @@
 //!      [`Error::ShapePairMismatch`].
 //!    - The [`AutoregressiveStt`] `decode_step` (and the internal `decode_tokens`
 //!      primitive) validate the encoder-states extent to exactly
-//!      `(1, n_audio_ctx, n_audio_state)` (`validate_encoder_states`) **before**
+//!      `(1, n_audio_ctx, n_audio_state)` (`normalize_encoder_states`) **before**
 //!      the decoder cross-attention projects it, reject a token prefix longer
 //!      than `max_context` (`n_text_ctx`) before the token array is built, and
 //!      the decoder additionally bounds `offset + seq_len` against the
@@ -680,7 +680,7 @@ impl WhisperModel {
   /// # Errors
   /// [`Error::ShapePairMismatch`] if `enc.shape() != [expected_group,
   /// n_audio_ctx, n_audio_state]`.
-  fn validate_encoder_states(&self, enc: &Array, expected_group: usize) -> Result<()> {
+  fn normalize_encoder_states(&self, enc: &Array, expected_group: usize) -> Result<Array> {
     let expected = [
       expected_group,
       self.dims.n_audio_ctx(),
@@ -694,7 +694,15 @@ impl WhisperModel {
         actual,
       )));
     }
-    Ok(())
+    // Dtype-normalize AFTER the O(1) shape guard — this is the single decoder
+    // boundary every entry funnels through (`decode_tokens`, the lazy/batched
+    // variants, and `prepare_decode_tail` for the step APIs), so caller-supplied
+    // `F32` states on an f16/bf16 checkpoint cannot promote the cross-attention
+    // K/V or the decoder cache regardless of which public wrapper delivered
+    // them (the reference casts features once at its decode entry,
+    // `decoding.py:538-539`). A same-dtype astype is a no-op, so states arriving
+    // from the crate's own encoder pay nothing.
+    enc.astype(self.dtype)
   }
 
   /// Broadcast `(1, n_audio_ctx, n_audio_state)` encoder states to `(n_group,
@@ -765,7 +773,8 @@ impl WhisperModel {
   /// here.
   ///
   /// The `encoder_states` extent is validated to exactly `(1, n_audio_ctx,
-  /// n_audio_state)` ([`Self::validate_encoder_states`]) BEFORE the decoder runs,
+  /// n_audio_state)` ([`Self::normalize_encoder_states`], which also casts them
+  /// to the model dtype) BEFORE the decoder runs,
   /// so a longer / batched `enc` from any caller (including a direct caller that
   /// bypasses the encoder) cannot drive the cross-attention past its config caps.
   /// That is an O(1) shape/rank pin only — the decoder trusts the *content* of
@@ -805,13 +814,13 @@ impl WhisperModel {
     // Bound the encoder extent BEFORE the decoder cross-attention projects it.
     // This single-sequence path builds `(1, T)` queries, so the encoder batch
     // must be exactly 1 (a wider K/V would silently broadcast-mismatch).
-    self.validate_encoder_states(encoder_states, 1)?;
+    let encoder_states = self.normalize_encoder_states(encoder_states, 1)?;
     // Pass the validated `&[u32]` straight to the decoder: it builds the
     // `(1, T)` `u32` array itself and enforces the empty / `id < n_vocab` /
     // `i32` / `offset + T <= n_text_ctx` guards at the single gather chokepoint —
     // so the value-range / rank / dtype classes are structurally closed there for
     // every caller, with no double Array-build at this layer.
-    let (logits, new_cache) = self.decoder.forward(tokens, encoder_states, cache)?;
+    let (logits, new_cache) = self.decoder.forward(tokens, &encoder_states, cache)?;
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
   }
@@ -826,8 +835,8 @@ impl WhisperModel {
     encoder_states: &Array,
     cache: Option<&DecoderKvCache>,
   ) -> Result<(Array, DecoderKvCache)> {
-    self.validate_encoder_states(encoder_states, 1)?;
-    let (logits, new_cache) = self.decoder.forward_array(token, encoder_states, cache)?;
+    let encoder_states = self.normalize_encoder_states(encoder_states, 1)?;
+    let (logits, new_cache) = self.decoder.forward_array(token, &encoder_states, cache)?;
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
   }
@@ -870,11 +879,11 @@ impl WhisperModel {
     // self-attention rows (a `(1, …)` or wrongly-sized `enc` would otherwise
     // silently broadcast under MLX rules against the `(n_group, …)` queries,
     // decoding every row against the wrong feature batch).
-    self.validate_encoder_states(encoder_states, n_group)?;
+    let encoder_states = self.normalize_encoder_states(encoder_states, n_group)?;
     let (logits, new_cache) =
       self
         .decoder
-        .forward_batched(tokens, n_group, encoder_states, cache)?;
+        .forward_batched(tokens, n_group, &encoder_states, cache)?;
     let logits = logits.astype(Dtype::F32)?;
     Ok((logits, new_cache))
   }
@@ -922,11 +931,11 @@ impl WhisperModel {
     // `prepare_decode_tail`, which returns the new (uncached) `&[u32]` tail. The
     // decoder builds the `(1, T_new)` array itself and re-checks the value range
     // at the gather chokepoint, so there is no double Array-build at this layer.
-    let new_tokens = self.prepare_decode_tail(cache, enc, tokens)?;
+    let (enc, new_tokens) = self.prepare_decode_tail(cache, enc, tokens)?;
     let (logits, new_cache, cross_qk) =
       self
         .decoder
-        .forward_with_cross_qk(new_tokens, enc, cache.inner.as_ref())?;
+        .forward_with_cross_qk(new_tokens, &enc, cache.inner.as_ref())?;
     // Run EVERY fallible step (the `f32` cast — `Inference.logits`'s
     // `.astype(mx.float32)`) BEFORE committing the cache, then make the cache
     // mutation the LAST step. If the cast (an allocation / backend op) failed
@@ -1074,15 +1083,17 @@ impl WhisperModel {
     cache: &WhisperDecodeCache,
     enc: &Array,
     tokens: &'t [u32],
-  ) -> Result<&'t [u32]> {
+  ) -> Result<(Array, &'t [u32])> {
     // Bound the encoder-states extent FIRST — before the token array or the
     // decoder allocates. A caller can supply any `enc`; the cross-attention
     // forms its scores from `enc.shape()[1]`, so a longer / batched segment must
     // be rejected before it can size the cross-attention buffers past the config
     // caps (which assume a single `[1, n_audio_ctx, n_audio_state]` segment).
     // This incremental path builds `(1, T_new)` queries, so the encoder batch
-    // must be exactly 1.
-    self.validate_encoder_states(enc, 1)?;
+    // must be exactly 1. The returned states are dtype-normalized to the model
+    // dtype (the decoder-boundary contract of `normalize_encoder_states`), so
+    // BOTH step APIs consume them instead of the caller's raw tensor.
+    let enc = self.normalize_encoder_states(enc, 1)?;
 
     let cached = cache.len();
     // Reject a token prefix longer than the decoder context BEFORE building the
@@ -1116,7 +1127,7 @@ impl WhisperModel {
            tokens to decode)",
         ))
       })?;
-    Ok(new_tokens)
+    Ok((enc, new_tokens))
   }
 
   /// Map the universal [`TranscribeOptions`] onto the lower-level
@@ -2564,9 +2575,9 @@ impl AutoregressiveStt for WhisperModel {
     // new-tail slice (the guards fire before any allocation they size).
     // `decode_tokens` builds the `(1, T)` array from this slice and re-checks the
     // value range at the gather chokepoint.
-    let new_tokens = self.prepare_decode_tail(cache, enc, tokens)?;
+    let (enc, new_tokens) = self.prepare_decode_tail(cache, enc, tokens)?;
 
-    let (logits, new_cache) = self.decode_tokens(new_tokens, enc, cache.inner.as_ref())?;
+    let (logits, new_cache) = self.decode_tokens(new_tokens, &enc, cache.inner.as_ref())?;
 
     // The decoder returns `[B=1, T, V]`; slice the LAST position and reshape to
     // the rank-1 `[V]` row the greedy driver reads `argmax` over. Run every

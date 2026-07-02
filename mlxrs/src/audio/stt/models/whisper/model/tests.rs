@@ -570,6 +570,46 @@ fn wrong_shape_mel_on_reduced_precision_is_typed_error_before_cast() {
   }
 }
 
+/// Caller-supplied PRE-ENCODED `F32` encoder states through the public step
+/// APIs are dtype-normalized at the decoder boundary
+/// (`normalize_encoder_states`): on an f16 checkpoint, `decode_step` and
+/// `decode_step_with_cross_qk` produce bit-identical logits for `F32` states
+/// and pre-cast f16 states — the caller's tensor dtype cannot promote the
+/// decode compute to `F32`, whichever public wrapper delivered the states.
+#[test]
+fn pre_encoded_f32_enc_on_f16_matches_precast_through_step_apis() {
+  let model = WhisperModel::from_weights(dims(), tiny_weights(), Dtype::F16).unwrap();
+  // F32 states of the encoder-output shape, NOT pre-cast by the caller (ones
+  // are exactly representable in f16, so the normalization cast is lossless
+  // and the two runs must agree bit-for-bit).
+  let enc_f32 = Array::ones::<f32>(&(1usize, TINY.n_audio_ctx, TINY.n_state)).unwrap();
+  let enc_f16 = enc_f32.astype(Dtype::F16).unwrap();
+
+  let mut c1 = model.new_cache();
+  let mut r1 = model.decode_step(&mut c1, &enc_f32, &[0u32]).unwrap();
+  let mut c2 = model.new_cache();
+  let mut r2 = model.decode_step(&mut c2, &enc_f16, &[0u32]).unwrap();
+  assert_eq!(
+    r1.to_vec::<f32>().unwrap(),
+    r2.to_vec::<f32>().unwrap(),
+    "decode_step must normalize F32 states to the model dtype (match pre-cast)"
+  );
+
+  let mut c3 = model.new_cache();
+  let (mut l3, _) = model
+    .decode_step_with_cross_qk(&mut c3, &enc_f32, &[0u32])
+    .unwrap();
+  let mut c4 = model.new_cache();
+  let (mut l4, _) = model
+    .decode_step_with_cross_qk(&mut c4, &enc_f16, &[0u32])
+    .unwrap();
+  assert_eq!(
+    l3.to_vec::<f32>().unwrap(),
+    l4.to_vec::<f32>().unwrap(),
+    "decode_step_with_cross_qk must normalize F32 states to the model dtype"
+  );
+}
+
 #[test]
 fn multi_layer_build_reserves_and_fills_every_block() {
   // The encoder / decoder block vectors and the decoder KV cache are reserved
