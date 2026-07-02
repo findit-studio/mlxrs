@@ -297,8 +297,10 @@ fn siglip2_oracle_text_parity() {
 
   for (i, prompt) in prompts.iter().enumerate() {
     // Tokenize with special tokens, then pad/truncate to the fixed seq len
-    // with the canonical SigLIP pad id (id 1 for the SigLIP sentencepiece —
-    // EOS-sticky pooling reads the last position regardless).
+    // with the checkpoint tokenizer's pad id (the Gemma `<pad>` = 0 for
+    // SigLIP2 — see `siglip_pad_id`; the sticky-EOS pooling reads the last
+    // position, a pad slot for short prompts, so the pad id is
+    // embedding-bearing and must match the HF processor's).
     let mut ids = tokenizer.encode(prompt, true).expect("encode prompt");
     pad_or_truncate(&mut ids, TEXT_SEQ_LEN, siglip_pad_id(&tokenizer));
     let ids_i32: Vec<i32> = ids.iter().map(|&u| u as i32).collect();
@@ -397,16 +399,26 @@ fn siglip2_oracle_text_overlength_eos_preserving_truncation() {
   );
 }
 
-/// The SigLIP sentencepiece pad token id (the model pads to a fixed length
-/// with this id). Falls back to `1` if the tokenizer does not expose a pad id.
-fn siglip_pad_id(_tokenizer: &mlxrs::tokenizer::Tokenizer) -> u32 {
-  // SigLIP's processor pads with the EOS/pad token (id 1 in the canonical
-  // SigLIP sentencepiece). The sticky-EOS pooling reads the LAST position, so
-  // padding with the pad id keeps the last real token in place only when the
-  // sequence is already at length; for shorter prompts SigLIP's processor
-  // right-pads and the last position is the pad token — which is what the
-  // reference fixtures encode, so mirror it exactly.
-  1
+/// The SigLIP2 pad token id (the model pads to a fixed length with this id) —
+/// the **checkpoint tokenizer's** `<pad>` id, falling back to the Gemma
+/// `<pad> = 0` when the tokenizer carries no pad token.
+///
+/// SigLIP2 ships a Gemma sentencepiece tokenizer (`tokenizer_config.json`:
+/// `GemmaTokenizer`, `<pad>` = 0, `<eos>` = 1, `add_eos_token = true`), and the
+/// HF `Siglip2Processor` pads with `tokenizer.pad_token_id` (= 0) — NOT
+/// SigLIP1's pad == EOS == 1. The sticky-EOS pooling reads the LAST position,
+/// which for any shorter-than-64 prompt is a pad slot, so the pad id is
+/// embedding-bearing: padding with `1` (= `<eos>`) pools a different token than
+/// the HF processor produces.
+///
+/// TODO(fixtures): the text-parity reference (`text_embeddings.npy`) must be
+/// generated with the HF `Siglip2Processor` (pad = 0). A fixture set produced
+/// under the old pad = 1 convention will now fail `siglip2_oracle_text_parity`
+/// for short prompts — regenerate it with the HF processor rather than
+/// re-padding with 1 (the fixtures dir is absent in this checkout, so it could
+/// not be verified or regenerated here).
+fn siglip_pad_id(tokenizer: &mlxrs::tokenizer::Tokenizer) -> u32 {
+  tokenizer.pad_token_id().unwrap_or(0)
 }
 
 /// Right-pad `ids` to `len` with `pad`, or truncate to `len`.

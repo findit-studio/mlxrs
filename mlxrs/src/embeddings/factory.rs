@@ -283,16 +283,82 @@ pub struct LoadedEmbeddingModel {
   /// [`load()`]'s weight discovery); root shards are verbatim. The constructor
   /// applies any further `sanitize`/remap itself.
   weights: EmbeddingWeights,
+  /// The local **tokenizer directory** the checkpoint's tokenizer is loaded
+  /// from, when known. [`load()`] attaches the SAME directory it builds the
+  /// [`Tokenizer`] from —
+  /// [`EmbeddingModelConfiguration::tokenizer_directory`], i.e. the separate
+  /// [`tokenizer_source`](EmbeddingModelConfiguration::tokenizer_source) when
+  /// set, else the model directory — via
+  /// [`with_tokenizer_dir`](Self::with_tokenizer_dir); a hand-built
+  /// `LoadedEmbeddingModel` carries `None`. Lets a constructor read
+  /// **tokenizer metadata** the weight map cannot carry (e.g. SigLIP2's
+  /// `tokenizer_config.json` pad-token id) without re-threading the path
+  /// through the constructor signature — from the directory the tokenizer
+  /// actually comes from, so a split-tokenizer configuration never resolves
+  /// stale metadata out of the model directory.
+  tokenizer_dir: Option<PathBuf>,
+  /// The pad-token id resolved from the LOADED [`Tokenizer`] (ground truth),
+  /// when the tokenizer metadata declares a pad token. [`load()`] reads the
+  /// pad-token STRING from `tokenizer_config.json` / `special_tokens_map.json`
+  /// (both must agree — [`read_pad_token_string`]) and maps it to an id via
+  /// [`Tokenizer::convert_token_to_id`] on the tokenizer it just built, so a
+  /// stale metadata id table (`added_tokens_decoder`) can never override what
+  /// the tokenizer itself would produce. `None` when the metadata declares no
+  /// (agreeing) pad token, the tokenizer does not know the token, or the
+  /// `LoadedEmbeddingModel` is hand-built.
+  pad_token_id: Option<u32>,
 }
 
 impl LoadedEmbeddingModel {
-  /// Construct a [`LoadedEmbeddingModel`] from its three components.
+  /// Construct a [`LoadedEmbeddingModel`] from its three components (no
+  /// tokenizer directory attached — chain
+  /// [`with_tokenizer_dir`](Self::with_tokenizer_dir) when the source
+  /// directory is known).
   pub fn new(model_type: String, config_json: String, weights: EmbeddingWeights) -> Self {
     Self {
       model_type,
       config_json,
       weights,
+      tokenizer_dir: None,
+      pad_token_id: None,
     }
+  }
+
+  /// Attach the local tokenizer directory the checkpoint's tokenizer is
+  /// loaded from (builder form, used by [`load()`] with the same
+  /// [`tokenizer_directory`](EmbeddingModelConfiguration::tokenizer_directory)
+  /// it builds the [`Tokenizer`] from), so a constructor can read tokenizer
+  /// metadata files (e.g. `tokenizer_config.json` /
+  /// `special_tokens_map.json`) from the directory that actually provides the
+  /// tokenizer.
+  #[must_use]
+  pub fn with_tokenizer_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+    self.tokenizer_dir = Some(dir.into());
+    self
+  }
+
+  /// The local tokenizer directory the checkpoint's tokenizer is loaded from,
+  /// when known (`None` for a hand-built `LoadedEmbeddingModel`).
+  #[inline(always)]
+  pub fn tokenizer_dir(&self) -> Option<&Path> {
+    self.tokenizer_dir.as_deref()
+  }
+
+  /// Attach the pad-token id resolved from the loaded [`Tokenizer`] (builder
+  /// form, used by [`load()`] — see the field doc for the resolution
+  /// contract).
+  #[must_use]
+  pub fn with_pad_token_id(mut self, id: Option<u32>) -> Self {
+    self.pad_token_id = id;
+    self
+  }
+
+  /// The pad-token id resolved from the loaded [`Tokenizer`], when known
+  /// (`None` for a hand-built `LoadedEmbeddingModel` or when the tokenizer
+  /// metadata declares no agreeing pad token).
+  #[inline(always)]
+  pub fn pad_token_id(&self) -> Option<u32> {
+    self.pad_token_id
   }
 
   /// The checkpoint's canonicalized architecture id.
@@ -647,7 +713,36 @@ pub fn load(
   // bakes its pooling config at construction. `pooling.as_ref()` borrows it for
   // the constructor; the owned `pooling` is moved into the returned context
   // below.
-  let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights);
+  // Attach the resolved TOKENIZER directory — the same directory the
+  // `Tokenizer` above was built from (the separate `tokenizer_source` when
+  // set, else the model directory) — so a constructor reading tokenizer
+  // metadata (e.g. SigLIP2's `tokenizer_config.json` pad id) resolves it from
+  // the directory that actually provides the tokenizer, never from a stale
+  // copy in the model directory under a split-tokenizer configuration.
+  // (6.5) Resolve the pad-token id from the LOADED tokenizer (ground truth):
+  // the metadata files supply only the pad-token STRING (and must agree —
+  // `read_pad_token_string`), while the id comes from the tokenizer that will
+  // actually encode the prompts. A stale `added_tokens_decoder` table in
+  // `tokenizer_config.json` therefore cannot override the tokenizer's own
+  // mapping (it is never consulted for the id at all). Best-effort: no
+  // agreeing pad token, or a token the tokenizer does not know, resolves to
+  // `None` and the consuming architecture keeps its own default.
+  // Metadata parsing needs `serde_json` (the base `embeddings` feature is
+  // deliberately serde_json-free, and the hand-rolled strict scanner is
+  // purpose-built for tiny flat files — scanning an arbitrary, nested
+  // `tokenizer_config.json` with it could false-match a `pad_token` key
+  // inside e.g. an embedded chat template). Every architecture that consumes
+  // `pad_token_id` (SigLIP2, …) enables `serde_json` transitively, so gating
+  // the resolution — not the field — keeps base-`embeddings` builds compiling
+  // with `None` (each consumer's own default applies).
+  #[cfg(feature = "serde_json")]
+  let pad_token_id =
+    read_pad_token_string(tokenizer_dir).and_then(|t| tokenizer.convert_token_to_id(&t));
+  #[cfg(not(feature = "serde_json"))]
+  let pad_token_id: Option<u32> = None;
+  let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights)
+    .with_tokenizer_dir(tokenizer_dir)
+    .with_pad_token_id(pad_token_id);
   let model = registry.create(&loaded, pooling.as_ref())?;
 
   Ok(LoadedEmbeddingContext {
@@ -2082,3 +2177,86 @@ impl JsonCursor<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Byte cap for the best-effort tokenizer-metadata reads
+/// ([`read_pad_token_string`]): a real `tokenizer_config.json` /
+/// `special_tokens_map.json` is tens of KB; 4 MiB accommodates the largest
+/// added-token tables with two orders of magnitude of headroom.
+#[cfg(feature = "serde_json")]
+const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
+
+/// Read the pad-token STRING declared by the tokenizer metadata under `dir` —
+/// `tokenizer_config.json` and/or `special_tokens_map.json`.
+///
+/// BOTH files are consulted: when both declare a `pad_token` and the contents
+/// DISAGREE (version skew in a split-source or hand-merged tokenizer
+/// directory), no token is returned — the caller keeps its own default rather
+/// than trusting either side (a stale `tokenizer_config.json` declaring the
+/// EOS string would otherwise win over a correct `special_tokens_map.json`).
+/// Only the token STRING is read here; the id is resolved by the caller
+/// against the loaded [`Tokenizer`] (the ground truth), never from a metadata
+/// id table.
+///
+/// Best-effort by design: an absent/unreadable/over-cap/malformed file simply
+/// contributes no declaration. Accepts both HF shapes for the field — a plain
+/// string and an AddedToken-style `{"content": …}` object.
+#[cfg(feature = "serde_json")]
+fn read_pad_token_string(dir: &Path) -> Option<String> {
+  let from_config = read_bounded_json(&dir.join("tokenizer_config.json"))
+    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned));
+  let from_special = read_bounded_json(&dir.join("special_tokens_map.json"))
+    .and_then(|special| token_content(special.get("pad_token")?).map(str::to_owned));
+  match (from_config, from_special) {
+    (Some(a), Some(b)) if a != b => None,
+    (Some(a), _) => Some(a),
+    (None, b) => b,
+  }
+}
+
+/// Read `path` as JSON with the [`MAX_TOKENIZER_METADATA_BYTES`] bounded-read
+/// discipline (`O_NONBLOCK | O_CLOEXEC` open so a planted FIFO cannot hang,
+/// post-open regular-file check, `Read::take` cap). Any failure — absent
+/// file, not a regular file, I/O error, over-cap size, malformed JSON — is
+/// `None`: this feeds the best-effort [`read_pad_token_string`] only.
+#[cfg(feature = "serde_json")]
+fn read_bounded_json(path: &Path) -> Option<serde_json::Value> {
+  use std::io::Read;
+
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .ok()?
+  };
+  #[cfg(not(unix))]
+  let file = std::fs::File::open(path).ok()?;
+
+  if !file.metadata().ok()?.is_file() {
+    return None;
+  }
+  let mut bytes = Vec::new();
+  file
+    .take(MAX_TOKENIZER_METADATA_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .ok()?;
+  if bytes.len() as u64 > MAX_TOKENIZER_METADATA_BYTES {
+    return None;
+  }
+  serde_json::from_slice(&bytes).ok()
+}
+
+/// The token string of an HF special-token JSON value, accepting both shapes
+/// the HF tokenizer files use: a plain string (`"<pad>"`) or an
+/// AddedToken-style object (`{"content": "<pad>", …}`). Anything else is
+/// `None`.
+#[cfg(feature = "serde_json")]
+fn token_content(value: &serde_json::Value) -> Option<&str> {
+  match value {
+    serde_json::Value::String(s) => Some(s.as_str()),
+    serde_json::Value::Object(o) => o.get("content")?.as_str(),
+    _ => None,
+  }
+}

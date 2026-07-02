@@ -114,6 +114,12 @@ pub struct Siglip2NaflexModel {
   logit_scale: Array,
   /// `logit_bias` `(1,)` — the contrastive bias.
   logit_bias: Array,
+  /// The pad id the fixed-length text scheme fills with. Defaults to the
+  /// SigLIP2 Gemma `<pad>` id
+  /// ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID), `0`);
+  /// the load-factory [`constructor`] refines it from the checkpoint's
+  /// tokenizer metadata via [`set_text_pad_token_id`](Self::set_text_pad_token_id).
+  text_pad_token_id: u32,
 }
 
 #[cfg(feature = "siglip2-naflex")]
@@ -125,23 +131,45 @@ impl Siglip2NaflexModel {
   /// it pins the intent.
   const NORMALIZE_EPS: f32 = SWIFT_L2_EPS;
 
-  /// The token id the SigLIP2 processor right-pads text to its fixed sequence
-  /// length with — the canonical SigLIP sentencepiece pad/EOS id (`1`). The
-  /// sticky-EOS pooling reads a fixed last position regardless of the mask, so
-  /// a shorter prompt's trailing positions hold this pad id (which is exactly
-  /// what the reference processor produces); it is a real, *unmasked* position.
-  const TEXT_PAD_TOKEN_ID: u32 = 1;
+  /// The default token id the SigLIP2 processor right-pads text to its fixed
+  /// sequence length with — the SigLIP2 **Gemma** tokenizer's `<pad>` id (`0`).
+  ///
+  /// SigLIP2 ships a Gemma sentencepiece tokenizer
+  /// (`google/siglip2-base-patch16-naflex`'s `tokenizer_config.json`:
+  /// `tokenizer_class = "GemmaTokenizer"`, `added_tokens_decoder` binding
+  /// `"0" → <pad>` and `"1" → <eos>`, `add_eos_token = true`), and the HF
+  /// `Siglip2Processor` pads with `padding="max_length"` — i.e. with
+  /// `tokenizer.pad_token_id == 0`. This is **not** SigLIP1's convention: the
+  /// original SigLIP sentencepiece used pad == EOS == `1`, and padding a
+  /// SigLIP2 prompt with `1` fills the tail with `<eos>` tokens instead of
+  /// `<pad>`. Because the sticky-EOS pooling reads a fixed **last** position
+  /// regardless of the mask — a *pad* slot for every shorter-than-`seq_len`
+  /// prompt — a wrong pad fill changes the pooled token embedding and shifts
+  /// every short prompt's embedding away from the reference processor's.
+  /// (HF `Siglip2TextConfig` still *declares* `pad_token_id = 1` as a class
+  /// default inherited from SigLIP1's CLIP-vocab defaults; that field is
+  /// unused by the tokenization path and is not what the processor pads with.)
+  ///
+  /// The load-factory [`constructor`] refines this default from the loaded
+  /// **tokenizer directory**'s metadata (`tokenizer_config.json` /
+  /// `special_tokens_map.json` — see [`read_text_pad_token_id`]); `0` is the
+  /// correct fallback when that metadata is unavailable (every published
+  /// SigLIP2 checkpoint uses the Gemma tokenizer's `<pad> = 0`).
+  const DEFAULT_TEXT_PAD_TOKEN_ID: u32 = 0;
 
-  /// The SigLIP2 sentencepiece `<eos>` id (`1`). The text tower pools the
+  /// The SigLIP2 sentencepiece `<eos>` id (`1` — the Gemma tokenizer's
+  /// `added_tokens_decoder` `"1" → <eos>`). The text tower pools the
   /// **last** position under the sticky-EOS invariant ("last token is always
   /// EOS"), so an **overlength** prompt must keep the EOS at its final position
   /// rather than a content token. The HF SigLIP processor enforces this by
   /// head-truncating to `max_length - n_added_tokens` and then appending the
   /// EOS via its post-processor template; this is the id the generic
   /// fixed-length builder forces into the last slot on truncation
-  /// ([`Padding::FixedLength::eos_token_id`]). It coincides with
-  /// [`TEXT_PAD_TOKEN_ID`](Self::TEXT_PAD_TOKEN_ID) for SigLIP (both `1`) but is
-  /// conceptually the EOS, not the pad fill.
+  /// ([`Padding::FixedLength::eos_token_id`]). It is distinct from the pad
+  /// fill ([`DEFAULT_TEXT_PAD_TOKEN_ID`](Self::DEFAULT_TEXT_PAD_TOKEN_ID),
+  /// `<pad> = 0`): only a *truncated* (overlength) prompt ends in this EOS at
+  /// the fixed last slot; a shorter prompt's last slot is a pad token, exactly
+  /// as the reference processor produces.
   const TEXT_EOS_TOKEN_ID: u32 = 1;
 
   /// The fixed text sequence length the SigLIP2 processor pads / truncates every
@@ -263,6 +291,7 @@ impl Siglip2NaflexModel {
       text,
       logit_scale,
       logit_bias,
+      text_pad_token_id: Self::DEFAULT_TEXT_PAD_TOKEN_ID,
     })
   }
 
@@ -270,6 +299,25 @@ impl Siglip2NaflexModel {
   #[inline(always)]
   pub fn config(&self) -> &Siglip2NaflexConfig {
     &self.config
+  }
+
+  /// The pad id the fixed-length text scheme
+  /// ([`TextEmbedder::text_encoding`]) fills with.
+  #[inline(always)]
+  pub fn text_pad_token_id(&self) -> u32 {
+    self.text_pad_token_id
+  }
+
+  /// Override the pad id the fixed-length text scheme fills with.
+  ///
+  /// Defaults to the SigLIP2 Gemma `<pad>` id (`DEFAULT_TEXT_PAD_TOKEN_ID`,
+  /// `0`). The load-factory [`constructor`] calls this with the id resolved
+  /// from the checkpoint's own tokenizer metadata (`read_text_pad_token_id`)
+  /// so the pad fill always tracks the tokenizer that produced the checkpoint;
+  /// a caller building the model directly via
+  /// [`from_weights`](Self::from_weights) can do the same.
+  pub fn set_text_pad_token_id(&mut self, id: u32) {
+    self.text_pad_token_id = id;
   }
 
   /// Encode one preprocessed image ([`NaflexInputs`]) to an L2-normalized
@@ -671,8 +719,20 @@ pub fn constructor() -> EmbeddingModelConstructor {
       // native key); a dense checkpoint has none and loads dense. An mlx-community
       // 8-bit SigLIP2 checkpoint loads its quantized projections through here.
       let quantization = parse_quantization(loaded.config_json())?;
-      let model =
+      let mut model =
         Siglip2NaflexModel::from_weights_quantized(config, weights, quantization.as_ref())?;
+      // Refine the text pad id from the LOADED tokenizer (ground truth): the
+      // factory reads the pad-token STRING from the tokenizer metadata (both
+      // files must agree) and resolves the id via the tokenizer's own
+      // `convert_token_to_id`, so a stale metadata id table can never override
+      // what the tokenizer that actually encodes the prompts would produce.
+      // Best-effort: a hand-built `LoadedEmbeddingModel`, no agreeing
+      // declaration, or an unknown token keep the Gemma `<pad> = 0` default —
+      // correct for every published SigLIP2 checkpoint (see
+      // `DEFAULT_TEXT_PAD_TOKEN_ID`).
+      if let Some(pad_id) = loaded.pad_token_id() {
+        model.set_text_pad_token_id(pad_id);
+      }
       Ok(Box::new(model))
     },
   )
@@ -1078,7 +1138,12 @@ impl TextEmbedder for Siglip2NaflexModel {
       None,
       Padding::FixedLength {
         length,
-        pad_token_id: Self::TEXT_PAD_TOKEN_ID,
+        // The checkpoint tokenizer's `<pad>` id (Gemma `<pad> = 0` by default;
+        // refined from the loaded tokenizer directory's metadata by the
+        // factory `constructor`). NOT the EOS: a short prompt's pooled last
+        // slot is a pad position, and the reference processor fills it with
+        // `<pad>`, not `<eos>`.
+        pad_token_id: self.text_pad_token_id,
         // Preserve the sticky-EOS invariant on overlength prompts: a truncated
         // row keeps its head to `length - 1` and the EOS is forced into the
         // last position (HF truncate-then-append-EOS), so the pooled last slot

@@ -199,6 +199,36 @@ impl QuantLinear {
   pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
     self.inner.forward(x)
   }
+
+  /// The projection's **compute dtype** — the float precision activations
+  /// should be cast to so a reduced-precision checkpoint is not silently
+  /// widened by MLX type promotion (`f16 op f32 → f32`) — when one exists:
+  ///
+  /// - **dense**: the weight's own (float) dtype;
+  /// - **affine-quantized**: the `scales` dtype — affine scales are float and
+  ///   carry the checkpoint's compute precision (the resolution mlx-lm /
+  ///   mlx-embeddings use for a quantized layer's effective dtype);
+  /// - **fp-mode quantized** (`mxfp4` / `mxfp8` / `nvfp4`): `None` — those
+  ///   scales are packed **e8m0 exponents** (`uint8`, enforced by the shared
+  ///   `validate_quantized_triple`), NOT a compute precision. Casting
+  ///   activations to them would feed an integer `x` into the non-affine
+  ///   `quantized_matmul`, which rejects it (mlx `ops.cpp`: "Only real
+  ///   floating types are supported").
+  ///
+  /// The decider is a **float gate** on the resolved dtype
+  /// (`F16 | BF16 | F32 | F64`) rather than the mode tag, so a pathological
+  /// dense integer weight is equally excluded. `None` means "no float
+  /// parameter dtype to pin to — do not cast" (the caller leaves the
+  /// activations in their own dtype, the pre-cast behavior).
+  ///
+  /// Reads only dtype metadata (no materialization / eval).
+  pub(crate) fn param_dtype(&self) -> Result<Option<Dtype>> {
+    let dt = match &self.inner {
+      MaybeQuantizedLinear::Dense(l) => l.weight_ref().dtype()?,
+      MaybeQuantizedLinear::Quantized(q) => q.scales_ref().dtype()?,
+    };
+    Ok(matches!(dt, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64).then_some(dt))
+  }
 }
 
 /// Validate a quantized layer's packed `<prefix>.weight` + `<prefix>.scales`
