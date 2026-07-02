@@ -303,6 +303,44 @@ fn global_layers_keep_full_attention_beyond_window() {
 }
 
 #[test]
+fn all_padding_batch_row_stays_finite_and_isolated() {
+  // pattern 1 → every layer GLOBAL (the padding-only mask path). Batch row 0
+  // is real, row 1 is ALL-padding: its key mask is all-`-inf` for every
+  // query, so without the forward-entry fully-masked-row reset every global
+  // layer softmaxes `NaN` for that row (`0 × NaN = NaN` then defeats
+  // pooling's all-padding handling). The reset keeps the row FINITE, and the
+  // REAL row must be unaffected — identical to a single-row forward (each
+  // batch row attends only within itself, so the sibling row cannot leak).
+  let model =
+    EmbeddingGemmaModel::from_weights(tiny_config_with_window(2, 1), tiny_weights(), None)
+      .expect("load");
+  let seq = 4usize;
+  let am =
+    Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], &(2usize, seq)).unwrap();
+  let mask = crate::embeddings::embeddinggemma::backbone::build_additive_mask(
+    &am,
+    model.backbone.embed_dtype().unwrap(),
+  )
+  .unwrap();
+  let ids = Array::from_slice::<i32>(&[1, 2, 3, 4, 1, 1, 1, 1], &(2usize, seq)).unwrap();
+  let h = model.backbone.forward(&ids, &mask).unwrap();
+  let v = eval_to_vec(&h);
+  assert!(
+    v.iter().all(|x| x.is_finite()),
+    "an all-padding batch row must not NaN through the global layers"
+  );
+
+  let ids1 = Array::from_slice::<i32>(&[1, 2, 3, 4], &(1usize, seq)).unwrap();
+  let h1 = backbone_hidden_for_ids(&model, &ids1, seq);
+  let hidden = HIDDEN as usize;
+  assert_eq!(
+    &v[..seq * hidden],
+    &h1[..],
+    "the real row must be unaffected by an all-padding sibling row"
+  );
+}
+
+#[test]
 fn window_at_or_above_seq_len_is_exactly_skipped() {
   // Short-input regression: for `seq_len <= sliding_window` the banded mask is
   // skipped and every layer gets the identical padding-only mask — bit-for-bit

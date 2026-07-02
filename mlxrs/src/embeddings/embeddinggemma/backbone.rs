@@ -601,12 +601,25 @@ impl Gemma3Backbone {
     let scale = embedding_scale_like(self.hidden_size as f32, &h)?;
     h = h.multiply(&scale)?;
 
+    // An ALL-padding batch row makes the padding-only mask all-`-inf` for
+    // every query in that row — softmax `NaN` at EVERY layer (global ones
+    // included), which pooling's all-padding handling cannot recover
+    // (`0 × NaN = NaN`). Reset such rows to fully-visible ONCE here (the HF
+    // fully-masked-row semantics, shared with the banded composition below);
+    // a mask with at least one visible key per row is returned unchanged in
+    // value, so the normal path is unaffected.
+    let mask = &reset_fully_masked_rows(mask)?;
+
     // The local layers' banded mask, built ONCE per forward (shared by every
-    // local layer) and only when the sequence actually exceeds the window —
-    // at `seq_len <= sliding_window` the band overlay would be identically
-    // zero (`|i - j| <= seq_len - 1 < window` everywhere), so skipping it is
-    // exact and keeps short inputs on the unchanged padding-only path.
-    let local_mask = if seq_len > self.sliding_window {
+    // local layer) and only when it can matter: the sequence must actually
+    // exceed the window — at `seq_len <= sliding_window` the band overlay
+    // would be identically zero (`|i - j| <= seq_len - 1 < window`
+    // everywhere), so skipping it is exact and keeps short inputs on the
+    // unchanged padding-only path — AND at least one layer must be local
+    // (`sliding_window_pattern = 1` makes every layer global; materializing
+    // the `(B, 1, S, S)` band for a consumer that does not exist would be
+    // pure allocation risk on long inputs).
+    let local_mask = if seq_len > self.sliding_window && self.layers.iter().any(|l| !l.is_global) {
       Some(build_local_layer_mask(mask, seq_len, self.sliding_window)?)
     } else {
       None
@@ -759,10 +772,26 @@ pub(crate) fn build_local_layer_mask(mask: &Array, seq_len: i32, window: i32) ->
   let combined = mask.add(&overlay)?;
   // The HF fully-masked-row fix: a row whose max is still -inf has no visible
   // key — reset exactly those rows to fully-visible.
-  let row_max = ops::reduction::max_axes(&combined, &[-1], true)?;
+  reset_fully_masked_rows(&combined)
+}
+
+/// Reset every attention row with **no** visible key (max over the key axis
+/// still `-inf`) to fully-visible (all-`0`) — HF `masking_utils.sdpa_mask`'s
+/// fully-masked-row fix (`attention_mask | torch.all(~attention_mask,
+/// dim=-1, keepdim=True)`). Without it such a row softmaxes all-`-inf`
+/// logits to `NaN`, and `0 × NaN = NaN` poisons every downstream consumer of
+/// that batch row. Shared by [`build_local_layer_mask`] (band-induced full
+/// rows at padded query positions) and the backbone forward's padding-only
+/// mask (an ALL-padding batch row would otherwise NaN through every layer,
+/// global ones included — the reset keeps the row finite, and pooling's
+/// all-padding handling owns its value).
+#[cfg(feature = "embeddinggemma")]
+pub(crate) fn reset_fully_masked_rows(mask: &Array) -> Result<Array> {
+  let dtype = mask.dtype()?;
+  let row_max = ops::reduction::max_axes(mask, &[-1], true)?;
   let fully_masked = ops::comparison::isneginf(&row_max)?;
   let zero = ops::misc::astype(&Array::full::<f32>(&(1,), 0.0)?, dtype)?;
-  ops::logical::select(&fully_masked, &zero, &combined)
+  ops::logical::select(&fully_masked, &zero, mask)
 }
 
 #[cfg(all(test, feature = "embeddinggemma"))]
