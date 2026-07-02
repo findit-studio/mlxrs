@@ -195,6 +195,48 @@ fn model_config_defaults_fill_top_level_fields() {
   cfg.validate().unwrap();
 }
 
+/// A PRESENT non-null nested `text_config.eos_token_id` that is not an
+/// in-range i32 — a string, float, object, or out-of-i32-range integer — is a
+/// hard parse error, never a silent fall-through to
+/// [`DEFAULT_EOS_TOKEN_ID`]: the nested canonical field gets the same
+/// strictness the top-level field gets from its `Option<i32>` derive, so a
+/// schema-drifted checkpoint cannot fabricate an EOS. An explicit nested
+/// `null` (with the top-level also null) still resolves to the default.
+#[test]
+fn malformed_nested_eos_token_id_is_a_parse_error() {
+  for bad in ["\"7\"", "7.5", "{}", "3000000000"] {
+    let json = format!(
+      r#"{{
+        "model_type": "lfm2-vl",
+        "eos_token_id": null,
+        "text_config": {{ "eos_token_id": {bad} }},
+        "vision_config": {{}}
+      }}"#
+    );
+    let parsed = serde_json::from_str::<ModelConfig>(&json);
+    assert!(
+      parsed.is_err(),
+      "nested eos_token_id {bad} must be a parse error"
+    );
+    // Same strictness even when the top-level value would win the precedence:
+    // a corrupt nested field is corrupt config, full stop.
+    let json_top = json.replace(r#""eos_token_id": null"#, r#""eos_token_id": 9"#);
+    assert!(
+      serde_json::from_str::<ModelConfig>(&json_top).is_err(),
+      "nested eos_token_id {bad} must error even with a valid top-level value"
+    );
+  }
+  // An explicit nested `null` (top-level also null) is MISSING, not malformed.
+  let json_null = r#"{
+    "model_type": "lfm2-vl",
+    "eos_token_id": null,
+    "text_config": { "eos_token_id": null },
+    "vision_config": {}
+  }"#;
+  let cfg: ModelConfig = serde_json::from_str(json_null).expect("nested null is missing");
+  assert_eq!(cfg.eos_token_id, DEFAULT_EOS_TOKEN_ID);
+}
+
 #[test]
 fn model_config_parses_explicit_tiling_fields() {
   // The image-splitting / tiling config fields (config.py:76-88) parse from JSON

@@ -582,13 +582,24 @@ impl<'de> serde::Deserialize<'de> for ModelConfig {
     let raw = RawModelConfig::deserialize(deserializer)?;
     // Pull the nested `text_config.eos_token_id` (the canonical home; `7` in the
     // released checkpoint) from the raw text-config object BEFORE converting it
-    // to the typed `TextConfig`, which does not model token ids. A non-integer /
-    // absent value yields `None` so the fallback chain continues.
-    let nested_eos = raw
-      .text_config
-      .get("eos_token_id")
-      .and_then(serde_json::Value::as_i64)
-      .and_then(|v| i32::try_from(v).ok());
+    // to the typed `TextConfig`, which does not model token ids. Only an ABSENT
+    // key or an explicit `null` continues the fallback chain; a present
+    // non-null value that is not an in-range i32 (a string, float, object, or
+    // out-of-range integer) is a hard parse error — the same strictness the
+    // top-level field gets from its `Option<i32>` derive — so a schema-drifted
+    // checkpoint cannot silently validate with a fabricated default EOS.
+    let nested_eos = match raw.text_config.get("eos_token_id") {
+      None | Some(serde_json::Value::Null) => None,
+      Some(v) => Some(
+        v.as_i64()
+          .and_then(|n| i32::try_from(n).ok())
+          .ok_or_else(|| {
+            D::Error::custom(format_args!(
+              "text_config.eos_token_id must be an i32 token id or null, got {v}"
+            ))
+          })?,
+      ),
+    };
     // Convert the captured raw text-config to the typed `TextConfig`. This runs
     // `TextConfig`'s own hand-written `Deserialize` (and its `__post_init__` RoPE
     // override) exactly as the former nested-derive path did.
