@@ -277,6 +277,10 @@ impl ClapModel {
   /// The mel-preprocessed boundary of [`embed_audio`](Self::embed_audio) (its
   /// `extract_mel` tail): HTSAT tower → audio projection → L2-normalize. The
   /// [`Embed<AudioInput>`] impl routes through here.
+  ///
+  /// The mel may stay in the front-end's `F32`: the tower casts it to the
+  /// model dtype at its entry ([`HtsatAudioTower::forward`]), so an f16/bf16
+  /// checkpoint computes — and returns its embedding — in its own dtype.
   pub fn embed_mel(&self, mel: &Array) -> Result<Embedding> {
     let feature = self.audio.forward(mel)?; // (B, audio_hidden=768)
     let projected = self.audio_projection.forward(&feature)?; // (B, projection_dim)
