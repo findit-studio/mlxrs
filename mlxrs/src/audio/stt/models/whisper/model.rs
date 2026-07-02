@@ -2518,18 +2518,19 @@ impl AutoregressiveStt for WhisperModel {
   /// Encode a Whisper mel `(num_frames, n_mels)` into encoder states
   /// `(1, n_audio_ctx, n_audio_state)`. Forwards to the encoder's `forward`.
   ///
-  /// The mel is cast to the model dtype first — the reference does this at the
-  /// decode entry (`_get_audio_features`, `decoding.py:538-539`: `fp16` ⇒
-  /// `mel.astype(mx.float16)`). [`log_mel_spectrogram_whisper`] produces an
-  /// `F32` mel, and MLX type promotion only widens (`f16 op f32 → f32`), so
-  /// without this cast an f16/bf16 checkpoint would silently run the whole
-  /// encoder — and, through the cross-attention K/V, the decoder and its KV
-  /// cache — in `F32`: ~2× compute/bandwidth on the entire transcribe hot
-  /// path. A same-dtype `astype` is a no-op, so an already-cast mel (or an
-  /// `F32` checkpoint) pays nothing.
+  /// The encoder normalizes the mel to the model dtype AFTER its O(1) shape
+  /// guards (the reference's decode-entry cast, `_get_audio_features`,
+  /// `decoding.py:538-539`: `fp16` ⇒ `mel.astype(mx.float16)`).
+  /// [`log_mel_spectrogram_whisper`] produces an `F32` mel, and MLX type
+  /// promotion only widens (`f16 op f32 → f32`), so without that cast an
+  /// f16/bf16 checkpoint would silently run the whole encoder — and, through
+  /// the cross-attention K/V, the decoder and its KV cache — in `F32`: ~2×
+  /// compute/bandwidth on the entire transcribe hot path. The cast lives
+  /// inside the encoder's `forward` behind its shape guards so a malformed
+  /// oversized mel stays a typed error before any full-size materialization;
+  /// a same-dtype `astype` is a no-op.
   fn encode(&self, mel: &Array) -> Result<Array> {
-    let mel = mel.astype(self.dtype)?;
-    self.encoder.forward(&mel)
+    self.encoder.forward(mel)
   }
 
   /// Mint a fresh, empty decode cache (no decoded positions). The model itself

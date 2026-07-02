@@ -514,7 +514,8 @@ fn checkpoint_encode_stays_dtype(dtype: Dtype) {
 /// [`log_mel_spectrogram_whisper`](crate::audio::stt::models::whisper::audio::log_mel_spectrogram_whisper)
 /// — the reference casts the mel to the model dtype *inside* the decode entry
 /// (`_get_audio_features`, `decoding.py:538-539`: `fp16` ⇒
-/// `mel.astype(mx.float16)`), so the model-side `encode` must own that cast.
+/// `mel.astype(mx.float16)`), so the encode path must own that cast (it lives
+/// in the encoder's forward, behind its O(1) shape guards).
 /// Without it, MLX's upward type promotion (`f16 op f32 → f32`) runs the whole
 /// encoder — and, through the cross-attention K/V, the decoder + its KV cache
 /// — in F32 on an f16 checkpoint: ~2× compute/bandwidth on the entire
@@ -549,6 +550,24 @@ fn f32_mel_encode_stays_model_dtype(dtype: Dtype) {
      `_get_audio_features` fp16 cast) — an F32 mel must not promote the \
      encoder graph to F32 on an f16/bf16 checkpoint"
   );
+}
+
+/// A malformed mel on a reduced-precision checkpoint stays a TYPED shape
+/// error: the encoder's O(1) shape guards run BEFORE the model-dtype cast
+/// (`astype` materializes a full-size copy), so a wrong-shaped —
+/// caller-controlled, potentially huge — `F32` mel is rejected by the cheap
+/// checks without any reduced-precision copy being scheduled first.
+#[test]
+fn wrong_shape_mel_on_reduced_precision_is_typed_error_before_cast() {
+  for dtype in [Dtype::F16, Dtype::BF16] {
+    let model = WhisperModel::from_weights(dims(), tiny_weights(), dtype).unwrap();
+    // Wrong frame count (not conv2.stride * n_ctx), F32 as production produces.
+    let bad = Array::ones::<f32>(&(10usize, TINY.n_mels)).unwrap();
+    assert!(
+      matches!(model.encode(&bad), Err(Error::ShapePairMismatch(_))),
+      "a wrong-shaped mel on a {dtype:?} checkpoint must be a typed shape error"
+    );
+  }
 }
 
 #[test]
