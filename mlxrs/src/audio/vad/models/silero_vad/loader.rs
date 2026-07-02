@@ -36,7 +36,9 @@ use crate::{
     },
     output::{SpeechSegment, VadOutput},
   },
-  error::{Error, FileIoPayload, FileOp, LayerKeyedPayload, MissingKeyPayload, Result},
+  error::{
+    Error, FileIoPayload, FileOp, LayerKeyedPayload, MissingKeyPayload, OutOfRangePayload, Result,
+  },
 };
 
 impl VadModel for SileroVadModel {
@@ -52,20 +54,37 @@ impl VadModel for SileroVadModel {
   ///
   /// [silero]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/vad/models/silero_vad/silero_vad.py#L243-L266
   fn generate(&self, audio: &Array, sample_rate: u32) -> Result<VadOutput> {
+    // Preprocess (stereo downmix + resample-to-supported-rate) before inference,
+    // exactly as the reference's `Model.generate` runs `_prepare_audio_array`
+    // first (silero_vad.py:244). `sample_rate` below is the RESOLVED rate.
+    let (audio, sample_rate) = self.prepare_audio(audio, sample_rate)?;
     let audio_len = *audio.shape().last().unwrap_or(&0) as i64;
-    let mut probabilities = self.predict_proba(audio, sample_rate)?;
+    let mut probabilities = self.predict_proba(&audio, sample_rate)?;
     probabilities.eval()?;
 
     // probs.tolist(): the reference indexes probabilities[0] when 2-D; here
     // predict_proba already returns the 1-D vector for a 1-D input. For a
     // batched input we take the first row (matching `probs = probabilities[0]
-    // if probabilities.ndim == 2`).
-    let probs_1d = if probabilities.ndim() == 2 {
-      probabilities.take_axis(&Array::from_slice::<i32>(&[0], &[0i32; 0])?, 0)?
+    // if probabilities.ndim == 2`) — guarded for a ZERO-ROW batch (a `(0, …)`
+    // input), whose rank-2 probabilities have no row 0 to take: an empty
+    // batch has no frames, so the segment extraction runs over an empty
+    // vector and the output carries no timestamps (the empty-waveform
+    // contract).
+    let probs_vec: Vec<f32> = if probabilities.ndim() == 2 {
+      if probabilities.shape()[0] == 0 {
+        Vec::new()
+      } else {
+        probabilities
+          .take_axis(&Array::from_slice::<i32>(&[0], &[0i32; 0])?, 0)?
+          .astype(crate::dtype::Dtype::F32)?
+          .to_vec::<f32>()?
+      }
     } else {
-      probabilities.try_clone()?
+      probabilities
+        .try_clone()?
+        .astype(crate::dtype::Dtype::F32)?
+        .to_vec::<f32>()?
     };
-    let probs_vec: Vec<f32> = probs_1d.astype(crate::dtype::Dtype::F32)?.to_vec::<f32>()?;
 
     let cfg = self.config();
     let timestamps: Vec<SpeechSegment> =
@@ -100,6 +119,18 @@ impl SileroVadModel {
   /// # Errors
   /// - [`Error::MissingKey`] naming the first absent tensor key.
   pub fn from_weights(config: ModelConfig, mut weights: HashMap<String, Array>) -> Result<Self> {
+    // Silero ships dense checkpoints only (the reference never quantizes its tiny
+    // model). A checkpoint carrying `<prefix>.scales` siblings is quantized;
+    // loading it dense would silently misinterpret the packed weights, so fail
+    // closed (the `.scales`-presence discriminator the other audio loaders share —
+    // here a rejection, since Silero has no quantized path).
+    if has_relevant_scales(&weights) {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad: quantized checkpoint",
+        "Silero VAD is dense-only; a quantized checkpoint (with .scales tensors) is unsupported",
+        "quantized",
+      )));
+    }
     let vad_16k = build_branch_from_weights(*config.branch_16k(), &mut weights, "vad_16k")?;
     let vad_8k = build_branch_from_weights(*config.branch_8k(), &mut weights, "vad_8k")?;
     Ok(Self::new(config, vad_16k, vad_8k))
@@ -177,18 +208,16 @@ fn take_weight(weights: &mut HashMap<String, Array>, branch: &str, suffix: &str)
     .ok_or_else(|| Error::MissingKey(MissingKeyPayload::new("silero_vad: missing weight", key)))
 }
 
-/// Silero ships a dense checkpoint by convention; this probe mirrors the
-/// `.scales`-presence discriminator the sensevoice / whisper loaders use, so a
-/// quantized Silero checkpoint (should one appear) can be detected. It returns
-/// `true` iff some loaded weight key has a sibling `<prefix>.scales`.
+/// Detect a quantized Silero checkpoint: `true` if ANY tensor key ends in
+/// `.scales`. Silero is dense-only, so any `.scales` sibling marks a quantized
+/// (or mixed) checkpoint that [`SileroVadModel::from_weights`] rejects.
 ///
-/// Carried for parity with the other audio loaders' quantization gate; the
-/// current load path is dense (`load` ignores any quantization block, as the
-/// reference does — its checkpoint is small and unquantized).
+/// This is a COMPLETE `.scales`-presence check, not the `<prefix>.weight` +
+/// `<prefix>.scales` sibling form quantize-aware loaders use: Silero consumes
+/// its LSTM weights as `lstm.Wx` / `lstm.Wh` (not `*.weight`), so a
+/// `lstm.Wx.scales` sibling would slip through a `.weight`-anchored check.
 pub fn has_relevant_scales(weights: &HashMap<String, Array>) -> bool {
-  weights.keys().any(|k| {
-    k.ends_with(".weight") && weights.contains_key(&format!("{}.scales", &k[..k.len() - 7]))
-  })
+  weights.keys().any(|k| k.ends_with(".scales"))
 }
 
 /// Read and merge every `*.safetensors` shard under `dir` into one weight map —

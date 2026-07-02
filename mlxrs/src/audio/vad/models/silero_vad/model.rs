@@ -564,7 +564,14 @@ impl SileroVadModel {
     } else {
       chunk
     };
-    let chunk_width = i32::try_from(*chunk.shape().last().unwrap_or(&0)).unwrap_or(-1);
+    let last_dim = *chunk.shape().last().unwrap_or(&0);
+    let chunk_width = i32::try_from(last_dim).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad feed: chunk width",
+        "must fit in i32",
+        format_smolstr!("{last_dim}"),
+      ))
+    })?;
     if chunk_width != branch.config().chunk_size() {
       return Err(Error::OutOfRange(OutOfRangePayload::new(
         "silero_vad feed: chunk width",
@@ -576,7 +583,13 @@ impl SileroVadModel {
       )));
     }
 
-    let batch = i32::try_from(chunk.shape()[0]).unwrap_or(1);
+    let batch = i32::try_from(chunk.shape()[0]).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad feed: batch size",
+        "must fit in i32",
+        format_smolstr!("{}", chunk.shape()[0]),
+      ))
+    })?;
     let state = match state {
       Some(s) => s,
       None => self.initial_state(batch, sample_rate)?,
@@ -644,7 +657,13 @@ impl SileroVadModel {
     let total = *audio.shape().last().unwrap_or(&0);
     if total == 0 {
       // Empty input → empty probabilities (1-D or (B, 0)).
-      let batch = i32::try_from(audio.shape()[0]).unwrap_or(0);
+      let batch = i32::try_from(audio.shape()[0]).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          "silero_vad predict_proba: batch size",
+          "must fit in i32",
+          format_smolstr!("{}", audio.shape()[0]),
+        ))
+      })?;
       return if original_ndim == 1 {
         Array::zeros::<f32>(&[0])?.astype(self.dtype())
       } else {
@@ -659,7 +678,27 @@ impl SileroVadModel {
         format_smolstr!("{total}"),
       ))
     })?;
-    let batch = i32::try_from(audio.shape()[0]).unwrap_or(1);
+    let batch = i32::try_from(audio.shape()[0]).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad predict_proba: batch size",
+        "must fit in i32",
+        format_smolstr!("{}", audio.shape()[0]),
+      ))
+    })?;
+
+    // A zero-ROW batch has the frame-count contract of the reference loop —
+    // `(0, ceil(total / chunk))` — but running the chunk loop over a
+    // data-less input would be width-proportional WORK (a `(0, huge)` shape
+    // would iterate millions of empty windows). Short-circuit to the final
+    // shape directly; every value axis is empty so the result is exact.
+    if batch == 0 {
+      // Ceil division in i64 (signed div_ceil is unstable; the +chunk-1 form
+      // could overflow i32 at extreme widths). The result never exceeds
+      // total_i, so the i32 narrowing is exact.
+      let frames =
+        ((i64::from(total_i) + i64::from(chunk_size) - 1) / i64::from(chunk_size)) as i32;
+      return Array::zeros::<f32>(&[0, frames])?.astype(self.dtype());
+    }
 
     // pad = (chunk_size - L % chunk_size) % chunk_size; right-pad with zeros.
     let pad = (chunk_size - total_i % chunk_size) % chunk_size;
@@ -690,23 +729,29 @@ impl SileroVadModel {
     while pos < padded_len {
       let window = slice_last_axis(&audio, pos - context_size, pos + chunk_size)?;
       let (out, new_state) = self.forward(&window, state.as_ref(), sample_rate)?;
-      // Mirror the reference (`silero_vad.py:312-313`): `async_eval(out, state)`
+      // Mirror the reference (`silero_vad.py:306-313`): `async_eval(out, state)`
       // every `EVAL_EVERY` (16) steps to BOUND lazy-graph retention on long
       // audio. Without this a long recording (the VAD's actual use case)
       // accumulates the entire recurrent graph until the single final eval,
-      // risking large memory growth / OOM. `async_eval` is non-blocking and does
-      // not change the result, only when materialization happens.
+      // risking large memory growth / OOM. The reference's `step` is 1-based
+      // (`enumerate(range(...), start=1)`), so `step` is incremented BEFORE the
+      // check: this both matches the reference phase AND, critically, fires the
+      // eval on the LAST chunk when the chunk count is an exact multiple of
+      // EVAL_EVERY (a 0-based `step` tops out at count-1, never reaching the
+      // multiple, and the tail guard below also skips the exact-multiple case —
+      // so the final state would never be bounded). `async_eval` is non-blocking
+      // and does not change the result, only when materialization happens.
+      step += 1;
       if step.is_multiple_of(EVAL_EVERY) {
         crate::transforms::async_eval(&[&out, &new_state])?;
       }
       outputs.push(out);
       state = Some(new_state);
       pos += chunk_size;
-      step += 1;
     }
     // Reference tail (`silero_vad.py:315-316`): async_eval the last output +
-    // state when the step count is not a multiple of `EVAL_EVERY` (the tail not
-    // already evaluated inside the loop).
+    // state when the chunk count is not a multiple of `EVAL_EVERY` (when it IS,
+    // the final in-loop eval above already bounded it).
     if !outputs.len().is_multiple_of(EVAL_EVERY)
       && let (Some(last), Some(st)) = (outputs.last(), state.as_ref())
     {
@@ -721,6 +766,309 @@ impl SileroVadModel {
       probabilities = probabilities.take_axis(&idx0(0)?, 0)?;
     }
     Ok(probabilities)
+  }
+
+  /// Preprocess raw input audio for inference — port of
+  /// `Model._prepare_audio_array` (silero_vad.py:323-351).
+  ///
+  /// Applies the reference's two corrections, both ABSENT from the lower-level
+  /// [`Self::predict_proba`] (which assumes already-prepared mono / batched
+  /// audio at a supported rate):
+  ///
+  /// 1. **stereo / multichannel downmix** — a rank-2 `(T, C)` waveform with a
+  ///    small trailing channel count (`C <= 8 < T`) is averaged over the channel
+  ///    axis to mono `(T,)`, while a `(B, T)` batch (trailing `T > 8`) is left
+  ///    untouched, exactly as the reference's `ndim == 2 and shape[-1] <= 8 <
+  ///    shape[0]` heuristic discriminates the two. Without this a `(T, 2)` stereo
+  ///    clip is silently misread as a `T`-stream / 2-sample batch;
+  /// 2. **resample** — a sample rate that is neither 8 kHz nor 16 kHz is linearly
+  ///    resampled to 16 kHz (`target_sr = sr if sr in (8000, 16000) else 16000`),
+  ///    so a 44.1 kHz / 48 kHz waveform is handled rather than rejected by
+  ///    [`Self::branch`].
+  ///
+  /// Returns the prepared waveform and the resolved sample rate. A rank outside
+  /// `(T,)` / `(B, T)` is rejected with a typed [`Error::RankMismatch`].
+  pub fn prepare_audio(&self, audio: &Array, sample_rate: u32) -> Result<(Array, u32)> {
+    // A zero sample rate can never resolve a timeline (the resample ratio and
+    // the empty-batch width arithmetic both divide by it) — reject it with
+    // the same typed class resample_linear uses, BEFORE any arithmetic, so
+    // no path can reach an integer divide-by-zero.
+    if sample_rate == 0 {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad prepare_audio: sample_rate",
+        "must be > 0",
+        "0",
+      )));
+    }
+    let ndim = audio.ndim();
+    if ndim != 1 && ndim != 2 {
+      return Err(Error::RankMismatch(RankMismatchPayload::new(
+        "silero_vad prepare_audio: audio must be rank-1 (T,) or rank-2 (B, T) / (T, C)",
+        ndim as u32,
+        audio.shape(),
+      )));
+    }
+    // Empty input of ANY layout — (0,), (0, T), (B, 0) — has nothing to
+    // downmix or resample; handle it before the downmix can reduce over a
+    // zero-length axis (a `(2, 0)` input would otherwise satisfy the stereo
+    // heuristic and `mean_axes` a zero-length axis) and before the resample
+    // row loop. The resolved rate follows the target-rate net, and the TIME
+    // AXIS follows it too: a zero-ROW batch with a nonzero width at an
+    // unsupported rate is returned with the width a real row would have
+    // after resampling (computed through the same resample_linear the
+    // non-empty path uses), so the downstream chunking's frame count
+    // reflects the resolved-rate timeline, not the original one.
+    if audio.shape().contains(&0) {
+      let target_sr = if sample_rate == 8_000 || sample_rate == 16_000 {
+        sample_rate
+      } else {
+        16_000
+      };
+      let shape = audio.shape();
+      let width = *shape.last().unwrap_or(&0);
+      if sample_rate != target_sr && shape.len() == 2 && width > 0 {
+        // The width a real row would resample to — the same arithmetic
+        // resample_linear derives its output length from (`in_len * to_rate
+        // / from_rate`, checked u64), computed WITHOUT materializing a dummy
+        // row: a data-less `(0, huge)` shape costs only shape arithmetic (a
+        // typed error on overflow), never a width-proportional allocation.
+        let resampled_width = usize::try_from(
+          (width as u64)
+            .checked_mul(u64::from(target_sr))
+            .ok_or_else(|| {
+              Error::ArithmeticOverflow(crate::error::ArithmeticOverflowPayload::with_operands(
+                "silero_vad prepare_audio: width * target_rate",
+                "u64",
+                [
+                  ("width", width as u64),
+                  ("target_rate", u64::from(target_sr)),
+                ],
+              ))
+            })?
+            / u64::from(sample_rate),
+        )
+        .unwrap_or(usize::MAX);
+        let w = i32::try_from(resampled_width).map_err(|_| {
+          Error::OutOfRange(OutOfRangePayload::new(
+            "silero_vad prepare_audio: resampled width",
+            "must fit in i32",
+            format_smolstr!("{resampled_width}"),
+          ))
+        })?;
+        return Ok((
+          Array::zeros::<f32>(&[0, w])?.astype(audio.dtype()?)?,
+          target_sr,
+        ));
+      }
+      return Ok((audio.try_clone()?, target_sr));
+    }
+    // Stereo / multichannel downmix: (T, C) with C <= 8 < T → mean over C —
+    // the EXACT reference predicate (`shape[-1] <= 8 < shape[0]`,
+    // silero_vad.py:338): the row count must exceed 8, not merely the column
+    // count, so a small batch such as (3, 2) stays a batch.
+    let downmixed = if ndim == 2 {
+      let shape = audio.shape();
+      let rows = shape[0];
+      let cols = shape[1];
+      if cols <= 8 && 8 < rows {
+        ops::reduction::mean_axes(audio, &[-1], false)?
+      } else {
+        audio.try_clone()?
+      }
+    } else {
+      audio.try_clone()?
+    };
+    // Resample to a supported rate when the input is neither 8 kHz nor 16 kHz.
+    let target_sr = if sample_rate == 8_000 || sample_rate == 16_000 {
+      sample_rate
+    } else {
+      16_000
+    };
+    if sample_rate == target_sr {
+      return Ok((downmixed, sample_rate));
+    }
+    Ok((
+      resample_audio_array(&downmixed, sample_rate, target_sr)?,
+      target_sr,
+    ))
+  }
+
+  /// Per-frame speech probabilities for raw audio — port of `Model.predict` /
+  /// the public `Model.predict_proba` (silero_vad.py:198-207).
+  ///
+  /// Prepares the audio ([`Self::prepare_audio`]: downmix + resample) then runs
+  /// the lower-level [`Self::predict_proba`] chunking core. (mlxrs's
+  /// [`Self::predict_proba`] is the reference's `_predict_proba_array`, which
+  /// assumes already-prepared audio; this is the public entry that downmixes /
+  /// resamples first.)
+  pub fn predict(&self, audio: &Array, sample_rate: u32) -> Result<Array> {
+    let (audio, sr) = self.prepare_audio(audio, sample_rate)?;
+    self.predict_proba(&audio, sr)
+  }
+
+  /// Reset to the initial streaming state — alias for [`Self::initial_state`]
+  /// (the reference's `Model.reset_state`, silero_vad.py:157-160).
+  pub fn reset_state(&self, batch_size: i32, sample_rate: u32) -> Result<SileroVadState> {
+    self.initial_state(batch_size, sample_rate)
+  }
+
+  /// Detect speech segments in raw audio — port of `Model.get_speech_timestamps`
+  /// (silero_vad.py:209-241).
+  ///
+  /// Prepares the audio ([`Self::prepare_audio`]), runs [`Self::predict_proba`],
+  /// then collapses the per-frame probabilities to padded speech segments via
+  /// [`probs_to_timestamps`]. Each non-`None` [`SpeechTimestampOptions`] field
+  /// overrides the corresponding model-config default for this call only (the
+  /// reference's per-call keyword overrides); a default (all-`None`) options uses
+  /// the config values, identical to the timestamps
+  /// [`VadModel::generate`](crate::audio::vad::VadModel::generate) emits.
+  ///
+  /// Sample indices are returned as [`SpeechSegment`]s;
+  /// [`SpeechSegment::start_seconds`] / [`SpeechSegment::end_seconds`] give the
+  /// reference's `return_seconds=True` view.
+  pub fn get_speech_timestamps(
+    &self,
+    audio: &Array,
+    sample_rate: u32,
+    options: SpeechTimestampOptions,
+  ) -> Result<Vec<SpeechSegment>> {
+    let (audio, sr) = self.prepare_audio(audio, sample_rate)?;
+    let audio_len = *audio.shape().last().unwrap_or(&0) as i64;
+    let mut probabilities = self.predict_proba(&audio, sr)?;
+    probabilities.eval()?;
+    // probs[0] when batched (the reference's `probs = probabilities[0] if 2-D`)
+    // — guarded for a ZERO-ROW batch (a `(0, …)` input), whose rank-2
+    // probabilities have no row 0 to take: an empty batch has no frames, so
+    // the segment extraction runs over an empty probability vector and
+    // returns no timestamps (consistent with the empty-waveform contract).
+    let probs_vec: Vec<f32> = if probabilities.ndim() == 2 {
+      if probabilities.shape()[0] == 0 {
+        Vec::new()
+      } else {
+        let mut row = probabilities.take_axis(&idx0(0)?, 0)?;
+        row.eval()?;
+        row.astype(Dtype::F32)?.to_vec::<f32>()?
+      }
+    } else {
+      probabilities.astype(Dtype::F32)?.to_vec::<f32>()?
+    };
+    let cfg = &self.config;
+    let threshold = options.threshold.unwrap_or(cfg.threshold());
+    let min_speech_duration_ms = options
+      .min_speech_duration_ms
+      .unwrap_or(cfg.min_speech_duration_ms());
+    let min_silence_duration_ms = options
+      .min_silence_duration_ms
+      .unwrap_or(cfg.min_silence_duration_ms());
+    let speech_pad_ms = options.speech_pad_ms.unwrap_or(cfg.speech_pad_ms());
+    // Validate the per-call overrides exactly as ModelConfig::validate does at
+    // load — the override path would otherwise bypass it. A negative pad widens
+    // start and shrinks end, which for a one-frame run yields a SpeechSegment
+    // with start > end, violating the output invariant.
+    if !threshold.is_finite() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad get_speech_timestamps: threshold",
+        "must be finite",
+        format_smolstr!("{threshold}"),
+      )));
+    }
+    for (field, v) in [
+      ("min_speech_duration_ms", min_speech_duration_ms),
+      ("min_silence_duration_ms", min_silence_duration_ms),
+      ("speech_pad_ms", speech_pad_ms),
+    ] {
+      if v < 0 {
+        return Err(Error::OutOfRange(OutOfRangePayload::new(
+          "silero_vad get_speech_timestamps: negative duration/padding override",
+          "must be >= 0",
+          format_smolstr!("{field}={v}"),
+        )));
+      }
+    }
+    Ok(probs_to_timestamps(
+      &probs_vec,
+      audio_len,
+      sr,
+      threshold,
+      min_speech_duration_ms,
+      min_silence_duration_ms,
+      speech_pad_ms,
+    ))
+  }
+}
+
+/// Per-call overrides for [`SileroVadModel::get_speech_timestamps`] — the
+/// keyword arguments of `Model.get_speech_timestamps` (silero_vad.py:209-241).
+///
+/// Each `None` field falls back to the model-config value, exactly like the
+/// reference's `self.config.X if x is None else x`. The [`Default`] (all-`None`)
+/// reproduces calling the reference with no keyword overrides.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeechTimestampOptions {
+  /// Speech-probability decision threshold (config default when `None`).
+  pub threshold: Option<f64>,
+  /// Minimum speech-segment duration in ms (config default when `None`).
+  pub min_speech_duration_ms: Option<i32>,
+  /// Minimum silence duration in ms to close a segment (config default when `None`).
+  pub min_silence_duration_ms: Option<i32>,
+  /// Padding in ms added to each side of a segment (config default when `None`).
+  pub speech_pad_ms: Option<i32>,
+}
+
+/// Linearly resample a waveform [`Array`] from `from` to `to` Hz via the
+/// [`crate::audio::io::resample_linear`] host primitive — a rank-1 `(T,)`
+/// waveform, or each row of a rank-2 `(B, T)` batch. Used by
+/// [`SileroVadModel::prepare_audio`] for the reference's resample-to-16-kHz net.
+fn resample_audio_array(audio: &Array, from: u32, to: u32) -> Result<Array> {
+  let shape = audio.shape();
+  // Defensive: an input with any zero dim has nothing to resample; return it
+  // unchanged rather than concatenating an empty row set (the caller already
+  // guards this, but keep the helper sound on its own).
+  if shape.contains(&0) {
+    return audio.try_clone();
+  }
+  let resample_1d = |samples: &[f32], leading_batch: bool| -> Result<Array> {
+    let out = crate::audio::io::resample_linear(samples, from, to)?;
+    let n = i32::try_from(out.len()).map_err(|_| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "silero_vad prepare_audio: resampled length",
+        "must fit in i32",
+        format_smolstr!("{}", out.len()),
+      ))
+    })?;
+    if leading_batch {
+      Array::from_slice::<f32>(&out, &[1, n])
+    } else {
+      Array::from_slice::<f32>(&out, &[n])
+    }
+  };
+  match shape.len() {
+    1 => {
+      let samples = audio.astype(Dtype::F32)?.to_vec::<f32>()?;
+      resample_1d(&samples, false)
+    }
+    2 => {
+      let rows = shape[0];
+      let f32_audio = audio.astype(Dtype::F32)?;
+      let mut resampled_rows: Vec<Array> = Vec::with_capacity(rows);
+      for r in 0..i32::try_from(rows).map_err(|_| {
+        Error::OutOfRange(OutOfRangePayload::new(
+          "silero_vad prepare_audio: batch size",
+          "must fit in i32",
+          format_smolstr!("{rows}"),
+        ))
+      })? {
+        let samples = f32_audio.take_axis(&idx0(r)?, 0)?.to_vec::<f32>()?;
+        resampled_rows.push(resample_1d(&samples, true)?);
+      }
+      let refs: Vec<&Array> = resampled_rows.iter().collect();
+      ops::shape::concatenate(&refs, 0)
+    }
+    _ => Err(Error::RankMismatch(RankMismatchPayload::new(
+      "silero_vad prepare_audio: resample rank",
+      shape.len() as u32,
+      shape,
+    ))),
   }
 }
 
@@ -814,7 +1162,7 @@ pub fn probs_to_timestamps(
   }
 
   // Pad each segment by `speech_pad` on each side and COALESCE when a padded
-  // start overlaps the previous padded end — a byte-faithful port of mlx-audio's
+  // start overlaps the previous padded end — a faithful port of mlx-audio's
   // `silero_vad.py:410-417` (`if padded and start <= padded[-1]["end"]:
   // padded[-1]["end"] = max(padded[-1]["end"], end)`). This intentionally
   // matches mlx-audio's merge-on-overlap, NOT the upstream PyTorch snakers4
@@ -872,6 +1220,44 @@ pub(super) fn build_branch(
   final_conv_weight: Array,
   final_conv_bias: Array,
 ) -> Result<SileroVadBranch> {
+  // mlx.nn.LSTM stores Wx as (4H, D), Wh as (4H, H), bias as (4H,). Infer the
+  // hidden size H from Wx's leading dim instead of hardcoding 128, and validate
+  // the three LSTM tensors are mutually consistent so a wrong-shaped checkpoint
+  // fails closed here with a clear error rather than mis-splitting the gates deep
+  // in the recurrence.
+  let wx_shape = lstm_wx.shape();
+  let wh_shape = lstm_wh.shape();
+  let bias_shape = lstm_bias.shape();
+  if wx_shape.len() != 2 || wh_shape.len() != 2 || bias_shape.len() != 1 {
+    return Err(Error::RankMismatch(RankMismatchPayload::new(
+      "silero_vad lstm weights: expected Wx (4H, D), Wh (4H, H), bias (4H,)",
+      wx_shape.len() as u32,
+      wx_shape,
+    )));
+  }
+  let four_h = wx_shape[0];
+  if four_h == 0 || !four_h.is_multiple_of(4) {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "silero_vad lstm Wx leading dim",
+      "must be a positive multiple of 4 (the 4*hidden gate stack)",
+      format_smolstr!("{four_h}"),
+    )));
+  }
+  let hidden = four_h / 4;
+  if wh_shape[0] != four_h || wh_shape[1] != hidden || bias_shape[0] != four_h {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "silero_vad lstm weights: Wh / bias inconsistent with Wx",
+      "Wh must be (4H, H) and bias (4H,) for H = Wx.shape[0] / 4",
+      format_smolstr!("Wx={wx_shape:?}, Wh={wh_shape:?}, bias={bias_shape:?}"),
+    )));
+  }
+  let hidden_size = i32::try_from(hidden).map_err(|_| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      "silero_vad lstm hidden size",
+      "must fit in i32",
+      format_smolstr!("{hidden}"),
+    ))
+  })?;
   let wx_t = ops::shape::swapaxes(lstm_wx, -2, -1)?;
   let wh_t = ops::shape::swapaxes(lstm_wh, -2, -1)?;
   Ok(SileroVadBranch {
@@ -905,7 +1291,7 @@ pub(super) fn build_branch(
       wx_t,
       wh_t,
       bias: lstm_bias,
-      hidden_size: 128,
+      hidden_size,
     },
     final_conv_weight,
     final_conv_bias,
