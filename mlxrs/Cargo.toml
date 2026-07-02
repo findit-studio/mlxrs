@@ -82,7 +82,7 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
   "ogg",
   "vorbis",
 ] }
-cpal = { version = "0.17", optional = true }
+cpal = { version = "0.18", optional = true }
 flate2 = { version = "1", optional = true } # zlib DEFLATE for the Whisper decode compression-ratio fallback heuristic
 unicode-normalization = { version = "0.1", optional = true }
 unicode-general-category = { version = "1", optional = true }
