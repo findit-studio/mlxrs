@@ -1722,10 +1722,13 @@ impl<'a> DecodingTask<'a> {
   }
 
   /// Encode the mel (or pass an already-encoded feature tensor straight
-  /// through) — `_get_audio_features` (`decoding.py:553-571`). mlxrs decodes
-  /// in the model dtype rather than forcing fp16, so the dtype cast is
-  /// dropped; the encoder is skipped if `mel` is already the encoder-output
-  /// shape `(n_audio_ctx, n_audio_state)`.
+  /// through) — `_get_audio_features` (`decoding.py:553-571`). The reference's
+  /// fp16 mel cast (`decoding.py:538-539`) lives inside the encoder's forward
+  /// behind its shape guards, generalized to the model dtype (an `F32` mel
+  /// would otherwise promote the whole encoder+decoder graph to `F32` on an
+  /// f16/bf16 checkpoint); [`encode_once`] applies the same normalization to
+  /// pass-through pre-encoded features. The encoder is skipped if `mel` is
+  /// already the encoder-output shape `(n_audio_ctx, n_audio_state)`.
   fn audio_features(&self, mel: &Array) -> Result<Array> {
     encode_once(self.model, mel)
   }
@@ -2778,8 +2781,15 @@ pub fn detect_language<'a>(
     )));
   }
 
+  // Normalize the caller-supplied features exactly as `decode` does
+  // ([`encode_once`]: shape-lift a rank-2 tensor, cast an MLX pass-through to
+  // the model dtype, encode a raw mel) — without this, correctly-shaped `F32`
+  // features on an f16/bf16 MLX checkpoint would promote the language-id
+  // cross-attention work to `F32` through this public entry.
+  let audio_features = encode_once(model, audio_features)?;
+
   // Single `sot` forward, fresh cache.
-  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], audio_features, None)?;
+  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], &audio_features, None)?;
   // logits[:, 0] → the only (first) position's row. Language detection runs
   // once (not per decode step), so reading this row to the host here is fine —
   // it is the masking + softmax over a small language-token set, not the hot
@@ -2931,8 +2941,17 @@ fn decode_resolved(
 /// shared by [`decode`] and language detection (`_get_audio_features`,
 /// `decoding.py:553-571`).
 ///
+/// The reference casts to the compute dtype BEFORE its encoded-shape check
+/// (`decoding.py:538-539`), so the pass-through arm normalizes the dtype too:
+/// a caller-supplied pre-encoded `F32` feature tensor on an f16/bf16 MLX model
+/// would otherwise promote the decoder cross-attention K/V and the KV cache to
+/// `F32` through the public [`decode`] / [`decode_with_fallback`] entries. A
+/// same-dtype `astype` is a no-op. The CoreML backend is excluded: its encoder
+/// states are host-side `f32` by contract and its decode path owns the
+/// layout/dtype conversion.
+///
 /// # Errors
-/// Propagates the encoder forward op errors.
+/// Propagates the encoder forward / cast op errors.
 fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
   let dims = model.dims();
   let shape = mel.shape();
@@ -2944,12 +2963,17 @@ fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
     [1, c, s] if *c == dims.n_audio_ctx() && *s == dims.n_audio_state()
   );
   if is_encoded {
-    if shape.len() == 2 {
+    let features = if shape.len() == 2 {
       let c = i32::try_from(dims.n_audio_ctx()).map_err(|_| dim_overflow("n_audio_ctx"))?;
       let s = i32::try_from(dims.n_audio_state()).map_err(|_| dim_overflow("n_audio_state"))?;
-      mel.reshape(&[1, c, s])
+      mel.reshape(&[1, c, s])?
     } else {
-      mel.try_clone()
+      mel.try_clone()?
+    };
+    match model {
+      WhisperBackend::Mlx(m) => features.astype(m.dtype()),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      WhisperBackend::CoreMl(_) => Ok(features),
     }
   } else {
     model.encode(mel)
