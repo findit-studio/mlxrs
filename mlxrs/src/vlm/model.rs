@@ -503,6 +503,16 @@ fn default_merge_embeddings(
     )));
   }
 
+  // The image slabs are spliced INTO the text-embedding sequence, and the
+  // merged result must stay in the LM's dtype: `concatenate` PROMOTES mixed
+  // inputs (bf16 text + F32 image features → an F32 merge that silently
+  // widens the whole LM forward on a reduced-precision checkpoint — the
+  // reference splices via setitem, whose destination dtype wins). Pin the
+  // image embeds to the text dtype before slicing; a same-dtype astype is a
+  // no-op.
+  let image_embeds = image_embeds.astype(text_embeds.dtype()?)?;
+  let image_embeds = &image_embeds;
+
   // Validate spans (start<end, in-bounds, non-overlapping, monotone) and
   // accumulate the total width — `Σ(end - start)` must match
   // `image_embeds.shape[0]`. Bound by a single forward walk over the
@@ -721,6 +731,34 @@ mod tests {
       got.to_vec::<f32>().unwrap(),
       want.to_vec::<f32>().unwrap(),
       "fixed-grid process reproduces preprocess element-for-element"
+    );
+  }
+
+  /// [`default_merge_embeddings`] splices image slabs INTO the text-embedding
+  /// sequence, so the merged result must stay in the text/LM dtype:
+  /// `concatenate` promotes mixed dtypes (bf16 text + F32 image features →
+  /// F32), which would silently widen the whole LM forward + KV cache on a
+  /// reduced-precision checkpoint. The splice must cast the image embeds to
+  /// the text dtype (the reference's setitem destination-dtype semantics).
+  #[test]
+  fn default_merge_embeddings_casts_image_embeds_to_text_dtype() {
+    use crate::dtype::Dtype;
+    // bf16 text embeds [1, 4, 2]; F32 image embeds [2, 2] (post-projector
+    // features that were never cast — e.g. an F32 vision tower feeding a bf16
+    // LM).
+    let text = Array::from_slice::<f32>(&[0.25; 8], &(1_usize, 4, 2))
+      .unwrap()
+      .astype(Dtype::BF16)
+      .unwrap();
+    let image = Array::from_slice::<f32>(&[1.5; 4], &(2_usize, 2)).unwrap();
+    assert_eq!(image.dtype().unwrap(), Dtype::F32);
+    let merged = default_merge_embeddings(&text, &image, &[(1, 3)]).unwrap();
+    assert_eq!(merged.shape(), vec![1, 4, 2]);
+    assert_eq!(
+      merged.dtype().unwrap(),
+      Dtype::BF16,
+      "merged embeds must stay in the text/LM dtype — F32 image embeds must \
+       not promote the merged sequence"
     );
   }
 }

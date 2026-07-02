@@ -234,8 +234,9 @@ impl Lfm2VlMultiModalProjector {
   ///
   /// Weight keys follow `lfm2_vl.py`'s module tree under the projector prefix
   /// (the VL-level `multi_modal_projector` prefix already stripped):
-  /// `layer_norm.{weight,bias}` (present iff `projector_use_layernorm`),
-  /// `linear_1.{weight,bias,scales,biases}`,
+  /// `layer_norm.{weight,bias}` (REQUIRED iff `projector_use_layernorm`; when
+  /// the flag is `false` any present pair is consumed and **dropped** — see
+  /// below), `linear_1.{weight,bias,scales,biases}`,
   /// `linear_2.{weight,bias,scales,biases}`. The `linear_*.bias` presence is
   /// gated by the authoritative `projector_bias` config flag
   /// (`lfm2_vl.py:20-30` builds both `Linear`s with `bias=config.projector_bias`):
@@ -245,6 +246,19 @@ impl Lfm2VlMultiModalProjector {
   /// dense and quantized paths via
   /// [`MaybeQuantizedLinear::from_weights_with_bias`] (NOT the auto-consuming
   /// `from_weights`).
+  ///
+  /// ## `projector_use_layernorm = false` still consumes `layer_norm.*`
+  ///
+  /// The reference `Lfm2VlMultiModalProjector.__init__` instantiates
+  /// `self.layer_norm = nn.LayerNorm(in_channels)` **unconditionally** and only
+  /// gates its *application* in `__call__` on `projector_use_layernorm` (as does
+  /// the HF-transformers module the published checkpoints are converted from) —
+  /// so a `projector_use_layernorm = false` checkpoint (e.g.
+  /// `LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}`) still carries both
+  /// `layer_norm.{weight,bias}` tensors. They are consumed and dropped here
+  /// (never applied), so the VL-level leftover-weight rejection does not fail
+  /// the load; a flag-`false` checkpoint *without* the pair (an
+  /// `nn.Identity()`-era conversion) loads identically.
   ///
   /// `quant` resolves a layer path's `(group_size, bits, mode)` from the parsed
   /// quantization config (`None` for a dense layer); a quantized layer is
@@ -277,6 +291,32 @@ impl Lfm2VlMultiModalProjector {
         LAYERNORM_DEFAULT_EPS,
       ))
     } else {
+      // `projector_use_layernorm = false` checkpoints STILL carry
+      // `layer_norm.{weight,bias}`: the reference instantiates the LayerNorm
+      // unconditionally and only gates its application in `__call__` (so the
+      // conversion always serializes the pair — the real
+      // `LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}` checkpoints are exactly this
+      // shape). Consume and DROP the pair (it is never applied) so the
+      // VL-level leftover-weight rejection does not hard-fail the load —
+      // BOTH-or-NEITHER: the unconditional reference module always serializes
+      // both, so a checkpoint carrying exactly one of the pair is schema
+      // drift, and silently dropping the stray key would defeat the
+      // leftover-weight integrity fence — it stays a typed error. Neither
+      // present keeps the (`nn.Identity()`-era) keyless layout loading
+      // unchanged.
+      let ln_weight = weights.remove("layer_norm.weight");
+      let ln_bias = weights.remove("layer_norm.bias");
+      if ln_weight.is_some() != ln_bias.is_some() {
+        let missing = if ln_weight.is_none() {
+          "layer_norm.weight"
+        } else {
+          "layer_norm.bias"
+        };
+        return Err(Error::MissingKey(crate::error::MissingKeyPayload::new(
+          "Lfm2VlMultiModalProjector: layer_norm pair must be both present or both absent (projector_use_layernorm = false drops the unused pair; a half-present pair is checkpoint schema drift)",
+          missing,
+        )));
+      }
       None
     };
 
@@ -367,7 +407,9 @@ impl Lfm2VlMultiModalProjector {
 /// [`Error::LengthMismatch`] on mismatch, mirroring the reference's
 /// `ValueError` at `lfm2_vl.py:173-176` — and replaces every masked position's
 /// embedding with the matching feature row (in row-major mask order). The result
-/// is `(B, T, D)`.
+/// is `(B, T, D)` **in `inputs_embeds`' dtype** (the feature rows are cast to
+/// it, mirroring `masked_scatter`'s assign-into-destination setitem semantics —
+/// F32 features must not promote a bf16/f16 embedding sequence).
 ///
 /// The splice is fully lazy (no in-place mutation): the masked flat positions
 /// are read host-side (a tiny `(B, T)` bool read) only to build the
@@ -466,6 +508,16 @@ pub fn merge_input_ids_with_image_features(
   if n == 0 {
     return inputs_embeds.try_clone();
   }
+
+  // The reference's `masked_scatter` assigns INTO `inputs_embeds`
+  // (`final_embedding_flattened[image_positions] = ...`, `lfm2_vl.py:75-93`) —
+  // mlx setitem implicitly casts the scattered rows to the DESTINATION dtype.
+  // The lazy `select` analogue below instead PROMOTES its branches (bf16
+  // embeds + F32 features → an F32 merge that silently widens the whole LM
+  // forward), so pin the feature rows to the embeddings dtype first. A
+  // same-dtype astype is a no-op.
+  let image_features = ops::misc::astype(image_features, inputs_embeds.dtype()?)?;
+  let image_features = &image_features;
 
   // Build the per-position gather index `(B*T,)`: the k-th masked flat position
   // gathers feature row `k`; every non-masked position gathers row 0 (its

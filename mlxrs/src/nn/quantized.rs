@@ -680,6 +680,31 @@ impl MaybeQuantizedLinear {
     Ok((to_i32(out)?, to_i32(in_features)?))
   }
 
+  /// The layer's **parameter precision** — the dtype an activation should be
+  /// cast to so the projection computes in the checkpoint's precision (the
+  /// reference pattern `x.astype(layer.weight.dtype)`, e.g. mlx-vlm
+  /// `lfm2_vl/vision.py`'s `pixel_values.astype(target_dtype)`).
+  ///
+  /// - **Dense**: the weight's own dtype (the logical weight verbatim).
+  /// - **Quantized**: the per-group `scales` dtype — the packed `uint32`
+  ///   `weight` is a bit-layout, not a precision; for the `affine` checkpoints
+  ///   mlx-community publishes the scales carry the source float dtype and the
+  ///   dequantized output follows it. (The `fp` modes' `uint8` scales are a
+  ///   packed exponent layout, NOT a float precision — a caller casting
+  ///   activations must gate on the returned dtype being floating before
+  ///   applying it.)
+  ///
+  /// Reads only `dtype()` metadata (no materialization / eval).
+  ///
+  /// # Errors
+  /// Propagates the dtype metadata read.
+  pub fn weight_dtype(&self) -> Result<Dtype> {
+    match self {
+      MaybeQuantizedLinear::Dense(l) => l.weight_ref().dtype(),
+      MaybeQuantizedLinear::Quantized(q) => q.scales_ref().dtype(),
+    }
+  }
+
   /// Run the layer: `mlx.nn.Linear.__call__` or
   /// `mlx.nn.QuantizedLinear.__call__` depending on the variant.
   ///

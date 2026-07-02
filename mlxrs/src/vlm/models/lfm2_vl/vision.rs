@@ -439,7 +439,11 @@ impl VisionModel {
   /// `0.0`, padded → `-inf`, broadcast over heads + query positions by SDPA).
   ///
   /// Returns the post-LayerNorm hidden states `(N, num_patches, hidden)`
-  /// (`vision.py`'s `last_hidden_state`).
+  /// (`vision.py`'s `last_hidden_state`), computed in the **patch-embedding
+  /// weight dtype** (`vision.py`'s two `astype(target_dtype)` casts — the
+  /// entry `pixel_values` cast and the post-position-add re-pin): the
+  /// processor's F32 `pixel_values` must not promote an f16/bf16 checkpoint's
+  /// tower to F32.
   ///
   /// # Errors
   /// - [`Error::RankMismatch`] if `pixel_values` is not rank-3, or
@@ -483,13 +487,36 @@ impl VisionModel {
       validate_active_grid(h_p, w_p, num_patches)?;
     }
 
-    // `patch_embeds = patch_embedding(pixel_values)` → (N, num_patches, hidden).
-    let patch_embeds = self.patch_embedding.forward(pixel_values)?;
+    // The tower's computation dtype: the patch-embedding weight dtype (the
+    // scales dtype when quantized), floating-gated. `None` only for the
+    // degenerate non-float case (an `fp`-mode quantized patch embed carries
+    // `uint8` scales) — pixels must never be cast to an integer dtype.
+    let compute_dtype = compute_dtype(&self.patch_embedding)?;
+
+    // `vision.py`'s `VisionEmbeddings.__call__` entry cast: `patch_embeds =
+    // self.patch_embedding(pixel_values.astype(target_dtype))`, `target_dtype =
+    // patch_embedding.weight.dtype`. The processor produces F32 pixel_values
+    // and MLX type promotion only widens (`bf16 op f32 → f32`), so without
+    // this cast an f16/bf16 checkpoint silently runs the WHOLE tower — and
+    // everything downstream of it — in F32. A same-dtype astype is a no-op.
+    let patch_embeds = match compute_dtype {
+      // `patch_embeds = patch_embedding(pixel_values)` → (N, num_patches, hidden).
+      Some(dt) => self.patch_embedding.forward(&pixel_values.astype(dt)?)?,
+      None => self.patch_embedding.forward(pixel_values)?,
+    };
 
     // Per-image position embedding: resize the trained square grid to each
     // image's (H_p, W_p) and scatter into the active patch rows.
     let pos = self.resize_positional_embeddings(&shapes, num_patches)?;
     let mut h = patch_embeds.add(&pos)?;
+    // `vision.py`'s `VisionModel.__call__` second cast (`x = x.astype(
+    // self.embeddings.patch_embedding.weight.dtype)`): the position term can
+    // be wider than the patch embeds (e.g. an F32 position table on an
+    // otherwise-bf16 checkpoint), and the add above would promote — re-pin
+    // the encoder input to the computation dtype.
+    if let Some(dt) = compute_dtype {
+      h = h.astype(dt)?;
+    }
 
     // Build the additive key-padding mask. When the companion
     // `pixel_attention_mask` is present, shape-validate it against the verified
@@ -517,7 +544,12 @@ impl VisionModel {
           .iter()
           .any(|&(h_p, w_p)| h_p.saturating_mul(w_p) < num_patches);
         if has_padding {
-          Some(build_attention_mask(&shapes, n, num_patches)?)
+          // The additive mask is built in the encoder input's dtype: mlx's
+          // fast SDPA requires the mask dtype to be promotable to the output
+          // dtype without widening it (`fast.cpp`'s mask check), so an F32
+          // mask against bf16/f16 activations is a hard backend error — and a
+          // widening mask would silently promote the attention math besides.
+          Some(build_attention_mask(&shapes, n, num_patches, h.dtype()?)?)
         } else {
           None
         }
@@ -604,6 +636,22 @@ impl VisionModel {
 
 // ───────────────────────── builders / helpers ─────────────────────────
 
+/// The tower's floating computation dtype — the patch-embedding weight dtype
+/// (the `scales` dtype when quantized,
+/// [`MaybeQuantizedLinear::weight_dtype`]), or `None` when that dtype is not a
+/// float (an `fp`-mode quantized patch embed carries packed `uint8` scales;
+/// pixel values must never be cast to an integer dtype — the quantized matmul
+/// consumes the float input as-is and its output follows it).
+///
+/// This is `vision.py`'s `target_dtype = self.patch_embedding.weight.dtype`,
+/// floating-gated for the quantized representations the reference's dense
+/// `.weight.dtype` read never sees.
+#[cfg(feature = "lfm2-vl")]
+fn compute_dtype(patch_embedding: &MaybeQuantizedLinear) -> Result<Option<Dtype>> {
+  let dt = patch_embedding.weight_dtype()?;
+  Ok(matches!(dt, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64).then_some(dt))
+}
+
 /// Build an additive attention key-mask `(N, 1, 1, num_patches)` *derived from
 /// `spatial_shapes`* (the active-grid source of truth): for image `i` the first
 /// `H_p * W_p` keys are active → `0.0`, the remaining `num_patches - H_p * W_p`
@@ -630,8 +678,19 @@ impl VisionModel {
 /// `shapes` are assumed already validated by [`validate_active_grid`] (positive
 /// dims, `H_p * W_p <= num_patches`); each is recomputed here with the same
 /// checked multiply for independent soundness.
+///
+/// `dtype` is the encoder input's (computation) dtype: mlx's fast SDPA
+/// requires the mask dtype to be promotable to the output dtype WITHOUT
+/// widening it, so an F32 mask against bf16/f16 activations is a hard backend
+/// error. The host buffer is staged in f32 (`-inf` is exactly representable in
+/// f16/bf16) and cast once; a same-dtype astype is a no-op.
 #[cfg(feature = "lfm2-vl")]
-fn build_attention_mask(shapes: &[(i32, i32)], n: usize, num_patches: i32) -> Result<Array> {
+fn build_attention_mask(
+  shapes: &[(i32, i32)],
+  n: usize,
+  num_patches: i32,
+  dtype: Dtype,
+) -> Result<Array> {
   debug_assert_eq!(shapes.len(), n, "shapes already read for n images");
   let np = num_patches as usize;
   // Host-side additive mask: `n * num_patches` f32, each image's active prefix
@@ -657,8 +716,8 @@ fn build_attention_mask(shapes: &[(i32, i32)], n: usize, num_patches: i32) -> Re
     }
   }
   // (N * num_patches,) host buffer → (N, 1, 1, num_patches) to broadcast over
-  // (B, heads, L_q, L_kv).
-  Array::from_slice::<f32>(&data, &(n, 1usize, 1usize, np))
+  // (B, heads, L_q, L_kv), in the encoder's computation dtype.
+  Array::from_slice::<f32>(&data, &(n, 1usize, 1usize, np))?.astype(dtype)
 }
 
 /// Validate one image's active grid `(H_p, W_p)` against the patch budget and
