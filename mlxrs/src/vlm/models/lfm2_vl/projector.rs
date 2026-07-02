@@ -297,11 +297,26 @@ impl Lfm2VlMultiModalProjector {
       // conversion always serializes the pair — the real
       // `LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}` checkpoints are exactly this
       // shape). Consume and DROP the pair (it is never applied) so the
-      // VL-level leftover-weight rejection does not hard-fail the load; both
-      // removes are no-ops for a checkpoint without the pair, keeping the
-      // (`nn.Identity()`-era) keyless layout loading unchanged.
-      weights.remove("layer_norm.weight");
-      weights.remove("layer_norm.bias");
+      // VL-level leftover-weight rejection does not hard-fail the load —
+      // BOTH-or-NEITHER: the unconditional reference module always serializes
+      // both, so a checkpoint carrying exactly one of the pair is schema
+      // drift, and silently dropping the stray key would defeat the
+      // leftover-weight integrity fence — it stays a typed error. Neither
+      // present keeps the (`nn.Identity()`-era) keyless layout loading
+      // unchanged.
+      let ln_weight = weights.remove("layer_norm.weight");
+      let ln_bias = weights.remove("layer_norm.bias");
+      if ln_weight.is_some() != ln_bias.is_some() {
+        let missing = if ln_weight.is_none() {
+          "layer_norm.weight"
+        } else {
+          "layer_norm.bias"
+        };
+        return Err(Error::MissingKey(crate::error::MissingKeyPayload::new(
+          "Lfm2VlMultiModalProjector: layer_norm pair must be both present or both absent (projector_use_layernorm = false drops the unused pair; a half-present pair is checkpoint schema drift)",
+          missing,
+        )));
+      }
       None
     };
 

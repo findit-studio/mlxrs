@@ -289,6 +289,24 @@ fn projector_no_layernorm_consumes_and_drops_stray_layer_norm_keys() {
   );
 }
 
+/// A HALF-present `layer_norm` pair under `projector_use_layernorm = false` is
+/// checkpoint schema drift, not a droppable stray: the reference module always
+/// serializes BOTH keys, so exactly one present must stay a typed error (the
+/// drop arm must not silently defeat the leftover-weight integrity fence).
+#[test]
+fn projector_no_layernorm_rejects_half_present_layer_norm_pair() {
+  let cfg = tiny_model_config(false);
+  for stray in ["layer_norm.weight", "layer_norm.bias"] {
+    let mut w = projector_dense_weights(false);
+    w.insert(stray.to_string(), vec_n(PROJ_IN));
+    let err = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap_err();
+    assert!(
+      matches!(err, Error::MissingKey(_)),
+      "a lone {stray} under flag=false must be a typed MissingKey error, got {err}"
+    );
+  }
+}
+
 /// A tiny config with an explicit `projector_bias` flag (otherwise identical to
 /// [`tiny_model_config`], layernorm on).
 fn tiny_model_config_bias(projector_bias: bool) -> ModelConfig {
