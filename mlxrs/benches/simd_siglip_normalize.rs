@@ -33,7 +33,12 @@ fn gen_rgba(n_pixels: usize) -> Vec<u8> {
 #[inline(never)]
 fn old_scalar_loop(src: &[u8]) -> Vec<f32> {
   let mut dst = vec![0.0f32; (src.len() / 4) * 3];
-  for (src_px, dst_px) in src.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
+  for (src_px, dst_px) in src
+    .as_chunks::<4>()
+    .0
+    .iter()
+    .zip(dst.as_chunks_mut::<3>().0)
+  {
     dst_px[0] = f32::from(src_px[0]) * SCALE - 1.0;
     dst_px[1] = f32::from(src_px[1]) * SCALE - 1.0;
     dst_px[2] = f32::from(src_px[2]) * SCALE - 1.0;

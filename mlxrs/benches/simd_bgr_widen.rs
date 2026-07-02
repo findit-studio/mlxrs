@@ -54,7 +54,7 @@ fn gen_bgr_src(n_pixels: usize) -> Vec<u8> {
 fn old_chunks_push_loop(src: &[u8]) -> Vec<f32> {
   let n_bytes = src.len();
   let mut buf: Vec<f32> = Vec::with_capacity(n_bytes);
-  for px in src.chunks_exact(3) {
+  for px in src.as_chunks::<3>().0 {
     buf.push(f32::from(px[2]));
     buf.push(f32::from(px[1]));
     buf.push(f32::from(px[0]));

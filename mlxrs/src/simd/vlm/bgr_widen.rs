@@ -246,7 +246,12 @@ pub fn bgr_widen_scalar(out: &mut [MaybeUninit<f32>], src: &[u8]) {
     src.len(),
   );
 
-  for (out_px, src_px) in out.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
+  for (out_px, src_px) in out
+    .as_chunks_mut::<3>()
+    .0
+    .iter_mut()
+    .zip(src.as_chunks::<3>().0)
+  {
     // R↔B swap encoded in the read indices: write R = src[2],
     // G = src[1], B = src[0]. Bit-exact match for the scalar arm at
     // the original call site (`buf.push(f32::from(px[2])); push(px[1]);

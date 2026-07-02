@@ -266,7 +266,7 @@ fn constant_image_is_preserved() {
   for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
     for &(dw, dh) in &[(3usize, 3usize), (9, 9), (4, 7)] {
       let out = resize_rgba8(&src, 6, 6, dw, dh, f).unwrap();
-      for px in out.chunks_exact(CHANNELS) {
+      for px in out.as_chunks::<CHANNELS>().0 {
         assert_eq!(
           px,
           &[123, 45, 200, 255],

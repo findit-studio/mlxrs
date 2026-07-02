@@ -131,13 +131,12 @@ use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 #[inline]
 #[doc(hidden)]
 pub fn pad_canvas_fill_scalar(out: &mut [MaybeUninit<u8>], rgb: [u8; 3]) {
-  let mut chunks = out.chunks_exact_mut(3);
-  for c in chunks.by_ref() {
+  let (chunks, tail) = out.as_chunks_mut::<3>();
+  for c in chunks {
     c[0].write(rgb[0]);
     c[1].write(rgb[1]);
     c[2].write(rgb[2]);
   }
-  let tail = chunks.into_remainder();
   // Partial-triple tail (1 or 2 bytes). Unreachable in the
   // `pad_to_square` call site (canvas is always `size * size * 3`
   // bytes — a multiple of 3) but tested via the

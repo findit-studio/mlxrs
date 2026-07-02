@@ -149,7 +149,7 @@ fn model_config_full_parses_and_validates() {
   assert_eq!(cfg.vision_feature_layer, -1);
   assert_eq!(cfg.max_num_patches, 1024);
   assert_eq!(cfg.tile_size, 512);
-  assert_eq!(cfg.eos_token_id, 7);
+  assert_eq!(cfg.eos_token_id(), 7);
   assert!(cfg.quantization().is_some(), "8-bit block present");
   // Both towers parsed.
   assert_eq!(cfg.vision_config.hidden_size, 768);
@@ -172,7 +172,12 @@ fn model_config_defaults_fill_top_level_fields() {
   assert_eq!(cfg.vision_feature_layer, -1);
   assert_eq!(cfg.max_num_patches, 1024);
   assert_eq!(cfg.tile_size, 512);
-  assert_eq!(cfg.eos_token_id, 7);
+  // Neither a top-level nor a nested `text_config.eos_token_id` is present, so
+  // the resolver backstops with `DEFAULT_EOS_TOKEN_ID`.
+  assert_eq!(cfg.eos_token_id(), DEFAULT_EOS_TOKEN_ID);
+  // The field itself stays public (the struct mirrors the reference dataclass;
+  // downstream crates read it directly) and is already resolved.
+  assert_eq!(cfg.eos_token_id, DEFAULT_EOS_TOKEN_ID);
   // Image-splitting / tiling config defaults (config.py:76-88).
   assert!(cfg.do_image_splitting);
   assert_eq!(cfg.encoder_patch_size, 16);
@@ -188,6 +193,48 @@ fn model_config_defaults_fill_top_level_fields() {
   assert_eq!(cfg.vision_config.hidden_act, "gelu_pytorch_tanh");
   assert!(cfg.quantization().is_none(), "dense by default");
   cfg.validate().unwrap();
+}
+
+/// A PRESENT non-null nested `text_config.eos_token_id` that is not an
+/// in-range i32 — a string, float, object, or out-of-i32-range integer — is a
+/// hard parse error, never a silent fall-through to
+/// [`DEFAULT_EOS_TOKEN_ID`]: the nested canonical field gets the same
+/// strictness the top-level field gets from its `Option<i32>` derive, so a
+/// schema-drifted checkpoint cannot fabricate an EOS. An explicit nested
+/// `null` (with the top-level also null) still resolves to the default.
+#[test]
+fn malformed_nested_eos_token_id_is_a_parse_error() {
+  for bad in ["\"7\"", "7.5", "{}", "3000000000"] {
+    let json = format!(
+      r#"{{
+        "model_type": "lfm2-vl",
+        "eos_token_id": null,
+        "text_config": {{ "eos_token_id": {bad} }},
+        "vision_config": {{}}
+      }}"#
+    );
+    let parsed = serde_json::from_str::<ModelConfig>(&json);
+    assert!(
+      parsed.is_err(),
+      "nested eos_token_id {bad} must be a parse error"
+    );
+    // Same strictness even when the top-level value would win the precedence:
+    // a corrupt nested field is corrupt config, full stop.
+    let json_top = json.replace(r#""eos_token_id": null"#, r#""eos_token_id": 9"#);
+    assert!(
+      serde_json::from_str::<ModelConfig>(&json_top).is_err(),
+      "nested eos_token_id {bad} must error even with a valid top-level value"
+    );
+  }
+  // An explicit nested `null` (top-level also null) is MISSING, not malformed.
+  let json_null = r#"{
+    "model_type": "lfm2-vl",
+    "eos_token_id": null,
+    "text_config": { "eos_token_id": null },
+    "vision_config": {}
+  }"#;
+  let cfg: ModelConfig = serde_json::from_str(json_null).expect("nested null is missing");
+  assert_eq!(cfg.eos_token_id, DEFAULT_EOS_TOKEN_ID);
 }
 
 #[test]
@@ -449,6 +496,81 @@ fn model_config_applies_rope_parameters_override_on_nested_text_config() {
   );
   // The override leaves an otherwise-valid config valid.
   cfg.validate().unwrap();
+}
+
+#[test]
+fn model_config_resolves_eos_from_text_config_when_top_level_null() {
+  // The canonical `LiquidAI/LFM2-VL-450M` `config.json` carries a TOP-LEVEL
+  // `eos_token_id: null` (the real value lives under `text_config`). A defaulted
+  // bare `i32` rejected the present `null` (`invalid type: null, expected i32`),
+  // which blocked loading the real checkpoint. The hand-written `Deserialize`
+  // must (a) parse the present `null` and (b) resolve the eos from the nested
+  // `text_config.eos_token_id` (`7`).
+  let json = r#"{
+    "model_type": "lfm2-vl",
+    "eos_token_id": null,
+    "bos_token_id": null,
+    "pad_token_id": null,
+    "text_config": {
+      "model_type": "lfm2",
+      "hidden_size": 1024,
+      "num_hidden_layers": 16,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 8,
+      "vocab_size": 65536,
+      "bos_token_id": 1,
+      "pad_token_id": 0,
+      "eos_token_id": 7
+    },
+    "vision_config": {"num_channels": 3}
+  }"#;
+  let cfg = ModelConfig::from_json(json).expect("top-level eos_token_id: null must parse");
+  // Resolved from `text_config.eos_token_id`, NOT the top-level null.
+  assert_eq!(
+    cfg.eos_token_id(),
+    7,
+    "a top-level null eos must resolve from text_config.eos_token_id"
+  );
+  cfg
+    .validate()
+    .expect("the canonical-shape config validates");
+}
+
+#[test]
+fn model_config_top_level_eos_wins_over_text_config() {
+  // Precedence: a present, non-null TOP-LEVEL `eos_token_id` wins over the nested
+  // `text_config.eos_token_id`. Here top-level `9` must beat nested `7`.
+  let json = r#"{
+    "eos_token_id": 9,
+    "text_config": {"eos_token_id": 7},
+    "vision_config": {}
+  }"#;
+  let cfg = ModelConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.eos_token_id(),
+    9,
+    "a present top-level eos_token_id must take precedence over the nested value"
+  );
+  cfg.validate().unwrap();
+}
+
+#[test]
+fn model_config_eos_falls_back_to_default_when_absent_everywhere() {
+  // Neither a top-level nor a nested `text_config.eos_token_id` is present
+  // (absent OR an explicit top-level null with no nested value) ⇒ the resolver
+  // backstops with `DEFAULT_EOS_TOKEN_ID` (`7`).
+  for json in [
+    r#"{"text_config": {}, "vision_config": {}}"#,
+    r#"{"eos_token_id": null, "text_config": {}, "vision_config": {}}"#,
+  ] {
+    let cfg = ModelConfig::from_json(json).unwrap();
+    assert_eq!(
+      cfg.eos_token_id(),
+      DEFAULT_EOS_TOKEN_ID,
+      "absent eos everywhere must fall back to DEFAULT_EOS_TOKEN_ID for {json}"
+    );
+    cfg.validate().unwrap();
+  }
 }
 
 // ──────────────────── config-controlled-allocation caps ─────────────────────

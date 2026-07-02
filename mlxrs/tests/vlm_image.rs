@@ -298,7 +298,7 @@ fn resize_non_rgba8_sources_convert_via_fallible_per_pixel_path() {
   let mut arr2 = image_to_array(&out_rgba, ColorOrder::Rgb).unwrap();
   let v2: Vec<f32> = arr2.to_vec().unwrap();
   // Channel-last [4, 4, 3] uniform (10, 20, 30).
-  for px in v2.chunks_exact(3) {
+  for px in v2.as_chunks::<3>().0 {
     assert!(
       close(px[0], 10.0) && close(px[1], 20.0) && close(px[2], 30.0),
       "uniform Rgba8 must survive resize as (10, 20, 30); got {px:?}"
@@ -691,7 +691,7 @@ fn resize_premultiplied_alpha_upscale() {
     );
     // Every interpolated column must have R == 0 (no transparent-red
     // colour bleed) — the core premultiplied-alpha guarantee.
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
       assert_eq!(
         px[0], 0,
         "{f:?} upscale: no red bleed — R must be 0 in every output pixel"
@@ -745,7 +745,7 @@ fn resize_opaque_alpha_unaffected_by_premultiply() {
   ] {
     let out = resize(&img, (2, 3), f).unwrap().to_rgba8().into_raw();
     // Alpha stays a solid 255 everywhere (premultiply identity on opaque).
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
       assert_eq!(
         px[3], 255,
         "{f:?} opaque resize: alpha must remain 255 (premultiply identity)"

@@ -750,7 +750,7 @@ where
       e,
     ))
   })?;
-  for chunk in data[..need].chunks_exact(N) {
+  for chunk in data[..need].as_chunks::<N>().0 {
     let mut elem = [0u8; N];
     elem.copy_from_slice(chunk);
     if swap {
@@ -788,7 +788,7 @@ fn build_complex64_swapped(
       e,
     ))
   })?;
-  for chunk in data[..need].chunks_exact(8) {
+  for chunk in data[..need].as_chunks::<8>().0 {
     let mut re = [chunk[0], chunk[1], chunk[2], chunk[3]];
     let mut im = [chunk[4], chunk[5], chunk[6], chunk[7]];
     if swap {
