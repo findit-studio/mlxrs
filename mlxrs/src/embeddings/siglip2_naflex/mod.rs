@@ -721,162 +721,21 @@ pub fn constructor() -> EmbeddingModelConstructor {
       let quantization = parse_quantization(loaded.config_json())?;
       let mut model =
         Siglip2NaflexModel::from_weights_quantized(config, weights, quantization.as_ref())?;
-      // Refine the text pad id from the checkpoint's OWN tokenizer metadata
-      // (`tokenizer_config.json` / `special_tokens_map.json` in the TOKENIZER
-      // directory — the same directory `embeddings::load` builds the
-      // `Tokenizer` from, respecting a split `tokenizer_source`), so the
-      // fixed-length pad fill tracks the tokenizer that actually encodes the
-      // prompts — never a stale copy in the model directory. Best-effort: an
-      // absent directory (a hand-built `LoadedEmbeddingModel`), missing files,
-      // or malformed metadata keep the Gemma `<pad> = 0` default — correct for
-      // every published SigLIP2 checkpoint (see `DEFAULT_TEXT_PAD_TOKEN_ID`).
-      if let Some(dir) = loaded.tokenizer_dir()
-        && let Some(pad_id) = read_text_pad_token_id(dir)
-      {
+      // Refine the text pad id from the LOADED tokenizer (ground truth): the
+      // factory reads the pad-token STRING from the tokenizer metadata (both
+      // files must agree) and resolves the id via the tokenizer's own
+      // `convert_token_to_id`, so a stale metadata id table can never override
+      // what the tokenizer that actually encodes the prompts would produce.
+      // Best-effort: a hand-built `LoadedEmbeddingModel`, no agreeing
+      // declaration, or an unknown token keep the Gemma `<pad> = 0` default —
+      // correct for every published SigLIP2 checkpoint (see
+      // `DEFAULT_TEXT_PAD_TOKEN_ID`).
+      if let Some(pad_id) = loaded.pad_token_id() {
         model.set_text_pad_token_id(pad_id);
       }
       Ok(Box::new(model))
     },
   )
-}
-
-/// Upper bound on a tokenizer-metadata JSON file read into memory by
-/// [`read_text_pad_token_id`]. A real `tokenizer_config.json` is tens of KB
-/// (`google/siglip2-base-patch16-naflex`'s is ~40 KB; the largest Gemma-family
-/// ones with embedded chat templates stay low-MB) and `special_tokens_map.json`
-/// is under 1 KB; the cap keeps a planted multi-GB file from being slurped
-/// (the same bounded-read discipline as the factory's `config.json` reader).
-#[cfg(feature = "siglip2-naflex")]
-const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
-
-/// Best-effort read of the text **pad token id** from the tokenizer metadata
-/// in the loaded **tokenizer directory** (the directory `embeddings::load`
-/// builds the [`crate::tokenizer::Tokenizer`] from — the separate
-/// `tokenizer_source` when configured, else the model directory) — the id the
-/// SigLIP2 processor right-pads with.
-///
-/// Resolution (mirroring how HF's `Siglip2Processor` derives the pad fill —
-/// `tokenizer.pad_token_id`, i.e. the configured `pad_token` string resolved
-/// through the tokenizer's added-token table):
-///
-/// 1. The pad token **string**: `tokenizer_config.json`'s `pad_token`, else
-///    `special_tokens_map.json`'s `pad_token` — each accepted in both HF
-///    shapes, a plain string (`"<pad>"`) or an `AddedToken`-style object
-///    (`{"content": "<pad>", …}`).
-/// 2. The string → **id**: the entry of `tokenizer_config.json`'s
-///    `added_tokens_decoder` (an `"<id>" → {"content": …}` map) whose
-///    `content` equals the pad token AND whose key parses as a `u32` id.
-///    (`google/siglip2-base-patch16-naflex` binds `"0" → <pad>`.) A
-///    content-matching entry under a corrupt non-numeric key is **skipped**,
-///    not a scan abort — a planted junk entry must not shadow the legitimate
-///    binding elsewhere in the table.
-///
-/// Returns `None` — the caller keeps the
-/// [`Siglip2NaflexModel::DEFAULT_TEXT_PAD_TOKEN_ID`] Gemma `<pad> = 0` default
-/// — on **any** miss: an absent or unreadable file, an over-cap file
-/// ([`MAX_TOKENIZER_METADATA_BYTES`]), malformed JSON, a missing `pad_token`
-/// field, or a pad token no numeric-keyed `added_tokens_decoder` entry
-/// resolves. The pad id is a refinement of an already-correct default, so a
-/// metadata problem must not turn a loadable checkpoint into a load error (the
-/// tokenizer load itself — which `embeddings::load` runs separately — still
-/// surfaces a malformed `tokenizer_config.json` as its own typed error). The
-/// deliberately **unconsulted** source is `config.json`'s
-/// `text_config.pad_token_id`: HF's `Siglip2TextConfig` declares
-/// `pad_token_id = 1` as a class default inherited from SigLIP1, which the
-/// real tokenization path never uses — the exact trap this resolution avoids.
-#[cfg(feature = "siglip2-naflex")]
-fn read_text_pad_token_id(dir: &std::path::Path) -> Option<u32> {
-  let tokenizer_config = read_bounded_json(&dir.join("tokenizer_config.json"));
-
-  // 1. The pad token string. BOTH metadata files are consulted: when both
-  //    declare a pad_token and they DISAGREE (version skew in a split-source
-  //    or hand-merged tokenizer directory), no id is resolved and the caller
-  //    keeps the SigLIP2 default (Gemma pad = 0) — trusting either side
-  //    blindly could reintroduce the pad-as-EOS corruption this resolution
-  //    exists to eliminate (a stale tokenizer_config declaring the EOS string
-  //    would win over a correct special_tokens_map).
-  let from_config = tokenizer_config
-    .as_ref()
-    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned));
-  let from_special = read_bounded_json(&dir.join("special_tokens_map.json"))
-    .and_then(|special| token_content(special.get("pad_token")?).map(str::to_owned));
-  let pad_token = match (from_config, from_special) {
-    (Some(a), Some(b)) if a != b => return None,
-    (Some(a), _) => a,
-    (None, Some(b)) => b,
-    (None, None) => return None,
-  };
-
-  // 2. Resolve the string to its id via `added_tokens_decoder` ("<id>" →
-  //    {"content": …}). The pad token is always an added special token, so
-  //    this table carries it in every real HF checkpoint layout. A
-  //    content-matching entry whose key is not a valid u32 id is SKIPPED
-  //    (continue) rather than aborting the scan: in this best-effort reader a
-  //    corrupt extra entry must not shadow a legitimate numeric binding later
-  //    in the table (real HF tables have unique contents under numeric keys,
-  //    so the skip only ever matters for pathological metadata).
-  let decoder = tokenizer_config.as_ref()?.get("added_tokens_decoder")?;
-  let entries = decoder.as_object()?;
-  for (id_str, entry) in entries {
-    if token_content(entry) == Some(pad_token.as_str())
-      && let Ok(id) = id_str.parse::<u32>()
-    {
-      return Some(id);
-    }
-  }
-  None
-}
-
-/// Read `path` as JSON with the [`MAX_TOKENIZER_METADATA_BYTES`] bounded-read
-/// discipline (post-open regular-file check + `Read::take` cap). Any failure —
-/// absent file, not a regular file, I/O error, over-cap size, malformed JSON —
-/// is `None`: this feeds the best-effort [`read_text_pad_token_id`] only.
-#[cfg(feature = "siglip2-naflex")]
-fn read_bounded_json(path: &std::path::Path) -> Option<serde_json::Value> {
-  use std::io::Read;
-
-  // `O_NONBLOCK | O_CLOEXEC` so a planted FIFO cannot hang the open (the same
-  // open discipline as the factory's `config.json` reader).
-  #[cfg(unix)]
-  let file = {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-      .open(path)
-      .ok()?
-  };
-  #[cfg(not(unix))]
-  let file = std::fs::File::open(path).ok()?;
-
-  // Reject a non-regular file (FIFO/device/directory) after the open.
-  if !file.metadata().ok()?.is_file() {
-    return None;
-  }
-  let mut bytes = Vec::new();
-  file
-    .take(MAX_TOKENIZER_METADATA_BYTES + 1)
-    .read_to_end(&mut bytes)
-    .ok()?;
-  if bytes.len() as u64 > MAX_TOKENIZER_METADATA_BYTES {
-    // Over-cap: a real tokenizer metadata file is far smaller; treat a planted
-    // oversized file as absent rather than parsing a truncated prefix.
-    return None;
-  }
-  serde_json::from_slice(&bytes).ok()
-}
-
-/// The token string of an HF special-token JSON value, accepting both shapes
-/// the HF tokenizer files use: a plain string (`"<pad>"`) or an
-/// `AddedToken`-style object (`{"content": "<pad>", …}`) — the same two shapes
-/// the tokenizer wrapper's `cfg_str` handles. Anything else is `None`.
-#[cfg(feature = "siglip2-naflex")]
-fn token_content(value: &serde_json::Value) -> Option<&str> {
-  match value {
-    serde_json::Value::String(s) => Some(s.as_str()),
-    serde_json::Value::Object(o) => o.get("content")?.as_str(),
-    _ => None,
-  }
 }
 
 /// The reserved (non-layer) keys of a `quantization` block — the three

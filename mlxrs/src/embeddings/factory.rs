@@ -297,6 +297,16 @@ pub struct LoadedEmbeddingModel {
   /// actually comes from, so a split-tokenizer configuration never resolves
   /// stale metadata out of the model directory.
   tokenizer_dir: Option<PathBuf>,
+  /// The pad-token id resolved from the LOADED [`Tokenizer`] (ground truth),
+  /// when the tokenizer metadata declares a pad token. [`load()`] reads the
+  /// pad-token STRING from `tokenizer_config.json` / `special_tokens_map.json`
+  /// (both must agree — [`read_pad_token_string`]) and maps it to an id via
+  /// [`Tokenizer::convert_token_to_id`] on the tokenizer it just built, so a
+  /// stale metadata id table (`added_tokens_decoder`) can never override what
+  /// the tokenizer itself would produce. `None` when the metadata declares no
+  /// (agreeing) pad token, the tokenizer does not know the token, or the
+  /// `LoadedEmbeddingModel` is hand-built.
+  pad_token_id: Option<u32>,
 }
 
 impl LoadedEmbeddingModel {
@@ -310,6 +320,7 @@ impl LoadedEmbeddingModel {
       config_json,
       weights,
       tokenizer_dir: None,
+      pad_token_id: None,
     }
   }
 
@@ -331,6 +342,23 @@ impl LoadedEmbeddingModel {
   #[inline(always)]
   pub fn tokenizer_dir(&self) -> Option<&Path> {
     self.tokenizer_dir.as_deref()
+  }
+
+  /// Attach the pad-token id resolved from the loaded [`Tokenizer`] (builder
+  /// form, used by [`load()`] — see the field doc for the resolution
+  /// contract).
+  #[must_use]
+  pub fn with_pad_token_id(mut self, id: Option<u32>) -> Self {
+    self.pad_token_id = id;
+    self
+  }
+
+  /// The pad-token id resolved from the loaded [`Tokenizer`], when known
+  /// (`None` for a hand-built `LoadedEmbeddingModel` or when the tokenizer
+  /// metadata declares no agreeing pad token).
+  #[inline(always)]
+  pub fn pad_token_id(&self) -> Option<u32> {
+    self.pad_token_id
   }
 
   /// The checkpoint's canonicalized architecture id.
@@ -691,8 +719,19 @@ pub fn load(
   // metadata (e.g. SigLIP2's `tokenizer_config.json` pad id) resolves it from
   // the directory that actually provides the tokenizer, never from a stale
   // copy in the model directory under a split-tokenizer configuration.
-  let loaded =
-    LoadedEmbeddingModel::new(model_type, config_json, weights).with_tokenizer_dir(tokenizer_dir);
+  // (6.5) Resolve the pad-token id from the LOADED tokenizer (ground truth):
+  // the metadata files supply only the pad-token STRING (and must agree —
+  // `read_pad_token_string`), while the id comes from the tokenizer that will
+  // actually encode the prompts. A stale `added_tokens_decoder` table in
+  // `tokenizer_config.json` therefore cannot override the tokenizer's own
+  // mapping (it is never consulted for the id at all). Best-effort: no
+  // agreeing pad token, or a token the tokenizer does not know, resolves to
+  // `None` and the consuming architecture keeps its own default.
+  let pad_token_id =
+    read_pad_token_string(tokenizer_dir).and_then(|t| tokenizer.convert_token_to_id(&t));
+  let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights)
+    .with_tokenizer_dir(tokenizer_dir)
+    .with_pad_token_id(pad_token_id);
   let model = registry.create(&loaded, pooling.as_ref())?;
 
   Ok(LoadedEmbeddingContext {
@@ -2127,3 +2166,82 @@ impl JsonCursor<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Byte cap for the best-effort tokenizer-metadata reads
+/// ([`read_pad_token_string`]): a real `tokenizer_config.json` /
+/// `special_tokens_map.json` is tens of KB; 4 MiB accommodates the largest
+/// added-token tables with two orders of magnitude of headroom.
+const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
+
+/// Read the pad-token STRING declared by the tokenizer metadata under `dir` —
+/// `tokenizer_config.json` and/or `special_tokens_map.json`.
+///
+/// BOTH files are consulted: when both declare a `pad_token` and the contents
+/// DISAGREE (version skew in a split-source or hand-merged tokenizer
+/// directory), no token is returned — the caller keeps its own default rather
+/// than trusting either side (a stale `tokenizer_config.json` declaring the
+/// EOS string would otherwise win over a correct `special_tokens_map.json`).
+/// Only the token STRING is read here; the id is resolved by the caller
+/// against the loaded [`Tokenizer`] (the ground truth), never from a metadata
+/// id table.
+///
+/// Best-effort by design: an absent/unreadable/over-cap/malformed file simply
+/// contributes no declaration. Accepts both HF shapes for the field — a plain
+/// string and an AddedToken-style `{"content": …}` object.
+fn read_pad_token_string(dir: &Path) -> Option<String> {
+  let from_config = read_bounded_json(&dir.join("tokenizer_config.json"))
+    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned));
+  let from_special = read_bounded_json(&dir.join("special_tokens_map.json"))
+    .and_then(|special| token_content(special.get("pad_token")?).map(str::to_owned));
+  match (from_config, from_special) {
+    (Some(a), Some(b)) if a != b => None,
+    (Some(a), _) => Some(a),
+    (None, b) => b,
+  }
+}
+
+/// Read `path` as JSON with the [`MAX_TOKENIZER_METADATA_BYTES`] bounded-read
+/// discipline (`O_NONBLOCK | O_CLOEXEC` open so a planted FIFO cannot hang,
+/// post-open regular-file check, `Read::take` cap). Any failure — absent
+/// file, not a regular file, I/O error, over-cap size, malformed JSON — is
+/// `None`: this feeds the best-effort [`read_pad_token_string`] only.
+fn read_bounded_json(path: &Path) -> Option<serde_json::Value> {
+  use std::io::Read;
+
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .ok()?
+  };
+  #[cfg(not(unix))]
+  let file = std::fs::File::open(path).ok()?;
+
+  if !file.metadata().ok()?.is_file() {
+    return None;
+  }
+  let mut bytes = Vec::new();
+  file
+    .take(MAX_TOKENIZER_METADATA_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .ok()?;
+  if bytes.len() as u64 > MAX_TOKENIZER_METADATA_BYTES {
+    return None;
+  }
+  serde_json::from_slice(&bytes).ok()
+}
+
+/// The token string of an HF special-token JSON value, accepting both shapes
+/// the HF tokenizer files use: a plain string (`"<pad>"`) or an
+/// AddedToken-style object (`{"content": "<pad>", …}`). Anything else is
+/// `None`.
+fn token_content(value: &serde_json::Value) -> Option<&str> {
+  match value {
+    serde_json::Value::String(s) => Some(s.as_str()),
+    serde_json::Value::Object(o) => o.get("content")?.as_str(),
+    _ => None,
+  }
+}

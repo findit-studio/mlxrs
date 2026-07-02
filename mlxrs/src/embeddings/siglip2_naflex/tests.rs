@@ -619,32 +619,16 @@ fn constructor_builds_model_from_loaded() {
   assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
 }
 
-// ───────────────────── pad-id resolution from tokenizer metadata ─────────────────────
+// ───────────────────── pad-id wiring from the factory ─────────────────────
 //
-// The factory constructor refines the text pad id from the loaded TOKENIZER
-// directory's metadata (`tokenizer_config.json` / `special_tokens_map.json` —
-// the same directory `embeddings::load` builds the `Tokenizer` from, so a
-// split `tokenizer_source` resolves from the tokenizer's own directory),
-// falling back to the Gemma `<pad> = 0` default on any miss. These pin the
-// resolution order, both HF token shapes (plain string and AddedToken object),
-// and the robustness contract (missing files / malformed JSON never error —
-// the default is already correct).
-
-/// A fresh, writable per-test temp directory (the crate's no-`tempfile`-crate
-/// convention: `temp_dir()` + pid + a process-unique counter so parallel tests
-/// never collide). Created empty.
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-  use std::sync::atomic::{AtomicU64, Ordering};
-  static COUNTER: AtomicU64 = AtomicU64::new(0);
-  let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-  let dir = std::env::temp_dir().join(format!(
-    "mlxrs-siglip2-padid-{tag}-{}-{n}",
-    std::process::id()
-  ));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).unwrap();
-  dir
-}
+// The FACTORY resolves the text pad id: it reads the pad-token STRING from
+// the tokenizer metadata (both files must agree) and maps it to an id via the
+// LOADED tokenizer's `convert_token_to_id` (ground truth — a stale metadata
+// id table can never override the tokenizer's own mapping), threading the
+// result through `LoadedEmbeddingModel::pad_token_id()`. The constructor here
+// only APPLIES that value (falling back to the Gemma `<pad> = 0` default);
+// the resolution itself is covered by `embeddings::factory` unit tests and
+// the `embeddings_load` integration tests.
 
 /// The raw (HF-namespaced) weight map the `LoadedEmbeddingModel` carries —
 /// the post-sanitize fixture un-namespaced one level.
@@ -664,16 +648,17 @@ fn raw_tiny_weights() -> HashMap<String, Array> {
   raw
 }
 
-/// Build via the registry constructor from a `LoadedEmbeddingModel` with the
-/// tokenizer directory attached, and read back the pad id the constructed
-/// model's `TextEncoding` declares.
-fn constructed_pad_id(dir: &std::path::Path) -> u32 {
+/// Build via the registry constructor from a `LoadedEmbeddingModel` carrying
+/// the FACTORY-resolved pad id (`with_pad_token_id` — the factory resolves it
+/// from the loaded tokenizer, see `embeddings::factory::load`), and read back
+/// the pad id the constructed model's `TextEncoding` declares.
+fn constructed_pad_id(pad: Option<u32>) -> u32 {
   let loaded = LoadedEmbeddingModel::new(
     "siglip2".to_string(),
     tiny_config_json(),
     raw_tiny_weights(),
   )
-  .with_tokenizer_dir(dir);
+  .with_pad_token_id(pad);
   let model = constructor()(&loaded, None).expect("constructor must build the model");
   let enc = model
     .as_text_embedder()
@@ -686,208 +671,25 @@ fn constructed_pad_id(dir: &std::path::Path) -> u32 {
 }
 
 #[test]
-fn constructor_resolves_pad_id_from_tokenizer_config() {
-  // The real `google/siglip2-base-patch16-naflex` layout: a string `pad_token`
-  // plus the `added_tokens_decoder` binding. A NON-zero id (3) proves the value
-  // is read from the metadata, not the 0 default.
-  let dir = fresh_dir("cfg");
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "add_eos_token": true,
-      "added_tokens_decoder": {
-        "3": { "content": "<pad>", "special": true },
-        "1": { "content": "<eos>", "special": true }
-      },
-      "pad_token": "<pad>",
-      "eos_token": "<eos>"
-    }"#,
-  )
-  .unwrap();
-  assert_eq!(constructed_pad_id(&dir), 3, "pad id read from metadata");
-  let _ = std::fs::remove_dir_all(&dir);
+fn constructor_applies_factory_resolved_pad_id() {
+  // A NON-zero id (3) proves the factory-resolved value is applied over the
+  // default. The id comes from `LoadedEmbeddingModel::pad_token_id()` — the
+  // factory resolves it from the LOADED tokenizer's `convert_token_to_id`
+  // (ground truth), never from a metadata id table, so a stale
+  // `added_tokens_decoder` cannot reach this constructor at all.
+  assert_eq!(
+    constructed_pad_id(Some(3)),
+    3,
+    "factory-resolved id applied"
+  );
 }
 
 #[test]
-fn constructor_resolves_pad_id_from_special_tokens_map_fallback() {
-  // `pad_token` absent from tokenizer_config.json but present (in the
-  // AddedToken object shape) in special_tokens_map.json; the id still resolves
-  // through tokenizer_config.json's `added_tokens_decoder`.
-  let dir = fresh_dir("special");
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "added_tokens_decoder": {
-        "5": { "content": "<pad>", "special": true },
-        "1": { "content": "<eos>", "special": true }
-      },
-      "eos_token": "<eos>"
-    }"#,
-  )
-  .unwrap();
-  std::fs::write(
-    dir.join("special_tokens_map.json"),
-    r#"{ "pad_token": { "content": "<pad>", "lstrip": false } }"#,
-  )
-  .unwrap();
-  assert_eq!(
-    constructed_pad_id(&dir),
-    5,
-    "pad token string from special_tokens_map.json resolves via added_tokens_decoder"
-  );
-  let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn constructor_pad_id_falls_back_to_zero_without_metadata() {
-  // No tokenizer dir attached (a hand-built LoadedEmbeddingModel), a dir with
-  // no metadata files, a dir with MALFORMED JSON, and a dir whose metadata
-  // cannot resolve the token to an id — every miss keeps the Gemma `<pad> = 0`
-  // default and never turns the load into an error.
-  // (a) no tokenizer dir attached.
-  let loaded = LoadedEmbeddingModel::new(
-    "siglip2".to_string(),
-    tiny_config_json(),
-    raw_tiny_weights(),
-  );
-  let model = constructor()(&loaded, None).expect("constructor must build without a tokenizer dir");
-  let enc = model.as_text_embedder().unwrap().text_encoding();
-  assert!(
-    matches!(
-      enc.padding,
-      Padding::FixedLength {
-        pad_token_id: 0,
-        ..
-      }
-    ),
-    "no tokenizer dir → default pad id 0"
-  );
-
-  // (b) dir without metadata files.
-  let empty = fresh_dir("empty");
-  assert_eq!(constructed_pad_id(&empty), 0, "no metadata files → 0");
-  let _ = std::fs::remove_dir_all(&empty);
-
-  // (c) malformed JSON in both files.
-  let bad = fresh_dir("malformed");
-  std::fs::write(bad.join("tokenizer_config.json"), "{ not json !!").unwrap();
-  std::fs::write(bad.join("special_tokens_map.json"), "[1, 2,").unwrap();
-  assert_eq!(constructed_pad_id(&bad), 0, "malformed metadata → 0");
-  let _ = std::fs::remove_dir_all(&bad);
-
-  // (d) a pad_token string no added_tokens_decoder entry resolves.
-  let unresolved = fresh_dir("unresolved");
-  std::fs::write(
-    unresolved.join("tokenizer_config.json"),
-    r#"{ "pad_token": "<pad>", "added_tokens_decoder": { "1": { "content": "<eos>" } } }"#,
-  )
-  .unwrap();
-  assert_eq!(
-    constructed_pad_id(&unresolved),
-    0,
-    "unresolvable pad token → 0"
-  );
-  let _ = std::fs::remove_dir_all(&unresolved);
-}
-
-#[test]
-fn read_text_pad_token_id_handles_both_hf_token_shapes() {
-  // The `pad_token` field appears as a plain string OR an AddedToken-style
-  // `{"content": …}` object across HF checkpoints; both must resolve. A
-  // non-u32 decoder key (a corrupt "<id>") is a SKIPPED entry, not a panic and
-  // not a scan abort.
-  let dir = fresh_dir("shapes");
-  // Object shape in tokenizer_config.json itself.
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "pad_token": { "content": "<pad>" },
-      "added_tokens_decoder": { "0": { "content": "<pad>" } }
-    }"#,
-  )
-  .unwrap();
-  assert_eq!(super::read_text_pad_token_id(&dir), Some(0));
-
-  // ONLY a corrupt (non-numeric) decoder id → None (the caller's 0 default
-  // applies — no numeric-keyed entry resolves the token).
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "pad_token": "<pad>",
-      "added_tokens_decoder": { "zero": { "content": "<pad>" } }
-    }"#,
-  )
-  .unwrap();
-  assert_eq!(super::read_text_pad_token_id(&dir), None);
-
-  // A corrupt non-numeric entry ALONGSIDE the legitimate numeric binding: the
-  // corrupt entry is skipped (continue), so the planted junk cannot shadow the
-  // real `"0" → <pad>` binding regardless of map iteration order.
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "pad_token": "<pad>",
-      "added_tokens_decoder": {
-        "junk": { "content": "<pad>" },
-        "0": { "content": "<pad>" }
-      }
-    }"#,
-  )
-  .unwrap();
-  assert_eq!(
-    super::read_text_pad_token_id(&dir),
-    Some(0),
-    "a corrupt non-numeric decoder entry must not shadow the numeric binding"
-  );
-  let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// When BOTH metadata files declare a `pad_token` and they DISAGREE (version
-/// skew in a split-source or hand-merged tokenizer directory), the resolver
-/// yields `None` — the caller keeps the SigLIP2 default `<pad> = 0` — instead
-/// of trusting either side: a stale `tokenizer_config.json` declaring the EOS
-/// string would otherwise reintroduce the pad-as-EOS corruption. Agreement
-/// (or a single declaring file) still resolves normally.
-#[test]
-fn read_text_pad_token_id_rejects_disagreeing_metadata() {
-  let dir = fresh_dir("disagree");
-  // Stale tokenizer_config declares <eos> (with a decoder binding to id 1);
-  // special_tokens_map declares the correct <pad>.
-  std::fs::write(
-    dir.join("tokenizer_config.json"),
-    r#"{
-      "pad_token": "<eos>",
-      "added_tokens_decoder": {
-        "0": { "content": "<pad>" },
-        "1": { "content": "<eos>" }
-      }
-    }"#,
-  )
-  .unwrap();
-  std::fs::write(
-    dir.join("special_tokens_map.json"),
-    r#"{ "pad_token": "<pad>" }"#,
-  )
-  .unwrap();
-  assert_eq!(
-    super::read_text_pad_token_id(&dir),
-    None,
-    "disagreeing pad_token declarations must resolve to None (default 0), \
-     never to the stale tokenizer_config's EOS id"
-  );
-
-  // Agreement between the two files resolves normally.
-  std::fs::write(
-    dir.join("special_tokens_map.json"),
-    r#"{ "pad_token": "<eos>" }"#,
-  )
-  .unwrap();
-  assert_eq!(
-    super::read_text_pad_token_id(&dir),
-    Some(1),
-    "agreeing declarations resolve via the decoder table"
-  );
-  let _ = std::fs::remove_dir_all(&dir);
+fn constructor_defaults_pad_id_when_unresolved() {
+  // No factory resolution (a hand-built bundle, no agreeing metadata
+  // declaration, or a token the tokenizer does not know) → the Gemma
+  // `<pad> = 0` default, correct for every published SigLIP2 checkpoint.
+  assert_eq!(constructed_pad_id(None), 0, "unresolved pad id → 0 default");
 }
 
 // ───────────────────── quantized-checkpoint loading ─────────────────────

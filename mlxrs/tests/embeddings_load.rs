@@ -99,6 +99,73 @@ fn mock_constructor() -> EmbeddingModelConstructor {
 
 /// Write a minimal but loadable `tokenizer.json` (3-token WordLevel +
 /// Whitespace pre-tokenizer) into `dir`.
+/// A tokenizer whose vocab carries `<pad>` at a KNOWN id (0) — the ground
+/// truth `load()` must resolve the pad id from, regardless of what any
+/// metadata id table claims.
+fn write_tokenizer_with_pad(dir: &Path) {
+  use tokenizers::{
+    Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+  };
+  let vocab = [("<pad>", 0u32), ("a", 1), ("b", 2), ("c", 3)]
+    .iter()
+    .map(|(w, i)| ((*w).to_string(), *i))
+    .collect();
+  let wl = WordLevel::builder()
+    .vocab(vocab)
+    .unk_token("a".to_string())
+    .build()
+    .unwrap();
+  let mut hf = HfTokenizer::new(wl);
+  hf.with_pre_tokenizer(Some(Whitespace {}));
+  hf.save(dir.join("tokenizer.json"), false).unwrap();
+}
+
+#[test]
+fn load_resolves_pad_id_from_tokenizer_not_stale_metadata_table() {
+  // tokenizer.json (the file the Tokenizer is actually built from) maps
+  // <pad> → 0. Both metadata files agree the pad token is "<pad>", but a
+  // STALE tokenizer_config.json added_tokens_decoder claims "1" → <pad>.
+  // The factory must resolve the id from the LOADED tokenizer (0), never
+  // from the metadata id table (1) — a stale table would otherwise pad
+  // short prompts with the wrong id (the pad-as-EOS corruption class).
+  let dir = temp_dir("pad_ground_truth");
+  write_model_dir(&dir, "bert");
+  write_tokenizer_with_pad(&dir);
+  fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": "<pad>",
+      "added_tokens_decoder": { "1": { "content": "<pad>" } }
+    }"#,
+  )
+  .unwrap();
+  fs::write(
+    dir.join("special_tokens_map.json"),
+    r#"{ "pad_token": "<pad>" }"#,
+  )
+  .unwrap();
+
+  let constructor: EmbeddingModelConstructor = Box::new(
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
+      assert_eq!(
+        loaded.pad_token_id(),
+        Some(0),
+        "the pad id must come from the loaded tokenizer's <pad> → 0 mapping, \
+         not the stale added_tokens_decoder claiming 1"
+      );
+      Ok(Box::new(MockEmbedding))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", constructor);
+  load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect("load should succeed (the constructor's pad-id assertion ran)");
+}
+
 fn write_tokenizer(dir: &Path) {
   use tokenizers::{
     Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
