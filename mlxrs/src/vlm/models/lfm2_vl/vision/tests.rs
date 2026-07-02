@@ -503,7 +503,9 @@ fn f32_pixel_values_encode_stay_model_dtype(dtype: Dtype) {
   );
 
   // Full-budget grid (no padding ⇒ the mask is skipped): the pure dtype flow.
-  let out = tower.forward(&pv, &spatial_shapes(&[(2, 2)]), None).unwrap();
+  let out = tower
+    .forward(&pv, &spatial_shapes(&[(2, 2)]), None)
+    .unwrap();
   assert_eq!(out.shape(), vec![1, NUM_PATCHES as usize, HIDDEN as usize]);
   assert_eq!(
     out.dtype().unwrap(),
