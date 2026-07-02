@@ -121,19 +121,30 @@ fn probe_head_activation_dtype() {
   let audio = Array::from_slice::<f32>(&samples, &[n as i32]).expect("audio");
 
   let mel = model.log_mel(&audio).expect("log_mel");
-  println!("mel: dtype={:?} shape={:?}", mel.dtype().expect("mel dtype"), mel.shape());
+  println!(
+    "mel: dtype={:?} shape={:?}",
+    mel.dtype().expect("mel dtype"),
+    mel.shape()
+  );
 
   let mel_win = pad_or_trim(&mel, 3000, 0).expect("pad_or_trim");
   let enc = model.encode(&mel_win).expect("encode");
   let enc_dtype = enc.dtype().expect("enc dtype");
-  println!("encoder output: dtype={enc_dtype:?} shape={:?}", enc.shape());
+  println!(
+    "encoder output: dtype={enc_dtype:?} shape={:?}",
+    enc.shape()
+  );
 
   // Report-only on the activation dtype: the assert documents the CURRENT
   // (hypothesized-broken) behavior so a fix flips it loudly.
   println!(
     "VERDICT: encoder runs in {enc_dtype:?} while model dtype is {:?} -> {}",
     model.dtype(),
-    if enc_dtype == model.dtype() { "OK (hypothesis REFUTED)" } else { "POISONED (hypothesis SUPPORTED)" }
+    if enc_dtype == model.dtype() {
+      "OK (hypothesis REFUTED)"
+    } else {
+      "POISONED (hypothesis SUPPORTED)"
+    }
   );
 }
 
@@ -159,7 +170,11 @@ fn probe_baseline_rtf() {
   let t0 = Instant::now();
   let mel = model.log_mel(&short).expect("log_mel");
   transforms::eval(&[&mel]).expect("eval mel");
-  println!("[stage] mel: {:.3}s (dtype={:?})", t0.elapsed().as_secs_f64(), mel.dtype().unwrap());
+  println!(
+    "[stage] mel: {:.3}s (dtype={:?})",
+    t0.elapsed().as_secs_f64(),
+    mel.dtype().unwrap()
+  );
 
   let mel_win = pad_or_trim(&mel, 3000, 0).expect("pad_or_trim");
   let t1 = Instant::now();
@@ -186,6 +201,9 @@ fn probe_baseline_rtf() {
       text.chars().count(),
       out.language()
     );
-    eprintln!("[text] {name} :: {}", text.chars().take(120).collect::<String>());
+    eprintln!(
+      "[text] {name} :: {}",
+      text.chars().take(120).collect::<String>()
+    );
   }
 }

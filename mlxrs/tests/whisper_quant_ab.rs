@@ -96,7 +96,10 @@ fn quant_ab() {
     let e = model.encode(&mel_win).expect("timed encode");
     transforms::eval(&[&e]).expect("eval");
   }
-  println!("[encode-kernel] {:.4}s / window (5-rep avg)", t.elapsed().as_secs_f64() / 5.0);
+  println!(
+    "[encode-kernel] {:.4}s / window (5-rep avg)",
+    t.elapsed().as_secs_f64() / 5.0
+  );
 
   // (3) decode comparisons on real audio.
   let fixtures: &[(&str, f64)] = &[
@@ -113,13 +116,17 @@ fn quant_ab() {
     .with_no_speech_threshold(None);
 
   // Warm-up.
-  let _ = model.transcribe(&load_wav(fixtures[0].0), &default_opts).expect("warmup");
+  let _ = model
+    .transcribe(&load_wav(fixtures[0].0), &default_opts)
+    .expect("warmup");
 
   for (label, opts) in [("default", &default_opts), ("no-fallback", &nofb_opts)] {
     for (name, dur) in fixtures {
       let audio = load_wav(name);
       let t = Instant::now();
-      let out = model.transcribe(&audio, opts).unwrap_or_else(|e| panic!("{name}: {e}"));
+      let out = model
+        .transcribe(&audio, opts)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
       let wall = t.elapsed().as_secs_f64();
       println!(
         "[{label}] {name} | dur={dur:.0}s | wall={wall:.2}s | rtf={:.4} | chars={} | lang={:?}",
