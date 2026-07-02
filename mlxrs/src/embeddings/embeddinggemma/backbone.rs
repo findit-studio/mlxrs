@@ -14,7 +14,7 @@
 //! - **Local** (sliding-window) layers additionally attend through the
 //!   **bidirectional sliding window**: query `i` sees key `j` only when
 //!   `|i - j| < sliding_window` (strict). The band overlay is materialized only
-//!   when `seq_len > sliding_window` ([`build_local_layer_mask`]); a shorter
+//!   when `seq_len > sliding_window` (`build_local_layer_mask`); a shorter
 //!   sequence skips it entirely, which is *exact* — every distance is then
 //!   `<= seq_len - 1 < sliding_window`, the overlay would be identically zero,
 //!   and `softmax(x + 0) = softmax(x)` — so `<= 512`-token inputs are
