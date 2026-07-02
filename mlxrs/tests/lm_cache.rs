@@ -530,8 +530,9 @@ fn trait_defaults_rope_offset_and_meta_state() {
   }
 }
 
-/// `state()`/`nbytes()`/`copy()`: Standard returns `[keys, values]` (else
-/// `[]`), `nbytes` is the byte sum, and `copy` is an independent deep clone.
+/// `state()`/`nbytes()`/`copy()`: Standard returns the offset-trimmed
+/// `[keys, values]` (else `[]`), `nbytes` is the byte sum of the PHYSICAL
+/// step-rounded buffers, and `copy` is an independent deep clone.
 #[test]
 fn standard_state_nbytes_copy() {
   let mut s = StandardKvCache::new();
@@ -543,8 +544,10 @@ fn standard_state_nbytes_copy() {
   let mut st = s.state().unwrap();
   assert_eq!(st.len(), 2);
   assert_eq!(st[0].to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
-  // 4 keys + 4 values f32 (1x1x4x1 each) = 8 * 4 bytes.
-  assert_eq!(s.nbytes(), 8 * 4);
+  // `nbytes` reports the PHYSICAL step-rounded buffers (mlx-lm KVCache
+  // parity: the sequence axis grows in 256-row STEP blocks), not the 4-row
+  // logical view `state()` returns: 2 sides * 256 rows * 1 f32 * 4 bytes.
+  assert_eq!(s.nbytes(), 2 * 256 * 4);
 
   // copy is independent: mutating the copy must not move the original.
   // `copy()` is fallible (Array::try_clone): it surfaces a Result and is
@@ -2097,22 +2100,25 @@ fn standard_materialize_noop_empty_and_eval_populated() {
   // Populate, then materialize: offset/contents/non-emptiness unchanged.
   s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
     .unwrap();
-  // Stored buffer == offset length (no over-allocation): 4 rows * 1 f32 * 4
-  // bytes for keys + the same for values = 32 bytes. This pins that the
-  // buffer `materialize` evals (self.keys/self.values) is exactly the 4-row
-  // stored buffer, which here equals `state()`.
+  // The step buffer (mlx-lm KVCache parity) allocates the sequence axis in
+  // 256-row STEP blocks: a 4-row update stores one step block per side, so
+  // the PHYSICAL buffer is 256 rows * 1 f32 * 4 bytes for keys + the same
+  // for values = 2048 bytes, while the LOGICAL view (`state()`, asserted
+  // below) trims to the 4-row offset length. This pins that the buffer
+  // `materialize` evals (self.keys/self.values) is the step-rounded stored
+  // buffer.
   assert_eq!(
     s.nbytes(),
-    32,
-    "StandardKvCache stores exactly offset-length buffers (no over-allocation)"
+    2048,
+    "StandardKvCache stores step-rounded buffers (one 256-row STEP block per side)"
   );
   s.materialize().unwrap();
   assert!(!s.is_empty());
   assert_eq!(s.offset(), 4);
   assert_eq!(
     s.nbytes(),
-    32,
-    "materialize is value/shape-preserving: stored buffer stays 4 rows"
+    2048,
+    "materialize is value/shape-preserving: stored buffer stays one step block"
   );
   let st = s.state().unwrap();
   assert_eq!(st.len(), 2);
