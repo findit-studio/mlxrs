@@ -30,6 +30,13 @@ const DENSE_INTER: i32 = HIDDEN * 4; // 32
 /// is decoupled from `hidden/heads` exactly as the real Gemma3 config is (here
 /// `8/2 = 4 = head_dim`, but the field is authoritative).
 fn tiny_config() -> Gemma3Config {
+  tiny_config_with_window(512, 6)
+}
+
+/// [`tiny_config`] with an explicit `sliding_window` / `sliding_window_pattern`
+/// — the sliding-window tests shrink the window below the test sequence length
+/// and flip the local/global layer split.
+fn tiny_config_with_window(sliding_window: i32, sliding_window_pattern: i32) -> Gemma3Config {
   let json = format!(
     r#"{{
       "model_type": "gemma3_text",
@@ -44,8 +51,8 @@ fn tiny_config() -> Gemma3Config {
       "rope_theta": 1000000.0,
       "rope_local_base_freq": 10000.0,
       "query_pre_attn_scalar": 256.0,
-      "sliding_window": 512,
-      "sliding_window_pattern": 6,
+      "sliding_window": {sliding_window},
+      "sliding_window_pattern": {sliding_window_pattern},
       "max_position_embeddings": 2048
     }}"#
   );
@@ -205,6 +212,271 @@ fn padding_changes_pooled_result_vs_unpadded() {
     assert!(
       (x - y).abs() < 1e-4,
       "masked padding must not change the pooled embedding: {x} vs {y}"
+    );
+  }
+}
+
+// ───────────── sliding-window masking (local vs global layers) ─────────────
+//
+// The google/HF Gemma3 reference (`transformers` `modeling_gemma3.py`, with
+// EmbeddingGemma's `use_bidirectional_attention: true`) restricts every
+// `sliding_attention` layer to the bidirectional band `|q - kv| <
+// sliding_window` (strict, `_bidirectional_window_overlay`) while the
+// `full_attention` layers see every real token. With `sliding_window_pattern =
+// 6` the 2-layer tiny fixture is all-LOCAL (`is_global_layer(i) = (i % 6 ==
+// 5)` is false for layers 0 and 1), so a window smaller than the sequence must
+// bound each token's receptive field: one local layer moves information at
+// most `window - 1` positions, so after 2 layers position `p` can only depend
+// on positions within `2 * (window - 1)` of `p`. With `pattern = 1` every
+// layer is GLOBAL and the window must have no effect at any length.
+
+/// Run the backbone to `last_hidden_state` over a full (no-padding) mask and
+/// read it back (f32 fixture weights → f32 hidden states).
+fn backbone_hidden_for_ids(model: &EmbeddingGemmaModel, ids_arr: &Array, seq: usize) -> Vec<f32> {
+  let mask = crate::embeddings::embeddinggemma::backbone::build_additive_mask(
+    &full_mask(1, seq),
+    model.backbone.embed_dtype().unwrap(),
+  )
+  .unwrap();
+  let h = model.backbone.forward(ids_arr, &mask).unwrap();
+  eval_to_vec(&h)
+}
+
+#[test]
+fn sliding_window_bounds_local_layer_receptive_field_beyond_window() {
+  // window 2 < seq 6, pattern 6 → both tiny layers are LOCAL. Perturbing the
+  // LAST token must not reach position 0: after 2 local layers position 0
+  // depends on positions 0..=2 only. Pre-fix (window never applied) position 0
+  // attended position 5 directly, so this assertion fails — the RED witness
+  // for the missing bidirectional sliding-window mask.
+  let model =
+    EmbeddingGemmaModel::from_weights(tiny_config_with_window(2, 6), tiny_weights(), None)
+      .expect("load");
+  let seq = 6usize;
+  let base = Array::from_slice::<i32>(&[1, 2, 3, 4, 5, 6], &(1usize, seq)).unwrap();
+  let perturbed = Array::from_slice::<i32>(&[1, 2, 3, 4, 5, 9], &(1usize, seq)).unwrap();
+  let h_a = backbone_hidden_for_ids(&model, &base, seq);
+  let h_b = backbone_hidden_for_ids(&model, &perturbed, seq);
+  let hidden = HIDDEN as usize;
+  // Guard the premise: the perturbation does change the perturbed position.
+  let last = 5 * hidden;
+  assert!(
+    h_a[last..last + hidden]
+      .iter()
+      .zip(&h_b[last..last + hidden])
+      .any(|(x, y)| (x - y).abs() > 1e-4),
+    "perturbing token 5 must change position 5's hidden state"
+  );
+  // Position 0 is outside the 2-layer receptive field of position 5: its
+  // hidden state must be untouched (masked logits are exactly -inf → exp → 0,
+  // so the perturbed value contributes 0 × v — bitwise no contribution).
+  for (i, (x, y)) in h_a[..hidden].iter().zip(&h_b[..hidden]).enumerate() {
+    assert!(
+      (x - y).abs() <= 1e-6,
+      "position 0 must be outside the local sliding window's receptive field, dim {i}: {x} vs {y}"
+    );
+  }
+}
+
+#[test]
+fn global_layers_keep_full_attention_beyond_window() {
+  // pattern 1 → EVERY layer is global (`i % 1 == 0 == pattern - 1`), so the
+  // window (2 < seq 6) must never be applied: perturbing the last token must
+  // reach position 0 through the full bidirectional attention. Guards against
+  // wrongly banding the global layers.
+  let model =
+    EmbeddingGemmaModel::from_weights(tiny_config_with_window(2, 1), tiny_weights(), None)
+      .expect("load");
+  let seq = 6usize;
+  let base = Array::from_slice::<i32>(&[1, 2, 3, 4, 5, 6], &(1usize, seq)).unwrap();
+  let perturbed = Array::from_slice::<i32>(&[1, 2, 3, 4, 5, 9], &(1usize, seq)).unwrap();
+  let h_a = backbone_hidden_for_ids(&model, &base, seq);
+  let h_b = backbone_hidden_for_ids(&model, &perturbed, seq);
+  let hidden = HIDDEN as usize;
+  assert!(
+    h_a[..hidden]
+      .iter()
+      .zip(&h_b[..hidden])
+      .any(|(x, y)| (x - y).abs() > 1e-6),
+    "a global layer must attend across the whole sequence (window not applied)"
+  );
+}
+
+#[test]
+fn all_padding_batch_row_stays_finite_and_isolated() {
+  // pattern 1 → every layer GLOBAL (the padding-only mask path). Batch row 0
+  // is real, row 1 is ALL-padding: its key mask is all-`-inf` for every
+  // query, so without the forward-entry fully-masked-row reset every global
+  // layer softmaxes `NaN` for that row (`0 × NaN = NaN` then defeats
+  // pooling's all-padding handling). The reset keeps the row FINITE, and the
+  // REAL row must be unaffected — identical to a single-row forward (each
+  // batch row attends only within itself, so the sibling row cannot leak).
+  let model =
+    EmbeddingGemmaModel::from_weights(tiny_config_with_window(2, 1), tiny_weights(), None)
+      .expect("load");
+  let seq = 4usize;
+  let am =
+    Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], &(2usize, seq)).unwrap();
+  let mask = crate::embeddings::embeddinggemma::backbone::build_additive_mask(
+    &am,
+    model.backbone.embed_dtype().unwrap(),
+  )
+  .unwrap();
+  let ids = Array::from_slice::<i32>(&[1, 2, 3, 4, 1, 1, 1, 1], &(2usize, seq)).unwrap();
+  let h = model.backbone.forward(&ids, &mask).unwrap();
+  let v = eval_to_vec(&h);
+  assert!(
+    v.iter().all(|x| x.is_finite()),
+    "an all-padding batch row must not NaN through the global layers"
+  );
+
+  let ids1 = Array::from_slice::<i32>(&[1, 2, 3, 4], &(1usize, seq)).unwrap();
+  let h1 = backbone_hidden_for_ids(&model, &ids1, seq);
+  let hidden = HIDDEN as usize;
+  assert_eq!(
+    &v[..seq * hidden],
+    &h1[..],
+    "the real row must be unaffected by an all-padding sibling row"
+  );
+}
+
+#[test]
+fn window_at_or_above_seq_len_is_exactly_skipped() {
+  // Short-input regression: for `seq_len <= sliding_window` the banded mask is
+  // skipped and every layer gets the identical padding-only mask — bit-for-bit
+  // the pre-window behavior. Skipping is EXACT, not approximate: every
+  // distance is `|i - j| <= seq - 1 < window`, so the band overlay would be
+  // identically zero and `softmax(x + 0) = softmax(x)`. Pin it by encoding the
+  // same input under window 512 (the real checkpoint, far above seq) and
+  // window == seq: identical outputs.
+  let seq = 6usize;
+  let encode = |window: i32| {
+    let model =
+      EmbeddingGemmaModel::from_weights(tiny_config_with_window(window, 6), tiny_weights(), None)
+        .expect("load");
+    eval_to_vec(
+      &model
+        .encode_text(&ids(1, seq), &full_mask(1, seq))
+        .expect("encode"),
+    )
+  };
+  let out_512 = encode(512);
+  let out_eq = encode(seq as i32);
+  assert_eq!(
+    out_512, out_eq,
+    "window >= seq must be byte-identical to the unwindowed encode"
+  );
+  // Teeth: a window strictly below seq must change the embedding — the band
+  // masks the corner pairs (0,5)/(5,0) on the all-local fixture, so an
+  // unchanged output would mean the window was silently ignored (the pre-fix
+  // bug).
+  let out_below = encode(seq as i32 - 1);
+  assert!(
+    out_512.iter().zip(&out_below).any(|(x, y)| x != y),
+    "window < seq must change the embedding (the band is real)"
+  );
+}
+
+#[test]
+fn long_padding_run_stays_finite_and_matches_standalone_encode() {
+  // window 2, batch row 0 = 2 real tokens + 4 pads: the padding run (4) is >=
+  // the window, so the trailing padded QUERIES see no real key inside the band
+  // — without the HF fully-masked-row reset such a row softmaxes all -inf
+  // logits, and a NaN there poisons the row's REAL tokens at the next layer
+  // (a real query weights the padded position's value by exp(-inf) = 0, and
+  // 0 × NaN = NaN). The pooled row must stay finite and match the standalone
+  // (un-padded, seq <= window → skip path) encode of the same two tokens: the
+  // window covers both positions, so windowed and full attention coincide.
+  let model =
+    EmbeddingGemmaModel::from_weights(tiny_config_with_window(2, 6), tiny_weights(), None)
+      .expect("load");
+  let batch_ids =
+    Array::from_slice::<i32>(&[1, 2, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8], &(2usize, 6usize)).unwrap();
+  let batch_mask = Array::from_slice::<f32>(
+    &[1., 1., 0., 0., 0., 0., 1., 1., 1., 1., 1., 1.],
+    &(2usize, 6usize),
+  )
+  .unwrap();
+  let out = model
+    .encode_text(&batch_ids, &batch_mask)
+    .expect("padded batch encode");
+  let v = eval_to_vec(&out);
+  assert!(
+    v.iter().all(|x| x.is_finite()),
+    "a padding run >= window must not produce NaN, got {v:?}"
+  );
+  let alone = model
+    .encode_text(
+      &Array::from_slice::<i32>(&[1, 2], &(1usize, 2usize)).unwrap(),
+      &full_mask(1, 2),
+    )
+    .expect("standalone encode");
+  let a = eval_to_vec(&alone);
+  let hidden = HIDDEN as usize;
+  for (i, (x, y)) in v[..hidden].iter().zip(&a[..hidden]).enumerate() {
+    assert!(
+      (x - y).abs() < 1e-4,
+      "the padded row must match its standalone encode, dim {i}: {x} vs {y}"
+    );
+  }
+}
+
+#[test]
+fn half_precision_checkpoints_encode_beyond_window_with_banded_mask() {
+  // The banded mask must reach the fused SDPA in the MODEL dtype: mlx's
+  // `fast.cpp` scaled_dot_product_attention REJECTS a non-bool mask whose
+  // dtype does not promote to the output type (`promote_types(mask, out) !=
+  // out` throws), so an f32-leaking band on a bf16/f16 model would be a hard
+  // error on this path. Run half-precision models past the window (band active
+  // on the all-local fixture, window 2 < seq 6) end to end.
+  for dt in [crate::dtype::Dtype::BF16, crate::dtype::Dtype::F16] {
+    let model = EmbeddingGemmaModel::from_weights(
+      tiny_config_with_window(2, 6),
+      tiny_weights_in_dtype(dt),
+      None,
+    )
+    .expect("load half-precision checkpoint");
+    let out = model
+      .encode_text(&ids(1, 6), &full_mask(1, 6))
+      .expect("banded half-precision encode");
+    let v = eval_to_vec(&out);
+    assert!(
+      v.iter().all(|x| x.is_finite()),
+      "banded {dt:?} encode must be finite, got {v:?}"
+    );
+  }
+}
+
+#[test]
+fn non_positive_sliding_window_is_rejected() {
+  // `sliding_window` is load-bearing (the band half-width): a zero / negative
+  // window would mask EVERY key on the local layers (|i-j| < 0 is never true)
+  // and softmax all -inf rows. Must be a typed OutOfRange at validate.
+  for bad in [0, -5] {
+    let json = format!(
+      r#"{{
+        "model_type": "gemma3_text",
+        "vocab_size": {VOCAB},
+        "hidden_size": {HIDDEN},
+        "num_hidden_layers": {LAYERS},
+        "intermediate_size": {INTER},
+        "num_attention_heads": {HEADS},
+        "head_dim": {HEAD_DIM},
+        "rms_norm_eps": 1e-6,
+        "num_key_value_heads": {KV_HEADS},
+        "rope_theta": 1000000.0,
+        "rope_local_base_freq": 10000.0,
+        "query_pre_attn_scalar": 256.0,
+        "sliding_window": {bad},
+        "sliding_window_pattern": 6,
+        "max_position_embeddings": 2048
+      }}"#
+    );
+    let cfg = Gemma3Config::from_json(&json).expect("parse");
+    let err = cfg.validate().unwrap_err();
+    assert!(
+      matches!(err, Error::OutOfRange(_)),
+      "sliding_window {bad} must be OutOfRange, got {err:?}"
     );
   }
 }
