@@ -788,15 +788,24 @@ const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
 fn read_text_pad_token_id(dir: &std::path::Path) -> Option<u32> {
   let tokenizer_config = read_bounded_json(&dir.join("tokenizer_config.json"));
 
-  // 1. The pad token string: tokenizer_config.json first, else
-  //    special_tokens_map.json (read only when needed).
-  let pad_token = tokenizer_config
+  // 1. The pad token string. BOTH metadata files are consulted: when both
+  //    declare a pad_token and they DISAGREE (version skew in a split-source
+  //    or hand-merged tokenizer directory), no id is resolved and the caller
+  //    keeps the SigLIP2 default (Gemma pad = 0) — trusting either side
+  //    blindly could reintroduce the pad-as-EOS corruption this resolution
+  //    exists to eliminate (a stale tokenizer_config declaring the EOS string
+  //    would win over a correct special_tokens_map).
+  let from_config = tokenizer_config
     .as_ref()
-    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned))
-    .or_else(|| {
-      let special = read_bounded_json(&dir.join("special_tokens_map.json"))?;
-      token_content(special.get("pad_token")?).map(str::to_owned)
-    })?;
+    .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned));
+  let from_special = read_bounded_json(&dir.join("special_tokens_map.json"))
+    .and_then(|special| token_content(special.get("pad_token")?).map(str::to_owned));
+  let pad_token = match (from_config, from_special) {
+    (Some(a), Some(b)) if a != b => return None,
+    (Some(a), _) => a,
+    (None, Some(b)) => b,
+    (None, None) => return None,
+  };
 
   // 2. Resolve the string to its id via `added_tokens_decoder` ("<id>" →
   //    {"content": …}). The pad token is always an added special token, so

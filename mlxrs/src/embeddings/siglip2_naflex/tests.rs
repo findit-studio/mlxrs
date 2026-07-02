@@ -842,6 +842,54 @@ fn read_text_pad_token_id_handles_both_hf_token_shapes() {
   let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// When BOTH metadata files declare a `pad_token` and they DISAGREE (version
+/// skew in a split-source or hand-merged tokenizer directory), the resolver
+/// yields `None` — the caller keeps the SigLIP2 default `<pad> = 0` — instead
+/// of trusting either side: a stale `tokenizer_config.json` declaring the EOS
+/// string would otherwise reintroduce the pad-as-EOS corruption. Agreement
+/// (or a single declaring file) still resolves normally.
+#[test]
+fn read_text_pad_token_id_rejects_disagreeing_metadata() {
+  let dir = fresh_dir("disagree");
+  // Stale tokenizer_config declares <eos> (with a decoder binding to id 1);
+  // special_tokens_map declares the correct <pad>.
+  std::fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": "<eos>",
+      "added_tokens_decoder": {
+        "0": { "content": "<pad>" },
+        "1": { "content": "<eos>" }
+      }
+    }"#,
+  )
+  .unwrap();
+  std::fs::write(
+    dir.join("special_tokens_map.json"),
+    r#"{ "pad_token": "<pad>" }"#,
+  )
+  .unwrap();
+  assert_eq!(
+    super::read_text_pad_token_id(&dir),
+    None,
+    "disagreeing pad_token declarations must resolve to None (default 0), \
+     never to the stale tokenizer_config's EOS id"
+  );
+
+  // Agreement between the two files resolves normally.
+  std::fs::write(
+    dir.join("special_tokens_map.json"),
+    r#"{ "pad_token": "<eos>" }"#,
+  )
+  .unwrap();
+  assert_eq!(
+    super::read_text_pad_token_id(&dir),
+    Some(1),
+    "agreeing declarations resolve via the decoder table"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ───────────────────── quantized-checkpoint loading ─────────────────────
 //
 // No local quantized SigLIP2 checkpoint is available (`models/siglip2-naflex`

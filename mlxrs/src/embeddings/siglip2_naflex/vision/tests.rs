@@ -398,12 +398,126 @@ fn fp_mode_quantized_patch_embed_does_not_cast_pixel_values() {
   assert_eq!(
     last_hidden.dtype().unwrap(),
     Dtype::F32,
-    "no float parameter dtype exists for an fp-mode patch embed — the input \
-     F32 passes through uncast"
+    "fp-mode patch embed falls back to the dense position-embedding dtype \
+     (F32 here) — an identity cast, byte-identical to the pre-cast behavior"
   );
   assert!(
     eval_to_vec(&last_hidden).iter().all(|x| x.is_finite()),
     "fp-mode forward must be finite"
+  );
+}
+
+/// An fp-mode quantized patch embed on a REDUCED-PRECISION checkpoint (f16
+/// dense remainder) must still pin the tower to the checkpoint precision: the
+/// compute dtype falls back to the dense position-embedding table's dtype
+/// (the u8 e8m0 scales are not a compute precision), so F32 pixel_values are
+/// cast to f16 and the tower does not promote back to F32 after the patch
+/// projection.
+#[test]
+fn fp_mode_quantized_patch_embed_falls_back_to_position_dtype_on_f16() {
+  const FP_PATCH: i32 = 8;
+  const FP_HIDDEN: i32 = 32;
+  const FP_INTER: i32 = 64;
+  const FP_FEAT: i32 = FP_PATCH * FP_PATCH * CHANNELS;
+  let json = format!(
+    r#"{{
+      "model_type": "siglip2_vision_model",
+      "image_size": 16,
+      "patch_size": {FP_PATCH},
+      "num_channels": {CHANNELS},
+      "hidden_size": {FP_HIDDEN},
+      "intermediate_size": {FP_INTER},
+      "num_attention_heads": {HEADS},
+      "num_hidden_layers": {LAYERS},
+      "layer_norm_eps": 1e-6,
+      "vision_use_head": false,
+      "num_patches": {NUM_PATCHES},
+      "max_num_patches": {NUM_PATCHES}
+    }}"#
+  );
+  let cfg = VisionConfig::from_json(&json).unwrap();
+
+  let f16 = |a: Array| a.astype(Dtype::F16).unwrap();
+  let mut w: HashMap<String, Array> = HashMap::new();
+  let dense_patch = mat(FP_HIDDEN, FP_FEAT);
+  let (w_q, scales, _) =
+    crate::ops::quantized::quantize(&dense_patch, 32, 4, "mxfp4", None).unwrap();
+  w.insert("embeddings.patch_embedding.weight".to_string(), w_q);
+  w.insert("embeddings.patch_embedding.scales".to_string(), scales);
+  w.insert(
+    "embeddings.patch_embedding.bias".to_string(),
+    f16(vec1(FP_HIDDEN)),
+  );
+  // f16 dense remainder — the checkpoint's real precision.
+  w.insert(
+    "embeddings.position_embedding.weight".to_string(),
+    f16(mat(NUM_PATCHES, FP_HIDDEN)),
+  );
+  for p in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+    w.insert(
+      format!("encoder.layers.0.self_attn.{p}.weight"),
+      f16(mat(FP_HIDDEN, FP_HIDDEN)),
+    );
+    w.insert(
+      format!("encoder.layers.0.self_attn.{p}.bias"),
+      f16(vec1(FP_HIDDEN)),
+    );
+  }
+  for ln in [
+    "encoder.layers.0.layer_norm1",
+    "encoder.layers.0.layer_norm2",
+    "post_layernorm",
+  ] {
+    w.insert(format!("{ln}.weight"), f16(vec1(FP_HIDDEN)));
+    w.insert(format!("{ln}.bias"), f16(vec1(FP_HIDDEN)));
+  }
+  w.insert(
+    "encoder.layers.0.mlp.fc1.weight".to_string(),
+    f16(mat(FP_INTER, FP_HIDDEN)),
+  );
+  w.insert(
+    "encoder.layers.0.mlp.fc1.bias".to_string(),
+    f16(vec1(FP_INTER)),
+  );
+  w.insert(
+    "encoder.layers.0.mlp.fc2.weight".to_string(),
+    f16(mat(FP_HIDDEN, FP_INTER)),
+  );
+  w.insert(
+    "encoder.layers.0.mlp.fc2.bias".to_string(),
+    f16(vec1(FP_HIDDEN)),
+  );
+
+  let quant = crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization {
+    group_size: 32,
+    bits: 4,
+    mode: crate::lm::quant::QuantMode::Mxfp4,
+  });
+  let tower = VisionTower::from_weights_quantized(&cfg, &mut w, Some(&quant))
+    .expect("an mxfp4 patch embed with an f16 remainder must load");
+
+  let per_patch = FP_FEAT as usize;
+  let pv: Vec<f32> = (0..NUM_PATCHES as usize * per_patch)
+    .map(|i| ((i % 7) as f32) * 0.01 + 0.01)
+    .collect();
+  let inputs = NaflexInputs {
+    pixel_values: Array::from_slice::<f32>(&pv, &(NUM_PATCHES as usize, per_patch)).unwrap(),
+    pixel_attention_mask: Array::from_slice::<i32>(
+      &vec![1i32; NUM_PATCHES as usize],
+      &(NUM_PATCHES as usize,),
+    )
+    .unwrap(),
+    spatial_shapes: Array::from_slice::<i32>(&[2, 2], &(2usize,)).unwrap(),
+  };
+
+  let (last_hidden, _) = tower
+    .forward(&inputs)
+    .expect("fp-mode patch embed with f16 remainder must forward");
+  assert_eq!(
+    last_hidden.dtype().unwrap(),
+    Dtype::F16,
+    "the compute dtype must fall back to the f16 position-embedding table — \
+     F32 pixel_values must not promote the tower back to F32"
   );
 }
 

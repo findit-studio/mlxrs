@@ -378,16 +378,6 @@ impl VisionTower {
         proj: QuantLinear::dense(patch_weight, Some(patch_bias)),
       }
     };
-    // The model compute dtype: the patch-embed projection's FLOAT parameter
-    // dtype (dense weight dtype / affine-quantized scales dtype) — the same
-    // resolution the references use for the pixel-values cast (HF
-    // `modeling_siglip2.py`'s `target_dtype = patch_embedding.weight.dtype`;
-    // mlx-embeddings `siglip.py`'s `patch_embedding.weight.dtype`). `None`
-    // for an fp-mode quantized patch embed (uint8 e8m0 scales — not a compute
-    // precision; `forward` then skips the cast). Resolved once here so
-    // `forward` pays no per-call metadata lookup.
-    let dtype = patch_embed.proj.param_dtype()?;
-
     // ── position embedding table ──
     // Built quantize-aware then materialized to a dense `(num_positions, hidden)`
     // table (dequantized once if quantized): the per-image positional resize
@@ -409,6 +399,26 @@ impl VisionTower {
         &[num_positions, hidden],
       )?;
       table
+    };
+    // The model compute dtype: the patch-embed projection's FLOAT parameter
+    // dtype (dense weight dtype / affine-quantized scales dtype) — the same
+    // resolution the references use for the pixel-values cast (HF
+    // `modeling_siglip2.py`'s `target_dtype = patch_embedding.weight.dtype`;
+    // mlx-embeddings `siglip.py`'s `patch_embedding.weight.dtype`). An
+    // fp-mode quantized patch embed carries uint8 e8m0 scales — not a compute
+    // precision — so it FALLS BACK to the dense position-embedding table's
+    // dtype (materialized above; it carries the checkpoint's real float
+    // precision): an f16/bf16 checkpoint with an fp-mode patch embed still
+    // computes the tower in its own precision instead of promoting back to
+    // F32 after the patch projection. Both arms are float-gated; if neither
+    // source is a float dtype the cast is skipped (`forward`'s None arm).
+    // Resolved once here so `forward` pays no per-call metadata lookup.
+    let dtype = match patch_embed.proj.param_dtype()? {
+      Some(dt) => Some(dt),
+      None => {
+        let pos_dt = position_embedding.dtype()?;
+        matches!(pos_dt, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64).then_some(pos_dt)
+      }
     };
     let pos_grid_side = isqrt_exact(num_positions, "VisionConfig: num_patches")?;
 
