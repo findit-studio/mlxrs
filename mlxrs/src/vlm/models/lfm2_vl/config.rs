@@ -389,12 +389,12 @@ impl VisionConfig {
 /// by [`crate::lm::models::lfm2::resolve_quantization`] (which also accepts the
 /// HuggingFace `quantization_config` key) at load time — the same path the LFM2
 /// LM and the other quantized ports use.
-/// `Deserialize` is **hand-written** (via the private [`RawModelConfig`] mirror)
+/// `Deserialize` is **hand-written** (via the private `RawModelConfig` mirror)
 /// rather than derived so the top-level `eos_token_id`'s null-coalescing and its
 /// fallback to `text_config.eos_token_id` are applied intrinsically on **every**
 /// deserialization path — a direct `serde_json::from_str::<ModelConfig>`, the
 /// `text_config`-nested path, and [`from_json`](Self::from_json) alike — exactly
-/// as the LFM2 LM [`TextConfig`](crate::lm::models::lfm2::TextConfig) hand-writes
+/// as the LFM2 LM [`TextConfig`] hand-writes
 /// its `Deserialize` to apply `__post_init__` intrinsically. The released
 /// `LFM2-VL` `config.json` carries a top-level `eos_token_id: null` with the real
 /// value (`7`) nested under `text_config`; a derived `Deserialize` over a bare
@@ -567,7 +567,7 @@ struct RawModelConfig {
 
 #[cfg(feature = "lfm2-vl")]
 impl<'de> serde::Deserialize<'de> for ModelConfig {
-  /// Deserialize a [`ModelConfig`] via the private [`RawModelConfig`] mirror,
+  /// Deserialize a [`ModelConfig`] via the private `RawModelConfig` mirror,
   /// then resolve the `eos_token_id` with the precedence documented on
   /// [`eos_token_id`](Self::eos_token_id) — so EVERY path that materializes a
   /// `ModelConfig` (a direct `serde_json::from_str::<ModelConfig>`, the nested
