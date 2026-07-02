@@ -2774,8 +2774,15 @@ pub fn detect_language<'a>(
     )));
   }
 
+  // Normalize the caller-supplied features exactly as `decode` does
+  // ([`encode_once`]: shape-lift a rank-2 tensor, cast an MLX pass-through to
+  // the model dtype, encode a raw mel) — without this, correctly-shaped `F32`
+  // features on an f16/bf16 MLX checkpoint would promote the language-id
+  // cross-attention work to `F32` through this public entry.
+  let audio_features = encode_once(model, audio_features)?;
+
   // Single `sot` forward, fresh cache.
-  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], audio_features, None)?;
+  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], &audio_features, None)?;
   // logits[:, 0] → the only (first) position's row. Language detection runs
   // once (not per decode step), so reading this row to the host here is fine —
   // it is the masking + softmax over a small language-token set, not the hot

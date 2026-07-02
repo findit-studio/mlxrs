@@ -1566,6 +1566,38 @@ fn detect_language_picks_a_language_code() {
   assert!(probs.iter().any(|(c, _)| *c == "en"));
 }
 
+/// `detect_language` accepts caller-supplied PRE-ENCODED features and must run
+/// them through the same [`encode_once`] normalization as `decode`: on a
+/// reduced-precision checkpoint, `F32` features are cast to the model dtype
+/// (not silently promoting the language-id cross-attention to `F32`), and the
+/// result matches handing in already-cast features.
+#[test]
+fn detect_language_normalizes_pre_encoded_f32_features() {
+  let dir = fresh_dir("detect_lang_dtype");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(
+    &tok,
+    true,
+    /* num_languages */ 2,
+    Some("en"),
+    Task::Transcribe,
+  )
+  .unwrap();
+  let model = tiny_model_dtype(4, Dtype::F16); // 4 == <|en|>
+
+  // F32 features of the encoder-output shape, NOT pre-cast by the caller.
+  let feats = Array::ones::<f32>(&(1usize, dims().n_audio_ctx(), dims().n_audio_state())).unwrap();
+  let (best, _) = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &feats).unwrap();
+
+  // Same call with the features pre-cast to the model dtype — must agree.
+  let feats_f16 = feats.astype(Dtype::F16).unwrap();
+  let (best_pre, _) = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &feats_f16).unwrap();
+  assert_eq!(
+    best, best_pre,
+    "F32 features must be normalized to the model dtype, matching pre-cast input"
+  );
+}
+
 /// Write a tokenizer whose structural special tokens stay at the fixture's
 /// low ids (so [`HFTokenizerWrapper::new`] resolves them and `sot` indexes the
 /// model's embedding) but whose LANGUAGE tokens `<|en|>` / `<|zh|>` are placed
