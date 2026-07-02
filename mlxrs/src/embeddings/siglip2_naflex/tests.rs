@@ -320,15 +320,18 @@ fn text_embedder_runs_text_tower() {
 fn text_encoding_declares_fixed_length_sticky_eos_scheme() {
   // SigLIP's `TextEncoding` must declare the fixed-length processor scheme the
   // sticky-EOS tower needs: special tokens on, and `FixedLength` padding to the
-  // text tower's `max_position_embeddings` with the SigLIP pad id `1`, an
-  // all-`1`-mask scheme, and `eos_token_id = Some(1)` so an overlength prompt
-  // keeps the EOS at its final position on truncation (sticky-EOS pooling). The
-  // tokenizer truncation cap is NOT carried in `max_length` here: the
-  // `FixedLength` scheme is itself the truncation cap, and the generic pipeline
-  // derives the effective cap (`length + 1` for this sticky-EOS scheme) CENTRALLY
-  // from the padding mode — so the cap does not depend on this model remembering
-  // to set `max_length`. The fixed length is read from the config (`MAX_POS`
-  // here), NOT hard-coded — so it tracks the checkpoint.
+  // text tower's `max_position_embeddings` with the SigLIP2 Gemma `<pad>` id
+  // `0` (NOT SigLIP1's pad == EOS == 1 — the Gemma tokenizer binds `<pad>` = 0,
+  // `<eos>` = 1, so padding with 1 would fill the pooled last slot of every
+  // short prompt with `<eos>` instead of `<pad>`), an all-`1`-mask scheme, and
+  // `eos_token_id = Some(1)` so an overlength prompt keeps the EOS at its final
+  // position on truncation (sticky-EOS pooling). The tokenizer truncation cap
+  // is NOT carried in `max_length` here: the `FixedLength` scheme is itself the
+  // truncation cap, and the generic pipeline derives the effective cap
+  // (`length + 1` for this sticky-EOS scheme) CENTRALLY from the padding mode —
+  // so the cap does not depend on this model remembering to set `max_length`.
+  // The fixed length is read from the config (`MAX_POS` here), NOT hard-coded —
+  // so it tracks the checkpoint.
   let model = tiny_model();
   let enc = model.text_encoding();
   assert!(enc.add_special_tokens, "siglip encodes with special tokens");
@@ -341,10 +344,34 @@ fn text_encoding_declares_fixed_length_sticky_eos_scheme() {
     enc.padding,
     Padding::FixedLength {
       length: MAX_POS as usize,
-      pad_token_id: 1,
+      pad_token_id: 0,
       eos_token_id: Some(1),
     },
-    "siglip pads/truncates to max_position_embeddings with pad id 1, all-1 mask, EOS-preserving truncation"
+    "siglip2 pads/truncates to max_position_embeddings with the Gemma <pad> id 0, \
+     all-1 mask, EOS-preserving truncation (EOS = 1 is distinct from the pad fill)"
+  );
+}
+
+#[test]
+fn text_pad_token_id_defaults_to_gemma_pad_zero_and_is_overridable() {
+  // A directly-built model (`from_weights`, no tokenizer metadata in reach)
+  // defaults to the SigLIP2 Gemma `<pad>` id 0 — never SigLIP1's `1`, which is
+  // the `<eos>` id under the Gemma vocab. `set_text_pad_token_id` overrides it
+  // (the hook the factory constructor uses for checkpoint-resolved ids), and
+  // the declared `TextEncoding` scheme tracks the override.
+  let mut model = tiny_model();
+  assert_eq!(model.text_pad_token_id(), 0, "default pad id is <pad> = 0");
+  model.set_text_pad_token_id(7);
+  assert_eq!(model.text_pad_token_id(), 7);
+  let enc = model.text_encoding();
+  assert_eq!(
+    enc.padding,
+    Padding::FixedLength {
+      length: MAX_POS as usize,
+      pad_token_id: 7,
+      eos_token_id: Some(1),
+    },
+    "the declared fixed-length scheme pads with the overridden id"
   );
 }
 
@@ -590,6 +617,79 @@ fn constructor_builds_model_from_loaded() {
     .embed_text(&ids(1, 4), &mask(1, 4))
     .unwrap();
   assert_eq!(emb.array().shape(), vec![1, PROJ as usize]);
+}
+
+// ───────────────────── pad-id wiring from the factory ─────────────────────
+//
+// The FACTORY resolves the text pad id: it reads the pad-token STRING from
+// the tokenizer metadata (both files must agree) and maps it to an id via the
+// LOADED tokenizer's `convert_token_to_id` (ground truth — a stale metadata
+// id table can never override the tokenizer's own mapping), threading the
+// result through `LoadedEmbeddingModel::pad_token_id()`. The constructor here
+// only APPLIES that value (falling back to the Gemma `<pad> = 0` default);
+// the resolution itself is covered by `embeddings::factory` unit tests and
+// the `embeddings_load` integration tests.
+
+/// The raw (HF-namespaced) weight map the `LoadedEmbeddingModel` carries —
+/// the post-sanitize fixture un-namespaced one level.
+fn raw_tiny_weights() -> HashMap<String, Array> {
+  let post = tiny_model_weights();
+  let mut raw = HashMap::with_capacity(post.len());
+  for (k, v) in post {
+    let raw_key = if let Some(rest) = k.strip_prefix("vision_model.vision_model.") {
+      format!("vision_model.{rest}")
+    } else if let Some(rest) = k.strip_prefix("text_model.text_model.") {
+      format!("text_model.{rest}")
+    } else {
+      k
+    };
+    raw.insert(raw_key, v);
+  }
+  raw
+}
+
+/// Build via the registry constructor from a `LoadedEmbeddingModel` carrying
+/// the FACTORY-resolved pad id (`with_pad_token_id` — the factory resolves it
+/// from the loaded tokenizer, see `embeddings::factory::load`), and read back
+/// the pad id the constructed model's `TextEncoding` declares.
+fn constructed_pad_id(pad: Option<u32>) -> u32 {
+  let loaded = LoadedEmbeddingModel::new(
+    "siglip2".to_string(),
+    tiny_config_json(),
+    raw_tiny_weights(),
+  )
+  .with_pad_token_id(pad);
+  let model = constructor()(&loaded, None).expect("constructor must build the model");
+  let enc = model
+    .as_text_embedder()
+    .expect("siglip exposes the universal text embedder")
+    .text_encoding();
+  match enc.padding {
+    Padding::FixedLength { pad_token_id, .. } => pad_token_id,
+    other => panic!("siglip declares FixedLength padding, got {other:?}"),
+  }
+}
+
+#[test]
+fn constructor_applies_factory_resolved_pad_id() {
+  // A NON-zero id (3) proves the factory-resolved value is applied over the
+  // default. The id comes from `LoadedEmbeddingModel::pad_token_id()` — the
+  // factory resolves it from the LOADED tokenizer's `convert_token_to_id`
+  // (ground truth), never from a metadata id table, so a stale
+  // `added_tokens_decoder` cannot reach this constructor at all.
+  assert_eq!(
+    constructed_pad_id(Some(3)),
+    3,
+    "factory-resolved id applied"
+  );
+}
+
+#[test]
+fn constructor_defaults_pad_id_when_unresolved() {
+  // No factory resolution (a hand-built bundle, no agreeing metadata
+  // declaration, or a token the tokenizer does not know) → the Gemma
+  // `<pad> = 0` default, correct for every published SigLIP2 checkpoint.
+  assert_eq!(constructed_pad_id(None), 0, "unresolved pad id → 0 default");
 }
 
 // ───────────────────── quantized-checkpoint loading ─────────────────────

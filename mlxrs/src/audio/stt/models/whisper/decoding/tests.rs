@@ -1069,6 +1069,12 @@ fn put_block(w: &mut HashMap<String, Array>, prefix: &str, n: usize, cross: bool
 /// is set to a large positive multiple of that post-LN direction's dominant
 /// dimension so its dot product dominates.
 fn tiny_model(target: u32) -> WhisperModel {
+  tiny_model_dtype(target, Dtype::F32)
+}
+
+/// As [`tiny_model`] but loading the weights at `dtype` — for the
+/// reduced-precision (f16/bf16) dtype-preservation tests.
+fn tiny_model_dtype(target: u32, dtype: Dtype) -> WhisperModel {
   let n = 4usize;
   let mut w = HashMap::new();
   // Non-uniform conv weights so the encoder output varies per channel.
@@ -1122,7 +1128,41 @@ fn tiny_model(target: u32) -> WhisperModel {
   put_block(&mut w, "decoder.blocks.0", n, true);
   put_ln(&mut w, "decoder.ln", n);
 
-  WhisperModel::from_weights(dims(), w, Dtype::F32).unwrap()
+  WhisperModel::from_weights(dims(), w, dtype).unwrap()
+}
+
+/// Caller-supplied PRE-ENCODED `F32` features on a reduced-precision model are
+/// cast to the model dtype by the pass-through arm of `encode_once` — the
+/// reference casts BEFORE its encoded-shape check (`decoding.py:538-539`), so
+/// the public `decode` / `decode_with_fallback` path cannot promote the
+/// decoder cross-attention K/V and the KV cache to `F32` by handing in
+/// pre-encoded features. Covers both accepted shapes: `(n_audio_ctx,
+/// n_audio_state)` (the reshape arm) and `(1, n_audio_ctx, n_audio_state)`
+/// (the clone arm).
+#[test]
+fn pre_encoded_f32_features_cast_to_model_dtype() {
+  for dtype in [Dtype::F16, Dtype::BF16] {
+    let model = tiny_model_dtype(13, dtype);
+    let backend = model.backend(false, None);
+    let (ctx, state) = (dims().n_audio_ctx(), dims().n_audio_state());
+
+    let rank2 = Array::ones::<f32>(&(ctx, state)).unwrap();
+    let out2 = encode_once(&backend, &rank2).unwrap();
+    assert_eq!(out2.shape(), vec![1, ctx, state]);
+    assert_eq!(
+      out2.dtype().unwrap(),
+      dtype,
+      "rank-2 pre-encoded F32 features must be cast to the model dtype"
+    );
+
+    let rank3 = Array::ones::<f32>(&(1usize, ctx, state)).unwrap();
+    let out3 = encode_once(&backend, &rank3).unwrap();
+    assert_eq!(
+      out3.dtype().unwrap(),
+      dtype,
+      "rank-3 pre-encoded F32 features must be cast to the model dtype"
+    );
+  }
 }
 
 #[test]
@@ -1524,6 +1564,38 @@ fn detect_language_picks_a_language_code() {
   let total: f64 = probs.iter().map(|(_, p)| p).sum();
   assert!((total - 1.0).abs() < 1e-5, "lang probs sum {total}");
   assert!(probs.iter().any(|(c, _)| *c == "en"));
+}
+
+/// `detect_language` accepts caller-supplied PRE-ENCODED features and must run
+/// them through the same [`encode_once`] normalization as `decode`: on a
+/// reduced-precision checkpoint, `F32` features are cast to the model dtype
+/// (not silently promoting the language-id cross-attention to `F32`), and the
+/// result matches handing in already-cast features.
+#[test]
+fn detect_language_normalizes_pre_encoded_f32_features() {
+  let dir = fresh_dir("detect_lang_dtype");
+  let tok = write_tokenizer(dir.as_path());
+  let wrapper = HFTokenizerWrapper::new(
+    &tok,
+    true,
+    /* num_languages */ 2,
+    Some("en"),
+    Task::Transcribe,
+  )
+  .unwrap();
+  let model = tiny_model_dtype(4, Dtype::F16); // 4 == <|en|>
+
+  // F32 features of the encoder-output shape, NOT pre-cast by the caller.
+  let feats = Array::ones::<f32>(&(1usize, dims().n_audio_ctx(), dims().n_audio_state())).unwrap();
+  let (best, _) = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &feats).unwrap();
+
+  // Same call with the features pre-cast to the model dtype — must agree.
+  let feats_f16 = feats.astype(Dtype::F16).unwrap();
+  let (best_pre, _) = detect_language(&WhisperBackend::Mlx(&model), &wrapper, &feats_f16).unwrap();
+  assert_eq!(
+    best, best_pre,
+    "F32 features must be normalized to the model dtype, matching pre-cast input"
+  );
 }
 
 /// Write a tokenizer whose structural special tokens stay at the fixture's

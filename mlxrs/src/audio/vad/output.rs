@@ -54,6 +54,29 @@ impl SpeechSegment {
   pub fn end(&self) -> u64 {
     self.end
   }
+
+  /// Start time in seconds — mlx-audio's `return_seconds=True` view
+  /// (`round(start / sample_rate, 3)`, silero_vad.py:419-426). `sample_rate` is
+  /// the inference rate ([`VadOutput::sample_rate`]); the result is rounded to
+  /// milliseconds (3 decimals) to match the reference.
+  #[inline]
+  pub fn start_seconds(&self, sample_rate: u32) -> f64 {
+    round_to_ms(self.start as f64 / f64::from(sample_rate.max(1)))
+  }
+
+  /// End time in seconds — the `return_seconds=True` view of [`Self::end`]
+  /// (see [`Self::start_seconds`]).
+  #[inline]
+  pub fn end_seconds(&self, sample_rate: u32) -> f64 {
+    round_to_ms(self.end as f64 / f64::from(sample_rate.max(1)))
+  }
+}
+
+/// Round seconds to milliseconds (3 decimals) — mlx-audio's `round(x, 3)` for
+/// the `return_seconds` view (silero_vad.py:422-423).
+#[inline]
+fn round_to_ms(seconds: f64) -> f64 {
+  (seconds * 1000.0).round() / 1000.0
 }
 
 /// The result of one VAD inference pass — port of

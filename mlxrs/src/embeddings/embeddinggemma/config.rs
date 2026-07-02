@@ -109,16 +109,29 @@ pub struct Gemma3Config {
   /// (`256`, so `scale = 1/16`). Gemma3 decouples this from `head_dim`.
   #[serde(default = "default_query_pre_attn_scalar")]
   pub query_pre_attn_scalar: f64,
-  /// Sliding-window size for the local-attention layers (`512`). Retained for
-  /// parity; EmbeddingGemma runs the backbone as a **bidirectional** encoder
-  /// (full attention every layer, with the padding mask), so the window is not
-  /// applied (see the module docs).
+  /// Sliding-window size for the local-attention layers (`512`). The local
+  /// layers attend through the **bidirectional** window — query `i` sees key
+  /// `j` only when `|i - j| < sliding_window` (strict, the HF Gemma3
+  /// `_bidirectional_window_overlay` semantics) — once the sequence is longer
+  /// than the window; shorter sequences are mathematically unaffected and skip
+  /// the band entirely (see the [`super::backbone`] module docs).
   #[serde(default = "default_sliding_window")]
   pub sliding_window: i32,
   /// Layers `i` with `(i + 1) % sliding_window_pattern == 0` are **global**
   /// (full-attention, `rope_theta`); the rest are sliding-window (local,
-  /// `rope_local_base_freq`). The pattern only selects which RoPE base a layer
-  /// uses here — the attention is bidirectional throughout (`6`).
+  /// `rope_local_base_freq`, and banded to
+  /// [`sliding_window`](Self::sliding_window) once the sequence exceeds it)
+  /// (`6`).
+  ///
+  /// **Checkpoint premise**: `google/embeddinggemma-300m`-family `config.json`s
+  /// publish the per-layer split as a `layer_types` array and carry the pattern
+  /// only under the *underscore-prefixed* `_sliding_window_pattern` key —
+  /// neither matches this field's serde name, so those checkpoints load the
+  /// default `6`. That default reproduces the published `layer_types` exactly:
+  /// `full_attention` at layers 5, 11, 17, 23 of 24 (20 sliding / 4 full) is
+  /// precisely `i % 6 == 5` (verified against
+  /// `mlx-community/embeddinggemma-300m-bf16`, whose `_sliding_window_pattern`
+  /// is also `6`).
   #[serde(default = "default_sliding_window_pattern")]
   pub sliding_window_pattern: i32,
   /// Maximum position embeddings (`2048`) — the trained context window.
@@ -263,9 +276,14 @@ impl Gemma3Config {
   /// Whether layer `i` is a **global** (full-attention) layer — the Gemma3
   /// `is_global = i % sliding_window_pattern == sliding_window_pattern - 1`
   /// (equivalently `(i + 1) % pattern == 0`). A global layer uses
-  /// [`rope_theta`](Self::rope_theta); a local layer uses
-  /// [`rope_local_base_freq`](Self::rope_local_base_freq). `pattern` is
-  /// validated `>= 1` so the modulo is well-defined.
+  /// [`rope_theta`](Self::rope_theta) and attends over all real tokens; a local
+  /// layer uses [`rope_local_base_freq`](Self::rope_local_base_freq) and is
+  /// additionally banded to [`sliding_window`](Self::sliding_window) once the
+  /// sequence exceeds the window. This is the single source of truth for the
+  /// split — the RoPE base and the mask selection both read it, so they cannot
+  /// disagree (see [`sliding_window_pattern`](Self::sliding_window_pattern) for
+  /// the verified checkpoint premise). `pattern` is validated `>= 1` so the
+  /// modulo is well-defined.
   #[inline]
   pub fn is_global_layer(&self, i: i32) -> bool {
     i % self.sliding_window_pattern == self.sliding_window_pattern - 1
@@ -277,9 +295,12 @@ impl Gemma3Config {
   /// Pins `model_type` to `"gemma3_text"`; requires every dimension / count
   /// positive; bounds the layer + head counts and `sliding_window_pattern` by
   /// `MAX_CARDINALITY`; bounds every width-like field (`vocab_size`,
-  /// `hidden_size`, `intermediate_size`, `head_dim`) by `MAX_CONFIG_DIM` so a
-  /// hostile width cannot drive an oversized embedding-table / matmul-axis
-  /// allocation; requires `num_attention_heads` divisible by
+  /// `hidden_size`, `intermediate_size`, `head_dim`, and `sliding_window` —
+  /// load-bearing as the local layers' band half-width, where a non-positive
+  /// value would mask every key, `|i - j| < 0` never holding) by
+  /// `MAX_CONFIG_DIM` so a hostile width cannot drive an oversized
+  /// embedding-table / matmul-axis allocation; requires `num_attention_heads`
+  /// divisible by
   /// `num_key_value_heads` (the grouped-query split); and requires the numeric
   /// `query_pre_attn_scalar`, `rms_norm_eps`, `rope_theta`, and
   /// `rope_local_base_freq` — each parsed as `f64` but **narrowed to `f32`** by
@@ -307,6 +328,10 @@ impl Gemma3Config {
       ("Gemma3Config: hidden_size", self.hidden_size),
       ("Gemma3Config: intermediate_size", self.intermediate_size),
       ("Gemma3Config: head_dim", self.head_dim),
+      // The local layers' band half-width: a non-positive window would mask
+      // EVERY key on a local layer (`|i - j| < 0` never holds) and softmax
+      // all-`-inf` rows; oversized is bounded like the other widths.
+      ("Gemma3Config: sliding_window", self.sliding_window),
     ] {
       require_in_range(name, value, 1, MAX_CONFIG_DIM)?;
     }

@@ -255,6 +255,20 @@ impl AudioEncoder {
       )));
     }
 
+    // Normalize the mel to the encoder's compute dtype AFTER the O(1) shape
+    // guards above — the reference casts at its decode entry
+    // (`decoding.py:538-539`, `fp16` ⇒ `mel.astype(mx.float16)`), and keeping
+    // that normalization BEHIND the guards preserves this module's
+    // typed-error-before-sized-allocation ordering (`astype` materializes a
+    // full-size copy; a malformed mel must fail the cheap checks first).
+    // `conv1`'s weight carries the model dtype (`from_weights` casts every
+    // weight), so deriving the target here keeps the sub-module
+    // self-consistent — and without this cast an `F32` mel on an f16/bf16
+    // checkpoint would silently promote the whole encoder, and through the
+    // cross-attention K/V the decoder and its KV cache, to `F32`. A same-dtype
+    // astype is a no-op.
+    let x = x.astype(self.conv1.weight.dtype()?)?;
+
     // conv1 → gelu (keeps the time axis), conv2 → gelu (stride 2 halves it).
     let x = gelu(&self.conv1.forward(&x)?)?;
     let x = gelu(&self.conv2.forward(&x)?)?;

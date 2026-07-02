@@ -17,15 +17,21 @@
 //! ## Architecture
 //!
 //! - **Backbone** (`backbone::Gemma3Backbone`): the Gemma3 text transformer
-//!   driven as a **bidirectional encoder** — every layer attends fully over the
-//!   real (non-padding) tokens via an additive padding mask, *not* causally.
+//!   driven as a **bidirectional encoder** — attention over the real
+//!   (non-padding) tokens via an additive padding mask, *not* causally.
 //!   Grouped-query attention with per-head **query/key RMSNorm**, RoPE (the base
 //!   alternates per the sliding-window pattern: global layers use `rope_theta`,
 //!   local layers use `rope_local_base_freq`), the Gemma gated `gelu_approx`
 //!   MLP, and the four-`RMSNorm` sandwich block. The token embedding is scaled
-//!   by `sqrt(hidden_size)`. (The sliding window itself is *not* applied — the
-//!   pattern only selects the RoPE base; the attention is full bidirectional
-//!   throughout, matching the mlx-embeddings encoder.)
+//!   by `sqrt(hidden_size)`. The **local** (sliding-window) layers additionally
+//!   restrict attention to the bidirectional band `|i - j| < sliding_window`
+//!   once the sequence exceeds the window — the google/HF Gemma3 reference
+//!   semantics (`use_bidirectional_attention`); shorter sequences skip the band
+//!   (mathematically exact) and global layers always see every real token.
+//!   This deliberately deviates from the declared upstream `mlx-embeddings`,
+//!   which never applies the window and so diverges from the google reference
+//!   for `> sliding_window`-token inputs — see the [`backbone`] module docs for
+//!   the full rationale.
 //! - **Pooling** ([`mean_pooling`](crate::embeddings::mean_pooling())): mask-aware
 //!   mean over the sequence.
 //! - **Dense head** (`dense::DenseHead`): two bias-free linear layers
@@ -245,7 +251,8 @@ impl EmbeddingGemmaModel {
   /// order the reference follows: "Pool first, then dense").
   pub fn encode_text(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
     // Build the additive padding mask in the backbone's embedding dtype so SDPA
-    // sees a matching-dtype mask.
+    // sees a matching-dtype mask. The backbone derives the local layers'
+    // sliding-window mask from it when seq_len exceeds the window.
     let dtype = self.backbone_dtype()?;
     let mask = build_additive_mask(attention_mask, dtype)?;
 

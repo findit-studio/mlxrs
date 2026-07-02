@@ -459,6 +459,86 @@ fn vision_sanitize_drops_position_ids() {
   assert!(w.contains_key("post_layernorm.weight"));
 }
 
+// ───────────────────── activation dtype (reduced-precision checkpoints) ─────────────────────
+
+/// Cast every fixture weight to `dtype` — the reduced-precision (f16/bf16)
+/// checkpoint analogue of the F32 synthetic map.
+fn cast_weights(w: HashMap<String, Array>, dtype: Dtype) -> HashMap<String, Array> {
+  w.into_iter()
+    .map(|(k, v)| (k, v.astype(dtype).unwrap()))
+    .collect()
+}
+
+/// Production hands the tower the raw F32 `pixel_values` straight from the
+/// NaFlex processor ([`super::super::processor::preprocess_image`] /
+/// `tile_image` both build `Array::from_slice::<f32>`) — the reference casts
+/// them to the patch-embedding weight dtype *inside* the tower (`vision.py`'s
+/// `pixel_values.astype(target_dtype)` entry cast + the post-embeddings
+/// `x.astype(...)` re-pin), so the tower must own both casts. Without them
+/// MLX's upward promotion (`bf16 op f32 → f32`) silently runs the whole
+/// encoder — and everything downstream of it — in F32 on an f16/bf16
+/// checkpoint (the whisper f32-mel regression class, 1723a5c).
+#[test]
+fn f32_pixel_values_on_bf16_tower_encode_in_bf16() {
+  f32_pixel_values_encode_stay_model_dtype(Dtype::BF16);
+}
+
+/// Same for f16.
+#[test]
+fn f32_pixel_values_on_f16_tower_encode_in_f16() {
+  f32_pixel_values_encode_stay_model_dtype(Dtype::F16);
+}
+
+fn f32_pixel_values_encode_stay_model_dtype(dtype: Dtype) {
+  let cfg = tiny_vision_config();
+  let mut w = cast_weights(tiny_vision_weights(LAYERS), dtype);
+  let tower = VisionModel::from_weights(&cfg, LAYERS, &mut w, &no_quant).unwrap();
+  // The pixel values exactly as the production processor produces them: F32,
+  // NOT pre-cast by the caller.
+  let pv = pixel_values(1);
+  assert_eq!(
+    pv.dtype().unwrap(),
+    Dtype::F32,
+    "precondition: the processor's pixel_values are F32"
+  );
+
+  // Full-budget grid (no padding ⇒ the mask is skipped): the pure dtype flow.
+  let out = tower
+    .forward(&pv, &spatial_shapes(&[(2, 2)]), None)
+    .unwrap();
+  assert_eq!(out.shape(), vec![1, NUM_PATCHES as usize, HIDDEN as usize]);
+  assert_eq!(
+    out.dtype().unwrap(),
+    dtype,
+    "the tower must cast the F32 pixel_values to the patch-embedding weight \
+     dtype (vision.py's target_dtype casts) — the encoder must not promote to \
+     F32 on a reduced-precision checkpoint"
+  );
+
+  // Below-budget grid + companion mask: the masked-SDPA path. The additive
+  // key mask must be built in the computation dtype — mlx's fast SDPA rejects
+  // a mask dtype that cannot promote to the output dtype without widening it,
+  // so an F32 mask against f16/bf16 activations is a hard backend error.
+  let out_masked = tower
+    .forward(
+      &pv,
+      &spatial_shapes(&[(1, 3)]),
+      Some(&patch_mask(3, NUM_PATCHES)),
+    )
+    .unwrap();
+  assert_eq!(
+    out_masked.dtype().unwrap(),
+    dtype,
+    "the masked (padded-grid) path must also stay in the model dtype"
+  );
+  assert!(
+    eval_to_vec(&out_masked.astype(Dtype::F32).unwrap())
+      .iter()
+      .all(|x| x.is_finite()),
+    "masked reduced-precision forward must be finite"
+  );
+}
+
 // ───────────────────── quantized-checkpoint loading ─────────────────────
 //
 // No local 8-bit checkpoint is available, so the quantized path is covered by a

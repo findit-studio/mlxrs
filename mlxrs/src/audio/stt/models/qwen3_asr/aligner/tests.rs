@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::{
+  Dtype,
   array::Array,
   audio::stt::{
     model::{AlignOptions, ForcedAligner as ForcedAlignerTrait},
@@ -1003,6 +1004,48 @@ fn forward_with_feature_length_trims_padding_for_splice() {
     .forward_with_feature_length(&ids, &feats, Some(8))
     .unwrap();
   assert_eq!(logits.shape(), vec![1, l, CLASSIFY_NUM as usize]);
+}
+
+// ════════════════════════════ splice dtype ════════════════════════════
+
+#[test]
+fn splice_audio_casts_audio_rows_to_embedding_dtype() {
+  // The released 8-bit checkpoint decodes in bf16 (quantized weights with bf16
+  // scales ⇒ bf16 token embeddings) while the crate's f32 mel frontend makes
+  // the audio tower emit f32 rows (a conv over an f32 input promotes a bf16
+  // kernel to f32). The reference casts the encoder output to the embedding
+  // dtype before the merge (`audio_features =
+  // audio_features.astype(inputs_embeds.dtype)`, qwen3_forced_aligner.py);
+  // without the cast the splice concat takes MLX's common type, and the
+  // spliced embeddings — and the whole decoder + lm_head after them —
+  // silently run in f32.
+  let a = tiny_aligner();
+  // (1, 3) ids with one <audio_pad> (audio_token_id = 30) at flat position 1.
+  let ids = Array::from_slice::<i32>(&[10, 30, 11], &(1usize, 3usize)).unwrap();
+  let embeds = filled(&[1, 3, HIDDEN], 0.02).astype(Dtype::BF16).unwrap();
+  let audio = filled(&[1, 1, HIDDEN], 0.5); // f32 encoder rows
+  let spliced = a
+    .splice_audio(&ids, &embeds, &audio, 3, HIDDEN as usize)
+    .expect("mixed-dtype splice must succeed");
+  assert_eq!(
+    spliced.dtype().unwrap(),
+    Dtype::BF16,
+    "spliced embeddings must keep the embedding dtype (audio rows cast to it, not promoted)"
+  );
+  // The cast must not disturb the splice itself: the pad row carries the
+  // audio value, the non-pad rows their own embedding value (both exactly
+  // representable in bf16's 8-bit mantissa within 1e-3).
+  let mut spliced_f32 = spliced.astype(Dtype::F32).unwrap();
+  let vals = spliced_f32.to_vec::<f32>().unwrap();
+  let h = HIDDEN as usize;
+  assert!(
+    vals[h..2 * h].iter().all(|&v| (v - 0.5).abs() < 1e-3),
+    "audio row not spliced into the pad position: {vals:?}"
+  );
+  assert!(
+    vals[..h].iter().all(|&v| (v - 0.02).abs() < 1e-3),
+    "non-pad embedding row disturbed: {vals:?}"
+  );
 }
 
 // ═══════════════════════ splice gather-index overflow ═══════════════════════

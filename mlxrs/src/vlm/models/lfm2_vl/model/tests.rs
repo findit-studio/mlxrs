@@ -484,6 +484,41 @@ fn get_input_embeddings_merges_image_features() {
 }
 
 #[test]
+fn f32_pixel_values_on_bf16_checkpoint_merge_in_bf16() {
+  // Production feeds `get_input_embeddings` per-image F32 pixel rows straight
+  // from the NaFlex processor. On a bf16 checkpoint the vision tower must cast
+  // the pixels to its weight dtype (vision.py's two `astype(target_dtype)`
+  // casts) and the merge must cast the projected feature rows to the
+  // embeddings dtype (`masked_scatter`'s destination-dtype setitem) — so the
+  // merged embeds (and through them the whole LM forward + KV cache) stay
+  // bf16 instead of silently promoting to F32 (the whisper f32-mel regression
+  // class, 1723a5c).
+  use crate::dtype::Dtype;
+  let weights: HashMap<String, Array> = dense_weights()
+    .into_iter()
+    .map(|(k, v)| (k, v.astype(Dtype::BF16).unwrap()))
+    .collect();
+  let model = Lfm2Vl::from_weights(tiny_config(false), weights, None).unwrap();
+  let img = synth_image(4);
+  assert_eq!(
+    img.pixel_values.dtype().unwrap(),
+    Dtype::F32,
+    "precondition: the per-image pixel rows are F32 (as the processor produces)"
+  );
+  let input_ids = ids(&[1, IMG, IMG, IMG, IMG, 2], 1, 6);
+  let merged = model
+    .get_input_embeddings(&input_ids, std::slice::from_ref(&img))
+    .unwrap();
+  assert_eq!(merged.shape(), vec![1, 6, THIDDEN as usize]);
+  assert_eq!(
+    merged.dtype().unwrap(),
+    Dtype::BF16,
+    "merged input embeddings must stay in the model dtype — F32 pixel_values \
+     must not promote the vision → projector → merge chain on a bf16 checkpoint"
+  );
+}
+
+#[test]
 fn forward_multimodal_count_mismatch_is_typed_error() {
   // 4 image tokens but a 6x6 image -> (6/2)^2 = 9 projected features. The merge
   // count check rejects the feature-vs-token mismatch with a typed error.

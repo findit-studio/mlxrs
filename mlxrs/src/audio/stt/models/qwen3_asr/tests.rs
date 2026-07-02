@@ -1282,3 +1282,100 @@ fn sanitize_drops_lm_head_and_text_decoder() {
   assert_eq!(out.len(), 1);
   assert!(out.contains_key("proj2.bias"));
 }
+
+#[test]
+fn sanitize_formatted_checkpoint_skips_conv_transpose() {
+  // The reference gates the conv transpose on the checkpoint being raw
+  // HF/PyTorch, detected over the whole map: `is_formatted = not
+  // any(k.startswith("thinker.") for k in weights)` (qwen3_forced_aligner.py
+  // sanitize). A converted MLX checkpoint — the released
+  // `mlx-community/Qwen3-ForcedAligner-0.6B-8bit`, whose index carries no
+  // `thinker.` keys and whose conv kernels are already channels-last — must
+  // pass through untransposed; a second transpose would permute the kernel to
+  // `(out, kW, in, kH)` and the shape-pinned conv loader would reject it.
+  let n = 2 * 3 * 3;
+  let ramp: Vec<f32> = (0..n).map(|i| i as f32).collect();
+  // Already channels-last (out=2, kH=3, kW=3, in=1).
+  let conv_w = Array::from_slice::<f32>(&ramp, &[2, 3, 3, 1]).unwrap();
+  let mut raw: HashMap<String, Array> = HashMap::new();
+  raw.insert("audio_tower.conv2d1.weight".into(), conv_w);
+  raw.insert("audio_tower.conv2d1.bias".into(), filled(&[2], 0.0));
+
+  let out = sanitize(raw).unwrap();
+  let mut w = out.get("conv2d1.weight").unwrap().try_clone().unwrap();
+  assert_eq!(
+    w.shape(),
+    vec![2, 3, 3, 1],
+    "already-channels-last conv kernel must not be re-transposed"
+  );
+  // Byte-identical pass-through, not merely shape-preserving.
+  let vals = w.to_vec::<f32>().unwrap();
+  let want: Vec<f32> = (0..n).map(|i| i as f32).collect();
+  assert_close(&vals, &want);
+}
+
+#[test]
+fn sanitize_formatted_layout_loads_audio_encoder() {
+  // End-to-end load of the *formatted* (converted-MLX) layout: `audio_tower.`
+  // prefix, NO `thinker.` anywhere, conv kernels already channels-last — the
+  // released 8-bit checkpoint's on-disk layout. sanitize must leave the
+  // kernels alone so the shape-pinned `AudioEncoder::from_weights` accepts
+  // them.
+  let cfg = tiny_config();
+  let raw: HashMap<String, Array> = tiny_weights(&cfg)
+    .into_iter()
+    .map(|(k, v)| (format!("audio_tower.{k}"), v))
+    .collect();
+  let weights = sanitize(raw).unwrap();
+  AudioEncoder::from_weights(cfg, weights).expect("formatted checkpoint must load");
+}
+
+#[test]
+fn sanitize_hf_layout_loads_audio_encoder() {
+  // The other direction: the raw HF/PyTorch layout (`thinker.audio_tower.`
+  // prefix, channels-first `(out, in, kH, kW)` conv kernels) must still be
+  // transposed to channels-last for the same shape-pinned loader.
+  let cfg = tiny_config();
+  let h = cfg.downsample_hidden_size;
+  let mut w = tiny_weights(&cfg);
+  // Replace the three conv kernels with channels-first stand-ins.
+  w.insert("conv2d1.weight".into(), filled(&[h, 1, 3, 3], 0.05));
+  w.insert("conv2d2.weight".into(), filled(&[h, h, 3, 3], 0.05));
+  w.insert("conv2d3.weight".into(), filled(&[h, h, 3, 3], 0.05));
+  let raw: HashMap<String, Array> = w
+    .into_iter()
+    .map(|(k, v)| (format!("thinker.audio_tower.{k}"), v))
+    .collect();
+  let weights = sanitize(raw).unwrap();
+  AudioEncoder::from_weights(cfg, weights).expect("raw HF checkpoint must load");
+}
+
+#[test]
+fn sanitize_mixed_prefix_map_transposes_every_conv_kernel() {
+  // Upstream parity on the gate's scope: `is_formatted` is computed over the
+  // WHOLE input map, so ONE `thinker.` key anywhere marks the checkpoint
+  // raw-HF and EVERY 4-D conv2d kernel is transposed — including one whose
+  // own key carries no `thinker.` prefix.
+  let mut raw: HashMap<String, Array> = HashMap::new();
+  raw.insert(
+    "thinker.audio_tower.ln_post.weight".into(),
+    filled(&[4], 1.0),
+  );
+  raw.insert(
+    "audio_tower.conv2d1.weight".into(),
+    filled(&[2, 1, 3, 3], 0.05),
+  );
+  let out = sanitize(raw).unwrap();
+  assert_eq!(
+    out.get("conv2d1.weight").unwrap().shape(),
+    vec![2, 3, 3, 1],
+    "a thinker.-prefixed sibling marks the map raw-HF: the un-prefixed conv kernel is transposed too"
+  );
+}
+
+#[test]
+fn sanitize_empty_map_is_empty() {
+  // Vacuously "formatted" (no key starts with `thinker.`) and nothing to
+  // rewrite — mirrors the reference on an empty dict.
+  assert!(sanitize(HashMap::new()).unwrap().is_empty());
+}

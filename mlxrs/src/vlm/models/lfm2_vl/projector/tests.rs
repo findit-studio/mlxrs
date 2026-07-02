@@ -252,6 +252,61 @@ fn projector_missing_layernorm_weight_is_typed_error() {
   assert!(matches!(err, Error::MissingKey(_)), "got {err}");
 }
 
+#[test]
+fn projector_no_layernorm_consumes_and_drops_stray_layer_norm_keys() {
+  // The published `projector_use_layernorm = false` checkpoints
+  // (`LiquidAI/LFM2.5-VL-450M-MLX-{bf16,8bit}`) STILL carry
+  // `layer_norm.{weight,bias}`: the reference instantiates the LayerNorm
+  // unconditionally and only gates its application in `__call__`, so the
+  // conversion always serializes the pair. The builder must consume and DROP
+  // both keys — leaving them in the map turns into a hard
+  // `InvariantViolation` at the VL model's leftover-weight rejection, making
+  // the flagship checkpoint unloadable.
+  let cfg = tiny_model_config(false);
+  let mut w = projector_dense_weights(false);
+  w.insert("layer_norm.weight".to_string(), vec_n(PROJ_IN));
+  w.insert("layer_norm.bias".to_string(), vec_n(PROJ_IN));
+  let proj = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap();
+  assert!(
+    w.is_empty(),
+    "flag=false must consume (and drop) the stray layer_norm pair so the \
+     VL-level reject_leftover does not fail the load; leftover: {:?}",
+    w.keys().collect::<Vec<_>>()
+  );
+
+  // The dropped pair is NOT applied: the forward output equals the projector
+  // built from the keyless flag=false map (LayerNorm skipped in both).
+  let mut w_keyless = projector_dense_weights(false);
+  let proj_keyless =
+    Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w_keyless, &no_quant).unwrap();
+  let x = mat(3, PROJ_IN);
+  let out = proj.forward(&x).unwrap();
+  assert_eq!(out.shape(), vec![3, TEXT_HIDDEN as usize]);
+  assert_eq!(
+    eval_to_vec(&out),
+    eval_to_vec(&proj_keyless.forward(&x).unwrap()),
+    "the dropped layer_norm weights must not be applied"
+  );
+}
+
+/// A HALF-present `layer_norm` pair under `projector_use_layernorm = false` is
+/// checkpoint schema drift, not a droppable stray: the reference module always
+/// serializes BOTH keys, so exactly one present must stay a typed error (the
+/// drop arm must not silently defeat the leftover-weight integrity fence).
+#[test]
+fn projector_no_layernorm_rejects_half_present_layer_norm_pair() {
+  let cfg = tiny_model_config(false);
+  for stray in ["layer_norm.weight", "layer_norm.bias"] {
+    let mut w = projector_dense_weights(false);
+    w.insert(stray.to_string(), vec_n(PROJ_IN));
+    let err = Lfm2VlMultiModalProjector::from_weights(&cfg, &mut w, &no_quant).unwrap_err();
+    assert!(
+      matches!(err, Error::MissingKey(_)),
+      "a lone {stray} under flag=false must be a typed MissingKey error, got {err}"
+    );
+  }
+}
+
 /// A tiny config with an explicit `projector_bias` flag (otherwise identical to
 /// [`tiny_model_config`], layernorm on).
 fn tiny_model_config_bias(projector_bias: bool) -> ModelConfig {

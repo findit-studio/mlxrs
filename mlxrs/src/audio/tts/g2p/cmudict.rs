@@ -7,9 +7,13 @@
 //! CMUDict ships as one row per line in the form
 //! `WORD<spaces>PHONEME PHONEME …`. Variant pronunciations are flagged
 //! `WORD(N)` (e.g. `the(2)  DH IY0`). Lines starting `;;;` are comments;
-//! blank lines are skipped. The parser is whitespace-tolerant (single or
-//! double space between word and pronunciation, the wild-style raw and
-//! pre-formatted dict files).
+//! blank lines are skipped. The canonical cmusphinx `cmudict.dict`
+//! additionally carries inline `#` comments on the pronunciation side
+//! (`aalborg AO1 L B AO0 R G # place, danish`) — a pronunciation token
+//! beginning with `#` starts a comment that runs to end-of-line and is
+//! stripped before ARPAbet → IPA conversion. The parser is
+//! whitespace-tolerant (single or double space between word and
+//! pronunciation, the wild-style raw and pre-formatted dict files).
 //!
 //! ## Local-file-only
 //!
@@ -182,6 +186,13 @@ fn parse_word_and_variant(word_token: &str, line_number: usize) -> Result<(&str,
 /// line that is missing whitespace or has a non-word/non-pronunciation
 /// shape after the split).
 ///
+/// Inline `#` comments on the pronunciation side (canonical cmusphinx
+/// `cmudict.dict` style, e.g. `aalborg AO1 L B AO0 R G # place, danish`)
+/// are stripped: the first pronunciation token beginning with `#` and
+/// everything after it are dropped. A `#` in the WORD column is part of
+/// the word; a row whose pronunciation is ONLY a comment errors (no
+/// phonemes left).
+///
 /// The error carries `line_number` so a bulk loader can surface the
 /// offending line position to the caller.
 pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
@@ -215,15 +226,30 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
   let (word_str, variant) = parse_word_and_variant(word_part, line_number)?;
   let word = word_str.to_lowercase();
 
+  // Inline `#` comment stripping — the canonical cmusphinx `cmudict.dict`
+  // annotates some rows with a trailing comment on the pronunciation side
+  // (`aalborg AO1 L B AO0 R G # place, danish`). A whitespace-delimited
+  // token BEGINNING with `#` starts the comment; it and everything after
+  // it are dropped before ARPAbet → IPA conversion (otherwise the strict
+  // converter would reject `#` and fail the whole file).
+  //
+  // Deliberately narrow:
+  // - only the pronunciation side is stripped — a `#` in the WORD column
+  //   (0.7b-style `#hash-mark`) is part of the word (it sits before the
+  //   first space, so it never reaches this tokenizer);
+  // - a `#` glued to the TAIL of a token (`G#`) does not start a comment:
+  //   the token is kept as-is so the strict converter still rejects it
+  //   loudly with the row's line/word context.
   let arpabet: Vec<String> = pron_part
     .split(' ')
     .filter(|s| !s.is_empty())
+    .take_while(|s| !s.starts_with('#'))
     .map(String::from)
     .collect();
   if arpabet.is_empty() {
     return Err(Error::OutOfRange(OutOfRangePayload::new(
       "CMUDict line",
-      "pronunciation must be non-empty",
+      "pronunciation must be non-empty (after inline `#` comment stripping)",
       format_smolstr!("{line_number}"),
     )));
   }

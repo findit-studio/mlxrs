@@ -1440,14 +1440,18 @@ impl<'a> DecodingTask<'a> {
     model.validate_token_ids("DecodingTask: initial token", &initial_tokens)?;
     let sample_begin = initial_tokens.len();
     // Soundness backstop: the prefill consumes `sample_begin` cache slots, so it
-    // must leave room for at least one sampled token within the backend's
-    // decoder-cache ceiling. `build_initial_tokens` already truncated prompt and
-    // prefix to `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence
-    // could still fill it; reject at task construction (before the encoder runs)
-    // rather than overrun the cache mid-prefill inside `decode_tokens`. On the MLX
-    // backend `max_decoder_ctx == n_text_ctx`, far above any real prefill, so this
-    // never fires (byte-identical).
-    if sample_begin >= max_decoder_ctx {
+    // must itself fit within the backend's decoder-cache ceiling.
+    // `build_initial_tokens` already truncated prompt and prefix to
+    // `max_decoder_ctx`, but a pathological `sot_prev` + SOT sequence could still
+    // exceed it; reject at task construction (before the encoder runs) rather
+    // than overrun the cache mid-prefill inside `decode_tokens`. A prefill that
+    // EXACTLY fills the ceiling (`==`) is allowed: the first sampled token is
+    // read off the prefill's last-position logits without a further forward (no
+    // extra cache slot), so one token can still be emitted — the reference
+    // `_main_loop` never rejects at construction (its `tokens.shape[-1] >
+    // self.n_ctx` bound is checked after sampling), and the CoreML backend's own
+    // `precheck_decode` allows `==` with the same strict-`>` bound.
+    if sample_begin > max_decoder_ctx {
       return Err(Error::CapExceeded(crate::error::CapExceededPayload::new(
         "DecodingTask: initial-token prefill",
         "max_decoder_ctx",
@@ -1455,18 +1459,21 @@ impl<'a> DecodingTask<'a> {
         sample_begin as u64,
       )));
     }
-    // Cap the sampled-token budget so the prompt + sampled tail never exceeds the
-    // backend's decoder-cache ceiling: the warm loops run `1..sample_len` and the
-    // prefill already consumes `sample_begin` cache slots, so bounding
-    // `sample_len <= max_decoder_ctx - sample_begin` makes every loop terminate
-    // by its own count at (or before) the cache bound. On the MLX backend
-    // `max_decoder_ctx == n_text_ctx`, so for any realistic `sample_begin` this
-    // `min` selects the original `sample_len` unchanged (byte-identical); on the
-    // CoreML backend it stops the loop cleanly at the 224-slot cache instead of
-    // reaching a mid-segment `CapExceeded`. `build_initial_tokens` above already
-    // ran with the ORIGINAL `sample_len`, so prompt/prefix truncation is
-    // unaffected by this cap.
-    let sample_len = sample_len.min(max_decoder_ctx.saturating_sub(sample_begin));
+    // Cap the sampled-token budget so the prompt + sampled tail never exceeds
+    // the backend's decoder-cache ceiling. Slot accounting: the prefill consumes
+    // `sample_begin` cache slots; the FIRST sampled token is read off the
+    // prefill's last-position logits without a further forward (no slot); the
+    // warm loops run `1..sample_len`, forwarding `sample_len - 1` more tokens
+    // (one slot each). So the bound is `sample_begin + sample_len - 1 <=
+    // max_decoder_ctx`, i.e. `sample_len <= max_decoder_ctx - sample_begin + 1`
+    // — the subtraction cannot underflow (the guard above ensures `sample_begin
+    // <= max_decoder_ctx`) and the `+ 1` saturates. On the CoreML backend this
+    // stops the loop cleanly at the 224-slot cache instead of reaching a
+    // mid-segment `CapExceeded`; when the prefill exactly fills the cache the
+    // cap is 1 — the prefill-logits token — and the warm loop `1..1` is empty.
+    // `build_initial_tokens` above already ran with the ORIGINAL `sample_len`,
+    // so prompt/prefix truncation is unaffected by this cap.
+    let sample_len = sample_len.min((max_decoder_ctx - sample_begin).saturating_add(1));
     let sot_index = initial_tokens
       .iter()
       .position(|&t| t == tokenizer.sot())
@@ -1715,10 +1722,13 @@ impl<'a> DecodingTask<'a> {
   }
 
   /// Encode the mel (or pass an already-encoded feature tensor straight
-  /// through) — `_get_audio_features` (`decoding.py:553-571`). mlxrs decodes
-  /// in the model dtype rather than forcing fp16, so the dtype cast is
-  /// dropped; the encoder is skipped if `mel` is already the encoder-output
-  /// shape `(n_audio_ctx, n_audio_state)`.
+  /// through) — `_get_audio_features` (`decoding.py:553-571`). The reference's
+  /// fp16 mel cast (`decoding.py:538-539`) lives inside the encoder's forward
+  /// behind its shape guards, generalized to the model dtype (an `F32` mel
+  /// would otherwise promote the whole encoder+decoder graph to `F32` on an
+  /// f16/bf16 checkpoint); [`encode_once`] applies the same normalization to
+  /// pass-through pre-encoded features. The encoder is skipped if `mel` is
+  /// already the encoder-output shape `(n_audio_ctx, n_audio_state)`.
   fn audio_features(&self, mel: &Array) -> Result<Array> {
     encode_once(self.model, mel)
   }
@@ -2771,8 +2781,15 @@ pub fn detect_language<'a>(
     )));
   }
 
+  // Normalize the caller-supplied features exactly as `decode` does
+  // ([`encode_once`]: shape-lift a rank-2 tensor, cast an MLX pass-through to
+  // the model dtype, encode a raw mel) — without this, correctly-shaped `F32`
+  // features on an f16/bf16 MLX checkpoint would promote the language-id
+  // cross-attention work to `F32` through this public entry.
+  let audio_features = encode_once(model, audio_features)?;
+
   // Single `sot` forward, fresh cache.
-  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], audio_features, None)?;
+  let (logits3d, _cache) = model.decode_tokens(&[tokenizer.sot()], &audio_features, None)?;
   // logits[:, 0] → the only (first) position's row. Language detection runs
   // once (not per decode step), so reading this row to the host here is fine —
   // it is the masking + softmax over a small language-token set, not the hot
@@ -2924,8 +2941,17 @@ fn decode_resolved(
 /// shared by [`decode`] and language detection (`_get_audio_features`,
 /// `decoding.py:553-571`).
 ///
+/// The reference casts to the compute dtype BEFORE its encoded-shape check
+/// (`decoding.py:538-539`), so the pass-through arm normalizes the dtype too:
+/// a caller-supplied pre-encoded `F32` feature tensor on an f16/bf16 MLX model
+/// would otherwise promote the decoder cross-attention K/V and the KV cache to
+/// `F32` through the public [`decode`] / [`decode_with_fallback`] entries. A
+/// same-dtype `astype` is a no-op. The CoreML backend is excluded: its encoder
+/// states are host-side `f32` by contract and its decode path owns the
+/// layout/dtype conversion.
+///
 /// # Errors
-/// Propagates the encoder forward op errors.
+/// Propagates the encoder forward / cast op errors.
 fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
   let dims = model.dims();
   let shape = mel.shape();
@@ -2937,12 +2963,17 @@ fn encode_once(model: &WhisperBackend<'_>, mel: &Array) -> Result<Array> {
     [1, c, s] if *c == dims.n_audio_ctx() && *s == dims.n_audio_state()
   );
   if is_encoded {
-    if shape.len() == 2 {
+    let features = if shape.len() == 2 {
       let c = i32::try_from(dims.n_audio_ctx()).map_err(|_| dim_overflow("n_audio_ctx"))?;
       let s = i32::try_from(dims.n_audio_state()).map_err(|_| dim_overflow("n_audio_state"))?;
-      mel.reshape(&[1, c, s])
+      mel.reshape(&[1, c, s])?
     } else {
-      mel.try_clone()
+      mel.try_clone()?
+    };
+    match model {
+      WhisperBackend::Mlx(m) => features.astype(m.dtype()),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      WhisperBackend::CoreMl(_) => Ok(features),
     }
   } else {
     model.encode(mel)

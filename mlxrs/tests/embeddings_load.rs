@@ -99,6 +99,75 @@ fn mock_constructor() -> EmbeddingModelConstructor {
 
 /// Write a minimal but loadable `tokenizer.json` (3-token WordLevel +
 /// Whitespace pre-tokenizer) into `dir`.
+/// A tokenizer whose vocab carries `<pad>` at a KNOWN id (0) — the ground
+/// truth `load()` must resolve the pad id from, regardless of what any
+/// metadata id table claims.
+#[cfg(feature = "serde_json")]
+fn write_tokenizer_with_pad(dir: &Path) {
+  use tokenizers::{
+    Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+  };
+  let vocab = [("<pad>", 0u32), ("a", 1), ("b", 2), ("c", 3)]
+    .iter()
+    .map(|(w, i)| ((*w).to_string(), *i))
+    .collect();
+  let wl = WordLevel::builder()
+    .vocab(vocab)
+    .unk_token("a".to_string())
+    .build()
+    .unwrap();
+  let mut hf = HfTokenizer::new(wl);
+  hf.with_pre_tokenizer(Some(Whitespace {}));
+  hf.save(dir.join("tokenizer.json"), false).unwrap();
+}
+
+#[cfg(feature = "serde_json")]
+#[test]
+fn load_resolves_pad_id_from_tokenizer_not_stale_metadata_table() {
+  // tokenizer.json (the file the Tokenizer is actually built from) maps
+  // <pad> → 0. Both metadata files agree the pad token is "<pad>", but a
+  // STALE tokenizer_config.json added_tokens_decoder claims "1" → <pad>.
+  // The factory must resolve the id from the LOADED tokenizer (0), never
+  // from the metadata id table (1) — a stale table would otherwise pad
+  // short prompts with the wrong id (the pad-as-EOS corruption class).
+  let dir = temp_dir("pad_ground_truth");
+  write_model_dir(&dir, "bert");
+  write_tokenizer_with_pad(&dir);
+  fs::write(
+    dir.join("tokenizer_config.json"),
+    r#"{
+      "pad_token": "<pad>",
+      "added_tokens_decoder": { "1": { "content": "<pad>" } }
+    }"#,
+  )
+  .unwrap();
+  fs::write(
+    dir.join("special_tokens_map.json"),
+    r#"{ "pad_token": "<pad>" }"#,
+  )
+  .unwrap();
+
+  let constructor: EmbeddingModelConstructor = Box::new(
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
+      assert_eq!(
+        loaded.pad_token_id(),
+        Some(0),
+        "the pad id must come from the loaded tokenizer's <pad> → 0 mapping, \
+         not the stale added_tokens_decoder claiming 1"
+      );
+      Ok(Box::new(MockEmbedding))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", constructor);
+  load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect("load should succeed (the constructor's pad-id assertion ran)");
+}
+
 fn write_tokenizer(dir: &Path) {
   use tokenizers::{
     Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
@@ -155,6 +224,89 @@ fn load_produces_context_via_public_surface() {
 
   let tok_ids = ctx.tokenizer.encode("a b c", false).unwrap();
   assert_eq!(tok_ids.len(), 3);
+}
+
+#[test]
+fn load_attaches_tokenizer_dir_to_loaded_model() {
+  // `load()` must hand the constructor a `LoadedEmbeddingModel` carrying the
+  // resolved TOKENIZER directory (`tokenizer_dir()`) — the SAME directory the
+  // `Tokenizer` is built from — so an architecture can read tokenizer metadata
+  // (SigLIP2 resolves its text pad id from `tokenizer_config.json` this way)
+  // from the directory that actually provides the tokenizer. With no separate
+  // `tokenizer_source` this is the model directory. A hand-built
+  // `LoadedEmbeddingModel::new` carries `None` until `with_tokenizer_dir`.
+  let dir = temp_dir("tok_dir_default");
+  write_model_dir(&dir, "bert");
+  let expected = dir.clone();
+  let constructor: EmbeddingModelConstructor = Box::new(
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
+      assert_eq!(
+        loaded.tokenizer_dir(),
+        Some(expected.as_path()),
+        "load() attaches the resolved tokenizer directory (= the model dir \
+         when no tokenizer_source is set) for the constructor"
+      );
+      Ok(Box::new(MockEmbedding))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", constructor);
+  load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  )
+  .expect("load should succeed (the constructor's tokenizer_dir assertion ran)");
+
+  // The builder/accessor round-trip on a hand-built LoadedEmbeddingModel.
+  let hand_built = LoadedEmbeddingModel::new("bert".into(), config_json("bert"), HashMap::new());
+  assert_eq!(
+    hand_built.tokenizer_dir(),
+    None,
+    "new() attaches no directory"
+  );
+  let with_dir = hand_built.with_tokenizer_dir(&dir);
+  assert_eq!(with_dir.tokenizer_dir(), Some(dir.as_path()));
+}
+
+#[test]
+fn load_attaches_split_tokenizer_source_dir_not_model_dir() {
+  // The split-tokenizer layout (`with_tokenizer_source`): the tokenizer — and
+  // therefore the tokenizer METADATA a constructor may read (SigLIP2's pad id)
+  // — comes from the separate tokenizer directory, NOT the model directory. A
+  // stale `tokenizer_config.json` left in the model directory must lose to the
+  // configured tokenizer source, exactly as the `Tokenizer` itself is built
+  // from `tokenizer_directory()`.
+  let model_dir = temp_dir("tok_dir_split_model");
+  write_model_dir(&model_dir, "bert");
+  let tok_dir = temp_dir("tok_dir_split_tok");
+  write_tokenizer(&tok_dir);
+
+  let expected = tok_dir.clone();
+  let unexpected = model_dir.clone();
+  let constructor: EmbeddingModelConstructor = Box::new(
+    move |loaded: &LoadedEmbeddingModel,
+          _pooling: Option<&StPoolingConfig>|
+          -> Result<Box<dyn EmbeddingModel>, Error> {
+      assert_eq!(
+        loaded.tokenizer_dir(),
+        Some(expected.as_path()),
+        "load() attaches the SEPARATE tokenizer_source directory"
+      );
+      assert_ne!(
+        loaded.tokenizer_dir(),
+        Some(unexpected.as_path()),
+        "the model directory must NOT win under a split-tokenizer config"
+      );
+      Ok(Box::new(MockEmbedding))
+    },
+  );
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", constructor);
+  load(
+    &EmbeddingModelConfiguration::from_directory(&model_dir).with_tokenizer_source(&tok_dir),
+    &registry,
+  )
+  .expect("split-tokenizer load should succeed (the tokenizer_dir assertions ran)");
 }
 
 #[test]
