@@ -818,8 +818,10 @@ fn fixture_transcribe_rtf() -> Result<()> {
 
   let bytes = std::fs::read(pcm_path).expect("read fixture.f32");
   let pcm: Vec<f32> = bytes
-    .chunks_exact(4)
-    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    .as_chunks::<4>()
+    .0
+    .iter()
+    .map(|b| f32::from_le_bytes(*b))
     .collect();
   let audio = Array::from_slice::<f32>(&pcm, &[pcm.len() as i32])?;
   let audio_secs = pcm.len() as f64 / 16000.0;

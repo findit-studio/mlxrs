@@ -114,7 +114,12 @@ pub fn rgba_to_rgb_affine_scalar(src: &[u8], dst: &mut [f32], scale: f32, bias: 
     src.len(),
   );
 
-  for (src_px, dst_px) in src.chunks_exact(RGBA).zip(dst.chunks_exact_mut(RGB)) {
+  for (src_px, dst_px) in src
+    .as_chunks::<RGBA>()
+    .0
+    .iter()
+    .zip(dst.as_chunks_mut::<RGB>().0)
+  {
     // Copy the 3 RGB channels through the affine, skip alpha (src_px[3]).
     // Non-fused `x * scale + bias` (two roundings) — bit-for-bit the
     // original `x * (1/127.5) - 1.0`, matching the NEON arm.

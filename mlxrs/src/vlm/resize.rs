@@ -652,7 +652,7 @@ fn muldiv255(c: u8, a: u8) -> u8 {
 /// [`resize_rgba8`]'s `src.len() == src_w * src_h * 4` check).
 fn premultiply_rgba(src: &[u8]) -> Result<Vec<u8>> {
   let mut out: Vec<u8> = try_with_capacity(src.len())?;
-  for px in src.chunks_exact(CHANNELS) {
+  for px in src.as_chunks::<CHANNELS>().0 {
     let a = px[3];
     // PIL premultiplies the colour channels only; alpha passes through.
     out.push(muldiv255(px[0], a));
@@ -688,7 +688,7 @@ fn premultiply_rgba(src: &[u8]) -> Result<Vec<u8>> {
 ///
 /// `buf.len()` must be a multiple of [`CHANNELS`].
 fn unpremultiply_rgba(buf: &mut [u8]) {
-  for px in buf.chunks_exact_mut(CHANNELS) {
+  for px in buf.as_chunks_mut::<CHANNELS>().0 {
     let a = px[3];
     if a == 0 || a == 255 {
       // PIL passthrough: opaque needs no division, and a zero-alpha

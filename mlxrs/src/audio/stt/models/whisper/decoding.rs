@@ -3442,7 +3442,9 @@ fn compute_seek_clips(
   // clips (`start >= end` after clamping) so they yield no windows.
   Ok(
     seek_points
-      .chunks_exact(2)
+      .as_chunks::<2>()
+      .0
+      .iter()
       .filter_map(|pair| {
         let start = pair[0].min(content_frames);
         let end = pair[1].min(content_frames);

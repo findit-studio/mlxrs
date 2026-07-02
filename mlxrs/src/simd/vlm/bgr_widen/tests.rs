@@ -342,7 +342,7 @@ fn image_to_array_bgr_matches_old_loop() {
     // `buf.push(f32::from(px[2|1|0]))` on a `Vec<f32>` grown from
     // `Vec::with_capacity(n_bytes)`).
     let mut old: Vec<f32> = Vec::with_capacity(n_bytes);
-    for px in raw.chunks_exact(3) {
+    for px in raw.as_chunks::<3>().0 {
       old.push(f32::from(px[2]));
       old.push(f32::from(px[1]));
       old.push(f32::from(px[0]));
