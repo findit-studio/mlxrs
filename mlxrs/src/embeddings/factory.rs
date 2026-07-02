@@ -727,8 +727,19 @@ pub fn load(
   // mapping (it is never consulted for the id at all). Best-effort: no
   // agreeing pad token, or a token the tokenizer does not know, resolves to
   // `None` and the consuming architecture keeps its own default.
+  // Metadata parsing needs `serde_json` (the base `embeddings` feature is
+  // deliberately serde_json-free, and the hand-rolled strict scanner is
+  // purpose-built for tiny flat files — scanning an arbitrary, nested
+  // `tokenizer_config.json` with it could false-match a `pad_token` key
+  // inside e.g. an embedded chat template). Every architecture that consumes
+  // `pad_token_id` (SigLIP2, …) enables `serde_json` transitively, so gating
+  // the resolution — not the field — keeps base-`embeddings` builds compiling
+  // with `None` (each consumer's own default applies).
+  #[cfg(feature = "serde_json")]
   let pad_token_id =
     read_pad_token_string(tokenizer_dir).and_then(|t| tokenizer.convert_token_to_id(&t));
+  #[cfg(not(feature = "serde_json"))]
+  let pad_token_id: Option<u32> = None;
   let loaded = LoadedEmbeddingModel::new(model_type, config_json, weights)
     .with_tokenizer_dir(tokenizer_dir)
     .with_pad_token_id(pad_token_id);
@@ -2171,6 +2182,7 @@ mod tests;
 /// ([`read_pad_token_string`]): a real `tokenizer_config.json` /
 /// `special_tokens_map.json` is tens of KB; 4 MiB accommodates the largest
 /// added-token tables with two orders of magnitude of headroom.
+#[cfg(feature = "serde_json")]
 const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
 
 /// Read the pad-token STRING declared by the tokenizer metadata under `dir` —
@@ -2188,6 +2200,7 @@ const MAX_TOKENIZER_METADATA_BYTES: u64 = 4 << 20;
 /// Best-effort by design: an absent/unreadable/over-cap/malformed file simply
 /// contributes no declaration. Accepts both HF shapes for the field — a plain
 /// string and an AddedToken-style `{"content": …}` object.
+#[cfg(feature = "serde_json")]
 fn read_pad_token_string(dir: &Path) -> Option<String> {
   let from_config = read_bounded_json(&dir.join("tokenizer_config.json"))
     .and_then(|cfg| token_content(cfg.get("pad_token")?).map(str::to_owned));
@@ -2205,6 +2218,7 @@ fn read_pad_token_string(dir: &Path) -> Option<String> {
 /// post-open regular-file check, `Read::take` cap). Any failure — absent
 /// file, not a regular file, I/O error, over-cap size, malformed JSON — is
 /// `None`: this feeds the best-effort [`read_pad_token_string`] only.
+#[cfg(feature = "serde_json")]
 fn read_bounded_json(path: &Path) -> Option<serde_json::Value> {
   use std::io::Read;
 
@@ -2238,6 +2252,7 @@ fn read_bounded_json(path: &Path) -> Option<serde_json::Value> {
 /// the HF tokenizer files use: a plain string (`"<pad>"`) or an
 /// AddedToken-style object (`{"content": "<pad>", …}`). Anything else is
 /// `None`.
+#[cfg(feature = "serde_json")]
 fn token_content(value: &serde_json::Value) -> Option<&str> {
   match value {
     serde_json::Value::String(s) => Some(s.as_str()),

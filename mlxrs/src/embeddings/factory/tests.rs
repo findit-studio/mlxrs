@@ -2184,6 +2184,7 @@ fn extract_decodes_valid_surrogate_pair_success() {
 // ───────────── pad-token STRING resolution (read_pad_token_string) ─────────────
 
 /// A fresh, writable per-test temp directory for the metadata tests.
+#[cfg(feature = "serde_json")]
 fn pad_meta_dir(tag: &str) -> std::path::PathBuf {
   use std::sync::atomic::{AtomicU64, Ordering};
   static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2201,6 +2202,7 @@ fn pad_meta_dir(tag: &str) -> std::path::PathBuf {
 /// `{"content": …}` object across HF checkpoints; both shapes must resolve,
 /// from either metadata file. Absent/malformed metadata resolves to `None`
 /// (best-effort — the caller keeps its default).
+#[cfg(feature = "serde_json")]
 #[test]
 fn read_pad_token_string_handles_both_hf_shapes_and_misses() {
   let dir = pad_meta_dir("shapes");
@@ -2249,6 +2251,7 @@ fn read_pad_token_string_handles_both_hf_shapes_and_misses() {
 /// skew in a split-source or hand-merged tokenizer directory), no token is
 /// returned — trusting either side could reintroduce a pad-as-EOS corruption.
 /// Agreement resolves normally.
+#[cfg(feature = "serde_json")]
 #[test]
 fn read_pad_token_string_rejects_disagreeing_metadata() {
   let dir = pad_meta_dir("disagree");

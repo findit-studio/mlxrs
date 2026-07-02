@@ -102,6 +102,7 @@ fn mock_constructor() -> EmbeddingModelConstructor {
 /// A tokenizer whose vocab carries `<pad>` at a KNOWN id (0) — the ground
 /// truth `load()` must resolve the pad id from, regardless of what any
 /// metadata id table claims.
+#[cfg(feature = "serde_json")]
 fn write_tokenizer_with_pad(dir: &Path) {
   use tokenizers::{
     Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
@@ -120,6 +121,7 @@ fn write_tokenizer_with_pad(dir: &Path) {
   hf.save(dir.join("tokenizer.json"), false).unwrap();
 }
 
+#[cfg(feature = "serde_json")]
 #[test]
 fn load_resolves_pad_id_from_tokenizer_not_stale_metadata_table() {
   // tokenizer.json (the file the Tokenizer is actually built from) maps
