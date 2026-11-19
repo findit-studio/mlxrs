@@ -72,7 +72,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true, features = ["preserve_order"] }
 memspan = { version = "0.1", optional = true }
 glob = { version = "0.3", optional = true }
-jiff = { version = "0.2", optional = true }
+jiff = { version = "1.0", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 symphonia = { version = "0.6", optional = true, default-features = false, features = [
   "wav",
